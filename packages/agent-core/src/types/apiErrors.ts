@@ -1,0 +1,136 @@
+/**
+ * Custom error class for API-related errors
+ */
+export class ApiError extends Error {
+    public readonly status: number;
+    public readonly statusText: string;
+    public readonly code?: string;
+    public readonly detail?: Record<string, unknown>;
+    public readonly retryAfterSeconds?: number;
+
+    constructor(
+        status: number,
+        statusText: string,
+        message?: string,
+        code?: string,
+        detail?: Record<string, unknown>,
+    ) {
+        super(message || `API error: ${status} - ${statusText}`);
+        this.name = 'ApiError';
+        this.status = status;
+        this.statusText = statusText;
+        this.code = code;
+        this.detail = detail;
+        this.retryAfterSeconds = typeof detail?.retry_after_seconds === 'number'
+            ? detail.retry_after_seconds
+            : undefined;
+    }
+
+    /**
+     * Check if this error indicates sync is not allowed
+     */
+    isSyncNotAllowed(): boolean {
+        return this.status === 403 && this.code === 'SYNC_NOT_ALLOWED';
+    }
+}
+
+/**
+ * Error thrown when an authenticated request can no longer be recovered
+ * because the user's session is no longer valid.
+ */
+export class SessionExpiredError extends ApiError {
+    constructor(message?: string) {
+        super(401, 'Unauthorized', message || 'Session expired', 'SESSION_EXPIRED');
+        this.name = 'SessionExpiredError';
+    }
+}
+
+/**
+ * Error thrown when refreshing an otherwise valid session fails for a
+ * transient or retryable reason.
+ */
+export class SessionRefreshError extends ApiError {
+    constructor(message?: string, status: number = 503, statusText: string = 'Service Unavailable') {
+        super(status, statusText, message || 'Session refresh failed', 'SESSION_REFRESH_FAILED');
+        this.name = 'SessionRefreshError';
+    }
+}
+
+/**
+ * The caller stopped waiting for a request whose outcome may be unknown.
+ *
+ * This remains a SessionRefreshError subtype so existing transient-network
+ * handling continues to apply, while mutation callers can distinguish a
+ * deadline from a definite server rejection and reconcile before updating UI.
+ */
+export class RequestTimeoutError extends SessionRefreshError {
+    constructor(message?: string) {
+        super(message || 'Request timed out', 0, 'Network Error');
+        this.name = 'RequestTimeoutError';
+    }
+}
+
+/**
+ * The server received the request without usable credentials, even though the
+ * client attached a bearer token.
+ *
+ * The backend's bearer scheme rejects such a request before any AsterMargin auth
+ * code runs, so this is never a token problem — an expired or malformed token
+ * comes back as 401. It means the `Authorization` header did not survive the
+ * trip, which in practice is a VPN, proxy, or TLS-inspecting antivirus
+ * rewriting the request.
+ */
+export class CredentialsBlockedError extends ApiError {
+    constructor(message?: string) {
+        super(
+            403,
+            'Forbidden',
+            message || 'Authorization header did not reach the server',
+            'CREDENTIALS_BLOCKED',
+        );
+        this.name = 'CredentialsBlockedError';
+    }
+}
+
+/**
+ * Error thrown for server-side errors
+ */
+export class ServerError extends Error {
+    constructor(message?: string) {
+        super(message || 'Server error occurred');
+        this.name = 'ServerError';
+    }
+}
+
+/** Structural classification survives separately evaluated bundles and serialized errors. */
+export function isApiError(error: unknown): error is ApiError {
+    return !!error && typeof error === 'object'
+        && typeof (error as ApiError).message === 'string'
+        && typeof (error as ApiError).status === 'number'
+        && typeof (error as ApiError).statusText === 'string';
+}
+export function isSessionExpiredError(error: unknown): error is SessionExpiredError {
+    return isApiError(error) && error.code === 'SESSION_EXPIRED';
+}
+export function isSessionRefreshError(error: unknown): error is SessionRefreshError {
+    return isApiError(error) && error.code === 'SESSION_REFRESH_FAILED';
+}
+export function isCredentialsBlockedError(error: unknown): error is CredentialsBlockedError {
+    return isApiError(error) && error.code === 'CREDENTIALS_BLOCKED';
+}
+export function isServerError(error: unknown): error is ServerError {
+    return !!error && typeof error === 'object' && (error as Error).name === 'ServerError';
+}
+
+/** Admission conflicts require history reconciliation and an explicit new operation. */
+export function isThreadConflict(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const value = error as { code?: string; type?: string };
+    return [
+        "thread_busy",
+        "thread_tail_mismatch",
+        "duplicate_run_id",
+        "thread_claim_lost",
+        "thread_not_found",
+    ].includes(value.code ?? value.type ?? "");
+}

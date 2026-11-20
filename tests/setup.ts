@@ -1,0 +1,314 @@
+/**
+ * Vitest global setup — stubs Zotero/Mozilla globals that the source code references.
+ *
+ * These stubs are intentionally minimal: only the shapes that the code under
+ * test actually touches need to exist.  Individual test files may override
+ * or extend them via vi.spyOn / vi.mocked.
+ */
+
+import { vi } from 'vitest';
+import { registerZoteroLibraryIdentity } from '../src/utils/libraryIdentity';
+
+// ---------------------------------------------------------------------------
+// Worker-scope `self` — code inside src/astermargin-extract/worker/ references
+// `self` at module-load time (e.g. workerScope.ts). Tests run in node, where
+// `self` is undefined; alias it to globalThis so worker-only modules can be
+// imported without ReferenceError. Runtime calls into the worker still need
+// to happen inside an actual worker, but the symbol resolution at import is
+// what matters here.
+// ---------------------------------------------------------------------------
+if (typeof (globalThis as any).self === 'undefined') {
+    (globalThis as any).self = globalThis;
+}
+
+// ---------------------------------------------------------------------------
+// IOUtils — Mozilla's async file I/O
+// ---------------------------------------------------------------------------
+const ioUtils = {
+    exists: vi.fn().mockResolvedValue(false),
+    stat: vi.fn().mockResolvedValue({ lastModified: 0, size: 0 }),
+    read: vi.fn().mockResolvedValue(new Uint8Array()),
+    write: vi.fn().mockResolvedValue(undefined),
+    readUTF8: vi.fn().mockResolvedValue(''),
+    writeUTF8: vi.fn().mockResolvedValue(undefined),
+    remove: vi.fn().mockResolvedValue(undefined),
+    getChildren: vi.fn().mockResolvedValue([]),
+    makeDirectory: vi.fn().mockResolvedValue(undefined),
+};
+(globalThis as any).IOUtils = ioUtils;
+
+// ---------------------------------------------------------------------------
+// PathUtils — Mozilla's path utilities
+// ---------------------------------------------------------------------------
+const pathUtils = {
+    join: vi.fn((...parts: string[]) => parts.join('/')),
+    filename: vi.fn((path: string) => {
+        const segments = path.split('/');
+        return segments[segments.length - 1];
+    }),
+    parent: vi.fn((path: string) => {
+        const at = path.lastIndexOf('/');
+        return at > 0 ? path.slice(0, at) : null;
+    }),
+};
+(globalThis as any).PathUtils = pathUtils;
+
+// ---------------------------------------------------------------------------
+// Ci — Mozilla component interfaces
+// ---------------------------------------------------------------------------
+(globalThis as any).Ci = {
+    nsIFile: {
+        DIRECTORY_TYPE: 1,
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Window lookup
+// ---------------------------------------------------------------------------
+// Unit tests run in the Node environment by default. Only suites that opt into
+// a DOM environment should expose `window`, so avoid eagerly importing jsdom
+// here. That import currently fails in this toolchain before any tests load.
+// Build a lazy, jsdom-backed window for tests that need real DOM APIs
+// (e.g. ProseMirror normalization in the notes suites). We try to load
+// jsdom at first access; if it isn't available or fails to initialize,
+// the fallback is an empty object and DOM-dependent tests will surface
+// their own descriptive errors rather than a stack-overflow recursion.
+let fallbackWindow: any = null;
+function getTestWindow() {
+    if (fallbackWindow) return fallbackWindow;
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { JSDOM } = require('jsdom');
+        const dom = new JSDOM('<!doctype html><html><body></body></html>');
+        fallbackWindow = dom.window;
+    } catch {
+        fallbackWindow = {};
+    }
+    return fallbackWindow;
+}
+
+// ---------------------------------------------------------------------------
+// Zotero namespace (minimal)
+// ---------------------------------------------------------------------------
+
+// Stable field/type IDs used by our SQL-level tests. These are what
+// Zotero.ItemFields.getID / Zotero.ItemTypes.getID return. Real Zotero
+// assigns these dynamically, but stable integers are sufficient for unit
+// tests since our seeded schema uses the same IDs.
+const TEST_FIELD_IDS: Record<string, number> = {
+    title: 110,
+    DOI: 26,
+    ISBN: 11,
+    date: 14,
+    publicationTitle: 12,   // a base field of its own; bookTitle maps onto it
+    bookTitle: 90,          // a publicationTitle-mapped field on bookSection
+    caseName: 118,          // a title-mapped field on case
+    dateDecided: 150,       // a date-mapped field on case
+    abstractNote: 2,        // valid for every type but attachment/note/annotation
+    publisher: 21,          // a base field only some types hold
+    distributor: 116,       // a publisher-mapped field on film
+};
+
+const TEST_TYPE_IDS: Record<string, number> = {
+    annotation: 1,
+    attachment: 3,
+    note: 28,
+    journalArticle: 4,
+    book: 2,
+    bookSection: 5,
+    film: 8,
+    blogPost: 37,
+};
+
+// Which fields each item type holds. A type-specific variant of a base field
+// is listed under the variant's own name (a film's `distributor` IS its
+// publisher), which is what getFieldIDFromTypeAndBase resolves. These follow
+// Zotero's real schema for the fields named: a test that asserts an item is
+// kept or dropped for holding a field is only worth anything if the schema it
+// asserts against is the real one.
+const TEST_TYPE_FIELDS: Record<string, string[]> = {
+    annotation: [],
+    note: [],
+    attachment: ['title'],
+    journalArticle: ['title', 'DOI', 'date', 'publicationTitle', 'abstractNote'],
+    book: ['title', 'DOI', 'ISBN', 'date', 'publisher', 'abstractNote'],
+    bookSection: ['title', 'DOI', 'ISBN', 'bookTitle', 'date', 'publisher', 'abstractNote'],
+    film: ['title', 'DOI', 'date', 'distributor', 'abstractNote'],
+    blogPost: ['title', 'DOI', 'date', 'abstractNote'],
+};
+
+// Zotero's base-field mapping: base field -> the type-specific fields that ARE
+// that field under another name. A subset of the real mapping — the entries
+// the seeded types need — but every entry is one Zotero really has, because
+// both mocked functions below answer from it and a made-up mapping would let a
+// test assert an item-type validity Zotero does not agree with.
+const TEST_BASE_FIELD_VARIANTS: Record<string, string[]> = {
+    title: ['caseName'],
+    date: ['dateDecided'],
+    publicationTitle: ['bookTitle'],
+    publisher: ['distributor'],
+};
+
+const testTypeNameFromID = (itemType: number | string): string | undefined =>
+    typeof itemType === 'number'
+        ? Object.keys(TEST_TYPE_IDS).find(name => TEST_TYPE_IDS[name] === itemType)
+        : itemType;
+
+// The {id, name} rows Zotero.ItemTypes.getAll returns, from the same map.
+const testItemTypes = () =>
+    Object.entries(TEST_TYPE_IDS).map(([name, id]) => ({ id, name }));
+
+// Minimal DOI cleaner — strips a common "https://doi.org/" prefix and lowercases.
+// Zotero's real cleanDOI is more thorough, but this is enough for comparisons.
+function testCleanDOI(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const s = String(value).trim();
+    if (!s) return null;
+    const match = s.match(/10\.\d{4,}\/\S+/);
+    if (!match) return null;
+    return match[0].replace(/[.,;:]+$/, '');
+}
+
+function testCleanISBN(value: string | null | undefined): string | null {
+    if (!value) return null;
+    const digits = String(value).replace(/[^0-9Xx]/g, '').toUpperCase();
+    if (digits.length !== 10 && digits.length !== 13) return null;
+    return digits;
+}
+
+function testRemoveDiacritics(s: string): string {
+    return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+(globalThis as any).Zotero = {
+    File: {
+        pathToFile: vi.fn((dir: string) => ({
+            clone: () => {
+                let currentPath = dir;
+                return {
+                    get path() { return currentPath; },
+                    append(name: string) { currentPath = currentPath + '/' + name; },
+                    exists: vi.fn(() => true),
+                    create: vi.fn(),
+                };
+            },
+        })),
+    },
+    Profile: {
+        dir: '/mock/profile',
+    },
+    Prefs: {
+        get: vi.fn().mockReturnValue(undefined),
+        set: vi.fn(),
+        clear: vi.fn(),
+        registerObserver: vi.fn(() => Symbol('pref-obs')),
+        unregisterObserver: vi.fn(),
+    },
+    Notifier: {
+        registerObserver: vi.fn(() => 'astermargin-bg-extractor'),
+        unregisterObserver: vi.fn(),
+    },
+    Sync: {
+        Runner: {
+            syncInProgress: false,
+        },
+    },
+    debug: vi.fn(),
+    getMainWindow: vi.fn(() => getTestWindow()),
+    Utilities: {
+        cleanDOI: vi.fn(testCleanDOI),
+        cleanISBN: vi.fn(testCleanISBN),
+        removeDiacritics: vi.fn(testRemoveDiacritics),
+    },
+    Date: {
+        strToDate: vi.fn((s: string | undefined | null) => {
+            if (!s) return {};
+            const match = String(s).match(/(\d{4})/);
+            return match ? { year: match[1] } : {};
+        }),
+    },
+    ItemFields: {
+        getID: vi.fn((name: string) => TEST_FIELD_IDS[name] ?? 0),
+        getTypeFieldsFromBase: vi.fn((baseField: string) =>
+            (TEST_BASE_FIELD_VARIANTS[baseField] ?? []).map(field => TEST_FIELD_IDS[field])),
+        // Zotero's own contract: the fieldID the type holds `baseField` under
+        // (the base field itself when the type holds it directly), false when
+        // the type has no such field, and a throw for an unknown type.
+        getFieldIDFromTypeAndBase: vi.fn((itemType: number | string, baseField: string) => {
+            const typeName = testTypeNameFromID(itemType);
+            if (!typeName || !(typeName in TEST_TYPE_FIELDS)) {
+                throw new Error(`Invalid item type '${itemType}'`);
+            }
+            const fields = TEST_TYPE_FIELDS[typeName];
+            if (fields.includes(baseField)) return TEST_FIELD_IDS[baseField];
+            const variant = (TEST_BASE_FIELD_VARIANTS[baseField] ?? [])
+                .find(field => fields.includes(field));
+            return variant ? TEST_FIELD_IDS[variant] : false;
+        }),
+    },
+    ItemTypes: {
+        getID: vi.fn((name: string) => TEST_TYPE_IDS[name] ?? 0),
+        // getAll and getTypes are the same function in Zotero.
+        getAll: vi.fn(testItemTypes),
+        getTypes: vi.fn(testItemTypes),
+    },
+    SearchConditions: {
+        // Permissive except for the conditions Zotero restricts and our
+        // handlers rely on. Enough to exercise the operator gate without
+        // restating Zotero's whole condition table.
+        hasOperator: vi.fn((condition: string, operator: string) => {
+            const restricted: Record<string, string[]> = {
+                itemType: ['is', 'isNot'],
+                collection: ['is', 'isNot'],
+                savedSearch: ['is', 'isNot'],
+                note: ['contains', 'doesNotContain'],
+            };
+            const allowed = restricted[condition];
+            return allowed ? allowed.includes(operator) : true;
+        }),
+    },
+    Libraries: {
+        getAll: vi.fn(() => [{ libraryID: 1 }]),
+    },
+    Attachments: {
+        LINK_MODE_IMPORTED_FILE: 0,
+        LINK_MODE_IMPORTED_URL: 1,
+        LINK_MODE_LINKED_FILE: 2,
+        LINK_MODE_LINKED_URL: 3,
+        LINK_MODE_EMBEDDED_IMAGE: 4,
+    },
+};
+
+// Expose the test field/type IDs so tests can reuse them when seeding rows.
+(globalThis as any).__TEST_FIELD_IDS = TEST_FIELD_IDS;
+(globalThis as any).__TEST_TYPE_IDS = TEST_TYPE_IDS;
+
+// ---------------------------------------------------------------------------
+// Library-identity resolvers — mirrors react/index.tsx's registration so
+// citation and note-reference parsing (citationGrammar.ts) resolves against the
+// Zotero stub above, the same as it does in the running plugin. Individual test
+// files that need the unregistered default get a fresh, unregistered module
+// instance via `vi.resetModules()` + a dynamic import.
+//
+// Because the reference is captured here, `vi.mock` of `libraryIdentity` in a
+// test file does not reach anything that resolves through these seams — that
+// now includes citation parsing and the `run-state` modules. A test that needs
+// to control how refs resolve should register its own resolver rather than mock
+// the module, which would otherwise pass while exercising the real one.
+// ---------------------------------------------------------------------------
+registerZoteroLibraryIdentity();
+
+// ---------------------------------------------------------------------------
+// ztoolkit global (used in hooks.ts, but not in our test targets)
+// ---------------------------------------------------------------------------
+(globalThis as any).ztoolkit = {
+    log: vi.fn(),
+};
+
+// ---------------------------------------------------------------------------
+// process.env stub (used in dev-only console.log guards)
+// ---------------------------------------------------------------------------
+if (typeof process === 'undefined') {
+    (globalThis as any).process = { env: {} };
+}
+process.env.NODE_ENV = 'test';

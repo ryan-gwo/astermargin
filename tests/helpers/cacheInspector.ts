@@ -1,0 +1,1309 @@
+/**
+ * Cache state inspection and cleanup helpers.
+ *
+ * Talks to the /astermargin/test/* endpoints registered in useHttpEndpoints.ts.
+ * Shared by live and integration tests.
+ */
+
+import { getBaseUrl, type AttachmentFixture } from './fixtures';
+
+async function post<T>(path: string, body: unknown = {}): Promise<T> {
+    const res = await fetch(`${getBaseUrl()}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Cache inspector: HTTP ${res.status}: ${text}`);
+    }
+    return (await res.json()) as T;
+}
+
+export interface PingResponse {
+    ok: boolean;
+    cache_available: boolean;
+    db_available: boolean;
+    platform?: {
+        zoteroVersion: string;
+        /** Gecko major version: 140 on Zotero 10, 153 on Zotero 11. */
+        platformMajorVersion: number;
+        prefs: {
+            allowUnsafeSubscriptLoads: boolean | null;
+            chromeBaselineCsp: boolean | null;
+        };
+    };
+}
+
+export interface CachedPageGeometry {
+    viewBox: [number, number, number, number];
+    width: number;
+    height: number;
+    rotation: 0 | 90 | 180 | 270;
+}
+
+export type ExtractContentKind = 'pdf' | 'epub' | 'text' | 'snapshot';
+
+/** Durable per-kind metadata blob persisted in `document_metadata_json`. */
+export interface PdfCachedDocumentMetadata {
+    content_kind: 'pdf';
+    pageCount: number | null;
+    pageLabels: Record<string, string> | null;
+    pages: (CachedPageGeometry | null)[] | null;
+}
+
+/** Per-section summary persisted in the EPUB metadata blob. */
+export interface EpubCachedSectionSummary {
+    index: number;
+    rawHref: string;
+    label?: string | null;
+    itemCount: number;
+}
+
+export interface EpubCachedDocumentMetadata {
+    content_kind: 'epub';
+    sectionCount: number;
+    sections: EpubCachedSectionSummary[];
+}
+
+export interface CacheMetadataRecord {
+    id: number;
+    itemId: number;
+    libraryId: number;
+    zoteroKey: string;
+    contentKind: ExtractContentKind;
+    filePath: string;
+    sourceSizeBytes: number;
+    contentType: string;
+    documentMetadata: PdfCachedDocumentMetadata | EpubCachedDocumentMetadata | null;
+    pageCount: number | null;
+    pageLabels: Record<string, string> | null;
+    pages: (CachedPageGeometry | null)[] | null;
+    errorCode: 'encrypted' | 'invalid_pdf' | 'no_text_layer' | null;
+    extractionSchemaVersion: string;
+    metadataFormatVersion: number;
+}
+
+export interface CachePayloadRecord {
+    id: number;
+    metadataId: number;
+    itemId: number;
+    libraryId: number;
+    zoteroKey: string;
+    payloadKind: 'structured' | 'markdown';
+    contentKind: ExtractContentKind;
+    sourceFilePath: string;
+    payloadPath: string;
+    payloadSizeBytes: number;
+    payloadSha256: string;
+    extractionSchemaVersion: string;
+    cacheFormatVersion: number;
+}
+
+export interface ResolveItemResponse {
+    item_id: number | null;
+    item_type: string | null;
+    is_attachment?: boolean;
+    parent_id?: number | null;
+    attachment_content_type?: string | null;
+    /**
+     * `<libraryId>-<zoteroKey>` of the PDF attachment the production resolver
+     * would extract for this item (the item itself when it is already a PDF
+     * attachment, or the single child PDF of a regular item). `null` when the
+     * item does not resolve to a PDF.
+     */
+    resolved_pdf_key?: string | null;
+    error?: string;
+}
+
+export async function ping(): Promise<PingResponse> {
+    return post('/astermargin/test/ping');
+}
+
+// ---------------------------------------------------------------------------
+// MuPDF worker plumbing helpers (PR #1)
+// ---------------------------------------------------------------------------
+
+export interface PdfPageCountResponse {
+    ok: boolean;
+    count?: number;
+    error?: {
+        name: string;
+        code?: string;
+        message: string;
+    };
+}
+
+export async function pdfPageCount(
+    attachment: AttachmentFixture,
+): Promise<PdfPageCountResponse> {
+    return post<PdfPageCountResponse>('/astermargin/test/pdf-page-count', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+    });
+}
+
+export async function pdfPageCountFromBytes(
+    bytes: Uint8Array,
+): Promise<PdfPageCountResponse> {
+    const base64 = bufferToBase64(bytes);
+    return post<PdfPageCountResponse>('/astermargin/test/pdf-page-count', {
+        raw_bytes_base64: base64,
+    });
+}
+
+function bufferToBase64(bytes: Uint8Array): string {
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+        binary += String.fromCharCode(...slice);
+    }
+    if (typeof Buffer !== 'undefined') {
+        return Buffer.from(bytes).toString('base64');
+    }
+    return (globalThis as any).btoa(binary);
+}
+
+function base64ToUint8Array(base64: string): Uint8Array {
+    if (typeof Buffer !== 'undefined') {
+        return new Uint8Array(Buffer.from(base64, 'base64'));
+    }
+    const binary = (globalThis as any).atob(base64) as string;
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// MuPDF worker plumbing helpers (PR #2)
+// ---------------------------------------------------------------------------
+
+export interface PdfPageImageOptions {
+    scale?: number;
+    dpi?: number;
+    alpha?: boolean;
+    showExtras?: boolean;
+    format?: 'png' | 'jpeg';
+    jpegQuality?: number;
+}
+
+export interface PdfRenderPagePayload {
+    pageIndex: number;
+    format: 'png' | 'jpeg';
+    width: number;
+    height: number;
+    scale: number;
+    dpi: number;
+    data_base64: string;
+    data_byte_length: number;
+}
+
+export interface PdfRenderPagesResponse {
+    ok: boolean;
+    pages?: PdfRenderPagePayload[];
+    error?: { name: string; code?: string; message: string };
+}
+
+export interface PdfRenderPagesWithMetaResponse {
+    ok: boolean;
+    pageCount?: number;
+    pageLabels?: Record<number, string>;
+    pages?: PdfRenderPagePayload[];
+    error?: { name: string; code?: string; message: string; pageCount?: number };
+}
+
+export interface PdfPageLabelsResponse {
+    ok: boolean;
+    pageCount?: number;
+    pageLabels?: Record<number, string>;
+    format?: string;
+    title?: string;
+    author?: string;
+    subject?: string;
+    keywords?: string;
+    creator?: string;
+    producer?: string;
+    creationDate?: string;
+    modDate?: string;
+    error?: { name: string; code?: string; message: string };
+}
+
+export interface PdfExtractRawDetailedResponse {
+    ok: boolean;
+    result?: {
+        pageIndex: number;
+        pageNumber: number;
+        width: number;
+        height: number;
+        label?: string;
+        blocks: unknown[];
+    };
+    error?: { name: string; code?: string; message: string };
+}
+
+export async function pdfPageLabels(
+    attachment: AttachmentFixture,
+): Promise<PdfPageLabelsResponse> {
+    return post<PdfPageLabelsResponse>('/astermargin/test/pdf-page-labels', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+    });
+}
+
+export async function pdfRenderPages(
+    attachment: AttachmentFixture,
+    body: { page_indices?: number[]; options?: PdfPageImageOptions } = {},
+): Promise<PdfRenderPagesResponse> {
+    return post<PdfRenderPagesResponse>('/astermargin/test/pdf-render-pages', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+export async function pdfRenderPagesFromBytes(
+    bytes: Uint8Array,
+    body: { page_indices?: number[]; options?: PdfPageImageOptions } = {},
+): Promise<PdfRenderPagesResponse> {
+    return post<PdfRenderPagesResponse>('/astermargin/test/pdf-render-pages', {
+        raw_bytes_base64: bufferToBase64(bytes),
+        ...body,
+    });
+}
+
+export async function pdfRenderPagesWithMeta(
+    attachment: AttachmentFixture,
+    body: {
+        page_indices?: number[];
+        page_range?: { startIndex: number; endIndex?: number; maxPages?: number };
+        options?: PdfPageImageOptions;
+    } = {},
+): Promise<PdfRenderPagesWithMetaResponse> {
+    return post<PdfRenderPagesWithMetaResponse>('/astermargin/test/pdf-render-pages-with-meta', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+export async function pdfExtractRawDetailed(
+    attachment: AttachmentFixture,
+    body: { page_index: number; include_images?: boolean },
+): Promise<PdfExtractRawDetailedResponse> {
+    return post<PdfExtractRawDetailedResponse>(
+        '/astermargin/test/pdf-extract-raw-detailed',
+        {
+            library_id: attachment.library_id,
+            zotero_key: attachment.zotero_key,
+            ...body,
+        },
+    );
+}
+
+export interface PdfErrorEnvelope {
+    name: string;
+    code?: string;
+    message: string;
+    payload?: {
+        ocrAnalysis?: unknown;
+        pageLabels?: Record<number, string>;
+        pageCount?: number;
+    };
+}
+
+export interface PdfExtractResponse {
+    ok: boolean;
+    result?: any;
+    error?: PdfErrorEnvelope;
+}
+
+export async function pdfExtract(
+    attachment: AttachmentFixture,
+    body: { settings?: Record<string, unknown> } = {},
+): Promise<PdfExtractResponse> {
+    return post<PdfExtractResponse>('/astermargin/test/pdf-extract', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+export async function pdfExtractParagraph(
+    attachment: AttachmentFixture,
+    body: { settings?: Record<string, unknown> } = {},
+): Promise<PdfExtractResponse> {
+    return post<PdfExtractResponse>('/astermargin/test/pdf-extract-paragraph', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+export async function pdfHasTextLayer(
+    attachment: AttachmentFixture,
+): Promise<{ ok: boolean; hasTextLayer?: boolean; error?: PdfErrorEnvelope }> {
+    return post('/astermargin/test/pdf-has-text-layer', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+    });
+}
+
+export async function pdfAnalyzeOcr(
+    attachment: AttachmentFixture,
+    body: { options?: Record<string, unknown> } = {},
+): Promise<PdfExtractResponse> {
+    return post<PdfExtractResponse>('/astermargin/test/pdf-analyze-ocr', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+export async function pdfSearchScored(
+    attachment: AttachmentFixture,
+    body: { query: string; options?: Record<string, unknown> },
+): Promise<PdfExtractResponse> {
+    return post<PdfExtractResponse>('/astermargin/test/pdf-search-scored', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+export async function pdfSentenceBBoxes(
+    attachment: AttachmentFixture,
+    body: { page_index: number; options?: Record<string, unknown> },
+): Promise<PdfExtractResponse> {
+    return post<PdfExtractResponse>('/astermargin/test/pdf-sentence-bboxes', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+/**
+ * `/astermargin/test/pdf-render-overlay` — renders a page and paints bbox
+ * overlays for the requested level. Sentence-level rects are produced by
+ * the same orchestration as `/astermargin/test/pdf-sentence-bboxes`; the
+ * `pdfRenderOverlayParity.live.test.ts` test asserts the bboxes match
+ * exactly.
+ */
+export interface PdfRenderOverlayRect {
+    rect: { l: number; t: number; r: number; b: number; origin: string };
+    color: string;
+    label?: string;
+    group: number;
+    degraded?: boolean;
+    marginPosition?: 'top' | 'bottom' | 'left' | 'right' | null;
+}
+
+export interface PdfRenderOverlayResponse {
+    ok: boolean;
+    level?: string;
+    page_index?: number;
+    page_width?: number;
+    page_height?: number;
+    image_width?: number;
+    image_height?: number;
+    dpi?: number;
+    group_count?: number;
+    stats?: Record<string, number | string | undefined>;
+    rects?: PdfRenderOverlayRect[];
+    image_base64?: string;
+    image_byte_length?: number;
+    error?: PdfErrorEnvelope;
+}
+
+export async function pdfRenderOverlay(
+    attachment: AttachmentFixture,
+    body: {
+        page_index: number;
+        level:
+            | 'columns'
+            | 'lines'
+            | 'items'
+            | 'sentences'
+            | 'margins';
+        dpi?: number;
+        language?: string;
+        analysis_page_window?: number;
+    },
+): Promise<PdfRenderOverlayResponse> {
+    return post<PdfRenderOverlayResponse>('/astermargin/test/pdf-render-overlay', {
+        library_id: attachment.library_id,
+        zotero_key: attachment.zotero_key,
+        ...body,
+    });
+}
+
+
+/** Decode a base64 image payload from `pdfRenderPages` for byte-level checks. */
+export function decodeRenderPayload(payload: PdfRenderPagePayload): Uint8Array {
+    return base64ToUint8Array(payload.data_base64);
+}
+
+export async function getCacheMetadata(
+    libraryId: number,
+    key: string,
+): Promise<CacheMetadataRecord | null> {
+    const res = await post<{ record: CacheMetadataRecord | null; error?: string }>(
+        '/astermargin/test/cache-metadata',
+        { library_id: libraryId, zotero_key: key },
+    );
+    if (res.error) throw new Error(res.error);
+    return res.record;
+}
+
+export async function getCachePayload(
+    libraryId: number,
+    key: string,
+    payloadKind: 'structured' | 'markdown' = 'markdown',
+): Promise<CachePayloadRecord | null> {
+    const res = await post<{ record: CachePayloadRecord | null; error?: string }>(
+        '/astermargin/test/cache-payload',
+        { library_id: libraryId, zotero_key: key, payload_kind: payloadKind },
+    );
+    if (res.error) throw new Error(res.error);
+    return res.record;
+}
+
+export async function invalidateCache(
+    libraryId: number,
+    key: string,
+): Promise<void> {
+    const res = await post<{ ok?: boolean; error?: string }>(
+        '/astermargin/test/cache-invalidate',
+        { library_id: libraryId, zotero_key: key },
+    );
+    if (res.error) throw new Error(res.error);
+}
+
+export interface SeedPageLabelsResponse {
+    ok?: boolean;
+    seeded?: boolean;
+    page_labels?: Record<string, string> | null;
+    error?: string;
+}
+
+/**
+ * `/astermargin/test/cache-seed-page-labels` — seed document-cache page labels for
+ * an attachment via the real `DocumentCache.putMetadata` write path. `labels`
+ * is a 0-based index → display-label map (e.g. `{ 0: 'iii', 1: 'iv' }`).
+ */
+export async function seedPageLabels(
+    libraryId: number,
+    key: string,
+    labels: Record<number, string>,
+    pageCount?: number,
+): Promise<SeedPageLabelsResponse> {
+    const res = await post<SeedPageLabelsResponse>('/astermargin/test/cache-seed-page-labels', {
+        library_id: libraryId,
+        zotero_key: key,
+        page_labels: labels,
+        page_count: pageCount,
+    });
+    if (res.error) throw new Error(res.error);
+    return res;
+}
+
+export async function resolveItem(
+    libraryId: number,
+    key: string,
+): Promise<ResolveItemResponse> {
+    return post('/astermargin/test/resolve-item', {
+        library_id: libraryId,
+        zotero_key: key,
+    });
+}
+
+export interface ValidateItemResponse {
+    ok: boolean;
+    state?: 'readable' | 'unreadable' | 'blocked';
+    severity?: 'info' | 'error' | null;
+    reason?: string | null;
+    status_code?: string | null;
+    content_kind?: string | null;
+    page_count?: number | null;
+    error?: string;
+}
+
+export interface ValidateItemOptions {
+    /** Whether the active model can read images (gates image attachments). */
+    supportsVision?: boolean;
+    /** Whether OCR can run locally (admits scanned/no-text PDFs). */
+    canHandleOCRLocally?: boolean;
+    /** Restrict the searchable libraries (excluded libraries are blocked). */
+    searchableLibraryIds?: number[];
+    timeout?: number;
+}
+
+/**
+ * `/astermargin/test/validate-item` — run `itemValidationManager.validateItem`
+ * against a live item. Capability flags drive the option-dependent gating
+ * (images, OCR, excluded libraries); omit them for the no-capability baseline.
+ */
+export async function validateItem(
+    libraryId: number,
+    key: string,
+    options?: ValidateItemOptions,
+): Promise<ValidateItemResponse> {
+    return post('/astermargin/test/validate-item', {
+        library_id: libraryId,
+        zotero_key: key,
+        supports_vision: options?.supportsVision,
+        can_handle_ocr_locally: options?.canHandleOCRLocally,
+        searchable_library_ids: options?.searchableLibraryIds,
+    }, { timeout: options?.timeout ?? 60_000 });
+}
+
+export interface ValidateRegularItemAttachment {
+    attachment_id: string;
+    state: 'readable' | 'unreadable' | 'blocked';
+    severity?: 'info' | 'error' | null;
+    reason?: string | null;
+    status_code?: string | null;
+    content_kind?: string | null;
+    page_count?: number | null;
+    is_primary: boolean;
+    filename?: string | null;
+}
+
+export interface ValidateRegularItemResponse {
+    ok: boolean;
+    state?: 'readable' | 'unreadable' | 'blocked';
+    severity?: 'info' | 'error' | null;
+    reason?: string | null;
+    attachments?: ValidateRegularItemAttachment[];
+    error?: string;
+}
+
+/**
+ * `/astermargin/test/validate-regular-item` — run
+ * `itemValidationManager.validateRegularItem` against a live regular item,
+ * surfacing the top-level state plus each child attachment's validation
+ * (including which child was promoted as primary).
+ */
+export async function validateRegularItem(
+    libraryId: number,
+    key: string,
+    options?: ValidateItemOptions,
+): Promise<ValidateRegularItemResponse> {
+    return post('/astermargin/test/validate-regular-item', {
+        library_id: libraryId,
+        zotero_key: key,
+        supports_vision: options?.supportsVision,
+        can_handle_ocr_locally: options?.canHandleOCRLocally,
+        searchable_library_ids: options?.searchableLibraryIds,
+    }, { timeout: options?.timeout ?? 60_000 });
+}
+
+/** Readable content kinds the resolver can classify (extractor + image). */
+export type ReadableContentKind = ExtractContentKind | 'image';
+
+export interface ResolveReadableResponse {
+    item_id: number | null;
+    item_type: string | null;
+    is_attachment?: boolean;
+    is_regular_item?: boolean;
+    /** Whether the item resolved to a readable attachment. */
+    resolved?: boolean;
+    /** `<libraryId>-<zoteroKey>` of the resolved readable attachment, or null. */
+    resolved_key?: string | null;
+    /** Readable content kind of the resolved attachment, or null on failure. */
+    content_kind?: ReadableContentKind | null;
+    content_type?: string | null;
+    /** Resolver failure code (`not_attachment` | `is_linked_url` | `not_readable`). */
+    error_code?: 'not_attachment' | 'is_linked_url' | 'not_readable' | null;
+    error?: string | null;
+}
+
+/**
+ * `/astermargin/test/resolve-readable` — runs the production
+ * `resolveToReadableAttachment` resolver and returns its result verbatim
+ * (including the chosen attachment key and content kind for non-PDF kinds),
+ * without triggering extraction.
+ */
+export async function resolveReadable(
+    libraryId: number,
+    key: string,
+): Promise<ResolveReadableResponse> {
+    return post('/astermargin/test/resolve-readable', {
+        library_id: libraryId,
+        zotero_key: key,
+    });
+}
+
+export interface BestEpubAttachmentResponse {
+    item_id: number | null;
+    item_type: string | null;
+    is_attachment?: boolean;
+    is_regular_item?: boolean;
+    /** Whether an EPUB attachment was selected. */
+    resolved?: boolean;
+    /** `<libraryId>-<zoteroKey>` of the selected EPUB attachment, or null. */
+    resolved_key?: string | null;
+    /** Content type of the selected attachment, or null when none/regular item. */
+    content_type?: string | null;
+    error?: string;
+}
+
+/**
+ * `/astermargin/test/best-epub-attachment` — runs the production
+ * `getBestEpubAttachmentAsync` helper (used by the EPUB citation-navigation
+ * path) and returns the selected attachment key/content type verbatim.
+ */
+export async function bestEpubAttachment(
+    libraryId: number,
+    key: string,
+): Promise<BestEpubAttachmentResponse> {
+    return post('/astermargin/test/best-epub-attachment', {
+        library_id: libraryId,
+        zotero_key: key,
+    });
+}
+
+/** Completely wipe the document cache (metadata rows, payload rows, files). */
+export async function clearAllCache(): Promise<{
+    metadataRows: number;
+    payloadRows: number;
+}> {
+    const res = await post<{
+        ok?: boolean;
+        metadataRows?: number;
+        payloadRows?: number;
+        error?: string;
+    }>('/astermargin/test/cache-clear-all', {});
+    if (res.error) throw new Error(res.error);
+    return { metadataRows: res.metadataRows ?? 0, payloadRows: res.payloadRows ?? 0 };
+}
+
+export interface FileStatus {
+    is_primary: boolean;
+    mime_type: string;
+    page_count: number | null;
+    status: 'readable' | 'unreadable' | 'processing';
+    status_code?: string;
+}
+
+/** Trigger `getAttachmentFileStatus` for an attachment (writes the doc cache). */
+export async function triggerFileStatus(
+    libraryId: number,
+    key: string,
+    isPrimary = true,
+): Promise<FileStatus> {
+    const res = await post<{ ok: boolean; status?: FileStatus; error?: string }>(
+        '/astermargin/test/file-status',
+        { library_id: libraryId, zotero_key: key, is_primary: isPrimary },
+    );
+    if (!res.ok || !res.status) throw new Error(res.error ?? 'file-status failed');
+    return res.status;
+}
+
+/**
+ * MCP error object shape — `read_attachment` returns this on failure.
+ */
+export interface McpToolError {
+    content: Array<{ type: string; text: string }>;
+    isError: true;
+}
+
+export type ReadAttachmentResult = string | McpToolError;
+
+/** Returns true when a `read_attachment` result is an MCP error object. */
+export function isMcpToolError(result: ReadAttachmentResult): result is McpToolError {
+    return typeof result === 'object' && result !== null && (result as McpToolError).isError === true;
+}
+
+/**
+ * Invoke the MCP `read_attachment` tool handler via the dev endpoint.
+ * `attachmentId` is the `<libraryId>-<zoteroKey>` form the tool expects.
+ */
+export async function readAttachment(body: {
+    attachment_id: string;
+    start_page?: number;
+    end_page?: number;
+}): Promise<ReadAttachmentResult> {
+    const res = await post<{ result: ReadAttachmentResult; error?: string }>(
+        '/astermargin/test/read-attachment',
+        body,
+    );
+    if (res.error) throw new Error(res.error);
+    return res.result;
+}
+
+// ---------------------------------------------------------------------------
+// MuPDF worker singleton stats / cache lifecycle (dev-only)
+// ---------------------------------------------------------------------------
+
+export interface WorkerCacheStats {
+    entries: number;
+    totalBytes: number;
+    hits: number;
+    misses: number;
+    evictions: number;
+    discards: number;
+    ttlMs: number;
+    maxEntries: number;
+    maxBytes: number;
+    cryptoUsable: boolean | null;
+}
+
+export interface WorkerStatsSnapshot {
+    hasWorker: boolean;
+    disposed: boolean;
+    spawnCount: number;
+    retryCount: number;
+    pendingCount: number;
+    nextId: number;
+    dispatchCounts: Record<string, number>;
+    lastSpawnTime: number | null;
+    idleTimerArmed: boolean;
+    workerHeapBytes: number | null;
+    peakWorkerHeapBytes: number | null;
+    completedDataOperationsSinceSpawn: number;
+    recycleHeapThresholdBytes: number | null;
+    recycleDataOperationThreshold: number | null;
+    proactiveRecyclePending: boolean;
+    proactiveRecycleCount: number;
+    lastProactiveRecycleReason: "heap_limit" | "data_operation_limit" | null;
+    lastProactiveRecycleTime: number | null;
+    lastProactiveRecycleHeapBytes: number | null;
+    lastProactiveRecycleDataOperations: number | null;
+    leaseReapCount: number;
+    lastLeaseReapTime: number | null;
+    lastLeaseReapOp: string | null;
+    lastLeaseReapAgeMs: number | null;
+}
+
+export interface WorkerStatsResponse {
+    ok: boolean;
+    stats: WorkerStatsSnapshot;
+    cacheStats: WorkerCacheStats | null;
+}
+
+export async function workerStats(
+    body: { reset?: boolean } = {},
+): Promise<WorkerStatsResponse> {
+    return post<WorkerStatsResponse>('/astermargin/test/worker-stats', body);
+}
+
+export async function workerCacheClear(
+    body: { resetCounters?: boolean } = {},
+): Promise<{ ok: boolean; cacheStats: WorkerCacheStats | null }> {
+    return post('/astermargin/test/worker-cache-clear', body);
+}
+
+export async function workerMarkStale(
+    body: { reason?: string } = {},
+): Promise<{ ok: boolean; before: WorkerStatsSnapshot; after: WorkerStatsSnapshot }> {
+    return post('/astermargin/test/worker-mark-stale', body);
+}
+
+/** One task outcome from the wedge-probe endpoint. */
+export interface WedgeProbeTaskResult {
+    label: string;
+    status: 'fulfilled' | 'rejected';
+    ms: number;
+    errorName?: string;
+    errorMessage?: string;
+}
+
+/**
+ * Drive a real busy-lease reap: shortens the hot slot's lease, dispatches a
+ * long worker op (plus an innocent sibling), and reports per-task outcomes
+ * and before/after stats. The lease is always restored server-side.
+ */
+export async function workerWedgeProbe(
+    fixture: { library_id: number; zotero_key: string },
+    body: {
+        leaseMs?: number;
+        op?: 'extractSerialized' | 'renderPages' | 'getPageCount' | 'search' | 'analyzeLayout';
+        sibling?: boolean;
+        renderEndIndex?: number;
+    } = {},
+): Promise<{
+    ok: boolean;
+    error?: string;
+    leaseMs?: number;
+    op?: string;
+    results?: WedgeProbeTaskResult[];
+    before?: Pick<
+        WorkerStatsSnapshot,
+        'spawnCount' | 'retryCount' | 'pendingCount' | 'leaseReapCount'
+    >;
+    after?: WorkerStatsSnapshot;
+}> {
+    return post('/astermargin/test/worker-wedge-probe', { ...fixture, ...body });
+}
+
+/**
+ * Drive a real idle-timer reap on the hot slot (proves the injected
+ * realm-independent timers fire). Restores the production idle timeout
+ * server-side.
+ */
+export async function workerIdleProbe(
+    body: { idleMs?: number; waitMs?: number } = {},
+): Promise<{
+    ok: boolean;
+    idleMs: number;
+    waitMs: number;
+    hasWorkerAfterPing: boolean;
+    idleTimerArmedAfterPing: boolean;
+    hasWorkerAfterWait: boolean;
+    idleTimerArmedAfterWait: boolean;
+}> {
+    return post('/astermargin/test/worker-idle-probe', body);
+}
+
+/** Realm/timer wiring info and self-heal probes for the hot worker slot. */
+export async function workerRealmProbe(
+    action: 'info' | 'identity' | 'legacy-stub',
+): Promise<{
+    ok: boolean;
+    error?: string;
+    // info
+    timersInjected?: boolean;
+    hasCreatorTracking?: boolean;
+    isCreatorRealmDead?: boolean;
+    createdFromWindowRecorded?: boolean;
+    // identity
+    sameInstance?: boolean;
+    // legacy-stub
+    replaced?: boolean;
+    replacementIsCreatorRealmDead?: boolean;
+    replacementHasTracking?: boolean;
+    stubDisposed?: boolean;
+}> {
+    return post('/astermargin/test/worker-realm-probe', { action });
+}
+
+// ---------------------------------------------------------------------------
+// Sync suppression (dev-only)
+//
+// Talks to `/astermargin/test/sync-pause`, which drives the real
+// `src/services/syncPause` module against the running Zotero's
+// `Zotero.Sync.Runner`. Shared instance with the production webpack path, so
+// always finish a test by releasing the pause (`syncPause('resume')`).
+// ---------------------------------------------------------------------------
+
+export type SyncPauseAction =
+    | 'status'
+    | 'pause'
+    | 'resume'
+    | 'schedule-resume'
+    | 'cancel-resume'
+    | 'probe-runner';
+
+export interface SyncPauseResponse {
+    ok: boolean;
+    action: SyncPauseAction;
+    runner: {
+        available: boolean;
+        delayIndefiniteAvailable: boolean;
+        delaySyncAvailable: boolean;
+        clearSyncTimeoutAvailable: boolean;
+        setSyncTimeoutAvailable: boolean;
+        syncInProgress: boolean | null;
+    };
+    paused: boolean;
+    releaseDebounceMs: number;
+    safetyIdleMs: number;
+    instanceServiceRegistered: boolean;
+    probe?: {
+        delayIndefiniteAvailable: boolean;
+        resolveType: string | null;
+        roundTripOk: boolean;
+        suppressionApisOk: boolean;
+        error?: string;
+    };
+}
+
+export async function syncPause(
+    action: SyncPauseAction = 'status',
+): Promise<SyncPauseResponse> {
+    return post<SyncPauseResponse>('/astermargin/test/sync-pause', { action });
+}
+
+// ---------------------------------------------------------------------------
+// Background extraction queue (dev-only)
+//
+// Talks to the `/astermargin/test/background-*` endpoints registered in
+// `useHttpEndpoints.ts` from `react/hooks/httpHandlers/testBackgroundHandlers.ts`.
+// ---------------------------------------------------------------------------
+
+export type BackgroundJobType =
+    | 'document_extract'
+    | 'document_ocr'
+    | 'fulltext_upsert'
+    | 'fulltext_untag';
+export type BackgroundJobPayloadKind = 'structured' | 'markdown';
+
+export interface PdfBackgroundJobPayload {
+    content_kind: 'pdf';
+    maxPages: number | null;
+    timeoutSeconds: number;
+}
+
+export type BackgroundJobPayload =
+    | PdfBackgroundJobPayload
+    | { content_kind: 'epub' }
+    | { content_kind: 'text' }
+    | { content_kind: 'snapshot' };
+
+export interface BackgroundJobRecord {
+    id: number;
+    jobType: BackgroundJobType;
+    libraryId: number;
+    itemId: number | null;
+    zoteroKey: string;
+    contentKind: ExtractContentKind;
+    payloadKind: BackgroundJobPayloadKind;
+    priority: number;
+    payload: BackgroundJobPayload | null;
+    enqueuedAt: number;
+    availableAt: number;
+    attemptCount: number;
+    lastError: string | null;
+}
+
+export interface BackgroundQueueStats {
+    pending: number;
+    available: number;
+    deferred: number;
+    dead: number;
+    byJobType: Record<string, number>;
+}
+
+export interface BackgroundEnqueueRequest {
+    library_id: number;
+    zotero_key: string;
+    content_kind: ExtractContentKind;
+    payload_kind: BackgroundJobPayloadKind;
+    job_type: BackgroundJobType;
+    priority?: number;
+    payload?: BackgroundJobPayload | null;
+    item_id?: number | null;
+    /**
+     * Wake the background loop after inserting. Defaults to `false` so
+     * tests can inspect deterministic queue state via peek/stats without
+     * the auto-tick claiming the row. Tests that exercise the auto-drain
+     * path pass `true` and pair it with `waitForQueueDrain()`.
+     */
+    notify?: boolean;
+}
+
+export interface BackgroundEnqueueResponse {
+    ok: boolean;
+    enqueued?: boolean;
+    id?: number;
+    error?: string;
+}
+
+export interface BackgroundStatsResponse {
+    ok: boolean;
+    queue?: BackgroundQueueStats;
+    lanes?: Partial<Record<BackgroundJobType, { inFlight: number; capacity: number }>>;
+    workers?: {
+        hot: WorkerStatsSnapshot | null;
+        background: WorkerStatsSnapshot | null;
+    };
+    /** Searchable-library mirror the dispatcher gates claims on. */
+    library_scope?: {
+        initialized: boolean | null;
+        searchable_library_ids: number[] | null;
+    };
+    error?: string;
+}
+
+export interface BackgroundPeekResponse {
+    ok: boolean;
+    jobs?: BackgroundJobRecord[];
+    error?: string;
+}
+
+export type BackgroundProcessOnceReason =
+    | 'stopped'
+    | 'shutting_down'
+    | 'no_window'
+    | 'hot_busy'
+    | 'library_scope_unknown'
+    | 'empty'
+    | 'job_done';
+
+export interface BackgroundProcessOnceResponse {
+    ok: boolean;
+    processed?: boolean;
+    reason?: BackgroundProcessOnceReason;
+    error?: string;
+}
+
+export async function backgroundEnqueue(
+    body: BackgroundEnqueueRequest,
+): Promise<BackgroundEnqueueResponse> {
+    return post<BackgroundEnqueueResponse>(
+        '/astermargin/test/background-enqueue',
+        body,
+    );
+}
+
+export async function backgroundStats(): Promise<BackgroundStatsResponse> {
+    return post<BackgroundStatsResponse>('/astermargin/test/background-stats', {});
+}
+
+export async function backgroundPeek(
+    body: { limit?: number } = {},
+): Promise<BackgroundPeekResponse> {
+    return post<BackgroundPeekResponse>('/astermargin/test/background-peek', body);
+}
+
+export async function backgroundProcessOnce(): Promise<BackgroundProcessOnceResponse> {
+    return post<BackgroundProcessOnceResponse>(
+        '/astermargin/test/background-process-once',
+        {},
+    );
+}
+
+export async function backgroundClear(): Promise<{ ok: boolean; error?: string }> {
+    return post('/astermargin/test/background-clear', {});
+}
+
+/**
+ * Poll `/astermargin/test/background-stats` until `queue.pending` is zero (or
+ * the timeout expires). The producer-side `notify()` in
+ * `handleTestBackgroundEnqueueHttpRequest` schedules a tick at 0ms that
+ * races the explicit `processOnce` HTTP call. For fast-completing jobs
+ * (missing item, non-PDF) the row may be drained by the background loop
+ * before `processOnce` claims it, so tests cannot rely on a deterministic
+ * winner. This helper waits for the queue to actually drain and returns
+ * the final stats snapshot.
+ */
+export async function waitForQueueDrain(
+    opts: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<BackgroundQueueStats> {
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    const pollMs = opts.pollMs ?? 100;
+    const start = Date.now();
+    let lastStats: BackgroundQueueStats | null = null;
+    while (Date.now() - start < timeoutMs) {
+        const stats = await backgroundStats();
+        if (stats.queue) {
+            lastStats = stats.queue;
+            if (stats.queue.pending === 0) return stats.queue;
+        }
+        await new Promise((r) => setTimeout(r, pollMs));
+    }
+    // A row that stays `available` was never claimed, which almost always means
+    // the idle gate: `BackgroundExtractor` only claims priority >= 100 (the
+    // enqueue default) after the OS has been idle for 30s, so such a job drains
+    // or not depending on whether someone is at the keyboard. Say so here — the
+    // raw stats look like a stuck queue.
+    const idleGated = (lastStats?.available ?? 0) > 0;
+    throw new Error(
+        `background queue did not drain within ${timeoutMs}ms; last stats: ${JSON.stringify(
+            lastStats,
+        )}`
+        + (idleGated
+            ? '. The row is still available (never claimed) — enqueue it with a '
+              + 'priority below 100 if the test needs a deterministic drain.'
+            : ''),
+    );
+}
+
+/** Item-display metadata resolved by the Zotero `itemData` citation host. */
+export interface ResolvedItemDisplay {
+    itemType?: string;
+    hasReadableAttachment: boolean;
+}
+
+interface ResolveItemDisplayResponse {
+    ok: boolean;
+    error?: string;
+    display: ResolvedItemDisplay | null;
+}
+
+/**
+ * Invoke the citation host's `resolveItemDisplay` for one item reference via
+ * `/astermargin/test/resolve-item-display`. Returns the resolved display metadata,
+ * or null when the item is missing/unresolvable.
+ */
+export async function resolveItemDisplay(
+    libraryId: number,
+    zoteroKey: string,
+): Promise<ResolvedItemDisplay | null> {
+    const res = await post<ResolveItemDisplayResponse>('/astermargin/test/resolve-item-display', {
+        library_id: libraryId,
+        zotero_key: zoteroKey,
+    });
+    if (!res.ok) throw new Error(`resolve-item-display failed: ${res.error ?? 'unknown'}`);
+    return res.display;
+}
+
+// -------------------------------------------------------------------------
+// Library exclusion (/astermargin/test/excluded-libraries)
+// -------------------------------------------------------------------------
+
+/** One entry in the profile's excluded-libraries list. */
+export interface ExcludedLibraryEntry {
+    type: 'user' | 'group';
+    group_id?: number | null;
+}
+
+export interface ExclusionStateResponse {
+    ok: boolean;
+    has_profile: boolean;
+    excluded_libraries: ExcludedLibraryEntry[];
+    searchable_library_ids: number[];
+    local_library_ids: number[];
+    error?: string;
+}
+
+/** Read the current in-memory exclusion state (excluded entries + derived ids). */
+export async function getExcludedLibraries(): Promise<ExclusionStateResponse> {
+    return post('/astermargin/test/excluded-libraries', { action: 'get' });
+}
+
+/**
+ * Overwrite the in-memory excluded set so exactly `libraryIds` are excluded.
+ * In-memory only (no backend write); pair with a restore in teardown.
+ */
+export async function setExcludedLibraries(libraryIds: number[]): Promise<ExclusionStateResponse> {
+    return post('/astermargin/test/excluded-libraries', {
+        action: 'set',
+        exclude_library_ids: libraryIds,
+    });
+}
+
+/** Restore the excluded set to a captured list of raw entries (verbatim). */
+export async function restoreExcludedLibraries(
+    entries: ExcludedLibraryEntry[],
+): Promise<ExclusionStateResponse> {
+    return post('/astermargin/test/excluded-libraries', {
+        action: 'set',
+        excluded_libraries: entries,
+    });
+}
+
+// -------------------------------------------------------------------------
+// Exclusion-gated handlers without a production HTTP route
+// -------------------------------------------------------------------------
+
+export interface GetAnnotationsResponse {
+    type?: string;
+    annotations?: unknown[];
+    total_count?: number;
+    error?: string | null;
+    error_code?: string | null;
+}
+
+/** Invoke `handleGetAnnotationsRequest` via `/astermargin/test/get-annotations`. */
+export async function getAnnotations(
+    attachment: AttachmentFixture,
+    extra?: { limit?: number; offset?: number },
+): Promise<GetAnnotationsResponse> {
+    return post('/astermargin/test/get-annotations', {
+        attachment_id: `${attachment.library_id}-${attachment.zotero_key}`,
+        limit: extra?.limit,
+        offset: extra?.offset,
+    });
+}
+
+export interface HandlerImageResponse {
+    type?: string;
+    kind?: string | null;
+    images?: unknown[];
+    error?: string | null;
+    error_code?: string | null;
+}
+
+/** Invoke `handleZoteroViewImagesRequest` for a Zotero attachment reference. */
+export async function viewAttachmentImages(
+    attachment: AttachmentFixture,
+    extra?: { start_page?: number; end_page?: number; dpi?: number },
+): Promise<HandlerImageResponse> {
+    return post('/astermargin/test/view-images', {
+        attachment: { library_id: attachment.library_id, zotero_key: attachment.zotero_key },
+        ...extra,
+    });
+}
+
+/** Invoke `handleZoteroAttachmentImageRequest` for a Zotero attachment reference. */
+export async function fetchAttachmentImage(
+    attachment: AttachmentFixture,
+    extra?: { max_width?: number; max_height?: number },
+): Promise<HandlerImageResponse> {
+    return post('/astermargin/test/attachment-image', {
+        attachment: { library_id: attachment.library_id, zotero_key: attachment.zotero_key },
+        ...extra,
+    });
+}
+
+// =============================================================================
+// Device-portable library identity (/astermargin/test/library-identity)
+// =============================================================================
+
+/** Structured `library_ref` returned by `parseLibraryRef`. */
+export type ParsedLibraryRef = { type: 'user' } | { type: 'group'; groupID: number };
+
+export interface ResolveItemReferenceResponse {
+    status: 'found' | 'library_unavailable' | 'not_found';
+    resolved_library_id?: number;
+    item_id?: string;
+    item_type?: string;
+}
+
+/** `libraryRefForLibraryID(library_id)` — portable ref for a local library id (null if none). */
+export async function libraryRefForId(
+    library_id: number,
+): Promise<{ library_ref: string | null; error?: string }> {
+    return post('/astermargin/test/library-identity', { op: 'ref_for_id', library_id });
+}
+
+/** `parseLibraryRef(library_ref)` + `LIBRARY_REF_PATTERN.test(library_ref)`. */
+export async function parseLibraryRefViaHttp(
+    library_ref: string,
+): Promise<{ parsed: ParsedLibraryRef | null; matches_pattern: boolean }> {
+    return post('/astermargin/test/library-identity', { op: 'parse', library_ref });
+}
+
+/** `resolveLibraryRef({ library_ref, library_id })` — local library id or null. */
+export async function resolveLibraryRefViaHttp(
+    ref: { library_ref?: string | null; library_id?: number },
+): Promise<{ resolved_library_id: number | null }> {
+    return post('/astermargin/test/library-identity', { op: 'resolve_ref', ...ref });
+}
+
+/** `resolveItemReference({ library_ref, library_id, zotero_key })` — tri-state resolution. */
+export async function resolveItemReferenceViaHttp(
+    ref: { library_ref?: string | null; library_id?: number; zotero_key?: string },
+): Promise<ResolveItemReferenceResponse> {
+    return post('/astermargin/test/library-identity', { op: 'resolve_item', ...ref });
+}
+
+// ---------------------------------------------------------------------------
+// Reader sidebar-width wrapper lifecycle (dev-only)
+//
+// Talks to `/astermargin/test/sidebar-width-handler` (see
+// `react/hooks/httpHandlers/testUiHandlers.ts`), which drives the real
+// UIManager install/unwrap/restore path against the live `Zotero.Reader`.
+// Every mutating scenario restores the slot before returning.
+// ---------------------------------------------------------------------------
+
+export type SidebarWidthScenario =
+    | 'inspect'
+    | 'restore-unwinds-own'
+    | 'restore-clears-bare-legacy'
+    | 'restore-leaves-foreign'
+    | 'unwrap-direct';
+
+export interface SidebarWidthScenarioResponse {
+    ok?: boolean;
+    error?: string;
+    [key: string]: unknown;
+}
+
+export async function sidebarWidthScenario(
+    scenario: SidebarWidthScenario,
+): Promise<SidebarWidthScenarioResponse> {
+    return post('/astermargin/test/sidebar-width-handler', { scenario });
+}

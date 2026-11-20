@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "module": "commonjs",
+    "target": "ES2016",
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    // Prefer path prefixes over baseUrl
+    "paths": {
+      "zotero-plugin-toolkit/*": ["./node_modules/zotero-plugin-toolkit/*"],
+      "../../addon/content/reactBundle": ["./typings/reactBundle.d.ts"],
+      // `packages` is deliberately absent from `include`: agent-core's
+      // globals.d.ts declares narrowed `navigator`/`crypto`/`URL` that would
+      // clash with lib.dom here. All three packages' sources still enter this
+      // program by being imported, and each has its own standalone gate
+      // (`npm run typecheck:core` / `npm run typecheck:ui` /
+      // `npm run typecheck:export`).
+      "@astermargin/agent-core/*": ["./packages/agent-core/src/*"],
+      "@astermargin/agent-ui/*": ["./packages/agent-ui/src/*"],
+      "@astermargin/agent-export/*": ["./packages/agent-export/src/*"],
+      "@astermargin/agent-local/*": ["./packages/agent-local/src/*"]
+    },
+    "jsx": "react",
+    "esModuleInterop": true,
+    "lib": ["DOM", "ES2016"],
+    "noEmit": true
+  },
+  "include": ["src", "react", "typings", "node_modules/zotero-types"],
+  "exclude": [
+    "build",
+    "addon",
+    "src/astermargin-extract/node",
+    "src/astermargin-extract/cli"
+  ]
+}

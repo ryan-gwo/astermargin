@@ -1,0 +1,597 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AuthApiError, AuthRetryableFetchError } from '@supabase/supabase-js';
+
+const { mockSupabase } = vi.hoisted(() => ({
+    mockSupabase: {
+        auth: {
+            getSession: vi.fn(),
+            refreshSession: vi.fn(),
+        },
+    },
+}));
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: mockSupabase,
+}));
+
+import {
+    isCredentialsBlockedError,
+    RequestTimeoutError,
+    SessionExpiredError,
+    SessionRefreshError,
+} from '@astermargin/agent-core/types/apiErrors';
+import { setCredentialAdapter } from '@astermargin/agent-core/transport/credentials';
+import { ApiService } from '@astermargin/agent-core/transport/apiService';
+import { getRuntimeAdapter, setRuntimeAdapter, type RuntimeAdapter } from '@astermargin/agent-core/platform/runtime';
+import {
+    BackendAccessBlockedError,
+    resetBackendAccessPolicyForTesting,
+    setBackendAccessPolicy,
+} from '@astermargin/agent-core/transport/backendAccessPolicy';
+
+beforeEach(() => {
+    resetBackendAccessPolicyForTesting();
+});
+
+describe('ApiService backend access policy', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it('refuses before reading credentials or dispatching when backend access is blocked', async () => {
+        const fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+        mockSupabase.auth.getSession.mockReset();
+        setBackendAccessPolicy(() => false);
+        const service = new ApiService('https://api.example.com');
+
+        const request = service.post('/threads', { a: 1 });
+
+        await expect(request).rejects.toBeInstanceOf(BackendAccessBlockedError);
+        await expect(request).rejects.toMatchObject({ surface: 'api:POST /threads' });
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(mockSupabase.auth.getSession).not.toHaveBeenCalled();
+    });
+});
+
+describe('ApiService authentication recovery', () => {
+    let service: ApiService;
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        service = new ApiService('https://api.example.com');
+        fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.refreshSession.mockReset();
+
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'stale-token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        setCredentialAdapter(undefined);
+        vi.unstubAllGlobals();
+    });
+
+    it('reports a repeated 401 once with the originating generation', async () => {
+        const report = vi.fn();
+        setCredentialAdapter({ auth: mockSupabase.auth as any, getGeneration: () => 7, reportSessionRejected: report });
+        mockSupabase.auth.refreshSession.mockResolvedValue({ data: { session: { access_token: 'fresh' } }, error: null });
+        fetchMock.mockImplementation(async () => new Response('{}', { status: 401 }));
+        await expect(service.get('/threads')).rejects.toBeInstanceOf(SessionExpiredError);
+        expect(report).toHaveBeenCalledExactlyOnceWith(7);
+    });
+
+    it.each([0, 429, 503])('does not report transient failure %s as a rejected session', async status => {
+        const report = vi.fn();
+        setCredentialAdapter({ auth: mockSupabase.auth as any, getGeneration: () => 7, reportSessionRejected: report });
+        if (status) fetchMock.mockResolvedValue(new Response('{}', { status }));
+        else fetchMock.mockRejectedValue(new TypeError('Failed to fetch'));
+        await expect(service.get('/threads')).rejects.toBeDefined();
+        expect(report).not.toHaveBeenCalled();
+    });
+
+    it('does not report rejection from a superseded account', async () => {
+        let generation = 7;
+        const report = vi.fn();
+        setCredentialAdapter({ auth: mockSupabase.auth as any, getGeneration: () => generation, reportSessionRejected: report });
+        fetchMock.mockImplementation(async () => { generation++; return new Response('{}', { status: 401 }); });
+        await expect(service.get('/threads')).rejects.toMatchObject({ code: 'ACCOUNT_CHANGED' });
+        expect(report).not.toHaveBeenCalled();
+    });
+
+    it('checks a dispatch guard before each attempt, including the retry after a refresh', async () => {
+        mockSupabase.auth.refreshSession.mockResolvedValue({ data: { session: { access_token: 'fresh' } }, error: null });
+        fetchMock.mockResolvedValueOnce(new Response('{}', { status: 401 }));
+        let allowed = true;
+        const assertDispatch = vi.fn(() => {
+            if (!allowed) throw new Error('no longer allowed');
+        });
+        // Permission is withdrawn while the token is refreshed.
+        mockSupabase.auth.refreshSession.mockImplementation(async () => {
+            allowed = false;
+            return { data: { session: { access_token: 'fresh' } }, error: null };
+        });
+
+        await expect(service.post('/api/v1/agent-actions/ack', {}, { assertDispatch }))
+            .rejects.toThrow('no longer allowed');
+        expect(assertDispatch).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('refreshes and retries once when the backend returns 401', async () => {
+        mockSupabase.auth.refreshSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'fresh-token',
+                },
+            },
+            error: null,
+        });
+
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                detail: 'token has expired',
+            }), {
+                status: 401,
+                statusText: 'Unauthorized',
+            }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ok: true,
+            }), {
+                status: 200,
+                statusText: 'OK',
+            }));
+
+        const result = await service.post<{ ok: boolean }>('/api/v1/account/profile', {
+            zotero_local_id: 'local-id',
+        });
+
+        expect(result).toEqual({ ok: true });
+        expect(mockSupabase.auth.refreshSession).toHaveBeenCalledTimes(1);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({
+            Authorization: 'Bearer stale-token',
+        });
+        expect(fetchMock.mock.calls[1][1]?.headers).toMatchObject({
+            Authorization: 'Bearer fresh-token',
+        });
+        expect(fetchMock.mock.calls[1][1]?.body).toBe(JSON.stringify({
+            zotero_local_id: 'local-id',
+        }));
+    });
+
+    it('throws SessionExpiredError when refresh fails after a 401 response', async () => {
+        mockSupabase.auth.refreshSession.mockResolvedValue({
+            data: {
+                session: null,
+            },
+            error: new AuthApiError('Invalid Refresh Token: Already Used', 400, 'refresh_token_not_found'),
+        });
+
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            detail: 'token has expired',
+        }), {
+            status: 401,
+            statusText: 'Unauthorized',
+        }));
+
+        await expect(service.post('/api/v1/account/profile', {
+            zotero_local_id: 'local-id',
+        })).rejects.toBeInstanceOf(SessionExpiredError);
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws SessionRefreshError when refresh fails with a retryable auth error', async () => {
+        mockSupabase.auth.refreshSession.mockResolvedValue({
+            data: {
+                session: null,
+            },
+            error: new AuthRetryableFetchError('Temporary auth outage', 503),
+        });
+
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            detail: 'token has expired',
+        }), {
+            status: 401,
+            statusText: 'Unauthorized',
+        }));
+
+        await expect(service.post('/api/v1/account/profile', {
+            zotero_local_id: 'local-id',
+        })).rejects.toBeInstanceOf(SessionRefreshError);
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws SessionExpiredError when the retry still returns 401', async () => {
+        mockSupabase.auth.refreshSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'fresh-token',
+                },
+            },
+            error: null,
+        });
+
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                detail: 'token has expired',
+            }), {
+                status: 401,
+                statusText: 'Unauthorized',
+            }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                detail: 'token has expired',
+            }), {
+                status: 401,
+                statusText: 'Unauthorized',
+            }));
+
+        await expect(service.post('/api/v1/account/profile', {
+            zotero_local_id: 'local-id',
+        })).rejects.toBeInstanceOf(SessionExpiredError);
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('throws SessionRefreshError when getSession fails before the request is sent', async () => {
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: null,
+            },
+            error: new Error('Transient storage error'),
+        });
+
+        await expect(service.post('/api/v1/account/profile', {
+            zotero_local_id: 'local-id',
+        })).rejects.toBeInstanceOf(SessionRefreshError);
+
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('throws SessionExpiredError when getSession surfaces a non-retryable auth failure', async () => {
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: null,
+            },
+            error: new AuthApiError('Invalid Refresh Token: Already Used', 400, 'refresh_token_not_found'),
+        });
+
+        await expect(service.post('/api/v1/account/profile', {
+            zotero_local_id: 'local-id',
+        })).rejects.toBeInstanceOf(SessionExpiredError);
+
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+});
+
+/**
+ * A request this class sends always carries a bearer token — `getAuthHeaders`
+ * throws rather than dispatch one without. So a 403 whose body says the server
+ * saw no credentials means they were stripped in transit, which is a network
+ * problem the user can act on, not a session problem.
+ */
+describe('ApiService blocked-credentials classification', () => {
+    let service: ApiService;
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        service = new ApiService('https://api.example.com');
+        fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.refreshSession.mockReset();
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        setCredentialAdapter(undefined);
+        vi.unstubAllGlobals();
+    });
+
+    function respond(status: number, body: unknown) {
+        fetchMock.mockImplementation(async () => new Response(JSON.stringify(body), { status }));
+    }
+
+    it.each([
+        ['a missing header', 'Not authenticated'],
+        ['a rewritten scheme', 'Invalid authentication credentials'],
+    ])('classifies a 403 reporting %s as blocked credentials', async (_case, detail) => {
+        respond(403, { detail });
+
+        const error = await service.get('/api/v1/account/profile').catch(e => e);
+
+        expect(isCredentialsBlockedError(error)).toBe(true);
+        expect(error.status).toBe(403);
+    });
+
+    it('leaves an application 403 alone', async () => {
+        respond(403, { detail: { code: 'SYNC_NOT_ALLOWED', message: 'Sync is not available' } });
+
+        const error = await service.get('/api/v1/sync/status').catch(e => e);
+
+        expect(isCredentialsBlockedError(error)).toBe(false);
+        expect(error.code).toBe('SYNC_NOT_ALLOWED');
+    });
+
+    it('does not refresh the session or retry, since the token was never rejected', async () => {
+        respond(403, { detail: 'Not authenticated' });
+
+        await expect(service.get('/api/v1/account/profile')).rejects.toBeDefined();
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(mockSupabase.auth.refreshSession).not.toHaveBeenCalled();
+    });
+});
+
+
+describe('ApiService version headers', () => {
+    let service: ApiService;
+    let fetchMock: ReturnType<typeof vi.fn>;
+    let originalAdapter: RuntimeAdapter;
+
+    beforeEach(() => {
+        originalAdapter = getRuntimeAdapter();
+
+        service = new ApiService('https://api.example.com');
+        fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            statusText: 'OK',
+        }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'stale-token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        setRuntimeAdapter(originalAdapter);
+    });
+
+    async function sentHeaders(): Promise<Record<string, string>> {
+        await service.get('/api/v1/status');
+        return fetchMock.mock.calls[0][1]?.headers as Record<string, string>;
+    }
+
+    it('attaches both version headers when the adapter reports both', async () => {
+        setRuntimeAdapter({
+            ...originalAdapter,
+            getVersionHeaders: () => ({
+                'X-Zotero-Version': '7.0.1',
+                'X-AsterMargin-Version': '0.22.3',
+            }),
+        });
+
+        const headers = await sentHeaders();
+        expect(headers).toMatchObject({
+            'X-Zotero-Version': '7.0.1',
+            'X-AsterMargin-Version': '0.22.3',
+        });
+    });
+
+    it('omits the plugin version header when the adapter does not report it', async () => {
+        setRuntimeAdapter({
+            ...originalAdapter,
+            getVersionHeaders: () => ({
+                'X-Zotero-Version': '7.0.1',
+            }),
+        });
+
+        const headers = await sentHeaders();
+        expect(headers['X-Zotero-Version']).toBe('7.0.1');
+        expect(headers['X-AsterMargin-Version']).toBeUndefined();
+    });
+
+    it('omits the Zotero version header when the adapter does not report it', async () => {
+        setRuntimeAdapter({
+            ...originalAdapter,
+            getVersionHeaders: () => ({
+                'X-AsterMargin-Version': '0.22.3',
+            }),
+        });
+
+        const headers = await sentHeaders();
+        expect(headers['X-AsterMargin-Version']).toBe('0.22.3');
+        expect(headers['X-Zotero-Version']).toBeUndefined();
+    });
+
+    it('omits both headers when the adapter reports nothing', async () => {
+        setRuntimeAdapter({
+            ...originalAdapter,
+            getVersionHeaders: () => ({}),
+        });
+
+        const headers = await sentHeaders();
+        expect(headers['X-Zotero-Version']).toBeUndefined();
+        expect(headers['X-AsterMargin-Version']).toBeUndefined();
+    });
+
+    // `fetch` resolves once response headers arrive, with the body still
+    // streaming, so a deadline released at that point leaves a stalled body
+    // read unbounded. Mirrors how a real `fetch` errors the body stream when
+    // its signal aborts.
+    /** Responds with the given status, then stalls the body until aborted. */
+    function respondWithStalledBody(status: number, statusText: string) {
+        let sawSignal: AbortSignal | undefined;
+        fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+            sawSignal = init.signal ?? undefined;
+            return Promise.resolve(
+                new Response(
+                    new ReadableStream({
+                        start(controller) {
+                            sawSignal?.addEventListener('abort', () =>
+                                controller.error(new DOMException('Aborted', 'AbortError')),
+                            );
+                        },
+                    }),
+                    { status, statusText },
+                ),
+            );
+        });
+        return () => sawSignal;
+    }
+
+    it('keeps the deadline armed while the response body is read', async () => {
+        const signal = respondWithStalledBody(200, 'OK');
+
+        await expect(service.get('/api/v1/status', { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(SessionRefreshError);
+        expect(signal()?.aborted).toBe(true);
+    });
+
+    // The status arrives before the deadline expires, so without classifying at
+    // the deadline this would surface as that status rather than as a timeout.
+    it('reports a timeout, not the HTTP status, when an error body stalls', async () => {
+        respondWithStalledBody(400, 'Bad Request');
+
+        await expect(service.get('/api/v1/status', { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(SessionRefreshError);
+    });
+
+    it('leaves requests unbounded when no deadline is given', async () => {
+        await expect(service.get('/api/v1/status')).resolves.toEqual({ ok: true });
+        expect(fetchMock.mock.calls[0][1].signal).toBeUndefined();
+    });
+
+    // PATCH gained a deadline for pin/unpin, which hold a UI control disabled
+    // until they settle. Without the `deadline` reaching `request`, the wrapper
+    // still compiles and the call still succeeds — only the bound is lost.
+    it('honours a deadline on PATCH', async () => {
+        respondWithStalledBody(200, 'OK');
+
+        await expect(service.patch('/api/v1/threads/t1/star', {}, { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(SessionRefreshError);
+        expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    });
+
+    it('leaves PATCH unbounded when no deadline is given', async () => {
+        await expect(service.patch('/api/v1/threads/t1/star', {})).resolves.toEqual({ ok: true });
+        expect(fetchMock.mock.calls[0][1].signal).toBeUndefined();
+    });
+
+    // getAuthHeaders() awaits supabase.auth.getSession() before any fetch
+    // exists, so a stalled auth lookup never observes the abort signal —
+    // only the deadline race can stop the caller from waiting on it.
+    it('rejects with SessionRefreshError when the auth lookup stalls', async () => {
+        mockSupabase.auth.getSession.mockReturnValue(new Promise(() => {}));
+
+        await expect(service.get('/api/v1/status', { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(SessionRefreshError);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('does not dispatch a PATCH when auth finishes after its deadline', async () => {
+        let resolveSession: (value: unknown) => void = () => {};
+        mockSupabase.auth.getSession.mockReturnValue(new Promise(resolve => {
+            resolveSession = resolve;
+        }));
+
+        await expect(service.patch('/api/v1/threads/t1/star', {}, { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(RequestTimeoutError);
+
+        resolveSession({
+            data: {
+                session: {
+                    access_token: 'late-token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    // Same gap on the 401 retry path: refreshAccessToken() awaits
+    // supabase.auth.refreshSession(), which also never sees the signal.
+    it('rejects with SessionRefreshError when the 401 refresh stalls', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            detail: 'token has expired',
+        }), {
+            status: 401,
+            statusText: 'Unauthorized',
+        }));
+        mockSupabase.auth.refreshSession.mockReturnValue(new Promise(() => {}));
+
+        await expect(service.get('/api/v1/status', { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(SessionRefreshError);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not retry when a 401 refresh finishes after the deadline', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            detail: 'token has expired',
+        }), {
+            status: 401,
+            statusText: 'Unauthorized',
+        }));
+        let resolveRefresh: (value: unknown) => void = () => {};
+        mockSupabase.auth.refreshSession.mockReturnValue(new Promise(resolve => {
+            resolveRefresh = resolve;
+        }));
+
+        await expect(service.patch('/api/v1/threads/t1/star', {}, { timeoutMs: 20 }))
+            .rejects.toBeInstanceOf(RequestTimeoutError);
+
+        resolveRefresh({
+            data: { session: { access_token: 'late-token' } },
+            error: null,
+        });
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('omits both headers when the adapter does not implement getVersionHeaders', async () => {
+        const { getVersionHeaders, ...rest } = originalAdapter;
+        setRuntimeAdapter(rest);
+
+        const headers = await sentHeaders();
+        expect(headers['X-Zotero-Version']).toBeUndefined();
+        expect(headers['X-AsterMargin-Version']).toBeUndefined();
+    });
+
+    it('still sends the request when the adapter throws', async () => {
+        setRuntimeAdapter({
+            ...originalAdapter,
+            getVersionHeaders: () => {
+                throw new Error('host unavailable');
+            },
+        });
+
+        const headers = await sentHeaders();
+        expect(headers['Authorization']).toBe('Bearer stale-token');
+        expect(headers['X-Zotero-Version']).toBeUndefined();
+        expect(headers['X-AsterMargin-Version']).toBeUndefined();
+    });
+});

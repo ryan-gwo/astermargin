@@ -1,0 +1,227 @@
+import { installMutationInstance } from '../../helpers/mutationInstance';
+/**
+ * `zotero_data` requests carry portable references, not device-local rowids.
+ *
+ * Once the backend stops pinning a numeric `library_id`, every reference in one
+ * request arrives with the same `library_id: 0` sentinel and is told apart only
+ * by its `library_ref`. The lookup keys request references by that portable
+ * identity, so two items with the same `zotero_key` in different libraries do
+ * not collapse onto one map entry.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({ logger: vi.fn() }));
+
+const mocks = vi.hoisted(() => ({
+    storeGet: vi.fn(),
+}));
+
+vi.mock('../../../react/store', () => ({ store: { get: mocks.storeGet } }));
+vi.mock('../../../react/atoms/profile', () => ({
+    searchableLibraryIdsAtom: Symbol('searchableLibraryIdsAtom'),
+    syncWithZoteroAtom: Symbol('syncWithZoteroAtom'),
+}));
+vi.mock('../../../react/atoms/auth', () => ({ userIdAtom: Symbol('userIdAtom') }));
+
+vi.mock('../../../src/services/agentDataProvider/utils', () => ({
+    checkLibraryExcluded: vi.fn(() => null),
+    computeItemStatus: vi.fn(async () => 'in_library'),
+    prefetchSyncDates: vi.fn(async () => new Map()),
+    getAttachmentFileStatus: vi.fn(),
+    getAttachmentFileStatusLightweight: vi.fn(),
+    getBestAttachmentBatch: vi.fn(async () => new Map()),
+}));
+
+vi.mock('../../../src/utils/zoteroSerializers', () => ({
+    formatZoteroCreatorsString: vi.fn(() => ''),
+    getCreatorsFromItem: vi.fn(() => []),
+    getYearFromItem: vi.fn(() => null),
+    serializeAttachment: vi.fn(),
+    serializeAnnotation: vi.fn(),
+    // Enough to tell the two items apart in the response.
+    serializeItem: vi.fn(async (item: any) => ({
+        library_id: item.libraryID,
+        zotero_key: item.key,
+        title: item.title,
+    })),
+    serializeNote: vi.fn(),
+    serializeItemStub: vi.fn(),
+}));
+
+import { lookupZoteroReferences } from '../../../src/services/agentDataProvider/lookupZoteroReferences';
+import { checkLibraryExcluded, getAttachmentFileStatusLightweight, getBestAttachmentBatch } from '../../../src/services/agentDataProvider/utils';
+import { serializeAttachment, serializeItem } from '../../../src/utils/zoteroSerializers';
+import { handleZoteroDataRequest } from '../../../src/services/agentDataProvider/handleZoteroDataRequest';
+
+// Group 555 -> local rowid 100, group 777 -> local rowid 300. Both hold an item
+// under the same key, which is exactly what a per-library key space allows.
+const SHARED_KEY = '3RRUYX5J';
+
+function regularItem(libraryID: number, title: string) {
+    return {
+        id: libraryID,
+        key: SHARED_KEY,
+        libraryID,
+        title,
+        parentID: null,
+        isAttachment: () => false,
+        isNote: () => false,
+        isAnnotation: () => false,
+        isRegularItem: () => true,
+        getAttachments: () => [],
+        getNotes: () => [],
+    };
+}
+
+const alphaItem = regularItem(100, 'Alpha paper');
+const excludedGroupItem = regularItem(300, 'Beta paper');
+
+beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(checkLibraryExcluded).mockReturnValue(null);
+    mocks.storeGet.mockImplementation(() => [1, 100, 300]);
+    (globalThis as any).Zotero = {
+        Libraries: {
+            get: vi.fn((id: number) => ({ libraryID: id, name: `Library ${id}` })),
+            getAll: vi.fn(() => []),
+            userLibraryID: 1,
+        },
+        Groups: {
+            getGroupIDFromLibraryID: vi.fn((libId: number) =>
+                libId === 100 ? 555 : libId === 300 ? 777 : false),
+            getLibraryIDFromGroupID: vi.fn((groupId: number) =>
+                groupId === 555 ? 100 : groupId === 777 ? 300 : false),
+        },
+        Items: {
+            getByLibraryAndKeyAsync: vi.fn(async (libraryID: number, key: string) => {
+                if (key !== SHARED_KEY) return null;
+                if (libraryID === 100) return alphaItem;
+                if (libraryID === 300) return excludedGroupItem;
+                return null;
+            }),
+            loadDataTypes: vi.fn(async () => undefined),
+            getAsync: vi.fn(async () => []),
+        },
+    };
+});
+
+beforeEach(() => {
+    installMutationInstance();
+    (Zotero as any).AsterMargin.searchableLibraryIds = [1, 100, 300];
+});
+
+describe('lookupZoteroReferences with portable-only references', () => {
+    it('loads parent trash state before returning attachment metadata through the existing response', async () => {
+        let parentLoaded = false;
+        const parent = { ...alphaItem, id: 101, key: 'PARENT00', deleted: true };
+        const attachment = { ...alphaItem, id: 102, parentID: 101,
+            isAttachment: () => true, isRegularItem: () => false };
+        vi.mocked(Zotero.Items.getByLibraryAndKeyAsync).mockResolvedValue(attachment as any);
+        vi.mocked(Zotero.Items.getAsync).mockImplementation(async () => { parentLoaded = true; return [parent] as any; });
+        vi.mocked(serializeAttachment).mockImplementation(async () => {
+            expect(parentLoaded).toBe(true);
+            return { library_id: 100, zotero_key: SHARED_KEY, deleted: parent.deleted } as any;
+        });
+        const result = await lookupZoteroReferences(
+            [{ library_id: 0, library_ref: 'g555', zotero_key: SHARED_KEY }],
+            { include_attachments: false, include_parents: true, include_notes: false, file_status_level: 'none' },
+        );
+        expect(result.errors).toEqual([]);
+        expect(result.attachments[0].attachment.deleted).toBe(true);
+    });
+
+    it('names the primary attachment even when no file is checked', async () => {
+        const parent = { ...alphaItem, id: 101, key: 'PARENT00' };
+        const attachment = { ...alphaItem, id: 102, parentID: 101,
+            isAttachment: () => true, isRegularItem: () => false };
+        vi.mocked(Zotero.Items.getByLibraryAndKeyAsync).mockResolvedValue(attachment as any);
+        vi.mocked(Zotero.Items.getAsync).mockResolvedValue([parent] as any);
+        vi.mocked(serializeAttachment).mockResolvedValue({ library_id: 100, zotero_key: SHARED_KEY } as any);
+        vi.mocked(getBestAttachmentBatch).mockResolvedValueOnce(new Map([[101, 102]]));
+        const result = await lookupZoteroReferences(
+            [{ library_id: 0, library_ref: 'g555', zotero_key: SHARED_KEY }],
+            { include_attachments: false, include_parents: true, include_notes: false, file_status_level: 'none' },
+        );
+        expect(result.attachments[0].file_status).toBeUndefined();
+        expect(result.attachments[0].is_primary).toBe(true);
+        expect(getAttachmentFileStatusLightweight).not.toHaveBeenCalled();
+    });
+
+    it.each(['item', 'attachment'] as const)('returns only identity fields when %s metadata becomes excluded during serialization', async (kind) => {
+        const item = { ...alphaItem, isAttachment: () => kind === 'attachment', isRegularItem: () => kind === 'item' };
+        vi.mocked(Zotero.Items.getByLibraryAndKeyAsync).mockResolvedValue(item as any);
+        const serialize = async () => {
+            vi.mocked(checkLibraryExcluded).mockReturnValue({ message: 'Library excluded' });
+            return { library_id: 100, zotero_key: SHARED_KEY, deleted: false,
+                title: 'PRIVATE_TITLE', abstract: 'PRIVATE_ABSTRACT', filename: 'PRIVATE_FILENAME' } as any;
+        };
+        if (kind === 'attachment') vi.mocked(serializeAttachment).mockImplementationOnce(serialize);
+        else vi.mocked(serializeItem).mockImplementationOnce(serialize);
+        const result = await handleZoteroDataRequest({
+            type: 'zotero_data_request', request_id: 'excluded-during-serialization',
+            items: [{ library_id: 0, library_ref: 'g555', zotero_key: SHARED_KEY }],
+            include_attachments: false, include_parents: false, include_notes: false, file_status_level: 'none',
+        });
+        expect(result.items).toEqual([]);
+        expect(result.attachments).toEqual([]);
+        expect(result.errors).toEqual([{
+            reference: { library_id: 100, zotero_key: SHARED_KEY, library_ref: 'g555' },
+            error: 'Library excluded', error_code: 'library_excluded',
+        }]);
+        expect(JSON.stringify(result)).not.toContain('PRIVATE_');
+    });
+
+    it('keeps same-key items in different libraries apart when no numeric id distinguishes them', async () => {
+        const result = await lookupZoteroReferences(
+            [
+                { library_id: 0, library_ref: 'g555', zotero_key: SHARED_KEY },
+                { library_id: 0, library_ref: 'g777', zotero_key: SHARED_KEY },
+            ],
+            { include_attachments: false, include_parents: false, include_notes: false, file_status_level: 'none' },
+        );
+
+        expect(result.errors).toEqual([]);
+        expect(result.items.map(i => i.item.title).sort()).toEqual(['Alpha paper', 'Beta paper']);
+    });
+
+    it('keeps legacy references apart when they share a malformed library_ref', async () => {
+        // Historical threads still carry numeric library ids. `resolveLibraryRef`
+        // ignores a ref that does not parse and falls back to the rowid, so both
+        // of these load — from *different* libraries. A key that trusted the
+        // unparseable ref would collapse them and serialize one item twice.
+        const result = await lookupZoteroReferences(
+            [
+                { library_id: 100, library_ref: '', zotero_key: SHARED_KEY } as any,
+                { library_id: 300, library_ref: '', zotero_key: SHARED_KEY } as any,
+            ],
+            { include_attachments: false, include_parents: false, include_notes: false, file_status_level: 'none' },
+        );
+
+        expect(result.errors).toEqual([]);
+        expect(result.items.map(i => i.item.title).sort()).toEqual(['Alpha paper', 'Beta paper']);
+    });
+
+    it('keeps them apart when the malformed ref is a non-empty bogus string', async () => {
+        const result = await lookupZoteroReferences(
+            [
+                { library_id: 100, library_ref: 'not-a-ref', zotero_key: SHARED_KEY } as any,
+                { library_id: 300, library_ref: 'not-a-ref', zotero_key: SHARED_KEY } as any,
+            ],
+            { include_attachments: false, include_parents: false, include_notes: false, file_status_level: 'none' },
+        );
+
+        expect(result.errors).toEqual([]);
+        expect(result.items.map(i => i.item.title).sort()).toEqual(['Alpha paper', 'Beta paper']);
+    });
+
+    it('reports a group that is not on this device as library_unavailable', async () => {
+        const result = await lookupZoteroReferences(
+            [{ library_id: 0, library_ref: 'g999999', zotero_key: SHARED_KEY }],
+            { include_attachments: false, include_parents: false, include_notes: false, file_status_level: 'none' },
+        );
+
+        expect(result.items).toEqual([]);
+        expect(result.errors).toHaveLength(1);
+        expect(result.errors[0].error_code).toBe('library_unavailable');
+    });
+});

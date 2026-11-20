@@ -1,0 +1,111 @@
+import React from "react";
+import { Icon, InformationCircleIcon } from "../icons/icons";
+import { parseTextWithLinksAndNewlines } from "../../utils/parseTextWithLinksAndNewlines";
+
+interface PreferenceToggleProps {
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+    disabled?: boolean;
+    error?: boolean;
+    title: string;
+    subtitle?: string;
+    className?: string;
+    description?: string;
+    tooltip?: string;
+    disabledTooltip?: string;
+    errorTooltip?: string;
+    tag?: string;
+    errorText?: string;
+}
+
+const PreferenceToggle: React.FC<PreferenceToggleProps> = ({
+    checked,
+    onChange,
+    disabled = false,
+    error = false,
+    title,
+    subtitle,
+    className = '',
+    description,
+    tooltip,
+    disabledTooltip,
+    errorTooltip,
+    tag,
+    errorText = "Error"
+}) => {
+    const handleToggle = () => {
+        onChange(!checked);
+    };
+
+    const getTooltip = () => {
+        if (disabled && disabledTooltip) {
+            return disabledTooltip;
+        }
+        return tooltip;
+    };
+
+    return (
+        <div
+            className={`display-flex flex-col rounded-md ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+            onClick={(e) => {
+                if (disabled) return;
+                // Don't toggle if clicking a link in the description
+                if ((e.target as HTMLElement).tagName.toLowerCase() === 'a' || (e.target as HTMLElement).closest('a')) {
+                    return;
+                }
+                handleToggle();
+            }}
+            title={getTooltip()}
+        >
+            <div className="display-flex flex-row gap-2 items-start">
+                <input
+                    type="checkbox"
+                    className={`mr-1 scale-90 ${tag ? 'mt-15' : 'mt-020'}`}
+                    style={{minWidth: 'auto'}}
+                    aria-label={subtitle ? `${title} ${subtitle}` : title}
+                    checked={checked}
+                    onChange={handleToggle}
+                    onClick={(e) => e.stopPropagation()}
+                    disabled={disabled}
+                />
+
+                <div className="display-flex flex-col">
+                    <div className="display-flex flex-col items-start gap-05">
+                        <div className="display-flex flex-row gap-2 items-center">
+                            <div className={`font-color-primary text-base ${className || ''}`}>
+                                {title}
+                            </div>
+                            {subtitle && (
+                                <div className="font-color-tertiary">
+                                    {subtitle}
+                                </div>
+                            )}
+                            {!disabled && !error && tag && (
+                                <div className="font-color-secondary scale-90 px-15 py-05 mt-015 text-sm rounded-md bg-quinary border-quinary">
+                                    {tag}
+                                </div>
+                            )}
+                            {error && (
+                                <div
+                                    className="scale-90 px-15 py-05 mt-020 text-sm rounded-md bg-quinary border-error"
+                                    style={{ color: 'var(--tag-red-secondary)', borderColor: 'var(--tag-red-tertiary)', background: 'var(--tag-red-quinary)' }}
+                                    title={errorTooltip}
+                                >
+                                    {errorText}
+                                </div>
+                            )}
+                        </div>
+                        {description && (
+                            <div className="font-color-secondary text-sm">
+                                {parseTextWithLinksAndNewlines(description)}
+                                {tooltip && <Icon icon={InformationCircleIcon} className="font-color-primary ml-05 mt-1 inline-flex" />}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default PreferenceToggle; 

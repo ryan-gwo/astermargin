@@ -1,0 +1,216 @@
+import React, { useEffect, useState, useRef } from 'react';
+import { PopupMessage, POPUP_MESSAGE_DURATION } from '../../../types/popupMessage';
+import { Icon, AlertIcon, InformationCircleIcon } from '../../icons/icons';
+import { useSetAtom } from 'jotai';
+import { removePopupMessageAtom } from '../../../utils/popupMessageUtils';
+import VersionUpdateMessageContent from './VersionUpdateMessageContent';
+import WelcomeOnboardingContent from './WelcomeOnboardingContent';
+import ReaderTipContent from './ReaderTipContent';
+import NoteTipContent from './NoteTipContent';
+import FeatureTipContent from './FeatureTipContent';
+import FileExportMessageContent from './FileExportMessageContent';
+import { CitationTipContent } from '../../sources/CitationTipContent';
+import Button from "@astermargin/agent-ui/primitives/Button";
+import PopupMessageHeader from './PopupMessageHeader';
+import { getWindowFromElement } from '@astermargin/agent-ui/utils/windowContext';
+import { parseTextWithLinksAndNewlines } from '../../../utils/parseTextWithLinksAndNewlines';
+
+interface PopupMessageItemProps {
+    message: PopupMessage;
+    /** Optional override for message removal. When provided, called instead of the default removePopupMessageAtom. */
+    onRemove?: (messageId: string) => void;
+    /** When true, renders in floating popup mode (e.g. version_update gets its own header) */
+    isFloating?: boolean;
+}
+
+const PopupMessageItem: React.FC<PopupMessageItemProps> = ({ message, onRemove, isFloating }) => {
+    const containerRef = useRef<HTMLDivElement>(null);
+    const defaultRemoveMessage = useSetAtom(removePopupMessageAtom);
+    const removeMessage = onRemove ?? defaultRemoveMessage;
+    
+    const [isHovering, setIsHovering] = useState(false);
+    const [timerExpired, setTimerExpired] = useState(false);
+
+    // Timer effect - sets the timerExpired flag when duration elapses
+    useEffect(() => {
+        // Get the correct window context for this component
+        const win = getWindowFromElement(containerRef.current);
+        if (!win) return;
+
+        let timerId: number | null = null;
+        if (message.expire !== false) { // Default to true if undefined
+            timerId = win.setTimeout(() => {
+                setTimerExpired(true);
+            }, message.duration || POPUP_MESSAGE_DURATION);
+        }
+
+        return () => {
+            if (timerId) {
+                win.clearTimeout(timerId);
+            }
+        };
+    }, [message]);
+
+    // Remove message when timer expires and not hovering
+    useEffect(() => {
+        if (timerExpired && !isHovering && message.expire !== false) {
+            removeMessage(message.id);
+        }
+    }, [timerExpired, isHovering, message.expire, message.id, removeMessage]);
+
+    const handleDismiss = () => {
+        removeMessage(message.id);
+    };
+
+    const getDefaultIcon = () => {
+        switch (message.type) {
+            case 'warning':
+                return <Icon icon={AlertIcon} className="scale-12 mt-020 font-color-primary" />;
+            case 'error':
+                return <Icon icon={AlertIcon} className="scale-12 mt-020 font-color-red" />;
+            case 'version_update':
+                // return <Icon icon={AiMagicIcon} className="scale-12 mt-020 font-color-secondary" />;
+                return null;
+            case 'info':
+            default:
+                return <Icon icon={InformationCircleIcon} className="scale-12 mt-020 font-color-primary" />;
+        }
+    };
+
+    let fontColor, backgroundColor, borderColor;
+
+    switch (message.type) {
+        case 'error':
+            fontColor = 'font-color-red';
+            backgroundColor = 'var(--astermargin-surface-overlay)';
+            borderColor = 'var(--astermargin-border-strong)';
+            break;
+        case 'info':
+        case 'warning':
+        case 'version_update':
+        default:
+            fontColor = 'font-color-primary';
+            backgroundColor = 'var(--astermargin-surface-overlay)';
+            borderColor = 'var(--astermargin-border-strong)';
+            break;
+    }
+
+    return (
+        <div
+            ref={containerRef}
+            className={`source-preview border-popup shadow-md mx-0 w-full ${message.type === 'version_update' || message.type === 'cloud_consent' ? 'astermargin-popup-message--unbounded' : ''}`}
+            style={{
+                background: backgroundColor,
+                backdropFilter: 'blur(6px)',
+                border: `1px solid ${borderColor}`,
+            }}
+            onMouseEnter={() => setIsHovering(true)}
+            onMouseLeave={() => setIsHovering(false)}
+        >
+            <div
+                className= {`
+                    ${(message.type === 'version_update' || message.type === 'cloud_consent') && isFloating ? 'p-4' : 'p-3'}
+                    display-flex flex-col items-start gap-2
+                `}
+            >
+                {/* Floating version_update/welcome_onboarding/reader_tip/cloud_consent render their own headers; a feature tip always does */}
+                {!(isFloating && (message.type === 'version_update' || message.type === 'welcome_onboarding' || message.type === 'reader_tip' || message.type === 'note_tip' || message.type === 'cloud_consent')) && message.type !== 'feature_tip' && message.type !== 'file_export' && (
+                    <PopupMessageHeader
+                        icon={message.icon || getDefaultIcon()}
+                        rightIcon={message.rightIcon}
+                        title={message.title}
+                        count={message.count}
+                        buttonIcon={message.buttonIcon}
+                        buttonOnClick={message.buttonOnClick}
+                        fontColor={
+                            message.type === 'version_update' && !isFloating
+                                ? 'font-color-primary'
+                                : fontColor
+                        }
+                        titleClassName={
+                            message.type === 'version_update' && !isFloating
+                                ? 'text-xl font-semibold mb-2'
+                                : undefined
+                        }
+                        handleDismiss={handleDismiss}
+                        cancelable={message.cancelable}
+                    />
+                )}
+
+                {/* Content for info, warning, error */}
+                {['info', 'warning', 'error', 'items_summary', 'cloud_consent'].includes(message.type) && (
+                    message.customContent ? (
+                        <div className="w-full">
+                            {message.customContent}
+                        </div>
+                    ) : (
+                        <div className='text-base font-color-secondary'>
+                            {message.text && parseTextWithLinksAndNewlines(message.text)}
+                            {message.learnMoreUrl && (
+                                <>
+                                    {' '}
+                                    <a
+                                        href={message.learnMoreUrl}
+                                        className="text-link"
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            Zotero.launchURL(message.learnMoreUrl!);
+                                        }}
+                                    >
+                                        {message.learnMoreLabel || 'Learn more'}
+                                    </a>
+                                </>
+                            )}
+                        </div>
+                    )
+                )}
+
+                {message.type === 'version_update' && (
+                    <VersionUpdateMessageContent message={message} onDismiss={handleDismiss} isFloating={isFloating} />
+                )}
+
+                {message.type === 'welcome_onboarding' && (
+                    <WelcomeOnboardingContent onDismiss={handleDismiss} />
+                )}
+
+                {message.type === 'reader_tip' && (
+                    <ReaderTipContent onDismiss={handleDismiss} />
+                )}
+
+                {message.type === 'note_tip' && (
+                    <NoteTipContent onDismiss={handleDismiss} />
+                )}
+
+                {message.type === 'feature_tip' && message.tipId && (
+                    <FeatureTipContent tipId={message.tipId} onDismiss={handleDismiss} />
+                )}
+
+                {message.type === 'file_export' && (
+                    <FileExportMessageContent message={message} onDismiss={handleDismiss} />
+                )}
+
+                {message.type === 'citation_tip' && (
+                    <CitationTipContent />
+                )}
+
+                {message.button && (
+                    <div className="display-flex flex-row gap-2 items-end w-full justify-end py-1">
+                        <Button
+                            onClick={() => {
+                                message.button!.onClick();
+                                handleDismiss();
+                            }}
+                            icon={message.button.icon}
+                            rightIcon={message.button.rightIcon}
+                            variant={message.button.variant ?? "outline"}
+                        >
+                            {message.button.text}
+                        </Button>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default PopupMessageItem;

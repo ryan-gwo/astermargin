@@ -1,0 +1,323 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { getReadableContentKind } from '../../../../src/services/documentExtraction/attachmentResolution';
+import { ZoteroIcon, ZOTERO_ICONS } from '../../../components/icons/ZoteroIcon';
+import { AlertIcon, Icon } from '../../../components/icons/icons';
+import { formatLocationChip } from '@astermargin/agent-ui/utils/locationDisplay';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { openCreateAnnotationTarget, pageIndexForItem } from './createAnnotationsNavigation';
+import { notifyReferenceUnavailable } from '../sourceActions';
+import { ASTERMARGIN_ANNOTATION_COLORS } from '../../../../src/constants/annotations';
+import { resolveLibraryRef } from '../../../../src/utils/libraryIdentity';
+import { TagPill } from '../../../components/agentRuns/TagPill';
+import { AnnotationTooltip, getAnnotationTooltipIcon } from '../../../components/agentRuns/AnnotationTooltip';
+import type {
+    CreateHighlightAnnotationsProposedData,
+    CreateHighlightAnnotationsResultData,
+    CreateNoteAnnotationsProposedData,
+    CreateNoteAnnotationsResultData,
+    CreatedAnnotationResult,
+    FailedAnnotationResult,
+    HighlightAnnotationItem,
+    NoteAnnotationItem,
+} from '@astermargin/agent-core/types/agentActions/createAnnotations';
+import { textAnnotationStyle } from '@astermargin/agent-core/types/agentActions/createAnnotations';
+import { useItemContextMenu } from '@astermargin/agent-ui/chat/useItemContextMenu';
+
+type ActionStatus = 'pending' | 'applied' | 'rejected' | 'undone' | 'error' | 'awaiting';
+
+interface CreateAnnotationsPreviewProps {
+    kind: 'highlight' | 'note';
+    actionData: Partial<CreateHighlightAnnotationsProposedData & CreateNoteAnnotationsProposedData>;
+    currentValue?: {
+        attachment_title?: string;
+        library_name?: string;
+        resolution_differs?: boolean;
+        needs_extraction?: boolean;
+    };
+    resultData?: Partial<CreateHighlightAnnotationsResultData & CreateNoteAnnotationsResultData>;
+    status: ActionStatus;
+    isStreaming?: boolean;
+}
+
+const COLOR_VALUES = ASTERMARGIN_ANNOTATION_COLORS;
+
+/**
+ * Resolve the page label to display for an item: a highlight's first page
+ * location carries its own label, a note carries it at the item level. Blank
+ * labels are treated as absent so the caller falls back to the page number.
+ */
+function pageLabelForItem(
+    kind: 'highlight' | 'note',
+    item: HighlightAnnotationItem | NoteAnnotationItem,
+    contentKind: 'pdf' | 'epub' | 'snapshot' | null,
+): string | null {
+    const raw = item as any;
+    const nonBlank = (value: unknown): string | null =>
+        typeof value === 'string' && value.trim() !== '' ? value : null;
+
+    if (contentKind === 'epub') {
+        return nonBlank(raw.page_label ?? raw.pageLabel);
+    }
+
+    if (kind !== 'highlight') {
+        return nonBlank(raw.page_label ?? raw.pageLabel);
+    }
+
+    const locations = raw.page_locations ?? raw.pageLocations ?? raw.locations;
+    const firstLocLabel = nonBlank(locations?.[0]?.page_label ?? locations?.[0]?.pageLabel);
+    if (firstLocLabel) return firstLocLabel;
+
+    // Single-page highlights may carry only an item-level label; the create
+    // executors use it as a fallback for single-location items, so mirror that
+    // here to keep the preview chip in sync with the saved annotation label.
+    if (locations?.length === 1) {
+        return nonBlank(raw.page_label ?? raw.pageLabel);
+    }
+    return null;
+}
+
+function statusForItem(
+    item: HighlightAnnotationItem | NoteAnnotationItem,
+    createdByClient: Map<string, CreatedAnnotationResult[]>,
+    failedByClient: Map<string, FailedAnnotationResult[]>,
+): 'created' | 'failed' | 'partial' | 'pending' {
+    const clientItemId = (item as any).client_item_id ?? (item as any).clientItemId ?? '';
+    const createdCount = createdByClient.get(clientItemId)?.length ?? 0;
+    const failedCount = failedByClient.get(clientItemId)?.length ?? 0;
+    if (createdCount > 0 && failedCount > 0) return 'partial';
+    if (createdCount > 0) return 'created';
+    if (failedCount > 0) return 'failed';
+    return 'pending';
+}
+
+function formatAnnotationFailureMessage(
+    failure: FailedAnnotationResult,
+    noun: string,
+): string {
+    switch (failure.error_code) {
+        case 'page_extraction_failed':
+            return 'Could not create annotation because the PDF could not be processed.';
+        case 'page_geometry_unavailable':
+            return 'Could not create annotation because the target position was not found in the PDF.';
+        case 'epub_section_not_found':
+            return 'Could not create annotation because the cited section was not found in the EPUB.';
+        case 'epub_text_not_found':
+            return 'Could not create annotation because the cited passage was not found in the EPUB.';
+        case 'epub_math_section_unsupported':
+            return 'Could not create annotation because the passage follows a math equation, which is not yet supported.';
+        case 'highlight_spans_too_many_pages':
+        case 'highlight_pages_not_consecutive':
+            return 'Could not create annotation because a highlight can cover at most two consecutive pages.';
+        case 'attachment_file_unavailable':
+            return 'Could not create annotation because the attachment file is not available locally.';
+        case 'apply_failed':
+            return `Failed to create ${noun}.`;
+        default:
+            return `Failed to create ${noun}.`;
+    }
+}
+
+function formatAnnotationFailureMessages(
+    failures: FailedAnnotationResult[],
+    noun: string,
+): string {
+    return Array.from(new Set(
+        failures.map((failure) => formatAnnotationFailureMessage(failure, noun)),
+    )).join('\n');
+}
+
+/**
+ * Preview for bulk highlight and note annotation actions.
+ */
+export const CreateAnnotationsPreview: React.FC<CreateAnnotationsPreviewProps> = ({
+    kind,
+    actionData,
+    resultData,
+    status,
+    isStreaming,
+}) => {
+    const previewRootRef = useRef<HTMLDivElement | null>(null);
+    const items = Array.isArray(actionData.items)
+        ? actionData.items as Array<HighlightAnnotationItem | NoteAnnotationItem>
+        : [];
+    // Call-level tags applied to every created annotation (shared across the batch).
+    const tags = Array.isArray(actionData.tags)
+        ? actionData.tags.filter((tag): tag is string => typeof tag === 'string' && tag.trim() !== '')
+        : [];
+    const created = Array.isArray(resultData?.created) ? resultData.created : [];
+    const failed = Array.isArray(resultData?.failed) ? resultData.failed as FailedAnnotationResult[] : [];
+    const createdByClient = new Map<string, CreatedAnnotationResult[]>();
+    const failedByClient = new Map<string, FailedAnnotationResult[]>();
+
+    for (const entry of created) {
+        const list = createdByClient.get(entry.client_item_id) ?? [];
+        list.push(entry);
+        createdByClient.set(entry.client_item_id, list);
+    }
+    for (const entry of failed) {
+        const list = failedByClient.get(entry.client_item_id) ?? [];
+        list.push(entry);
+        failedByClient.set(entry.client_item_id, list);
+    }
+
+    const resolvedRef = actionData.resolved_ref;
+    // A group attachment's device-local library_id is UNRESOLVED_LIBRARY_ID (0) —
+    // its identity is the portable library_ref. Resolve to this device's local
+    // library id (null when the library isn't on this device) so the content-kind
+    // lookup below works for available group attachments. No exclusion gate:
+    // rendering persisted actions is not gated on library exclusion (writes are
+    // gated in the action's validate/execute paths).
+    const resolvedLibraryId = resolveLibraryRef({
+        library_ref: resolvedRef?.library_ref,
+        library_id: resolvedRef?.library_id,
+    });
+    // Underlines share the highlight action and differ only in the type Zotero stores.
+    const isUnderline = kind === 'highlight' && textAnnotationStyle(actionData.style) === 'underline';
+    const noun = kind === 'note' ? 'note' : isUnderline ? 'underline' : 'highlight';
+    const { openItemMenu, itemMenu } = useItemContextMenu();
+
+    // Resolve the attachment's content kind once
+    const [contentKind, setContentKind] = useState<'pdf' | 'epub' | null>(null);
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            // resolvedLibraryId is null when the attachment's library isn't on
+            // this device; the lookup below would throw on an unresolved id.
+            if (!resolvedRef?.zotero_key || !resolvedLibraryId) return;
+            try {
+                const attachment = await Zotero.Items.getByLibraryAndKeyAsync(
+                    resolvedLibraryId,
+                    resolvedRef.zotero_key,
+                );
+                const resolved = attachment ? getReadableContentKind(attachment as Zotero.Item) : null;
+                if (!cancelled) setContentKind(resolved === 'pdf' || resolved === 'epub' ? resolved : null);
+            } catch (error) {
+                logger(`CreateAnnotationsPreview: content-kind resolution failed: ${error}`, 1);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [resolvedLibraryId, resolvedRef?.zotero_key]);
+    const isEpub = contentKind === 'epub';
+
+    const handleItemClick = useCallback(async (
+        item: HighlightAnnotationItem | NoteAnnotationItem,
+        createdEntries: CreatedAnnotationResult[],
+    ) => {
+        const outcome = await openCreateAnnotationTarget(kind, resolvedRef, item, createdEntries);
+        if (outcome !== 'opened') notifyReferenceUnavailable(createdEntries.length > 0 && status === 'applied' ? 'annotation' : 'item', outcome);
+    }, [kind, status, resolvedRef?.library_id, resolvedRef?.library_ref, resolvedRef?.zotero_key]);
+
+    return (
+        <div ref={previewRootRef} className="create-annotations-preview overflow-hidden">
+            <div className="display-flex flex-col px-3 py-2 gap-4">
+
+                <div className="display-flex flex-col gap-1">
+                    {items.map((item) => {
+                        const rawItem = item as any;
+                        const clientItemId = rawItem.client_item_id ?? rawItem.clientItemId ?? '';
+                        const itemStatus = statusForItem(item, createdByClient, failedByClient);
+                        const failures = failedByClient.get(clientItemId) ?? [];
+                        const createdEntries = createdByClient.get(clientItemId) ?? [];
+                        const text = kind === 'highlight'
+                            ? (rawItem.text ?? '')
+                            : (rawItem.comment ?? '');
+                        const color = rawItem.color;
+                        const isFailed = itemStatus === 'failed';
+                        const isPartial = itemStatus === 'partial';
+                        const isCreated = itemStatus === 'created' || itemStatus === 'partial';
+                        const failureMessage = formatAnnotationFailureMessages(failures, noun);
+                        const pageIndex = pageIndexForItem(kind, item);
+                        const pageNumber = typeof pageIndex === 'number' ? pageIndex + 1 : null;
+                        const pageLabel = pageLabelForItem(kind, item, contentKind);
+                        const fallbackLabel = isEpub
+                            ? pageLabel
+                            : pageLabel ?? (pageNumber !== null ? String(pageNumber) : null);
+                        // Route through the shared chip formatter
+                        const pageDisplay = formatLocationChip(isEpub ? 'epub' : 'pdf', fallbackLabel)
+                            ? fallbackLabel
+                            : null;
+
+                        const kindLabel = noun === 'underline'
+                            ? 'Underline Annotation'
+                            : noun === 'highlight' ? 'Highlight Annotation' : 'Sticky Note';
+                        const tooltipContent = text || rawItem.title || '';
+                        // Only a pending highlight previews (the reader flashes its
+                        // cited extent). Notes have no flashable extent and applied
+                        // items navigate to the saved annotation, so both say "view".
+                        let footerLabel = isFailed
+                            ? failureMessage || `Failed to create ${noun}`
+                            : (kind === 'highlight' && !isCreated)
+                                ? `Click to preview in Zotero Reader`
+                                : `Click to view in Zotero Reader`;
+                        if (kind === 'note' && !isCreated) footerLabel = `Click to view page in Zotero Reader`
+                        const footerClass = isFailed ? 'font-color-red' : 'font-color-tertiary';
+
+                        const isDimmed = status === 'rejected' || status === 'undone';
+                        const row = (
+                            <div
+                                className={`create-annotations-preview-row display-flex flex-row items-start gap-2 py-15 cursor-pointer ${isDimmed ? 'opacity-60' : ''}`}
+                                onClick={() => handleItemClick(item, createdEntries)}
+                                // Only a created annotation is a library item with a menu.
+                                onContextMenu={createdEntries[0] ? (event) => openItemMenu(createdEntries[0], event) : undefined}
+                            >
+                                {isFailed ? (
+                                    <Icon icon={AlertIcon} size={14} className="font-color-red" style={{ marginTop: 2 }} />
+                                ) : (
+                                    <ZoteroIcon
+                                        icon={noun === 'underline'
+                                            ? ZOTERO_ICONS.ANNOTATE_UNDERLINE
+                                            : noun === 'highlight' ? ZOTERO_ICONS.ANNOTATE_HIGHLIGHT : ZOTERO_ICONS.ANNOTATION}
+                                        size={14}
+                                        color={COLOR_VALUES[color] ?? COLOR_VALUES.yellow}
+                                        style={{ marginTop: 2 }}
+                                    />
+                                )}
+
+                                <div className="display-flex flex-row min-w-0 flex-1 justify-between gap-3">
+                                    <div className={`truncate ${isFailed ? 'font-color-red' : ''}`}>
+                                        {rawItem.title || text || `${noun} annotation`}
+                                    </div>
+                                    {(isFailed || isPartial || pageDisplay !== null) && (
+                                        <div className='font-color-tertiary whitespace-nowrap'>
+                                            {pageDisplay !== null ? `Page ${pageDisplay}` : ''}
+                                        </div>
+                                    )}
+                                </div>
+
+                            </div>
+                        );
+
+                        return (
+                            <AnnotationTooltip
+                                key={`${clientItemId}-${rawItem.index}`}
+                                typeLabel={kindLabel}
+                                pageDisplay={pageDisplay}
+                                body={tooltipContent}
+                                footerLabel={footerLabel}
+                                footerClassName={footerClass}
+                                typeIcon={getAnnotationTooltipIcon(noun)}
+                                stayOpenOnAnchorClick
+                            >
+                                {row}
+                            </AnnotationTooltip>
+                        );
+                    })}
+                    {itemMenu}
+                </div>
+
+                {tags.length > 0 && (
+                    <div className="display-flex flex-row items-center gap-2 flex-wrap">
+                        <span className="font-color-primary shrink-0 mb-1">
+                            {tags.length > 1 ? `${tags.length} Tags` : `${tags.length} Tag`}
+                        </span>
+                        {tags.map((tag, index) => (
+                            <TagPill key={`${tag}-${index}`} name={tag} />
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default CreateAnnotationsPreview;

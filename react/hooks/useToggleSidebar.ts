@@ -1,0 +1,70 @@
+import { getContextWindow, getWindowRuntime } from '../runtime/windowRuntime';
+import { useSetAtom } from 'jotai';
+import { store } from '../store';
+import { isSidebarVisibleAtom } from '../atoms/ui';
+import { useEventSubscription } from './useEventSubscription';
+import { uiManager } from '../ui/UIManager';
+import { isLibraryTabSelected } from '../../src/ui/libraryPane';
+import { getPref } from '../../src/utils/prefs';
+import { removePopupMessagesByTypeAtom } from '../atoms/ui';
+import { currentMessageItemsAtom, updateMessageItemsFromZoteroSelectionAtom } from '../atoms/messageComposition';
+import { isProfileLoadedAtom } from '../atoms/profile';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { dismissDiffPreview } from '../utils/noteEditorDiffPreview';
+
+export function useToggleSidebar() {
+    const setSidebarVisible = useSetAtom(isSidebarVisibleAtom);
+    const removePopupMessagesByType = useSetAtom(removePopupMessagesByTypeAtom);
+    const updateMessageItemsFromZoteroSelection = useSetAtom(updateMessageItemsFromZoteroSelectionAtom);
+    const setCurrentMessageItems = useSetAtom(currentMessageItemsAtom);
+
+    useEventSubscription('toggleChat', (detail) => {
+        if (getWindowRuntime().kind === "standalone") {
+            getWindowRuntime().hostWindow.focus();
+            return;
+        }
+        // Update atoms
+        setSidebarVisible((prev) => {
+            const currentlyOpen = prev;
+            const newIsVisible = detail?.forceOpen ? true : !currentlyOpen;
+
+            // Already in the desired state — no-op
+            if (newIsVisible === currentlyOpen) return prev;
+            const isLibraryTab = isLibraryTabSelected(getContextWindow());
+
+            logger(`useToggleSidebar: toggleChat event received - currently open: ${currentlyOpen}, will be: ${newIsVisible}, location: ${isLibraryTab ? 'library' : 'reader'}`);
+
+            // If closing, dismiss any active diff preview
+            if (currentlyOpen && !newIsVisible) {
+                dismissDiffPreview();
+            }
+
+            // If just opened, initialize
+            if (!currentlyOpen) {
+                setCurrentMessageItems([]);
+                removePopupMessagesByType(['items_summary']);
+                if (!detail?.skipAutoPopulate) {
+                    const isProfileLoaded = store.get(isProfileLoadedAtom);
+                    const addSelectedItemsOnOpen = getPref('addSelectedItemsOnOpen');
+                    if (addSelectedItemsOnOpen && isLibraryTab && isProfileLoaded) {
+                        const maxAddAttachmentToMessage = getPref('maxAddAttachmentToMessage');
+                        updateMessageItemsFromZoteroSelection(maxAddAttachmentToMessage);
+                    }
+                }
+            }
+            
+            // Show or hide the sidebar in the selected tab's pane
+            uiManager.updateUI({ isVisible: newIsVisible, isLibraryTab });
+
+            // Announce the state change to screen readers, and when closing
+            // move focus to the toolbar button so it isn't lost on the now
+            // hidden sidebar content.
+            uiManager.announceSidebarState(newIsVisible);
+            if (!newIsVisible) {
+                uiManager.focusToggleButton();
+            }
+
+            return newIsVisible;
+        });
+    });
+}

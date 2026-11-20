@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-stylesheet href="chrome://global/skin/" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero/skin/zotero.css" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero/skin/overlay.css" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero-platform/content/zotero.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-tokens.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-utilities.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-components.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-table.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/astermargin.css" type="text/css"?>
+<!DOCTYPE window>
+<window
+    id="astermargin-preferences-window"
+    orient="vertical"
+    width="920"
+    height="660"
+    minwidth="840"
+    minheight="560"
+    title="AsterMargin Settings"
+    persist="screenX screenY width height"
+    windowtype="astermargin:preferences"
+    xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+    xmlns:html="http://www.w3.org/1999/xhtml"
+>
+    <script type="application/javascript" src="chrome://astermargin/content/astermarginPreferences.js"/>
+
+    <!-- React mount point. `astermargin-root` is the scoping root for the shared
+         @astermargin/agent-ui sheets, which select `.astermargin-root .foo`; it belongs on
+         every element carrying a `astermargin-pane-*` id. The preferences pane is a
+         full React surface built from the same utility vocabulary, so it needs
+         the class as much as the sidebar does. -->
+    <html:div id="astermargin-pane-preferences" class="astermargin-root display-flex flex-1 flex-col h-full w-full min-w-0" style="height: 100%; width: 100%; display: flex;"></html:div>
+</window>

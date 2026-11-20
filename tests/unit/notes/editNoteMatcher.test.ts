@@ -1,0 +1,2010 @@
+import { describe, it, expect, vi } from 'vitest';
+
+// =============================================================================
+// Module mocks
+// =============================================================================
+// Stub the supabase / agentDataProvider utils transitive deps that the real
+// noteHtmlSimplifier module pulls in via zoteroUtils → apiService → supabase.
+// These stubs are only here to let the module load in a unit-test harness.
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: { auth: { getSession: vi.fn() } },
+}));
+
+vi.mock('../../../src/services/agentDataProvider/utils', () => ({
+    getAttachmentFileStatus: vi.fn(() => 'unavailable'),
+    getDeferredToolPreference: vi.fn(() => 'always_ask'),
+}));
+
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    createCitationHTML: vi.fn(() => ''),
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test' })),
+}));
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({ logger: vi.fn() }));
+
+// Identity expansion: simplified == raw for these tests. All other primitives
+// (entity encode/decode, NFKC via String.prototype, countOccurrences, strip*)
+// are exercised for real — they encapsulate the behavior we want to verify.
+vi.mock('../../../src/utils/noteCitationExpand', async () => {
+    const actual = await vi.importActual<typeof import('../../../src/utils/noteCitationExpand')>(
+        '../../../src/utils/noteCitationExpand'
+    );
+    return {
+        ...actual,
+        expandToRawHtml: vi.fn((str: string) => str),
+    };
+});
+
+// =============================================================================
+// Imports
+// =============================================================================
+
+import {
+    findBestMatch,
+    expandBase,
+    type MatchInput,
+    type BaseExpansion,
+} from '../../../src/utils/editNoteMatcher';
+import { expandToRawHtml } from '../../../src/utils/noteCitationExpand';
+import type { EditNoteOperation } from '@astermargin/agent-core/types/agentActions/editNote';
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+function makeInput(overrides: Partial<MatchInput>): MatchInput {
+    const simplified = overrides.simplified ?? overrides.strippedHtml ?? '';
+    return {
+        oldString: '',
+        newString: '',
+        operation: 'str_replace' as EditNoteOperation,
+        metadata: { elements: new Map() } as any,
+        simplified,
+        strippedHtml: overrides.strippedHtml ?? simplified,
+        externalRefContext: { externalRefs: new Map(), externalItemMapping: new Map() } as any,
+        pageLabels: {},
+        ...overrides,
+    };
+}
+
+function match(input: MatchInput): ReturnType<typeof findBestMatch> {
+    const base: BaseExpansion = expandBase(input);
+    return findBestMatch(input, base);
+}
+
+// =============================================================================
+// Per-strategy coverage
+// =============================================================================
+
+describe('findBestMatch strategies', () => {
+    it('exact: returns the base match when expandedOld is found verbatim', () => {
+        const result = match(makeInput({
+            oldString: 'hello',
+            newString: 'hi',
+            strippedHtml: '<p>hello world</p>',
+        }));
+        expect(result?.strategy).toBe('exact');
+        expect(result?.matchCount).toBe(1);
+        expect(result?.expandedOld).toBe('hello');
+        expect(result?.expandedNew).toBe('hi');
+        expect(result?.normalizeAnchor('abc')).toBe('abc');
+    });
+
+    it('entity_decode: matches when note has decoded form but needle has entities', () => {
+        const result = match(makeInput({
+            oldString: 'it&#x27;s',
+            newString: 'it&#x27;s was',
+            strippedHtml: "<p>it's fine</p>",
+        }));
+        expect(result?.strategy).toBe('entity_decode');
+        expect(result?.expandedOld).toBe("it's");
+        expect(result?.expandedNew).toBe("it's was");
+    });
+
+    it('entity_encode: matches when note has entity-encoded form but needle has literal char', () => {
+        const result = match(makeInput({
+            oldString: "it's",
+            newString: "it's was",
+            strippedHtml: '<p>it&#x27;s fine</p>',
+        }));
+        expect(result?.strategy).toBe('entity_encode');
+        expect(result?.expandedOld).toMatch(/&#x27;|&#39;|&apos;/);
+        // normalizeAnchor re-applies the same entity form
+        expect(result?.normalizeAnchor("it's")).not.toBe("it's");
+    });
+
+    it('entity_encode: matches when note has &amp; but needle has literal &', () => {
+        const result = match(makeInput({
+            oldString: 'Smith & Jones',
+            newString: 'Smith and Jones',
+            strippedHtml: '<p>Smith &amp; Jones (1999)</p>',
+        }));
+        expect(result?.strategy).toBe('entity_encode');
+        expect(result?.expandedOld).toBe('Smith &amp; Jones');
+        expect(result?.expandedNew).toBe('Smith and Jones');
+    });
+
+    it('nfkc: matches when note has half-width form but needle has full-width', () => {
+        const result = match(makeInput({
+            oldString: '（ア）',  // full-width parens
+            newString: '（イ）',
+            strippedHtml: '<p>(ア)</p>',  // half-width parens
+        }));
+        expect(result?.strategy).toBe('nfkc');
+        expect(result?.expandedOld).toBe('(ア)');
+        expect(result?.normalizeAnchor('（テスト）')).toBe('(テスト)');
+    });
+
+    it('trim_trailing_newlines: strips extra \\n from old_string and new_string', () => {
+        const result = match(makeInput({
+            oldString: 'hello\n\n',
+            newString: 'hi\n\n',
+            strippedHtml: '<p>hello world</p>',
+        }));
+        expect(result?.strategy).toBe('trim_trailing_newlines');
+        expect(result?.oldString).toBe('hello');
+        expect(result?.newString).toBe('hi');
+    });
+
+    it('trim_trailing_newlines: does not trim new_string for insert_after', () => {
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: 'hello\n\n',
+            newString: 'payload\n\n',
+            strippedHtml: '<p>hello world</p>',
+        }));
+        expect(result?.strategy).toBe('trim_trailing_newlines');
+        expect(result?.oldString).toBe('hello');
+        expect(result?.newString).toBe('payload\n\n');  // untouched for insert
+    });
+
+    it('trim_trailing_newlines: trims merged insert_after replacement during execution', () => {
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: 'hello\n\n',
+            newString: 'hello\n\n world',
+            strippedHtml: '<p>hello world</p>',
+        }));
+        expect(result?.strategy).toBe('trim_trailing_newlines');
+        expect(result?.oldString).toBe('hello');
+        expect(result?.newString).toBe('hello world');
+    });
+
+    it('trim_trailing_newlines: trims merged insert_before replacement during execution', () => {
+        const result = match(makeInput({
+            operation: 'insert_before' as EditNoteOperation,
+            oldString: 'hello\n\n',
+            newString: 'world hello\n\n',
+            strippedHtml: '<p>hello world</p>',
+        }));
+        expect(result?.strategy).toBe('trim_trailing_newlines');
+        expect(result?.oldString).toBe('hello');
+        expect(result?.newString).toBe('world hello');
+    });
+
+    it('json_unescape: converts literal \\\\n / \\\\" escapes to real chars', () => {
+        const result = match(makeInput({
+            oldString: 'hello\\nworld',  // literal backslash-n
+            newString: 'hi\\nthere',
+            strippedHtml: '<p>hello\nworld extra</p>',  // real newline
+        }));
+        expect(result?.strategy).toBe('json_unescape');
+        expect(result?.oldString).toBe('hello\nworld');
+        expect(result?.newString).toBe('hi\nthere');
+    });
+
+    it('spurious_wrap_strip: unwraps matching <p>…</p> when note has bare text', () => {
+        const result = match(makeInput({
+            oldString: '<p>hello</p>',
+            newString: '<p>hi</p>',
+            strippedHtml: 'hello world',
+        }));
+        expect(result?.strategy).toBe('spurious_wrap_strip');
+        expect(result?.oldString).toBe('hello');
+        expect(result?.newString).toBe('hi');
+    });
+
+    it('markdown_to_html: converts **bold** in old_string to <strong>', () => {
+        const result = match(makeInput({
+            oldString: 'the **important** part',
+            newString: 'the **critical** part',
+            strippedHtml: '<p>the <strong>important</strong> part</p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('the <strong>important</strong> part');
+        expect(result?.newString).toBe('the <strong>critical</strong> part');
+        expect(result?.matchCount).toBe(1);
+    });
+
+    it('markdown_to_html: converts __bold__ (GFM alt syntax) to <strong>', () => {
+        const result = match(makeInput({
+            oldString: 'the __important__ part',
+            newString: 'the __critical__ part',
+            strippedHtml: '<p>the <strong>important</strong> part</p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('the <strong>important</strong> part');
+        expect(result?.newString).toBe('the <strong>critical</strong> part');
+    });
+
+    it('markdown_to_html: converts ATX headings on their own line', () => {
+        const result = match(makeInput({
+            oldString: '## 系统组件',
+            newString: '## 核心组件',
+            strippedHtml: '<h2>系统组件</h2>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>系统组件</h2>');
+        expect(result?.newString).toBe('<h2>核心组件</h2>');
+    });
+
+    it('markdown_to_html: handles multiple heading levels (# through ######)', () => {
+        const result = match(makeInput({
+            oldString: '#### a',
+            newString: '#### b',
+            strippedHtml: '<h4>a</h4>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h4>a</h4>');
+    });
+
+    it('markdown_to_html: strips optional ATX closing fence (## Title ##)', () => {
+        // CommonMark: closing `#+` preceded by whitespace is not part of the
+        // heading text. Without stripping it, `## Title ##` would convert to
+        // `<h2>Title ##</h2>` and never match the rendered `<h2>Title</h2>`.
+        const result = match(makeInput({
+            oldString: '## Title ##',
+            newString: '## NewTitle ###',
+            strippedHtml: '<h2>Title</h2>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>Title</h2>');
+        expect(result?.newString).toBe('<h2>NewTitle</h2>');
+    });
+
+    it('markdown_to_html: accepts tab between # and heading text (CommonMark)', () => {
+        const result = match(makeInput({
+            oldString: '##\tHeading',
+            newString: '##\tNew',
+            strippedHtml: '<h2>Heading</h2>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>Heading</h2>');
+        expect(result?.newString).toBe('<h2>New</h2>');
+    });
+
+    it('markdown_to_html: accepts up to 3 leading spaces before # (CommonMark)', () => {
+        const result = match(makeInput({
+            oldString: '   ## Heading',
+            newString: '   ## New',
+            strippedHtml: '<h2>Heading</h2>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>Heading</h2>');
+    });
+
+    it('markdown_to_html: rejects 4+ leading spaces (would be a code block in CommonMark)', () => {
+        const result = match(makeInput({
+            oldString: '    ## Heading',
+            newString: '    ## New',
+            strippedHtml: '<h2>Heading</h2>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('markdown_to_html: rejects # without trailing whitespace (#Heading is not ATX)', () => {
+        const result = match(makeInput({
+            oldString: '##Heading',
+            newString: '##New',
+            strippedHtml: '<h2>Heading</h2>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('markdown_to_html: trims trailing whitespace from heading text', () => {
+        // CommonMark strips trailing whitespace from heading text. Without
+        // this, `<h2>Heading   </h2>` would not match the rendered `<h2>Heading</h2>`.
+        const result = match(makeInput({
+            oldString: '## Heading   ',
+            newString: '## New   ',
+            strippedHtml: '<h2>Heading</h2>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>Heading</h2>');
+        expect(result?.newString).toBe('<h2>New</h2>');
+    });
+
+    it('markdown_to_html: absorbs CRLF \\r so heading text never carries it', () => {
+        // Stored notes use LF line endings. If model sends CRLF, the captured
+        // heading text must still produce `<h2>Heading</h2>` and not
+        // `<h2>Heading\r</h2>`, which would never match.
+        const result = match(makeInput({
+            oldString: '## Heading\r\nNext line',
+            newString: '## New\r\nNext line',
+            strippedHtml: '<h2>Heading</h2>\nNext line',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>Heading</h2>\nNext line');
+    });
+
+    it('markdown_to_html: keeps trailing # when not preceded by whitespace (## Section#5)', () => {
+        // CommonMark requires whitespace before the closing fence; `Section#5`
+        // must stay intact in the heading text.
+        const result = match(makeInput({
+            oldString: '## Section#5',
+            newString: '## Section#6',
+            strippedHtml: '<h2>Section#5</h2>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>Section#5</h2>');
+        expect(result?.newString).toBe('<h2>Section#6</h2>');
+    });
+
+    it('markdown_to_html: does not convert markdown inside HTML tag attributes', () => {
+        // `**x**` inside a tag attribute stays literal — attribute safety via
+        // split-on-tags. The `<citation .../>` tag itself is unchanged.
+        const result = match(makeInput({
+            oldString: 'pre <citation label="**x**"/> **real** post',
+            newString: 'pre <citation label="**x**"/> **changed** post',
+            strippedHtml: 'pre <citation label="**x**"/> <strong>real</strong> post',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('pre <citation label="**x**"/> <strong>real</strong> post');
+        expect(result?.newString).toBe('pre <citation label="**x**"/> <strong>changed</strong> post');
+    });
+
+    it('markdown_to_html: returns null when old_string has no markdown markers', () => {
+        // Plain text without markdown falls through past markdown_to_html to null.
+        const result = match(makeInput({
+            oldString: 'plain text not in note',
+            newString: 'replacement',
+            strippedHtml: '<p>totally different content</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('markdown_to_html: returns null when converted markdown still does not match', () => {
+        const result = match(makeInput({
+            oldString: '**missing**',
+            newString: '**new**',
+            strippedHtml: '<p>no match here</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('markdown_to_html: supports insert_after with markdown old_string', () => {
+        // Validation-time: new_string is the bare payload (no merge yet).
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '**title**',
+            newString: ' tail',
+            strippedHtml: '<p><strong>title</strong> body</p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<strong>title</strong>');
+        expect(result?.newString).toBe(' tail');
+    });
+
+    it('markdown_to_html: symmetrically converts merged insert_after new_string', () => {
+        // Execution-time: new_string = old + injected (merged by caller).
+        // Converting both sides keeps the prefix aligned.
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '**title**',
+            newString: '**title** injected',
+            strippedHtml: '<p><strong>title</strong> body</p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<strong>title</strong>');
+        expect(result?.newString).toBe('<strong>title</strong> injected');
+        // Replacement must start with the transformed anchor so the merged
+        // form still "inserts after" the anchor in raw HTML space.
+        expect(result?.newString.startsWith(result!.oldString)).toBe(true);
+    });
+
+    it('markdown_render: matches composed Markdown rendered by the handler', () => {
+        const renderedOld = [
+            '<h3>1. Batch Normalization — A &amp; B</h3>',
+            '<p>核心 <strong>bold</strong> and $x_i$.</p>',
+            '<ul><li>first item</li><li>second item</li></ul>',
+        ].join('\n');
+        const renderedNew = [
+            '<h3>1. Batch Normalization — A &amp; B</h3>',
+            '<p>核心 <strong>updated</strong> and $x_i$.</p>',
+            '<ul><li>first item</li><li>second item</li></ul>',
+        ].join('\n');
+
+        const result = match(makeInput({
+            oldString: [
+                '### 1. Batch Normalization — A & B',
+                '',
+                '核心 **bold** and $x_i$.',
+                '- first item',
+                '- second item',
+            ].join('\n'),
+            newString: [
+                '### 1. Batch Normalization — A & B',
+                '',
+                '核心 **updated** and $x_i$.',
+                '- first item',
+                '- second item',
+            ].join('\n'),
+            strippedHtml: `<section>${renderedOld}</section>`,
+            renderedOldSimplified: renderedOld,
+            renderedNewSimplified: renderedNew,
+        }));
+
+        expect(result?.strategy).toBe('markdown_render');
+        expect(result?.oldString).toBe(renderedOld);
+        expect(result?.newString).toBe(renderedNew);
+        expect(result?.expandedNew).toBe(renderedNew);
+    });
+
+    it('markdown_render: preserves rendered citation tags in new_string', () => {
+        const renderedOld = '<h3>A &amp; B</h3><p><strong>anchor</strong></p><ul><li>x</li></ul>';
+        const renderedNew = '<p>See <citation id="1-ABCDEFGH"/></p>';
+
+        const result = match(makeInput({
+            oldString: '### A & B\n\n**anchor**\n- x',
+            newString: 'See <citation id="1-ABCDEFGH"/>',
+            strippedHtml: renderedOld,
+            renderedOldSimplified: renderedOld,
+            renderedNewSimplified: renderedNew,
+        }));
+
+        expect(result?.strategy).toBe('markdown_render');
+        expect(result?.expandedNew).toBe(renderedNew);
+    });
+
+    it('markdown_render: preserves rendered raw HTML in new_string', () => {
+        const renderedOld = '<h3>A &amp; B</h3><p><strong>anchor</strong></p><ul><li>x</li></ul>';
+        const renderedNew = '<blockquote><p>Replacement <em>HTML</em></p></blockquote>';
+
+        const result = match(makeInput({
+            oldString: '### A & B\n\n**anchor**\n- x',
+            newString: '<blockquote><p>Replacement <em>HTML</em></p></blockquote>',
+            strippedHtml: renderedOld,
+            renderedOldSimplified: renderedOld,
+            renderedNewSimplified: renderedNew,
+        }));
+
+        expect(result?.strategy).toBe('markdown_render');
+        expect(result?.expandedNew).toBe(renderedNew);
+    });
+
+    it('markdown_render: supports insert_after with a rendered merged replacement', () => {
+        const renderedOld = '<h3>A &amp; B</h3><p><strong>anchor</strong></p><ul><li>x</li></ul>';
+        const renderedNew = `${renderedOld}<p>inserted</p>`;
+
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '### A & B\n\n**anchor**\n- x',
+            newString: '\n\ninserted',
+            strippedHtml: renderedOld,
+            renderedOldSimplified: renderedOld,
+            renderedNewSimplified: renderedNew,
+        }));
+
+        expect(result?.strategy).toBe('markdown_render');
+        expect(result?.expandedNew.startsWith(result!.expandedOld)).toBe(true);
+    });
+
+    it('markdown_render: supports insert_before with a rendered merged replacement', () => {
+        const renderedOld = '<h3>A &amp; B</h3><p><strong>anchor</strong></p><ul><li>x</li></ul>';
+        const renderedNew = `<p>inserted</p>${renderedOld}`;
+
+        const result = match(makeInput({
+            operation: 'insert_before' as EditNoteOperation,
+            oldString: '### A & B\n\n**anchor**\n- x',
+            newString: 'inserted\n\n',
+            strippedHtml: renderedOld,
+            renderedOldSimplified: renderedOld,
+            renderedNewSimplified: renderedNew,
+        }));
+
+        expect(result?.strategy).toBe('markdown_render');
+        expect(result?.expandedNew.endsWith(result!.expandedOld)).toBe(true);
+    });
+});
+
+// =============================================================================
+// Priority ordering
+// =============================================================================
+
+describe('findBestMatch priority', () => {
+    it('picks exact over trim_trailing_newlines when both would match', () => {
+        // If exact matches, trim is never tried. `hello` exists in the html
+        // both as `hello\n\n` (exact) and `hello` (trimmed).
+        const result = match(makeInput({
+            oldString: 'hello\n\n',
+            newString: 'hi\n\n',
+            strippedHtml: '<p>hello\n\n world</p>',
+        }));
+        expect(result?.strategy).toBe('exact');
+        expect(result?.oldString).toBe('hello\n\n');
+    });
+
+    it('picks entity_decode before spurious_wrap_strip', () => {
+        // Both could theoretically apply, but entity_decode ranks higher.
+        const result = match(makeInput({
+            oldString: 'it&#x27;s',
+            newString: "it's",
+            strippedHtml: "<p>it's fine</p>",
+        }));
+        expect(result?.strategy).toBe('entity_decode');
+    });
+
+    it('falls through decode/encode/nfkc to trim when none of those apply', () => {
+        const result = match(makeInput({
+            oldString: 'plain\n',
+            newString: 'replaced',
+            strippedHtml: '<p>plain text</p>',
+        }));
+        expect(result?.strategy).toBe('trim_trailing_newlines');
+    });
+
+    it('prefers exact over markdown_to_html when old_string already has <strong>', () => {
+        // Regression guard: markdown_to_html must never shadow an exact match.
+        const result = match(makeInput({
+            oldString: 'the <strong>important</strong> part',
+            newString: 'replacement',
+            strippedHtml: '<p>the <strong>important</strong> part here</p>',
+        }));
+        expect(result?.strategy).toBe('exact');
+    });
+
+    it('markdown_to_html runs last: tried only after all other strategies fail', () => {
+        // Construct a case where only markdown_to_html can win by making all
+        // earlier strategies definitively fail.
+        const result = match(makeInput({
+            oldString: '**x**',
+            newString: '**y**',
+            strippedHtml: '<p><strong>x</strong></p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+    });
+});
+
+// =============================================================================
+// quote_normalized
+// =============================================================================
+
+describe('quote_normalized strategy', () => {
+    it('German low quotes: needle has "…" and haystack has „…"', () => {
+        const rawSlice = '<p>Onfray, „Les sagesses antiques."</p>';
+        const html = `<div data-schema-version="9">${rawSlice} other content</div>`;
+        const result = match(makeInput({
+            oldString: '<p>Onfray, "Les sagesses antiques."</p>',
+            newString: '<p>Onfray, Les sagesses.</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.matchCount).toBe(1);
+        // The returned expandedOld is the raw slice with curly quotes preserved.
+        expect(result?.expandedOld).toBe(rawSlice);
+        expect(result?.expandedNew).toBe('<p>Onfray, Les sagesses.</p>');
+        // Anchors fold on their way to the executor's raw-space lookup.
+        expect(result?.normalizeAnchor('„literal"')).toBe('"literal"');
+    });
+
+    it('English curly double quotes: \u201C…\u201D → "…"', () => {
+        const rawSlice = '<p>\u201CImportant\u201D note here with body text</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>"Important" note here with body text</p>',
+            newString: '<p>updated</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.expandedOld).toBe(rawSlice);
+    });
+
+    it('French guillemets: «…» → "…"', () => {
+        const rawSlice = '<p>Et «voilà» la preuve</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>Et "voilà" la preuve</p>',
+            newString: '<p>fini</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.expandedOld).toBe(rawSlice);
+    });
+
+    it('smart single quotes: it\u2019s → it\'s', () => {
+        const rawSlice = '<p>it\u2019s a test sentence</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: "<p>it's a test sentence</p>",
+            newString: "<p>REPLACED</p>",
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.expandedOld).toBe(rawSlice);
+    });
+
+    it('falls through to `exact` when both sides use ASCII quotes only', () => {
+        const result = match(makeInput({
+            oldString: '<p>"plain ASCII"</p>',
+            newString: '<p>replaced</p>',
+            strippedHtml: '<div data-schema-version="9"><p>"plain ASCII"</p></div>',
+        }));
+        expect(result?.strategy).toBe('exact');
+    });
+
+    it('`entity_decode` wins over `quote_normalized` (ordering regression)', () => {
+        // Needle uses entity form, haystack has the decoded ASCII. entity_decode
+        // should claim this case because it runs earlier in the chain.
+        const result = match(makeInput({
+            oldString: 'it&#x27;s fine',
+            newString: 'it&#x27;s done',
+            strippedHtml: "<p>it's fine here</p>",
+        }));
+        expect(result?.strategy).toBe('entity_decode');
+    });
+
+    it('rejects when mixed curly shapes fold to the same ASCII form (ambiguous)', () => {
+        // Safety: when the model's ASCII needle folds to the same form as two
+        // differently-quoted spans in the note (e.g., one „…" and one "…"),
+        // picking the first folded position's raw slice would silently edit
+        // the wrong one. The strategy refuses so the retry_prompt's candidate
+        // hints can show both forms and the model can pick explicitly.
+        // Both rawSlices must fold to the same text as the needle — same
+        // surrounding letters, different quote styles.
+        const rawSliceA = '<p>Quote \u201Etest case\u201D text</p>';
+        const rawSliceB = '<p>Quote \u201Ctest case\u201D text</p>';
+        const html = `<div data-schema-version="9">${rawSliceA}${rawSliceB}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>Quote "test case" text</p>',
+            newString: '<p>X</p>',
+            strippedHtml: html,
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('matches when distinct surrounding text disambiguates the folded form', () => {
+        // Same haystack topology as the rejection case above, but here only
+        // one folded occurrence matches — the other paragraph's letter
+        // sequence differs. foldedCount = 1 so the uniqueness gate passes.
+        const rawSlice = '<p>Quote \u201Etest case\u201D A text</p>';
+        const html = `<div data-schema-version="9">${rawSlice}<p>Quote "test case" B text</p></div>`;
+        const result = match(makeInput({
+            oldString: '<p>Quote "test case" A text</p>',
+            newString: '<p>X</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.matchCount).toBe(1);
+        expect(result?.expandedOld).toBe(rawSlice);
+    });
+
+    it('rejects str_replace_all when folded matches carry different raw slices', () => {
+        // Safety gate: splitting on actualRawSlice would miss occurrences with
+        // a different curly shape. Both rawSlices must be non-ASCII so that
+        // `exact` can't win before this strategy runs.
+        const rawSliceA = '<p>\u201Etest case\u201D example text</p>';  // low-9 + curly close
+        const rawSliceB = '<p>\u201Ctest case\u201D example text</p>';  // curly open + curly close
+        const html = `<div data-schema-version="9">${rawSliceA}${rawSliceB}</div>`;
+        const result = match(makeInput({
+            operation: 'str_replace_all' as EditNoteOperation,
+            oldString: '<p>"test case" example text</p>',
+            newString: '<p>X</p>',
+            strippedHtml: html,
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('allows str_replace_all when all folded matches share the same raw slice', () => {
+        // Two occurrences of the same curly shape → split/join works cleanly.
+        // Use a curly-only slice so `exact` can't win.
+        const rawSlice = '<p>\u201Etest\u201D repeat body</p>';
+        const html = `<div data-schema-version="9">${rawSlice}${rawSlice}</div>`;
+        const result = match(makeInput({
+            operation: 'str_replace_all' as EditNoteOperation,
+            oldString: '<p>"test" repeat body</p>',
+            newString: '<p>X</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.matchCount).toBe(2);
+    });
+
+    it('returns null when no curly variants are present in either side', () => {
+        // Defensive: foldedOld === base.expandedOld means nothing to do.
+        const result = match(makeInput({
+            oldString: 'ASCII only here',
+            newString: 'something else',
+            strippedHtml: '<p>totally different</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('insert_after (execute form): preserves curly glyphs in the actual raw slice', () => {
+        // Model wrote ASCII `"…"` in old_string, the note has German low
+        // quotes. The merged newString (execute-time shape) starts with the
+        // ASCII old_string prefix; if we naively expanded the whole merged
+        // form, the inserted region would lose the note's `„…"` glyphs.
+        const rawSlice = '<p>Foucault, \u201EHistoire\u201C</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const needle = '<p>Foucault, "Histoire"</p>';
+        const merged = needle + '<p>Injected payload</p>';
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: needle,
+            newString: merged,
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        // Must be rawSlice (with „…") + injected payload, NOT needle + injected.
+        expect(result?.expandedNew).toBe(rawSlice + '<p>Injected payload</p>');
+        expect(result?.expandedNew.startsWith(rawSlice)).toBe(true);
+    });
+
+    it('insert_before (execute form): preserves curly glyphs in the actual raw slice', () => {
+        const rawSlice = '<p>Foucault, \u201EHistoire\u201C</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const needle = '<p>Foucault, "Histoire"</p>';
+        const merged = '<p>Preamble</p>' + needle;
+        const result = match(makeInput({
+            operation: 'insert_before' as EditNoteOperation,
+            oldString: needle,
+            newString: merged,
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.expandedNew).toBe('<p>Preamble</p>' + rawSlice);
+        expect(result?.expandedNew.endsWith(rawSlice)).toBe(true);
+    });
+
+    it('insert_after (validate form): expandedNew still starts with the preserved raw slice', () => {
+        // Validate-time shape: newString is just the raw injected payload,
+        // not prefixed by oldString. Insert branch falls through to expanding
+        // newString as-is, then concatenates with actualRawSlice.
+        const rawSlice = '<p>Foucault, \u201EHistoire\u201C long enough body</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '<p>Foucault, "Histoire" long enough body</p>',
+            newString: '<p>Injected payload</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        expect(result?.expandedNew.startsWith(rawSlice)).toBe(true);
+        expect(result?.expandedNew.endsWith('<p>Injected payload</p>')).toBe(true);
+    });
+
+    it('normalizeAnchor folds curly quotes on target context strings', () => {
+        const rawSlice = '<p>Onfray, „Les sagesses antiques."</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>Onfray, "Les sagesses antiques."</p>',
+            newString: '<p>X</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('quote_normalized');
+        // Executor calls normalizeAnchor on validator-supplied target_before/
+        // after_context before matching. Curly shapes collapse to ASCII so
+        // anchors can match no matter which quote style the validator stored.
+        expect(result?.normalizeAnchor('Before „test" and')).toBe('Before "test" and');
+        expect(result?.normalizeAnchor("after \u2018single\u2019")).toBe("after 'single'");
+    });
+});
+
+// =============================================================================
+// No-match
+// =============================================================================
+
+describe('findBestMatch nothing matches', () => {
+    it('returns null when no strategy can find old_string', () => {
+        const result = match(makeInput({
+            oldString: 'this text does not exist',
+            newString: 'replacement',
+            strippedHtml: '<p>totally unrelated content</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('returns null for empty old_string', () => {
+        const result = match(makeInput({
+            oldString: '',
+            newString: 'x',
+            strippedHtml: '<p>hello</p>',
+        }));
+        // exact strategy's countOccurrences of '' returns 0 (guarded by
+        // countOccurrences itself), so no strategy matches.
+        expect(result).toBeNull();
+    });
+});
+
+// =============================================================================
+// Multi-match behavior
+// =============================================================================
+
+describe('findBestMatch multi-match', () => {
+    it('returns matchCount > 1 when str_replace_all has multiple occurrences', () => {
+        const result = match(makeInput({
+            operation: 'str_replace_all' as EditNoteOperation,
+            oldString: 'hello',
+            newString: 'hi',
+            strippedHtml: '<p>hello hello hello</p>',
+        }));
+        expect(result?.strategy).toBe('exact');
+        expect(result?.matchCount).toBe(3);
+    });
+
+    it('returns matchCount > 1 for str_replace — disambiguation is caller-level', () => {
+        const result = match(makeInput({
+            operation: 'str_replace' as EditNoteOperation,
+            oldString: 'dup',
+            newString: 'new',
+            strippedHtml: '<p>dup and dup</p>',
+        }));
+        expect(result?.strategy).toBe('exact');
+        expect(result?.matchCount).toBe(2);
+        expect(result?.rawPositionHint).toBeUndefined();
+    });
+});
+
+// =============================================================================
+// Failure scenarios: real old_string_not_found failures. Each seeds the haystack
+// with the actual rendered HTML from create_note's note_content and the needle
+// with the markdown the model submitted.
+// =============================================================================
+
+describe('markdown_to_html failure scenarios', () => {
+    it('CJK bold: model sent **扩展** but note has <strong>扩展</strong>', () => {
+        const result = match(makeInput({
+            oldString: '该研究**扩展**了现有光操控文献中的观点',
+            newString: '该研究**深化**了现有光操控文献中的观点',
+            strippedHtml:
+                '<p>一、研究主要内容</p>\n'
+                + '<p>本文研究了<strong>在外部光照下的旋转粒子动力学</strong>，'
+                + '该研究<strong>扩展</strong>了现有光操控文献中的观点，'
+                + '突破了经典系统中无法实现净光放大的传统认知。</p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('该研究<strong>扩展</strong>了现有光操控文献中的观点');
+        expect(result?.newString).toBe('该研究<strong>深化</strong>了现有光操控文献中的观点');
+    });
+
+    it('English inline bold: **Key insight:** matches rendered <strong>Key insight:</strong>', () => {
+        const result = match(makeInput({
+            oldString: '<p>**Key insight:** Recession gave way to **stagflation in India**</p>',
+            newString: '<p>**Key insight:** Recession yielded to **stagflation**</p>',
+            strippedHtml:
+                '<p><strong>Key insight:</strong> Recession gave way to '
+                + '<strong>stagflation in India</strong></p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe(
+            '<p><strong>Key insight:</strong> Recession gave way to <strong>stagflation in India</strong></p>',
+        );
+    });
+
+    it('ATX heading: ## 系统组件与技术选择 matches rendered <h2>', () => {
+        const result = match(makeInput({
+            oldString: '## 系统组件与技术选择',
+            newString: '## 核心系统组件',
+            strippedHtml:
+                '<p>强度，$\\rho$ 为密度。</p>\n'
+                + '<h2>系统组件与技术选择</h2>\n'
+                + '<h3>2.1 飞轮/转子材料</h3>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+        expect(result?.oldString).toBe('<h2>系统组件与技术选择</h2>');
+    });
+});
+
+// =============================================================================
+// whitespace_relaxed
+// =============================================================================
+
+describe('whitespace_relaxed strategy', () => {
+    // -- Positive cases --
+
+    it('matches when needle has an extra blank line between tags', () => {
+        // Failure scenario: model's old_string had <hr>\n\n<p>…
+        // while note had <hr>\n<p>….
+        const rawSlice = '<hr>\n<p><strong>Synthese :</strong> long body text anchor</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<hr>\n\n<p><strong>Synthese :</strong> long body text anchor</p>',
+            newString: '<p>REPLACED</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.matchCount).toBe(1);
+        expect(result?.expandedOld).toBe(rawSlice);
+        expect(result?.oldString).toBe(rawSlice);
+        expect(result?.expandedNew).toBe('<p>REPLACED</p>');
+        expect(result?.normalizeAnchor('abc')).toBe('abc');
+    });
+
+    it('matches when needle has multiple spaces where note has single spaces', () => {
+        // Pure ASCII whitespace drift — nfkc can't handle it (no full-width
+        // chars), so this isolates the whitespace_relaxed path.
+        const noteText = '<p>hello world with more padding text here for anchor</p>';
+        const result = match(makeInput({
+            oldString: 'hello   world with  more   padding text here for anchor',
+            newString: 'hi there',
+            strippedHtml: noteText,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.matchCount).toBe(1);
+        expect(result?.expandedOld).toBe('hello world with more padding text here for anchor');
+    });
+
+    it('pins JS `\\s` matching \\u00A0 (NBSP) via normalizeWS', () => {
+        // NBSP is also handled upstream by `nfkc`, so we assert the edit
+        // succeeds — not that this specific strategy wins. This pins the
+        // runtime behavior that NBSP is whitespace under `\s`.
+        const result = match(makeInput({
+            oldString: 'hello\u00A0world with more padding text here for anchor',
+            newString: 'hi there',
+            strippedHtml: '<p>hello world with more padding text here for anchor</p>',
+        }));
+        expect(result).not.toBeNull();
+        // Either nfkc (which would normalize NBSP) or whitespace_relaxed is
+        // acceptable — both produce a correct edit.
+        expect(['nfkc', 'whitespace_relaxed']).toContain(result?.strategy);
+    });
+
+    it('matches when needle has a tab where note has spaces', () => {
+        const html = '<p>key: value with enough chars after to pass the gate</p>';
+        const result = match(makeInput({
+            oldString: 'key:\tvalue with enough chars after to pass the gate',
+            newString: 'replaced',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedOld).toBe('key: value with enough chars after to pass the gate');
+    });
+
+    it('insert_after (validate form): expandedNew starts with actual raw slice', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '<p>Anchor  paragraph with plenty  of text here</p>',  // double spaces
+            newString: '<p>Injected payload</p>',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedOld).toBe(rawSlice);
+        expect(result?.expandedNew.startsWith(rawSlice)).toBe(true);
+        expect(result?.expandedNew.endsWith('<p>Injected payload</p>')).toBe(true);
+    });
+
+    it('insert_after (execute form, pre-merged newString): strips prefix before expanding', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const needle = '<p>Anchor  paragraph with plenty  of text here</p>';
+        const merged = needle + '<p>Injected</p>';
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: needle,
+            newString: merged,  // already merged form (from normalized_action_data)
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        // Must be rawSlice + '<p>Injected</p>', NOT rawSlice + merged.
+        expect(result?.expandedNew).toBe(rawSlice + '<p>Injected</p>');
+    });
+
+    it('insert_before (execute form, pre-merged newString): expandedNew ends with raw slice', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const needle = '<p>Anchor  paragraph with plenty  of text here</p>';
+        const merged = '<p>Preamble</p>' + needle;
+        const result = match(makeInput({
+            operation: 'insert_before' as EditNoteOperation,
+            oldString: needle,
+            newString: merged,
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedNew).toBe('<p>Preamble</p>' + rawSlice);
+        expect(result?.expandedNew.endsWith(rawSlice)).toBe(true);
+    });
+
+    // -- <pre> is whitespace-significant --
+
+    describe('<pre> whitespace is not relaxed', () => {
+        // Replacements must preserve the note's code indentation.
+
+        it('refuses a str_replace whose needle opens a <pre> with drifted indentation', () => {
+            const html = '<div data-schema-version="9"><pre>{\n    "alpha": 1,\n    "beta": 2\n}</pre></div>';
+            const result = match(makeInput({
+                // 1-space indent where the note has 4.
+                oldString: '<pre>{\n "alpha": 1,\n "beta": 2\n}</pre>',
+                newString: '<pre>{\n "alpha": 9,\n "beta": 2\n}</pre>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('refuses a str_replace whose needle sits inside a <pre> it never opened', () => {
+            // The overlap gate catches snippets without an opening `<pre>`.
+            const html = '<div data-schema-version="9"><p>intro</p><pre>function demo() {\n        return 42;\n}</pre></div>';
+            const result = match(makeInput({
+                oldString: 'function demo() {\n    return 42;\n}',
+                newString: 'function demo() {\n    return 7;\n}',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('still matches when the needle reproduces the <pre> indentation exactly', () => {
+            // Only prose outside the code block drifted.
+            const rawSlice = '<p>Some intro text here</p><pre>if (x) {\n    doIt();\n}</pre>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const result = match(makeInput({
+                oldString: '<p>Some intro  text here</p><pre>if (x) {\n    doIt();\n}</pre>',
+                newString: '<p>REPLACED</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('still relaxes prose when an unrelated <pre> sits elsewhere in the note', () => {
+            const html = '<div data-schema-version="9"><pre>code block here</pre><p>hello world with more padding text here</p></div>';
+            const result = match(makeInput({
+                oldString: 'hello   world with  more padding text here',
+                newString: 'replaced',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe('hello world with more padding text here');
+        });
+
+        it('still relaxes text starting immediately after </pre> — the gate needs a real overlap', () => {
+            // The code block ends exactly where the match begins.
+            const html = '<div data-schema-version="9"><pre>x = 1</pre>hello world with more padding text here</div>';
+            const result = match(makeInput({
+                oldString: 'hello   world with  more padding text here',
+                newString: 'replaced',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe('hello world with more padding text here');
+        });
+
+        it('still relaxes inside <pre class="math"> — LaTeX spacing is not indentation', () => {
+            const rawSlice = '<pre class="math">$$x = 1 + 2 + 3 + 4$$</pre>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const result = match(makeInput({
+                oldString: '<pre class="math">$$x  =  1 + 2 + 3 + 4$$</pre>',
+                newString: '<pre class="math">$$y = 5$$</pre>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('allows insert_after anchored inside a <pre> — the note bytes are spliced back', () => {
+            // Inserts reuse the raw slice, preserving its indentation.
+            const rawSlice = 'const a = 1;\n        const b = 2;';
+            const html = `<div data-schema-version="9"><pre>${rawSlice}</pre></div>`;
+            const result = match(makeInput({
+                operation: 'insert_after' as EditNoteOperation,
+                oldString: 'const a = 1;\n    const b = 2;',
+                newString: '\n    const c = 3;',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+            expect(result?.expandedNew).toBe(rawSlice + '\n    const c = 3;');
+        });
+    });
+
+    // -- Safety gates --
+
+    it('rejects when normalized needle is shorter than the minimum length', () => {
+        const result = match(makeInput({
+            oldString: 'A B',  // normalized length 3, below threshold
+            newString: 'X',
+            strippedHtml: '<p>A    B here and more</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('rejects when non-whitespace char count in needle is too low', () => {
+        // Needle: 7 non-ws chars (a b c d e f g) — below 12. Must differ in
+        // whitespace shape from the haystack so exact/trim don't grab it.
+        const needle = 'a  b\n\n\n\nc  d   \t\t  e  f  g';
+        const haystack = '<p>a b c d e f g</p>';  // single spaces
+        expect(needle.length).toBeGreaterThanOrEqual(20);
+        expect(needle.replace(/\s/g, '').length).toBeLessThan(12);
+        const result = match(makeInput({
+            oldString: needle,
+            newString: 'x',
+            strippedHtml: haystack,
+        }));
+        // Other strategies don't apply (no exact, no entity, no trim match on
+        // this structure), so full chain returns null.
+        expect(result).toBeNull();
+    });
+
+    it('rejects when needle has leading whitespace', () => {
+        const result = match(makeInput({
+            oldString: '  anchor paragraph with enough length here',
+            newString: 'x',
+            strippedHtml: '<p>anchor  paragraph with enough length here</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('rejects when needle has trailing whitespace', () => {
+        const result = match(makeInput({
+            oldString: 'anchor paragraph with enough length here   ',
+            newString: 'x',
+            strippedHtml: '<p>anchor  paragraph with enough length here</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('rejects when the regex finds multiple raw matches', () => {
+        // Two ws-relaxed occurrences with whitespace shapes distinct from the
+        // needle so `exact` misses and whitespace_relaxed sees 2.
+        const result = match(makeInput({
+            oldString: 'foo\n\nbar with enough chars after to pass gate',
+            newString: 'x',
+            strippedHtml:
+                '<p>foo bar with enough chars after to pass gate</p>'
+                + '<p>foo\tbar with enough chars after to pass gate</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('rejects str_replace_all even when the normalized match is unique', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const result = match(makeInput({
+            operation: 'str_replace_all' as EditNoteOperation,
+            oldString: '<p>Anchor  paragraph with plenty  of text here</p>',
+            newString: 'x',
+            strippedHtml: `<div data-schema-version="9">${rawSlice}</div>`,
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('matches when needle contains a citation and haystack shares the expanded form', () => {
+        // Regression guard for the extended behavior: whitespace_relaxed now
+        // builds the regex from `base.expandedOld` (raw space), so needles
+        // that contain <citation>/<annotation>/math delimiters can still
+        // match through whitespace drift. The needle's simplified form
+        // differs from its expanded form, but the haystack carries the
+        // expanded form — the strategy should find it.
+        const mocked = vi.mocked(expandToRawHtml);
+        mocked.mockImplementationOnce(
+            (s: string) => s.replace('CITE', '<span class="citation">X</span>'),
+        );
+        try {
+            const rawSlice
+                = 'anchor <span class="citation">X</span> with enough body text to clear the length gate';
+            const html = `<p>${rawSlice}</p>`;
+            const result = match(makeInput({
+                oldString: 'anchor CITE with enough body  text to clear the length gate',
+                newString: 'x',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(html.indexOf(result!.expandedOld)).toBeGreaterThanOrEqual(0);
+        } finally {
+            mocked.mockImplementation((s: string) => s);
+        }
+    });
+
+    it('rejects when needle has no whitespace at all', () => {
+        // Defensive gate: exact would've handled any no-ws needle already.
+        const result = match(makeInput({
+            oldString: 'singletokenwithnowhitespace',
+            newString: 'x',
+            strippedHtml: '<p>singletokenwithnowhitespace here</p>',
+        }));
+        // `exact` should claim this — `whitespace_relaxed` is not responsible.
+        expect(result?.strategy).toBe('exact');
+    });
+
+    it('rejects when needle length exceeds the ReDoS cap', () => {
+        const chunk = 'abc def ';
+        const huge = chunk.repeat(700);  // ~5600 chars > 5000 cap
+        expect(huge.length).toBeGreaterThan(5000);
+        const result = match(makeInput({
+            oldString: huge,
+            newString: 'x',
+            strippedHtml: `<p>${huge.replace(/ /g, '\t')}</p>`,
+        }));
+        // Other strategies don't match either (no exact, no entity, etc.), so
+        // the full chain returns null.
+        expect(result).toBeNull();
+    });
+
+    // -- Priority / regression --
+
+    it('exact wins over whitespace_relaxed when the needle matches byte-for-byte', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const result = match(makeInput({
+            oldString: rawSlice,
+            newString: 'x',
+            strippedHtml: `<div data-schema-version="9">${rawSlice}</div>`,
+        }));
+        expect(result?.strategy).toBe('exact');
+    });
+
+    it('markdown_to_html wins over whitespace_relaxed when whitespace is unchanged', () => {
+        // Needle uses markdown; note has same whitespace shape but HTML tags.
+        // markdown_to_html ranks before whitespace_relaxed — regression guard.
+        const result = match(makeInput({
+            oldString: 'the **important** anchor with enough chars here',
+            newString: 'replacement',
+            strippedHtml: '<p>the <strong>important</strong> anchor with enough chars here</p>',
+        }));
+        expect(result?.strategy).toBe('markdown_to_html');
+    });
+
+    it('falls through to whitespace_relaxed only after all other strategies fail', () => {
+        // No exact, no entity drift, no trim tail, no markdown — only ws diff.
+        const rawSlice = '<p>Unique anchor phrase with enough chars to pass</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>Unique  anchor  phrase  with  enough  chars  to  pass</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+    });
+
+    // -- Sanity invariants --
+
+    it('normalizeAnchor is the identity function', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const result = match(makeInput({
+            oldString: '<p>Anchor  paragraph  with  plenty  of text here</p>',
+            newString: 'x',
+            strippedHtml: `<div data-schema-version="9">${rawSlice}</div>`,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.normalizeAnchor('<p>before</p>')).toBe('<p>before</p>');
+    });
+
+    it('returned expandedOld is a literal substring of strippedHtml', () => {
+        const rawSlice = '<p>Anchor paragraph with plenty of text here</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>Anchor  paragraph  with  plenty of text here</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        // Executor's invariant: expandedOld must be in strippedHtml as-is.
+        expect(html.indexOf(result!.expandedOld)).toBeGreaterThanOrEqual(0);
+    });
+
+    it('matches a needle whose simplified form contains a `<citation>` tag', () => {
+        // d35fc72d repro: the model's old_string differs from the note only
+        // in whitespace, but contains a <citation> — so the pre-extension
+        // gate `input.oldString !== base.expandedOld` used to reject it.
+        const mocked = vi.mocked(expandToRawHtml);
+        const expand = (s: string) =>
+            s.replace(
+                /<citation ref="([^"]+)" (?:id|item_id)="([^"]+)"\/>/g,
+                '<span class="citation" data-ref="$1" data-item="$2">(…)</span>',
+            );
+        mocked.mockImplementation(expand);
+        try {
+            const rawSlice =
+                '<p>Anchor paragraph intro '
+                + '<span class="citation" data-ref="c_A_0" data-item="1-AAAAAAAA">(…)</span>'
+                + ' with enough body text to clear the length gate</p>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            // Needle uses double whitespace where the note has single — classic
+            // whitespace drift, now tolerated even with the <citation>.
+            const needleWithDrift =
+                '<p>Anchor   paragraph intro\n\n'
+                + '<citation ref="c_A_0" id="1-AAAAAAAA"/>'
+                + '  with enough body text to clear the length gate</p>';
+            const result = match(makeInput({
+                oldString: needleWithDrift,
+                newString: '<p>REWRITTEN</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            // expandedOld is a literal slice of strippedHtml.
+            expect(html.indexOf(result!.expandedOld)).toBeGreaterThanOrEqual(0);
+        } finally {
+            mocked.mockImplementation((s: string) => s);
+        }
+    });
+
+    // -- CJK ↔ ASCII boundary spacing (Pangu drift) --
+
+    it('matches needle with added space at CJK ↔ ASCII boundary', () => {
+        // Model wrote `共识 [14]` / `1.5 mg/kg/d 欠充分` (boundary spaces).
+        // Note has the same content without boundary spaces.
+        const rawSlice = '<p>CSCO指南及2026版共识[14]将激素抵抗性CIP定义为：本例初始甲泼尼龙约1.5 mg/kg/d欠充分。</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>CSCO 指南及 2026 版共识 [14] 将激素抵抗性 CIP 定义为：本例初始甲泼尼龙约 1.5 mg/kg/d 欠充分。</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedOld).toBe(rawSlice);
+        expect(html.indexOf(result!.expandedOld)).toBeGreaterThanOrEqual(0);
+    });
+
+    it('matches needle missing CJK ↔ ASCII boundary spaces present in the note', () => {
+        // Symmetric reverse: needle has NO boundary spaces but the note does.
+        // The strategy must still enter (no whitespace in needle) via the
+        // CJK-boundary short-circuit.
+        const rawSlice = '<p>共识 [14] 将激素抵抗性 CIP 定义为初始足量糖皮质激素治疗。</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>共识[14]将激素抵抗性CIP定义为初始足量糖皮质激素治疗。</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedOld).toBe(rawSlice);
+    });
+
+    it('preserves required whitespace inside a pure-ASCII run when only the CJK boundary drifted', () => {
+        // `1.5 mg/kg/d` is ASCII-internal — its space must NOT be folded away.
+        // Only the boundary between `约` (CJK) ↔ `1.5` (ASCII) and between
+        // `mg/kg/d` (ASCII) ↔ `欠充分` (CJK) is optional.
+        const rawSlice = '<p>本例初始甲泼尼龙约1.5 mg/kg/d欠充分，需要更高起始剂量。</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>本例初始甲泼尼龙约 1.5 mg/kg/d 欠充分，需要更高起始剂量。</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedOld).toBe(rawSlice);
+        // Internal `1.5 mg/kg/d` whitespace survives — needle without the
+        // internal space should NOT match if it dropped the ASCII-internal space.
+        const wrongNeedle = match(makeInput({
+            oldString: '<p>本例初始甲泼尼龙约 1.5mg/kg/d 欠充分，需要更高起始剂量。</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(wrongNeedle).toBeNull();
+    });
+
+    it('rejects multi-occurrence Pangu drift (uniqueness gate)', () => {
+        // Two raw-distinct occurrences of the same CJK-spaced phrase; the
+        // regex finds both, and the strategy must refuse rather than guess.
+        const rawSlice = '<p>共识[14]将激素抵抗性CIP定义为初始足量糖皮质激素治疗。</p>';
+        const html = `<div data-schema-version="9">${rawSlice}${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>共识 [14] 将激素抵抗性 CIP 定义为初始足量糖皮质激素治疗。</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('does not insert CJK relaxation inside HTML attribute values', () => {
+        // Pangu relaxation must be confined to visible prose. A needle
+        // `title="中文"` whose attribute value happens to end at a CJK ↔ `"`
+        // boundary must NOT match a haystack `title="中文 "` (attribute drift)
+        // — replacing markup whose attribute value isn't the requested anchor
+        // would silently mutate metadata the user didn't ask to touch.
+        const rawSlice = '<span title="中文 ">long visible body for the length gate here</span>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<span title="中文">long visible body for the length gate here</span>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('does not insert CJK relaxation at tag-delimiter boundaries', () => {
+        // The boundary `文` (CJK) ↔ `<` (tag-open) must not become optional
+        // whitespace — would let `中文<strong>` match `中文 <strong>` even
+        // when the model intentionally placed the inline tag flush.
+        const rawSlice = '<p>中文 <strong>anchor</strong> with enough body for the length gate</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>中文<strong>anchor</strong> with enough body for the length gate</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('relaxes visible-prose CJK boundaries even when needle contains HTML tags', () => {
+        // Regression guard: the inTag tracking must not block relaxation in
+        // text nodes between tags. The boundary `识` ↔ `[` is in prose
+        // (outside any tag) and must still relax.
+        const rawSlice = '<p>CSCO指南及2026版共识[14]将激素抵抗性CIP定义为初始足量糖皮质激素治疗。</p>';
+        const html = `<div data-schema-version="9">${rawSlice}</div>`;
+        const result = match(makeInput({
+            oldString: '<p>CSCO 指南及 2026 版共识 [14] 将激素抵抗性 CIP 定义为初始足量糖皮质激素治疗。</p>',
+            newString: 'x',
+            strippedHtml: html,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.expandedOld).toBe(rawSlice);
+    });
+
+    // -- Inter-tag whitespace (note-editor serializer drift) --
+
+    describe('inter-tag whitespace', () => {
+        // The note editor's serializer inserts a `\n` after every block tag and
+        // before the first child of every list/table element on save, so HTML
+        // AsterMargin wrote as `<td><p>` reads back as `<td>\n<p>` once the user has
+        // opened the note. Models anchor on their own earlier HTML, so both
+        // directions have to match.
+        //
+        // `newString` deliberately shares no wrapper with `oldString` here: a
+        // shared `<td>`/`</td>` would let `spurious_wrap_strip` (rank 9) claim
+        // the edit before `whitespace_relaxed` (rank 12) is reached.
+
+        const ROW_FLUSH =
+            '<tr><td><p>Alpha cell body</p></td><td><p>Beta cell body</p></td></tr>';
+        const ROW_SERIALIZED =
+            '<tr>\n<td>\n<p>Alpha cell body</p>\n</td>\n<td>\n<p>Beta cell body</p>\n</td>\n</tr>';
+
+        it('matches a flush needle against a note with serializer newlines', () => {
+            const html = `<div data-schema-version="9"><table>\n${ROW_SERIALIZED}\n</table>\n</div>`;
+            const result = match(makeInput({
+                oldString: ROW_FLUSH,
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.matchCount).toBe(1);
+            // The note's own bytes are what gets replaced.
+            expect(result?.expandedOld).toBe(ROW_SERIALIZED);
+            expect(html.indexOf(result!.expandedOld)).toBeGreaterThanOrEqual(0);
+        });
+
+        it('matches a newline-carrying needle against a flush note', () => {
+            const html = `<div data-schema-version="9"><table>${ROW_FLUSH}</table></div>`;
+            const result = match(makeInput({
+                oldString: ROW_SERIALIZED,
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(ROW_FLUSH);
+        });
+
+        it('enters the strategy for an all-tags needle with no whitespace of its own', () => {
+            // Neither whitespace nor a CJK boundary — `><` is the only gate
+            // that can let this needle in.
+            const rawSlice = '<blockquote>\n<p>Untouchedparagraphbody</p>\n</blockquote>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const needle = '<blockquote><p>Untouchedparagraphbody</p></blockquote>';
+            expect(/\s/.test(needle)).toBe(false);
+            const result = match(makeInput({
+                oldString: needle,
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('does not relax the newline after a <pre> opener', () => {
+            // Code-block indentation stays byte-exact: `<pre>` raises the
+            // significant depth at its `<`, so its own `>` is not a relax point.
+            const html = '<div data-schema-version="9"><pre>\n<code>const answer = 42;</code></pre></div>';
+            const result = match(makeInput({
+                oldString: '<pre><code>const answer = 42;</code></pre>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('rejects a needle that is unique only before inter-tag collapsing', () => {
+            // Two cells that are identical once inter-tag whitespace is
+            // optional: the uniqueness gate must refuse rather than pick one.
+            const cell = '<td>\n<p>Some cell body text</p>\n</td>';
+            const html = `<div data-schema-version="9"><table><tr>${cell}${cell}</tr></table></div>`;
+            const result = match(makeInput({
+                oldString: '<td><p>Some cell body text</p></td>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('still refuses str_replace_all with inter-tag drift', () => {
+            const html = '<div data-schema-version="9"><table><tr>'
+                + '<td>\n<p>Some cell body text</p>\n</td>'
+                + '</tr></table></div>';
+            const result = match(makeInput({
+                operation: 'str_replace_all' as EditNoteOperation,
+                oldString: '<td><p>Some cell body text</p></td>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not make prose whitespace optional', () => {
+            // Only `>`↔`<` gaps become optional; a missing word space must
+            // still fail.
+            const html = '<div data-schema-version="9"><p>alpha beta gamma delta epsilon</p></div>';
+            const result = match(makeInput({
+                oldString: '<p>alpha beta gamma deltaepsilon</p>',
+                newString: '<p>x</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not relax whitespace between two inline elements', () => {
+            // `<strong>Alpha</strong><em>Beta</em>` reads "AlphaBeta" while the
+            // note reads "Alpha Beta" — the anchor did not specify that space,
+            // so matching it would replace text the model never named.
+            const html = '<div data-schema-version="9">'
+                + '<p>Lead in text. <strong>Alpha</strong> <em>Beta</em> trailing words.</p></div>';
+            const result = match(makeInput({
+                oldString: '<p>Lead in text. <strong>Alpha</strong><em>Beta</em> trailing words.</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not relax inline whitespace in the reverse direction either', () => {
+            const html = '<div data-schema-version="9">'
+                + '<p>Lead in text. <strong>Alpha</strong><em>Beta</em> trailing words.</p></div>';
+            const result = match(makeInput({
+                oldString: '<p>Lead in text. <strong>Alpha</strong> <em>Beta</em> trailing words.</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not relax an &nbsp; separator between inline elements', () => {
+            const html = '<div data-schema-version="9">'
+                + '<p>Lead in text. <strong>Alpha</strong>&nbsp;<em>Beta</em> trailing words.</p></div>';
+            const result = match(makeInput({
+                oldString: '<p>Lead in text. <strong>Alpha</strong><em>Beta</em> trailing words.</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('relaxes a block boundary that sits next to inline markup', () => {
+            // `</p>` is block, so its trailing newline is still optional even
+            // though the neighbouring content is inline-heavy.
+            const rawSlice = '<p>First <em>emphasised</em> paragraph</p>\n<p>Second <strong>bold</strong> one</p>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const result = match(makeInput({
+                oldString: '<p>First <em>emphasised</em> paragraph</p><p>Second <strong>bold</strong> one</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('does not relax after a bare `>` in prose', () => {
+            // A `>` that is not a tag close must not license optional
+            // whitespace before the next tag.
+            const html = '<div data-schema-version="9"><p>Compare 5 > <em>threshold</em> in the table.</p></div>';
+            const result = match(makeInput({
+                oldString: '<p>Compare 5 ><em>threshold</em> in the table.</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('relaxes a block tag that carries attributes', () => {
+            // Only `</p>` gets a trailing newline — `<em>` is inline, so the
+            // serializer leaves its boundaries flush.
+            const rawSlice = '<p style="text-align: center"><em>Centred caption line</em></p>\n<p>Following paragraph body</p>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const result = match(makeInput({
+                oldString: '<p style="text-align: center"><em>Centred caption line</em></p><p>Following paragraph body</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('does not relax between two adjacent citation spans', () => {
+            // Raw citations are inline `<span>`s and the serializer never puts
+            // a newline between them, so the space here is real content.
+            const cite = (k: string) => `<span class="citation" data-item="${k}">(x)</span>`;
+            const html = '<div data-schema-version="9">'
+                + `<p>Body text with citations ${cite('A')} ${cite('B')} and a tail.</p></div>`;
+            const result = match(makeInput({
+                oldString: `<p>Body text with citations ${cite('A')}${cite('B')} and a tail.</p>`,
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not treat an &nbsp; after an opening <p> as serializer whitespace', () => {
+            // Reviewer case: a paragraph that starts with a non-breaking space
+            // is visible content, and the serializer never writes an NBSP.
+            const html = '<div data-schema-version="9">'
+                + '<p>&nbsp;<em>Indented paragraph body</em></p></div>';
+            const result = match(makeInput({
+                oldString: '<p><em>Indented paragraph body</em></p>',
+                // Shares no wrapper with old_string, so `spurious_wrap_strip`
+                // cannot claim the edit before `whitespace_relaxed` is reached.
+                newString: '<blockquote>Replaced</blockquote>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not treat a literal U+00A0 as serializer whitespace', () => {
+            // JS `\s` matches U+00A0, so the ASCII-only class is what stops this.
+            const html = '<div data-schema-version="9">'
+                + '<td> <p>Some cell body text</p></td></div>';
+            const result = match(makeInput({
+                oldString: '<td><p>Some cell body text</p></td>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not treat an &nbsp; entity at a real gap site as serializer whitespace', () => {
+            const html = '<div data-schema-version="9">'
+                + '<td>&nbsp;<p>Some cell body text</p></td></div>';
+            const result = match(makeInput({
+                oldString: '<td><p>Some cell body text</p></td>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not relax after an opening <p>, which is not a serializer gap site', () => {
+            // `p` is a textNode: the serializer writes a newline AFTER `</p>`,
+            // never after `<p>`. A note in that shape did not come from the
+            // serializer, so the anchor must match it byte-for-byte.
+            const html = '<div data-schema-version="9">'
+                + '<p>\n<em>Indented paragraph body</em></p></div>';
+            const result = match(makeInput({
+                oldString: '<p><em>Indented paragraph body</em></p>',
+                // Shares no wrapper with old_string, so `spurious_wrap_strip`
+                // cannot claim the edit before `whitespace_relaxed` is reached.
+                newString: '<blockquote>Replaced</blockquote>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('does not relax after an opening <h2> either', () => {
+            const html = '<div data-schema-version="9">'
+                + '<h2>\n<em>Heading body text here</em></h2></div>';
+            const result = match(makeInput({
+                oldString: '<h2><em>Heading body text here</em></h2>',
+                newString: '<blockquote>Replaced</blockquote>',
+                strippedHtml: html,
+            }));
+            expect(result).toBeNull();
+        });
+
+        it('still relaxes after a closing </p>, which is a gap site', () => {
+            const rawSlice = '<p>First paragraph body</p>\n<p>Second paragraph body</p>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const result = match(makeInput({
+                oldString: '<p>First paragraph body</p><p>Second paragraph body</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('still relaxes after an opening <td>, which is a gap site', () => {
+            const rawSlice = '<td>\n<p>Some cell body text</p>\n</td>';
+            const html = `<div data-schema-version="9"><table><tr>${rawSlice}</tr></table></div>`;
+            const result = match(makeInput({
+                oldString: '<td><p>Some cell body text</p></td>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('relaxes after <hr>, a void element whose only tag is the opening one', () => {
+            const rawSlice = '<hr>\n<p>Paragraph after the rule here</p>';
+            const html = `<div data-schema-version="9">${rawSlice}</div>`;
+            const result = match(makeInput({
+                oldString: '<hr><p>Paragraph after the rule here</p>',
+                newString: '<p>Replaced</p>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(rawSlice);
+        });
+
+        it('insert_after splices the note bytes, newlines and all', () => {
+            const html = `<div data-schema-version="9"><table>${ROW_SERIALIZED}</table></div>`;
+            const result = match(makeInput({
+                operation: 'insert_after' as EditNoteOperation,
+                oldString: ROW_FLUSH,
+                newString: '<tr><td><p>Appended</p></td></tr>',
+                strippedHtml: html,
+            }));
+            expect(result?.strategy).toBe('whitespace_relaxed');
+            expect(result?.expandedOld).toBe(ROW_SERIALIZED);
+            expect(result?.expandedNew).toBe(ROW_SERIALIZED + '<tr><td><p>Appended</p></td></tr>');
+        });
+    });
+});
+
+// =============================================================================
+// whitespace_relaxed with literal `&nbsp;` entity
+// =============================================================================
+//
+// Failure scenario: the note's saved HTML contained literal `&nbsp;` (5 chars)
+// as the text between words, while the model's old_string used regular spaces.
+// The original `\s+` whitespace pattern matched U+00A0 the *character* but not
+// the 5-char *string* `&nbsp;`, so the strategy refused. Folding `&nbsp;` into
+// the whitespace class fixes both directions.
+
+describe('whitespace_relaxed handles literal &nbsp; entity failure scenario', () => {
+    it('matches model space against literal &nbsp; in haystack', () => {
+        // Long enough to clear MIN_WS_RELAXED_NORMALIZED_LENGTH (20) and
+        // MIN_WS_RELAXED_NON_WS_LENGTH (12).
+        const needle = 'analyzed using linear mixed-effects models with FDR correction';
+        const haystack = '<p>analyzed using&nbsp;linear mixed-effects models with FDR correction</p>';
+        const result = match(makeInput({
+            oldString: needle,
+            newString: needle + ' replaced',
+            strippedHtml: haystack,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.matchCount).toBe(1);
+        // expandedOld is the actual raw slice (preserving `&nbsp;`).
+        expect(result?.expandedOld).toContain('&nbsp;');
+    });
+
+    // Symmetric direction — proves the `hasWhitespaceOrNbsp()` gate works.
+    // Without the gate change, this case would skip whitespace_relaxed
+    // entirely (the old `/\s/.test(needle)` returns false for a needle
+    // whose only whitespace is `&nbsp;`).
+    it('matches model &nbsp; against regular space in haystack', () => {
+        const needle = 'analyzed using&nbsp;linear mixed-effects models with FDR correction';
+        const haystack = '<p>analyzed using linear mixed-effects models with FDR correction</p>';
+        const result = match(makeInput({
+            oldString: needle,
+            newString: 'analyzed using&nbsp;linear mixed-effects models with FDR correction (added)',
+            strippedHtml: haystack,
+        }));
+        expect(result?.strategy).toBe('whitespace_relaxed');
+        expect(result?.matchCount).toBe(1);
+        // The replacement should splice in the haystack's actual raw slice
+        // (with regular spaces), not the model's `&nbsp;` form.
+        expect(result?.expandedOld).not.toContain('&nbsp;');
+    });
+});
+
+// =============================================================================
+// tag_attribute_strip
+// =============================================================================
+//
+// Failure scenario: when the model writes
+// `<p style="font-size: 0.85em; margin-left: 2em;">⁴ <strong>…</strong>…</p>`
+// in op=rewrite, Zotero's PM normalizer strips the inline `style` attribute,
+// leaving `<p>⁴ <strong>…</strong>…</p>`. A subsequent edit_note that uses
+// the model's original styled form fails. This strategy recovers by stripping
+// attributes from block-level structural tags (p, h1–h6, blockquote).
+
+describe('tag_attribute_strip strategy', () => {
+    // ── When tag_attribute_strip is strictly necessary ──
+    //
+    // `spurious_wrap_strip` already handles the symmetric case where old and
+    // new share the SAME wrapping tag (`<p style="x">…</p>` on both sides):
+    // it strips the shared wrap and matches inner content. So
+    // `tag_attribute_strip` only WINS the chain when old and new differ in
+    // their leading or trailing tag, e.g. insert_after where the injected
+    // payload has a bare `<p>`. Both strategies produce a correct edit when
+    // they apply; the dedicated tests below isolate cases tag_attribute_strip
+    // alone can solve.
+
+    it('wins for str_replace when old and new have different leading tag attributes', () => {
+        // Old has `<p style="x">`, new has plain `<p>` — they don't share the
+        // leading tag so spurious_wrap_strip can't strip it. tag_attribute_strip
+        // claims this by stripping the style off old's `<p>` to match the
+        // haystack's bare `<p>`.
+        const result = match(makeInput({
+            oldString: '<p style="font-size: 0.85em;">⁴ footnote text.</p>',
+            newString: '<p>⁴ footnote text. (added)</p>',
+            strippedHtml: '<p>⁴ footnote text.</p>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+        expect(result?.expandedOld).toBe('<p>⁴ footnote text.</p>');
+        expect(result?.expandedNew).toBe('<p>⁴ footnote text. (added)</p>');
+        expect(result?.matchCount).toBe(1);
+    });
+
+    it('strips multiple attributes (style, class, id) on the same tag', () => {
+        const result = match(makeInput({
+            oldString: '<p id="x" class="y" style="z">body content here</p>',
+            newString: '<h2>different shape</h2>',  // different leading tag
+            strippedHtml: '<p>body content here</p>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+        expect(result?.expandedOld).toBe('<p>body content here</p>');
+        expect(result?.expandedNew).toBe('<h2>different shape</h2>');
+    });
+
+    it('strips attributes from <h2> headings (asymmetric needle)', () => {
+        // Old has `<h2 class>`, new is bare `<h2>` — spurious_wrap_strip
+        // would only strip if both shared `<h2 class>`.
+        const result = match(makeInput({
+            oldString: '<h2 class="section">3.4 Title</h2>',
+            newString: '<h2>3.4 New Title</h2>',
+            strippedHtml: '<h2>3.4 Title</h2>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+        expect(result?.expandedOld).toBe('<h2>3.4 Title</h2>');
+    });
+
+    it('strips attributes from <blockquote> (asymmetric needle)', () => {
+        const result = match(makeInput({
+            oldString: '<blockquote class="quote">cited text</blockquote>',
+            newString: '<blockquote>replaced</blockquote>',
+            strippedHtml: '<blockquote>cited text</blockquote>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+    });
+
+    it('symmetric attribute-laden case is correctly handled by spurious_wrap_strip', () => {
+        // When old and new share the same wrapping `<p style="x">…</p>`, the
+        // earlier spurious_wrap_strip strategy claims the case (it strips the
+        // shared wrap and matches inner content). Either result produces a
+        // correct edit; this regression guard pins the actual ordering.
+        const result = match(makeInput({
+            oldString: '<p style="font-size: 0.85em;">⁴ footnote text.</p>',
+            newString: '<p style="font-size: 0.85em;">⁴ footnote text. (added)</p>',
+            strippedHtml: '<p>⁴ footnote text.</p>',
+        }));
+        expect(result?.strategy).toBe('spurious_wrap_strip');
+        expect(result?.matchCount).toBe(1);
+    });
+
+    it('does NOT touch <span> attributes (citation tags must keep their data)', () => {
+        // span/div/a are intentionally excluded so `<span class="citation"
+        // data-citation="…">` and similar carriers keep their attributes.
+        // This test sets up a haystack that would only match if span attrs
+        // were stripped — the strategy should refuse.
+        const result = match(makeInput({
+            oldString: '<span class="x">irrelevant payload</span>',
+            newString: '<span class="x">y</span>',
+            strippedHtml: '<p>completely different content here</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('does NOT touch <div> attributes (data-schema-version wrapper, etc.)', () => {
+        const result = match(makeInput({
+            oldString: '<div data-schema-version="9">wrapper content</div>',
+            newString: '<div data-schema-version="9">replaced</div>',
+            strippedHtml: '<p>unrelated content</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    it('returns null when the needle has no strippable block-tag attributes', () => {
+        // Without attributes to strip, the strategy correctly defers to later
+        // strategies (or the overall null result if none match).
+        const result = match(makeInput({
+            oldString: '<p>plain</p>',
+            newString: '<p>replaced</p>',
+            strippedHtml: '<p>completely different</p>',
+        }));
+        expect(result).toBeNull();
+    });
+
+    // Insert-op shapes — same coverage other strategies with insertion
+    // semantics (whitespace_relaxed, markdown_to_html) carry, so
+    // tag_attribute_strip doesn't regress when execution re-enters the
+    // matcher with the merged form from normalized_action_data.
+    it('insert_after with validate-time bare new_string preserves the anchor (regression: P2)', () => {
+        // Validate-time shape: new_string is just the injected payload.
+        // Without the insert-aware splice, expandedNew would be just
+        // `<p>injected</p>` and the executor's str_replace would REPLACE the
+        // anchor instead of inserting after it. The fix mirrors
+        // whitespace_relaxed/quote_normalized: build `expandedOld + injected`
+        // so the splice keeps the anchor.
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '<p style="font-size: 0.85em;">anchor body text</p>',
+            newString: '<p>injected</p>',  // bare payload (validate-time shape)
+            strippedHtml: '<p>anchor body text</p>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+        expect(result?.expandedOld).toBe('<p>anchor body text</p>');
+        // expandedNew = anchor + injected (splice preserves the anchor).
+        expect(result?.expandedNew).toBe('<p>anchor body text</p><p>injected</p>');
+        expect(result?.expandedNew.startsWith(result!.expandedOld)).toBe(true);
+    });
+
+    it('insert_after with execute-time merged new_string is handled by spurious_wrap_strip (leading-only)', () => {
+        // Document the actual ordering: when execute re-runs the matcher with
+        // normalized_action_data, the merged new_string is `oldString +
+        // injected`, so it always shares the leading wrap with oldString.
+        // spurious_wrap_strip's leading-only candidate strips the shared
+        // `<p style="…">` from both, then matches `anchor body text</p>` in
+        // the haystack's `<p>anchor body text</p>` and splices the injected
+        // payload after it. The end-to-end result is correct (the saved HTML
+        // has the bare `<p>` form) — tag_attribute_strip is not needed here.
+        const result = match(makeInput({
+            operation: 'insert_after' as EditNoteOperation,
+            oldString: '<p style="font-size: 0.85em;">anchor body text</p>',
+            newString: '<p style="font-size: 0.85em;">anchor body text</p><p>injected</p>',
+            strippedHtml: '<p>anchor body text</p>',
+        }));
+        expect(result?.strategy).toBe('spurious_wrap_strip');
+        expect(result?.matchCount).toBe(1);
+    });
+
+    // Note on execute-time merged inputs: when normalized_action_data is
+    // present, the merged new_string starts with oldString. spurious_wrap_strip
+    // (which runs first) handles all such cases by leading-strip — the
+    // tag_attribute_strip insert handler's prefix-strip path is the safety
+    // net for the merged shape if it ever falls through. The end-to-end
+    // round-trip test in editNote.test.ts covers the validate→normalize→
+    // execute cycle for tag_attribute_strip explicitly.
+
+    it('insert_before with bare validate-time new_string preserves the anchor (regression: P2)', () => {
+        // Validate-time: new_string is the bare injected payload (no merge yet).
+        // Old = `<p style=…>anchor</p>`, new = `<p>injected</p>`. They don't
+        // share the leading tag (different attributes) but DO share the
+        // trailing `</p>`. spurious_wrap_strip's trailing-only candidate
+        // produces `<p style=…>anchor` and `<p>injected` — the styled form
+        // doesn't appear in the bare-`<p>` haystack, so it fails. Falls
+        // through to tag_attribute_strip, which must build `injected + anchor`
+        // so the splice doesn't replace the anchor.
+        const result = match(makeInput({
+            operation: 'insert_before' as EditNoteOperation,
+            oldString: '<p style="font-size: 0.85em;">anchor body text</p>',
+            newString: '<p>injected</p>',
+            strippedHtml: '<p>anchor body text</p>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+        expect(result?.expandedOld).toBe('<p>anchor body text</p>');
+        expect(result?.expandedNew).toBe('<p>injected</p><p>anchor body text</p>');
+        expect(result?.expandedNew.endsWith(result!.expandedOld)).toBe(true);
+    });
+
+    // Priority — make sure tag_attribute_strip slots in correctly and doesn't
+    // shadow more specific strategies that already handle the case.
+    it('exact wins when the model already wrote bare tags', () => {
+        const result = match(makeInput({
+            oldString: '<p>bare tag</p>',
+            newString: '<p>replaced</p>',
+            strippedHtml: '<p>bare tag</p>',
+        }));
+        expect(result?.strategy).toBe('exact');
+    });
+
+    it('runs before markdown_to_html (more specific signal)', () => {
+        // Asymmetric leading tags so spurious_wrap_strip cannot claim it.
+        // Falls through past spurious_wrap_strip to tag_attribute_strip,
+        // which must run before markdown_to_html so the strategy chain
+        // doesn't try to read `**…**` as markdown when it's actually plain
+        // text in an attribute-laden block tag.
+        const result = match(makeInput({
+            oldString: '<p style="x">plain body without markdown markers</p>',
+            newString: '<h2>different shape</h2>',
+            strippedHtml: '<p>plain body without markdown markers</p>',
+        }));
+        expect(result?.strategy).toBe('tag_attribute_strip');
+    });
+});

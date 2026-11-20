@@ -1,0 +1,367 @@
+import type { DomItemKind } from "@astermargin/agent-core/extract/document/dom/schema";
+
+// EPUB-originated namespace support is harmless for plain HTML documents.
+const EPUB_TYPE_NS = "http://www.idpf.org/2007/ops";
+
+export interface DomElementMapping {
+    kind: DomItemKind;
+    level?: number;
+}
+
+export interface DomItemCandidate extends DomElementMapping {
+    element: Element;
+    text: string;
+    anchorId?: string;
+    /** First real text node that contributes to this emitted candidate. */
+    firstTextNode?: Text;
+    /** For a data table: one linearized string per row, so rows are citable. */
+    rows?: string[];
+}
+
+/** Normalize DOM text into a compact single-line string. */
+export function normalizeText(text: string | null | undefined): string {
+    return (text ?? "").replace(/\s+/g, " ").trim();
+}
+
+/** Return the nearest stable element id at or above the current element. */
+export function findNearestAnchorId(element: Element): string | undefined {
+    let current: Element | null = element;
+    while (current) {
+        const id = current.getAttribute("id");
+        if (id) return id;
+        current = current.parentElement;
+    }
+    return undefined;
+}
+
+/** Detect footnote semantics without namespace-prefixed CSS selectors. */
+export function isFootnoteElement(element: Element): boolean {
+    const epubType = element.getAttributeNS(EPUB_TYPE_NS, "type");
+    const plainType = element.getAttribute("type");
+    const className = element.getAttribute("class");
+    return hasToken(epubType, "footnote")
+        || hasToken(plainType, "footnote")
+        || hasToken(className, "footnote");
+}
+
+// Element names that break the inline text flow during the walk: each marks a
+// boundary where accumulated prose is flushed and the element is visited on its
+// own (a block container, or an image/figure that becomes its own item).
+// Everything not listed here is treated as inline and folded into the
+// surrounding text. The list is deliberately broad so unanticipated containers
+// (e.g. `<dd>`, `<pre>`) keep their text instead of dropping it.
+const BLOCK_LEVEL_NAMES = new Set([
+    "div", "section", "article", "p", "blockquote", "pre", "address",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "li", "dl", "dt", "dd",
+    "table", "caption", "figure", "figcaption",
+    "nav", "header", "footer", "aside", "main", "details", "summary",
+    "tr", "td", "th", "tbody", "thead", "tfoot",
+    "img", "svg",
+]);
+
+function isBlockBoundary(element: Element): boolean {
+    return BLOCK_LEVEL_NAMES.has(element.localName.toLowerCase());
+}
+
+// Elements whose text content is code/markup, never prose. Skipped entirely by
+// the walk (and excluded from the coverage denominator) so inline CSS/JS in a
+// section body is not captured as citable text.
+const NON_CONTENT_NAMES = new Set(["style", "script", "template", "noscript"]);
+
+export function isNonContentElement(element: Element): boolean {
+    return NON_CONTENT_NAMES.has(element.localName.toLowerCase());
+}
+
+export const NON_CONTENT_SELECTOR = "style, script, template, noscript";
+
+/** `textContent` normalized, with non-content (style/script) subtrees removed. */
+export function visibleTextContent(element: Element): string {
+    if (!element.querySelector(NON_CONTENT_SELECTOR)) {
+        return normalizeText(element.textContent);
+    }
+    const clone = element.cloneNode(true) as Element;
+    for (const el of Array.from(clone.querySelectorAll(NON_CONTENT_SELECTOR)) as Element[]) {
+        el.remove();
+    }
+    return normalizeText(clone.textContent);
+}
+
+const TEXT_NODE = 3;
+const ELEMENT_NODE = 1;
+
+// A cell holding at least this many characters of prose marks a layout table
+// (body text positioned in a table) rather than tabular data.
+const LAYOUT_TABLE_PROSE_CHARS = 200;
+
+/**
+ * Distinguish a layout table (body text positioned in a table — common in
+ * PDF/Word→EPUB conversions) from a genuine data table.
+ *
+ * Data tables are emitted as one opaque `table` item; layout tables are walked
+ * transparently so their headings, paragraphs, and prose cells are recovered.
+ */
+function isLayoutTable(table: Element): boolean {
+    // Header cells signal tabular data — keep those opaque. Only count header
+    // cells that belong to this table, not to a table nested inside a cell:
+    // an outer wrapper around a th-bearing data table must stay a layout table
+    // so the walk descends and classifies the inner table on its own.
+    const headerCells = Array.from(table.querySelectorAll("th")) as Element[];
+    if (headerCells.some((th) => th.closest("table") === table)) return false;
+    // Block-flow content or nested tables inside cells are not tabular data.
+    if (table.querySelector("table, p, div, h1, h2, h3, h4, h5, h6, blockquote, ul, ol")) {
+        return true;
+    }
+    // No nested tables remain past this point, so cell counting is flat.
+    const cells = Array.from(table.querySelectorAll("td")) as Element[];
+    // A single-cell table is a positioning wrapper, not a data grid.
+    if (cells.length === 1) return true;
+    // A cell carrying a long run of prose is body text laid out in a table.
+    for (const cell of cells) {
+        if (cell && visibleTextContent(cell).length >= LAYOUT_TABLE_PROSE_CHARS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Classify a DOM element into a special item kind, or return `undefined` for a
+ * generic element whose text is captured by the walk.
+ *
+ * This is the allowlist as an *override*: it names only the elements that carry
+ * a distinct kind (heading, list item, caption, footnote, data table, picture).
+ * Everything else — `div`, `td`, `dd`, `pre`, prose laid out in unrecognized
+ * containers — falls through to `undefined` and is captured as generic text, so
+ * the walk never drops body text just because a tag is unanticipated.
+ */
+export function mapElement(element: Element): DomElementMapping | undefined {
+    if (isFootnoteElement(element)) {
+        return { kind: "footnote" };
+    }
+
+    const name = element.localName.toLowerCase();
+    if (name === "p" || name === "blockquote") return { kind: "text" };
+    if (/^h[1-6]$/.test(name)) {
+        return { kind: "section_header", level: Number(name.slice(1)) };
+    }
+    if (name === "li") return { kind: "list_item" };
+    if (name === "figcaption") return { kind: "caption" };
+    // Layout tables map to nothing so the walk descends into their cells; only
+    // genuine data tables become an opaque `table` item.
+    if (name === "table") return isLayoutTable(element) ? undefined : { kind: "table" };
+    if (name === "img" || name === "svg") return { kind: "picture" };
+    return undefined;
+}
+
+/**
+ * Walk a DOM section body and emit ordered, non-duplicated item candidates.
+ *
+ * Modeled on the reader's Read Aloud DOM walk (the Mozilla Narrator algorithm):
+ * text capture is the default and is tag-agnostic, so body text is never dropped
+ * just because it sits in an unrecognized container. A {@link mapElement}
+ * classification is an *override* — a special element (heading, list item,
+ * caption, footnote, data table, picture) owns its whole subtree as one item and
+ * is not descended into. Generic elements contribute their own inline text (in
+ * document order) and the walk descends into their block-level children.
+ */
+export function collectDomItems(body: Element): DomItemCandidate[] {
+    const candidates: DomItemCandidate[] = [];
+
+    // Explicit frames preserve recursive walk order without risking stack overflow
+    // on deeply nested DOM.
+    interface Frame {
+        parent: Element;
+        children: Node[];
+        index: number;
+        buffer: string;
+        firstTextNode?: Text;
+    }
+
+    const makeFrame = (parent: Element): Frame => ({
+        parent,
+        children: Array.from(parent.childNodes).filter((n): n is Node => n != null),
+        index: 0,
+        buffer: "",
+        firstTextNode: undefined,
+    });
+
+    const flush = (frame: Frame): void => {
+        const text = normalizeText(frame.buffer);
+        frame.buffer = "";
+        if (text) {
+            candidates.push({
+                element: frame.parent,
+                kind: "text",
+                text,
+                anchorId: findNearestAnchorId(frame.parent),
+                ...(frame.firstTextNode ? { firstTextNode: frame.firstTextNode } : {}),
+            });
+        }
+        frame.firstTextNode = undefined;
+    };
+
+    const stack: Frame[] = [makeFrame(body)];
+    while (stack.length > 0) {
+        const frame = stack[stack.length - 1];
+        if (frame.index >= frame.children.length) {
+            flush(frame);
+            stack.pop();
+            continue;
+        }
+        const node = frame.children[frame.index++];
+        if (!node) continue;
+
+        if (node.nodeType === TEXT_NODE) {
+            const textNode = node as Text;
+            if (!frame.firstTextNode && /\S/.test(textNode.nodeValue ?? "")) {
+                frame.firstTextNode = textNode;
+            }
+            frame.buffer += ` ${textNode.nodeValue ?? ""} `;
+            continue;
+        }
+        if (node.nodeType !== ELEMENT_NODE) continue;
+
+        const child = node as Element;
+        if (isNonContentElement(child)) continue;
+
+        if (isBlockBoundary(child)) {
+            // Inline text before a block must become its own preceding item.
+            flush(frame);
+            const mapping = mapElement(child);
+            if (mapping) {
+                const candidate = buildCandidate(child, mapping);
+                if (candidate) candidates.push(candidate);
+            } else {
+                stack.push(makeFrame(child));
+            }
+        } else {
+            // Inline element: fold its text into the surrounding prose.
+            frame.firstTextNode ??= firstContentTextNode(child);
+            frame.buffer += ` ${visibleTextContent(child)} `;
+        }
+    }
+
+    return candidates;
+}
+
+function buildCandidate(
+    element: Element,
+    mapping: DomElementMapping,
+): DomItemCandidate | undefined {
+    if (mapping.kind === "table") {
+        const rows = linearizeTableRows(element);
+        // The caption is the table's identity (e.g. "Table 3: …") but lives
+        // outside any <tr>; surface it as the first citable row so it is not
+        // silently dropped from an opaque data-table item.
+        const caption = tableCaptionText(element);
+        if (caption && rows.length > 0) {
+            rows.unshift(caption);
+        }
+        // Linearized row text reads as a TSV-ish table and keeps row boundaries;
+        // empty/degenerate tables fall back to the flat text content.
+        const text = rows.length > 0 ? rows.join("\n") : visibleTextContent(element);
+        if (!text) return undefined;
+        return {
+            element,
+            kind: "table",
+            text,
+            ...(rows.length > 0 ? { rows } : {}),
+            anchorId: findNearestAnchorId(element),
+            ...optionalFirstTextNode(element),
+        };
+    }
+
+    const text = textForMappedElement(element, mapping.kind);
+    if (!text) return undefined;
+    return {
+        element,
+        kind: mapping.kind,
+        level: mapping.level,
+        text,
+        anchorId: findNearestAnchorId(element),
+        ...optionalFirstTextNode(element),
+    };
+}
+
+function optionalFirstTextNode(element: Element): Pick<DomItemCandidate, "firstTextNode"> {
+    const firstTextNode = firstContentTextNode(element);
+    return firstTextNode ? { firstTextNode } : {};
+}
+
+function firstContentTextNode(element: Element): Text | undefined {
+    // Iterative pre-order DFS keeps document order without recursive descent.
+    const stack: Node[] = [];
+    const pushChildren = (parent: Node): void => {
+        const children = parent.childNodes;
+        for (let i = children.length - 1; i >= 0; i--) {
+            const child = children[i];
+            if (child) stack.push(child);
+        }
+    };
+
+    pushChildren(element);
+    while (stack.length > 0) {
+        const node = stack.pop() as Node;
+        if (node.nodeType === TEXT_NODE) {
+            if (/\S/.test(node.nodeValue ?? "")) return node as Text;
+        } else if (node.nodeType === ELEMENT_NODE) {
+            if (isNonContentElement(node as Element)) continue;
+            pushChildren(node);
+        }
+    }
+    return undefined;
+}
+
+function textForMappedElement(element: Element, kind: DomItemKind): string {
+    if (kind === "picture") {
+        return normalizeText(
+            element.getAttribute("alt")
+            || element.getAttribute("title"),
+        );
+    }
+    return visibleTextContent(element);
+}
+
+/**
+ * Linearize a data table into one string per row, cells joined by " | ".
+ *
+ * Each row becomes a citable unit (a sentence) instead of the whole table being
+ * one opaque blob. Only direct `td`/`th` cells of each row are used; rows whose
+ * cells are all empty are dropped. Rows of tables nested inside a cell are
+ * skipped — their text already appears once in the enclosing cell's content —
+ * so nesting never duplicates rows.
+ */
+/** Text of the table's own <caption>, ignoring captions of nested tables. */
+function tableCaptionText(table: Element): string {
+    for (const caption of Array.from(table.querySelectorAll("caption")) as Element[]) {
+        if (caption.closest("table") === table) {
+            return visibleTextContent(caption);
+        }
+    }
+    return "";
+}
+
+export function linearizeTableRows(table: Element): string[] {
+    const rows: string[] = [];
+    for (const tr of Array.from(table.querySelectorAll("tr")) as Element[]) {
+        if (tr.closest("table") !== table) continue;
+        const cells: string[] = [];
+        for (const cell of Array.from(tr.children) as Element[]) {
+            const name = cell.localName.toLowerCase();
+            if (name !== "td" && name !== "th") continue;
+            cells.push(visibleTextContent(cell));
+        }
+        // Drop fully empty rows (spacer/separator rows) but keep internal empty
+        // cells so column alignment survives.
+        if (cells.some((cell) => cell.length > 0)) {
+            rows.push(cells.join(" | "));
+        }
+    }
+    return rows;
+}
+
+function hasToken(value: string | null, token: string): boolean {
+    if (!value) return false;
+    return value.split(/\s+/).some((part) => part.toLowerCase() === token);
+}

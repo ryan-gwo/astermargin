@@ -1,0 +1,479 @@
+import { AsterMarginInstance } from '../../src/runtime/instance';
+/**
+ * Shutdown hooks close the agent connection through `AsterMarginReact`.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const {
+    mockCloseAsterMarginWindow,
+    mockClosePreferencesWindow,
+    mockCleanupContextMenus,
+    mockCancelAllActiveTasks,
+    mockCloseWindowsRenderedBy,
+    mockDisposeMuPDFWorker,
+    mockRemoveChatPanel,
+    mockUnregisterShortcuts,
+} = vi.hoisted(() => ({
+    mockCloseAsterMarginWindow: vi.fn(),
+    mockClosePreferencesWindow: vi.fn(),
+    mockCleanupContextMenus: vi.fn(),
+    mockCancelAllActiveTasks: vi.fn(),
+    mockCloseWindowsRenderedBy: vi.fn(),
+    mockDisposeMuPDFWorker: vi.fn().mockResolvedValue(undefined),
+    mockRemoveChatPanel: vi.fn(),
+    mockUnregisterShortcuts: vi.fn(),
+}));
+
+vi.mock('../../src/ui/ui', () => ({
+    AsterMarginUIFactory: {
+        closeAsterMarginWindow: vi.fn(),
+        registerChatPanel: vi.fn(),
+        removeChatPanel: mockRemoveChatPanel,
+        registerShortcuts: vi.fn(),
+        unregisterShortcuts: mockUnregisterShortcuts,
+        closeAsterMarginWindow: mockCloseAsterMarginWindow,
+        closePreferencesWindow: mockClosePreferencesWindow,
+        closeWindowsRenderedBy: mockCloseWindowsRenderedBy,
+    },
+}));
+
+vi.mock('../../src/astermargin-extract', () => ({
+    disposeMuPDFWorker: mockDisposeMuPDFWorker,
+}));
+
+vi.mock('../../src/services/protocolHandler', () => ({
+    registerAsterMarginProtocolHandler: vi.fn(),
+    unregisterAsterMarginProtocolHandler: vi.fn(),
+}));
+
+vi.mock('../../src/utils/backgroundTasks', () => ({
+    cancelAllActiveTasks: mockCancelAllActiveTasks,
+}));
+
+vi.mock('../../src/modules/zoteroContextMenu', () => ({
+    initContextMenus: vi.fn(),
+    cleanupContextMenus: mockCleanupContextMenus,
+}));
+
+vi.mock('../../src/utils/locale', () => ({ initLocale: vi.fn() }));
+vi.mock('../../src/utils/ztoolkit', () => ({ createZToolkit: vi.fn() }));
+vi.mock('../../src/services/CitationService', () => ({
+    CitationService: class MockCitationService {},
+}));
+vi.mock('../../src/services/database', () => ({ AsterMarginDB: class MockAsterMarginDB {} }));
+vi.mock('../../src/services/backgroundExtractor', () => ({
+    BackgroundExtractor: class MockBackgroundExtractor {
+        start = vi.fn();
+        stop = vi.fn().mockResolvedValue(undefined);
+        processOnce = vi.fn().mockResolvedValue({ processed: false });
+    },
+}));
+vi.mock('../../src/utils/prefs', () => ({ getPref: vi.fn(), setPref: vi.fn() }));
+vi.mock('../../src/utils/versionNotificationPrefs', () => ({
+    addPendingVersionNotification: vi.fn(),
+}));
+vi.mock('../../react/constants/versionUpdateMessages', () => ({
+    getAllVersionUpdateMessageVersions: vi.fn(() => []),
+}));
+
+function makeWindow(closeAgentConnection: unknown = vi.fn()) {
+    const win = {
+        EventTarget,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        closed: false,
+        document: { getElementById: vi.fn().mockReturnValue(null), querySelector: vi.fn().mockReturnValue(null) },
+        AsterMarginReact: { closeAgentConnection },
+    } as unknown as Window & Record<string, any>;
+    (globalThis as any).addon.runtime.attachWindow(win);
+    return win;
+}
+
+function setupGlobals({ appShuttingDown }: { appShuttingDown: boolean }) {
+    delete (Zotero as any).__astermarginMuPDFWorkerClient_hot;
+    delete (Zotero as any).__astermarginMuPDFWorkerClient_background;
+
+    (globalThis as any).Services = {
+        startup: { shuttingDown: appShuttingDown },
+        io: { newURI: vi.fn((uri: string) => uri) },
+        obs: { addObserver: vi.fn(), removeObserver: vi.fn() },
+    };
+
+    (globalThis as any).Cc = {
+        '@mozilla.org/content/style-sheet-service;1': {
+            getService: vi.fn(() => ({
+                sheetRegistered: vi.fn().mockReturnValue(false),
+                unregisterSheet: vi.fn(),
+                loadAndRegisterSheet: vi.fn(),
+            })),
+        },
+    };
+
+    (globalThis as any).Ci = {
+        ...(globalThis as any).Ci,
+        nsIFile: { DIRECTORY_TYPE: 1 },
+        nsIStyleSheetService: { AUTHOR_SHEET: 'author' },
+    };
+
+    (globalThis as any).addon = {
+        threads: { start: vi.fn(), dispose: vi.fn() },
+        presence: { dispose: vi.fn() },
+        runtime: new AsterMarginInstance(),
+        mutations: { cancelOwner: vi.fn(), dispose: vi.fn().mockResolvedValue(undefined) },
+        itemImport: { dispose: vi.fn() },
+        images: { dispose: vi.fn() },
+        notePreviews: { detachOwner: vi.fn().mockResolvedValue(undefined) },
+        syncPause: { releaseWindow: vi.fn(), scheduleResumeAfterRun: vi.fn(), resumeSyncNow: vi.fn() },
+        transactionWatch: { start: vi.fn(), stop: vi.fn(), openAgeMs: vi.fn(() => 0) },
+        data: {
+            alive: true,
+            config: {
+                addonRef: 'astermargin',
+                addonInstance: 'AsterMargin',
+                addonID: 'astermargin@test',
+            },
+        },
+    };
+
+    (globalThis as any).rootURI = 'chrome://astermargin/';
+    (globalThis as any).ztoolkit = { log: vi.fn(), unregisterAll: vi.fn() };
+
+    Object.assign(globalThis.Zotero, {
+        getMainWindows: vi.fn(() => []),
+        getMainWindow: vi.fn(() => null),
+        __astermarginShuttingDown: false,
+        AsterMargin: {},
+    });
+}
+
+async function loadHooks() {
+    return (await import('../../src/hooks')).default;
+}
+
+describe('closing the agent connection on window unload', () => {
+    beforeEach(() => {
+        vi.resetModules();
+        vi.clearAllMocks();
+        mockDisposeMuPDFWorker.mockResolvedValue(undefined);
+    });
+
+    it('names the quit when the app is going away', async () => {
+        setupGlobals({ appShuttingDown: true });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).toHaveBeenCalledExactlyOnceWith('Zotero quitting', {
+            rememberInterruptedThread: true,
+        });
+    });
+
+    it('records the interrupted chat on a quit even when another window is still open', async () => {
+        setupGlobals({ appShuttingDown: true });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        // Every window is going away, and this one may be the one holding the
+        // socket — the windows that unload later have nothing left to close.
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win, makeWindow()]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).toHaveBeenCalledExactlyOnceWith('Zotero quitting', {
+            rememberInterruptedThread: true,
+        });
+    });
+
+    it('records a window interruption even when another main window remains', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win, makeWindow()]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).toHaveBeenCalledExactlyOnceWith('Main window closed', {
+            rememberInterruptedThread: true,
+        });
+    });
+
+    it('records the interrupted chat when the last window closes', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        // Only this window, and it is on its way out.
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).toHaveBeenCalledExactlyOnceWith('Main window closed', {
+            rememberInterruptedThread: true,
+        });
+    });
+
+    it("keeps a window open after its last Zotero 11 library view closes", async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        // Zotero 11 reports the unload while the window's readers stay open.
+        win.ZoteroPane = { libraryViews: [] };
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).not.toHaveBeenCalled();
+        expect((globalThis as any).addon.runtime.getWindow(win)).toBeDefined();
+    });
+
+    it("cleans up when a window without library views itself unloads", async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        win.ZoteroPane = { libraryViews: [] };
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        await hooks.onMainWindowUnload(win, { windowUnloading: true });
+
+        expect(close).toHaveBeenCalledExactlyOnceWith('Main window closed', {
+            rememberInterruptedThread: true,
+        });
+    });
+
+    it('ignores a window that is already closed when counting what remains', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        const gone = makeWindow();
+        (gone as any).closed = true;
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win, gone]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).toHaveBeenCalledExactlyOnceWith('Main window closed', {
+            rememberInterruptedThread: true,
+        });
+    });
+
+    it('closes the socket before anything else in teardown', async () => {
+        setupGlobals({ appShuttingDown: false });
+        (Zotero as any).__astermarginMuPDFWorkerClient_hot = { spawnedFromWindow: null };
+        const hooks = await loadHooks();
+        const close = vi.fn();
+        const win = makeWindow(close);
+        (Zotero as any).__astermarginMuPDFWorkerClient_hot.spawnedFromWindow = win;
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win, makeWindow()]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(close).toHaveBeenCalled();
+        expect(mockDisposeMuPDFWorker).not.toHaveBeenCalled();
+        expect(mockCloseWindowsRenderedBy).toHaveBeenCalled();
+        expect(mockRemoveChatPanel).toHaveBeenCalled();
+        for (const later of [
+            mockCloseWindowsRenderedBy,
+            mockRemoveChatPanel,
+        ]) {
+            expect(close.mock.invocationCallOrder[0]).toBeLessThan(
+                later.mock.invocationCallOrder[0],
+            );
+        }
+    });
+
+    it('carries on when the bundle throws', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const win = makeWindow(vi.fn(() => {
+            throw new Error('bundle is already gone');
+        }));
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win, makeWindow()]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(mockRemoveChatPanel).toHaveBeenCalled();
+        expect(ztoolkit.log).toHaveBeenCalledWith(
+            expect.stringContaining('closeAgentConnection: Error: bundle is already gone'),
+        );
+    });
+
+    it('carries on when the window has no bundle to ask', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const win = makeWindow();
+        delete win.AsterMarginReact;
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win, makeWindow()]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect(mockRemoveChatPanel).toHaveBeenCalled();
+    });
+});
+
+describe('closing the agent connection on plugin shutdown', () => {
+    it('shares one disposal when shutdown is requested concurrently', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const closeDatabase = vi.fn().mockResolvedValue(undefined);
+        (globalThis as any).addon.db = { closeDatabase };
+        const first = hooks.onShutdown();
+        const second = hooks.onShutdown();
+        expect(second).toBe(first);
+        await Promise.all([first, second]);
+        expect(closeDatabase).toHaveBeenCalledOnce();
+        await hooks.onShutdown();
+        expect(closeDatabase).toHaveBeenCalledOnce();
+    });
+
+    beforeEach(() => {
+        vi.resetModules();
+        vi.clearAllMocks();
+        mockDisposeMuPDFWorker.mockResolvedValue(undefined);
+    });
+
+    it('closes every open window\'s connection when the plugin is disabled', async () => {
+        setupGlobals({ appShuttingDown: false });
+        const hooks = await loadHooks();
+        const firstClose = vi.fn();
+        const secondClose = vi.fn();
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([
+            makeWindow(firstClose),
+            makeWindow(secondClose),
+        ]);
+
+        await hooks.onShutdown();
+
+        // The bundle goes away with the plugin, so both record.
+        expect(firstClose).toHaveBeenCalledExactlyOnceWith('AsterMargin plugin shutting down', {
+            rememberInterruptedThread: true,
+        });
+        expect(secondClose).toHaveBeenCalledExactlyOnceWith('AsterMargin plugin shutting down', {
+            rememberInterruptedThread: true,
+        });
+    });
+});
+
+describe('late application shutdown', () => {
+    beforeEach(() => {
+        vi.resetModules();
+        vi.clearAllMocks();
+        mockDisposeMuPDFWorker.mockResolvedValue(undefined);
+        setupGlobals({ appShuttingDown: true });
+    });
+
+    it('disposes services once without accessing windows or UI registries', async () => {
+        const hooks = await loadHooks();
+        const instance = (globalThis as any).addon;
+        const stopWatcher = vi.fn();
+        const stopReconciler = vi.fn();
+        const stopExtractor = vi.fn().mockResolvedValue(undefined);
+        const closeDatabase = vi.fn().mockResolvedValue(undefined);
+        const disposeCitation = vi.fn();
+        instance.newItemWatcher = { stop: stopWatcher };
+        instance.processingReconciler = { stop: stopReconciler };
+        instance.backgroundExtractor = { stop: stopExtractor };
+        instance.db = { closeDatabase };
+        instance.citationService = { dispose: disposeCitation };
+        const disposeRuntime = vi.spyOn(instance.runtime, 'disposeInstance');
+        vi.mocked(Zotero.getMainWindows).mockImplementation(() => { throw new Error('Windows destroyed'); });
+        vi.mocked(Zotero.getMainWindow).mockImplementation(() => { throw new Error('Window destroyed'); });
+
+        const first = hooks.onAppShutdown();
+        expect(hooks.onAppShutdown()).toBe(first);
+        await first;
+        for (const cleanup of [stopWatcher, stopReconciler, stopExtractor, closeDatabase, disposeCitation, mockDisposeMuPDFWorker]) {
+            expect(cleanup).toHaveBeenCalledOnce();
+        }
+        expect(Zotero.getMainWindows).not.toHaveBeenCalled();
+        expect(Zotero.getMainWindow).not.toHaveBeenCalled();
+        for (const cleanup of [disposeRuntime, mockRemoveChatPanel, mockCloseWindowsRenderedBy, mockUnregisterShortcuts, mockCleanupContextMenus, mockCloseAsterMarginWindow]) {
+            expect(cleanup).not.toHaveBeenCalled();
+        }
+        expect(instance.db).toBeUndefined();
+        expect(instance.data.alive).toBe(false);
+        expect(Zotero.__astermarginShuttingDown).toBe(true);
+    });
+
+    it('continues service cleanup after failures and preserves the DB fallback', async () => {
+        const hooks = await loadHooks();
+        const instance = (globalThis as any).addon;
+        instance.newItemWatcher = { stop: vi.fn(() => { throw new Error('watcher failed'); }) };
+        instance.backgroundExtractor = { stop: vi.fn().mockRejectedValue(new Error('extractor failed')) };
+        const closeDatabase = vi.fn().mockRejectedValue(new Error('database failed'));
+        instance.db = { closeDatabase };
+        const dispose = vi.fn();
+        instance.citationService = { dispose };
+        await hooks.onAppShutdown();
+        expect(mockDisposeMuPDFWorker).toHaveBeenCalledOnce();
+        expect(closeDatabase).toHaveBeenCalledOnce();
+        expect(instance.db.closeDatabase).toBe(closeDatabase);
+        expect(dispose).toHaveBeenCalledOnce();
+    });
+});
+
+describe('quitting with several windows', () => {
+    beforeEach(() => {
+        vi.resetModules();
+        vi.clearAllMocks();
+        mockDisposeMuPDFWorker.mockResolvedValue(undefined);
+        setupGlobals({ appShuttingDown: true });
+    });
+
+    it('runs the app-wide cleanup once when every window reads as closed', async () => {
+        const hooks = await loadHooks();
+        const instance = (globalThis as any).addon;
+        const closeDatabase = vi.fn().mockResolvedValue(undefined);
+        instance.db = { closeDatabase };
+        const disposeRuntime = vi.spyOn(instance.runtime, 'disposeInstance');
+        const first = makeWindow();
+        const second = makeWindow();
+        // During a quit the other windows already read as closed, so each
+        // unload takes itself for the last window.
+        (first as any).closed = true;
+        (second as any).closed = true;
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([first, second]);
+
+        await hooks.onMainWindowUnload(first);
+        // The registry is still live for the window that has yet to unload.
+        expect(closeDatabase).not.toHaveBeenCalled();
+        expect(disposeRuntime).not.toHaveBeenCalled();
+        await hooks.onMainWindowUnload(second);
+
+        expect(closeDatabase).toHaveBeenCalledOnce();
+        expect(disposeRuntime).toHaveBeenCalledOnce();
+        expect(mockUnregisterShortcuts).toHaveBeenCalledOnce();
+        // Each window still tears down its own UI and closes its own socket.
+        expect(mockRemoveChatPanel).toHaveBeenCalledWith(first);
+        expect(mockRemoveChatPanel).toHaveBeenCalledWith(second);
+        expect(first.AsterMarginReact.closeAgentConnection).toHaveBeenCalledOnce();
+        expect(second.AsterMarginReact.closeAgentConnection).toHaveBeenCalledOnce();
+    });
+
+    it('shares the database close between overlapping shutdown paths', async () => {
+        const hooks = await loadHooks();
+        const instance = (globalThis as any).addon;
+        let finishClose!: () => void;
+        const closeDatabase = vi.fn(() => new Promise<void>(resolve => { finishClose = resolve; }));
+        instance.db = { closeDatabase };
+        const win = makeWindow();
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        const unload = hooks.onMainWindowUnload(win);
+        await vi.waitFor(() => expect(closeDatabase).toHaveBeenCalledOnce());
+        // APP_SHUTDOWN arrives while the window's cleanup is still closing it.
+        const appShutdown = hooks.onAppShutdown();
+        // Let APP_SHUTDOWN reach its own database step before the close settles.
+        await new Promise(resolve => setTimeout(resolve, 20));
+        finishClose();
+        await Promise.all([unload, appShutdown]);
+
+        expect(closeDatabase).toHaveBeenCalledOnce();
+        expect(instance.db).toBeUndefined();
+    });
+});

@@ -1,0 +1,865 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({
+    logger: vi.fn(),
+}));
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: {
+        auth: {
+            getSession: vi.fn(),
+        },
+    },
+}));
+
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test-user' })),
+}));
+
+vi.mock('../../../react/store', () => ({
+    store: { get: vi.fn(() => [1]) },
+}));
+
+vi.mock('../../../react/atoms/profile', () => ({
+    searchableLibraryIdsAtom: Symbol('searchableLibraryIdsAtom'),
+}));
+
+vi.mock('../../../src/services/agentDataProvider/utils', () => ({
+    getCollectionByIdOrName: vi.fn(),
+    validateLibraryAccess: vi.fn(),
+    resolveStoredTagName: vi.fn(),
+    isLibrarySearchable: vi.fn(() => true),
+    getSearchableLibraries: vi.fn(() => []),
+    extractYear: vi.fn(() => null),
+    formatCreatorsString: vi.fn(() => ''),
+    getAttachmentInfoForItem: vi.fn(),
+    getBestAttachmentBatch: vi.fn(async () => new Map()),
+    ROW_DATA_TYPES: ['primaryData', 'itemData', 'creators', 'note'],
+    degradedRegularRow: vi.fn((item: any) => ({
+        result_type: 'regular',
+        item_id: `${item.libraryID}-${item.key}`,
+        item_type: item.itemType,
+        title: null,
+        creators: null,
+        year: null,
+    })),
+    degradedNoteRow: vi.fn((item: any, parentInfo: any) => ({
+        result_type: 'note',
+        item_id: `${item.libraryID}-${item.key}`,
+        title: null,
+        parent_item_id: parentInfo?.item_id ?? null,
+        parent_item: parentInfo ?? null,
+    })),
+    // Mirrors the real stub's shape. The guarded reads it is built from are
+    // covered directly by tests/unit/utils/attachmentFiles.test.ts.
+    degradedAttachmentRow: vi.fn((item: any, parentInfo: any) => ({
+        result_type: 'attachment',
+        attachment_id: `${item.libraryID}-${item.key}`,
+        parent_item_id: parentInfo?.item_id ?? null,
+        title: null,
+        filename: null,
+        content_kind: 'other',
+        status: 'unreadable',
+        status_reason: 'malformed',
+        page_count: null,
+        line_count: null,
+        is_primary: false,
+        parent_title: parentInfo?.title ?? null,
+        parent_item: parentInfo ?? null,
+        date_modified: null,
+    })),
+}));
+
+// Keep the real serializeNote; stub serializeItemStub so parent serialization
+// doesn't hit getCreators/getYear on mock items.
+vi.mock('../../../src/utils/zoteroSerializers', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../../../src/utils/zoteroSerializers')>();
+    return {
+        ...actual,
+        serializeItemStub: vi.fn((item: any) => ({
+            item_id: `${item.libraryID}-${item.key}`,
+            item_type: item.itemType,
+            title: item.getField?.('title', false, true) || item.getDisplayTitle?.() || null,
+            creators: null,
+            year: null,
+        })),
+    };
+});
+
+import { handleListItemsRequest } from '../../../src/services/agentDataProvider/handleListItemsRequest';
+import {
+    getAttachmentInfoForItem,
+    getBestAttachmentBatch,
+    getCollectionByIdOrName,
+    resolveStoredTagName,
+    validateLibraryAccess,
+} from '../../../src/services/agentDataProvider/utils';
+
+type MockItem = Omit<
+    Partial<Zotero.Item>,
+    'itemType' | 'numAnnotations' | 'getField' | 'parentItemID' | 'attachmentFilename'
+> & {
+    id: number;
+    key: string;
+    libraryID: number;
+    itemType: string;
+    parentItemID?: number | false | null;
+    attachmentFilename?: string | null;
+    attachmentContentType?: string | null;
+    isNote: ReturnType<typeof vi.fn>;
+    isAttachment: ReturnType<typeof vi.fn>;
+    isRegularItem: ReturnType<typeof vi.fn>;
+    isFileAttachment?: ReturnType<typeof vi.fn>;
+    isAnnotation?: ReturnType<typeof vi.fn>;
+    getField?: ReturnType<typeof vi.fn>;
+    numAnnotations?: ReturnType<typeof vi.fn>;
+};
+
+function makeItem(overrides: Partial<MockItem> = {}): MockItem {
+    const itemType = overrides.itemType ?? 'journalArticle';
+    const isNote = itemType === 'note';
+    const isAttachment = itemType === 'attachment';
+    return {
+        id: 1,
+        key: 'ITEM1',
+        libraryID: 1,
+        itemType,
+        parentItemID: null,
+        dateAdded: '2024-01-01',
+        dateModified: '2024-01-02',
+        getField: vi.fn(() => ''),
+        getCreators: vi.fn(() => []),
+        getDisplayTitle: vi.fn(() => ''),
+        getNotes: vi.fn(() => []),
+        getAttachments: vi.fn(() => []),
+        getTags: vi.fn(() => []),
+        numAttachments: vi.fn(() => 0),
+        isNote: vi.fn(() => isNote),
+        isAttachment: vi.fn(() => isAttachment),
+        isRegularItem: vi.fn(() => !isNote && !isAttachment && itemType !== 'annotation'),
+        ...overrides,
+    };
+}
+
+describe('handleListItemsRequest', () => {
+    const searchResults: number[][] = [];
+    const itemsById = new Map<number, MockItem>();
+    const searches: { addCondition: ReturnType<typeof vi.fn>; search: ReturnType<typeof vi.fn> }[] = [];
+
+    /** Every ['field', 'operator', 'value'] the handler put on its search. */
+    const addedConditions = () =>
+        searches.flatMap(search => search.addCondition.mock.calls.map(call => call.slice(0, 3)));
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        searchResults.length = 0;
+        searches.length = 0;
+        itemsById.clear();
+
+        (validateLibraryAccess as any).mockReturnValue({
+            valid: true,
+            library: { libraryID: 1, name: 'My Library' },
+        });
+        (getCollectionByIdOrName as any).mockReturnValue({
+            libraryID: 1,
+            collection: { id: 10, name: 'Collection' },
+        });
+        vi.mocked(getAttachmentInfoForItem).mockImplementation(async (item: any, options: any = {}) => ({
+            attachment_id: `${item.libraryID}-${item.key}`,
+            parent_item_id: options.parentItemId ?? null,
+            title: item.getDisplayTitle?.() || item.key,
+            filename: item.attachmentFilename ?? null,
+            content_kind: item.attachmentContentType === 'application/pdf' ? 'pdf' : 'linked_url',
+            status: item.attachmentContentType === 'application/pdf' ? 'readable' : 'unreadable',
+            page_count: item.attachmentContentType === 'application/pdf' ? 12 : null,
+            line_count: null,
+            is_primary: Boolean(options.isPrimary),
+            annotations_count: item.isFileAttachment?.() ? item.numAnnotations?.() ?? 0 : 0,
+        } as any));
+
+        vi.mocked(resolveStoredTagName).mockResolvedValue({ found: true, name: 'to-read' });
+
+        class MockSearch {
+            libraryID = 1;
+            addCondition = vi.fn();
+            search = vi.fn(async () => searchResults.shift() ?? []);
+            constructor() {
+                searches.push(this);
+            }
+        }
+
+        (globalThis as any).Zotero.Search = MockSearch;
+        (globalThis as any).Zotero.Libraries.get = vi.fn(() => ({ libraryID: 1, name: 'My Library' }));
+        (globalThis as any).Zotero.Items = {
+            getAsync: vi.fn(async (ids: number | number[]) => {
+                if (Array.isArray(ids)) {
+                    return ids.map(id => itemsById.get(id) ?? null);
+                }
+                return itemsById.get(ids) ?? null;
+            }),
+            loadDataTypes: vi.fn(async () => undefined),
+        };
+    });
+
+    it('returns an empty result for annotation-only listings instead of malformed regular items', async () => {
+        const annotation = makeItem({
+            id: 1,
+            key: 'ANN1',
+            itemType: 'annotation',
+            isAnnotation: vi.fn(() => true),
+        });
+        itemsById.set(annotation.id, annotation);
+        searchResults.push([annotation.id]);
+
+        const response = await handleListItemsRequest({
+            event: 'list_items_request',
+            request_id: 'req-1',
+            item_category: 'annotation',
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        });
+
+        expect(response.error).toBeUndefined();
+        expect(response.total_count).toBe(0);
+        expect(response.items).toEqual([]);
+    });
+
+    it('does not add child annotations to collection all listings', async () => {
+        const parent = makeItem({
+            id: 1,
+            key: 'PARENT',
+            itemType: 'journalArticle',
+            getField: vi.fn((field: string) => field === 'title' ? 'Parent' : ''),
+            getNotes: vi.fn(() => [2]),
+            getAttachments: vi.fn(() => [3]),
+        });
+        const note = makeItem({
+            id: 2,
+            key: 'NOTE',
+            itemType: 'note',
+            parentItemID: parent.id,
+            isNote: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+            getDisplayTitle: vi.fn(() => 'Note'),
+        });
+        const attachment = makeItem({
+            id: 3,
+            key: 'ATTACH',
+            itemType: 'attachment',
+            parentItemID: parent.id,
+            isAttachment: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+            getDisplayTitle: vi.fn(() => 'Attachment'),
+            attachmentFilename: 'paper.pdf',
+            attachmentContentType: 'application/pdf',
+            isFileAttachment: vi.fn(() => true),
+            numAnnotations: vi.fn(() => 1),
+        });
+        const annotation = makeItem({
+            id: 4,
+            key: 'ANN1',
+            itemType: 'annotation',
+            isAnnotation: vi.fn(() => true),
+        });
+
+        for (const item of [parent, note, attachment, annotation]) {
+            itemsById.set(item.id, item);
+        }
+        searchResults.push([parent.id], [parent.id]);
+
+        const response = await handleListItemsRequest({
+            event: 'list_items_request',
+            request_id: 'req-2',
+            library_id: 1,
+            collection_key: 'COLLECTION',
+            item_category: 'all',
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        });
+
+        expect(response.total_count).toBe(3);
+        expect(response.items).toEqual(expect.arrayContaining([
+            expect.objectContaining({ item_id: '1-PARENT', result_type: 'regular' }),
+            expect.objectContaining({ item_id: '1-NOTE', result_type: 'note' }),
+            expect.objectContaining({ attachment_id: '1-ATTACH', result_type: 'attachment', annotations_count: 1 }),
+        ]));
+        expect(response.items).not.toContainEqual(expect.objectContaining({ item_id: '1-ANN1' }));
+        expect(attachment.numAnnotations).toHaveBeenCalledOnce();
+    });
+
+    it('returns zero annotations_count for file attachments with no annotations', async () => {
+        const attachment = makeItem({
+            id: 1,
+            key: 'ATTACH',
+            itemType: 'attachment',
+            isAttachment: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+            getDisplayTitle: vi.fn(() => 'Attachment'),
+            attachmentFilename: 'paper.pdf',
+            attachmentContentType: 'application/pdf',
+            isFileAttachment: vi.fn(() => true),
+            numAnnotations: vi.fn(() => 0),
+        });
+
+        itemsById.set(attachment.id, attachment);
+        searchResults.push([attachment.id]);
+
+        const response = await handleListItemsRequest({
+            event: 'list_items_request',
+            request_id: 'req-3',
+            item_category: 'attachment',
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        });
+
+        expect(response.items[0]).toEqual(expect.objectContaining({
+            attachment_id: '1-ATTACH',
+            result_type: 'attachment',
+            annotations_count: 0,
+        }));
+        expect(attachment.numAnnotations).toHaveBeenCalledOnce();
+    });
+
+    it('returns zero annotations_count for non-file attachments without reading annotations', async () => {
+        const attachment = makeItem({
+            id: 1,
+            key: 'LINK',
+            itemType: 'attachment',
+            isAttachment: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+            getDisplayTitle: vi.fn(() => 'Linked URL'),
+            attachmentFilename: null,
+            attachmentContentType: 'text/html',
+            isFileAttachment: vi.fn(() => false),
+            numAnnotations: vi.fn(() => {
+                throw new Error('numAnnotations should not be called');
+            }),
+        });
+
+        itemsById.set(attachment.id, attachment);
+        searchResults.push([attachment.id]);
+
+        const response = await handleListItemsRequest({
+            event: 'list_items_request',
+            request_id: 'req-4',
+            item_category: 'attachment',
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        });
+
+        expect(response.items[0]).toEqual(expect.objectContaining({
+            attachment_id: '1-LINK',
+            result_type: 'attachment',
+            annotations_count: 0,
+        }));
+        expect(attachment.numAnnotations).not.toHaveBeenCalled();
+    });
+
+    it('emits a portable "u-<key>" item_id when this device can map the library to the personal library', async () => {
+        (globalThis as any).Zotero.Libraries.userLibraryID = 1;
+        const item = makeItem({
+            id: 1,
+            key: 'PORTABLE1',
+            itemType: 'journalArticle',
+            getField: vi.fn((field: string) => (field === 'title' ? 'Portable Item' : '')),
+        });
+        itemsById.set(item.id, item);
+        searchResults.push([item.id]);
+
+        const response = await handleListItemsRequest({
+            event: 'list_items_request',
+            request_id: 'req-5',
+            item_category: 'all',
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        });
+
+        expect(response.items[0]).toEqual(expect.objectContaining({
+            item_id: 'u-PORTABLE1',
+            result_type: 'regular',
+        }));
+    });
+
+    describe('include_abstract', () => {
+        const listRequest = (includeAbstract?: boolean) => ({
+            event: 'list_items_request' as const,
+            request_id: 'req-abstract',
+            item_category: 'regular' as const,
+            recursive: true,
+            sort_by: 'dateAdded',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+            ...(includeAbstract === undefined ? {} : { include_abstract: includeAbstract }),
+        });
+
+        beforeEach(() => {
+            const withAbstract = makeItem({
+                id: 1,
+                key: 'WITHABS1',
+                getField: vi.fn((field: string) => (field === 'abstractNote' ? 'We study X.' : '')),
+            });
+            const withoutAbstract = makeItem({ id: 2, key: 'NOABS1', dateAdded: '2023-01-01' });
+            itemsById.set(withAbstract.id, withAbstract);
+            itemsById.set(withoutAbstract.id, withoutAbstract);
+            searchResults.push([withAbstract.id, withoutAbstract.id]);
+        });
+
+        it('adds the abstract to regular rows, "" when the item has none', async () => {
+            const response = await handleListItemsRequest(listRequest(true));
+
+            expect(response.items.map((row: any) => row.abstract)).toEqual(['We study X.', '']);
+        });
+
+        it('leaves abstract out when it was not requested', async () => {
+            const response = await handleListItemsRequest(listRequest());
+
+            expect(response.items.every((row: any) => !('abstract' in row))).toBe(true);
+        });
+    });
+
+    it('degrades an unreadable attachment to a stub instead of failing the page', async () => {
+        const good1 = makeItem({
+            id: 1,
+            key: 'GOOD1',
+            itemType: 'attachment',
+            isAttachment: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+            attachmentFilename: 'good1.pdf',
+            attachmentContentType: 'application/pdf',
+        });
+        // Stands in for a linked file whose stored path Zotero cannot parse:
+        // reading it throws NS_ERROR_FILE_UNRECOGNIZED_PATH.
+        const bad = makeItem({
+            id: 2,
+            key: 'BAD',
+            itemType: 'attachment',
+            isAttachment: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+        });
+        const good2 = makeItem({
+            id: 3,
+            key: 'GOOD2',
+            itemType: 'attachment',
+            isAttachment: vi.fn(() => true),
+            isRegularItem: vi.fn(() => false),
+            attachmentFilename: 'good2.pdf',
+            attachmentContentType: 'application/pdf',
+        });
+
+        const resolveInfo = vi.mocked(getAttachmentInfoForItem).getMockImplementation()!;
+        vi.mocked(getAttachmentInfoForItem).mockImplementation(async (item: any, options: any = {}) => {
+            if (item.key === 'BAD') {
+                throw new Error(
+                    'OperationError: PathUtils.filename: Could not initialize path: '
+                    + 'NS_ERROR_FILE_UNRECOGNIZED_PATH'
+                );
+            }
+            return resolveInfo(item, options);
+        });
+
+        for (const item of [good1, bad, good2]) {
+            itemsById.set(item.id, item);
+        }
+        searchResults.push([good1.id, bad.id, good2.id]);
+
+        const response = await handleListItemsRequest({
+            event: 'list_items_request',
+            request_id: 'req-6',
+            item_category: 'attachment',
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        });
+
+        expect(response.error).toBeUndefined();
+        expect(response.error_code).toBeUndefined();
+        expect(response.total_count).toBe(3);
+        expect(response.items).toHaveLength(3);
+        expect(response.items.map((i: any) => i.attachment_id)).toEqual(
+            expect.arrayContaining(['1-GOOD1', '1-BAD', '1-GOOD2'])
+        );
+        expect(response.items.find((i: any) => i.attachment_id === '1-BAD')).toEqual(
+            expect.objectContaining({ result_type: 'attachment', status: 'unreadable' })
+        );
+    });
+
+    describe('tag filter', () => {
+        it('searches the casing the library stores, not the one the caller sent', async () => {
+            const item = makeItem({ id: 1, key: 'ITEM1' });
+            itemsById.set(1, item);
+            searchResults.push([1]);
+
+            const response = await handleListItemsRequest({
+                type: 'list_items',
+                request_id: 'req-tag-casing',
+                library_id: 1,
+                tag: 'TO-READ',
+            } as any);
+
+            expect(response.error).toBeUndefined();
+            expect(resolveStoredTagName).toHaveBeenCalledWith(1, 'My Library', 'TO-READ');
+            expect(addedConditions()).toContainEqual(['tag', 'is', 'to-read']);
+            expect(addedConditions()).not.toContainEqual(['tag', 'is', 'TO-READ']);
+        });
+
+        it('keeps a collection child whose tag differs only in casing from the caller\'s', async () => {
+            // The primary search resolves to the stored casing; the child
+            // expansion compares tag names itself, so it has to resolve too or
+            // the child is dropped from a listing its parent matched.
+            const parent = makeItem({
+                id: 1,
+                key: 'PARENT',
+                itemType: 'journalArticle',
+                getNotes: vi.fn(() => [2]),
+                getAttachments: vi.fn(() => []),
+            });
+            const note = makeItem({
+                id: 2,
+                key: 'NOTE',
+                itemType: 'note',
+                parentItemID: parent.id,
+                isNote: vi.fn(() => true),
+                isRegularItem: vi.fn(() => false),
+                getDisplayTitle: vi.fn(() => 'Note'),
+                getTags: vi.fn(() => [{ tag: 'to-read' }]),
+            });
+            itemsById.set(parent.id, parent);
+            itemsById.set(note.id, note);
+            searchResults.push([parent.id], [parent.id]);
+
+            const response = await handleListItemsRequest({
+                event: 'list_items_request',
+                request_id: 'req-child-tag-casing',
+                library_id: 1,
+                collection_key: 'COLLECTION',
+                tag: 'TO-READ',
+                item_category: 'all',
+                recursive: true,
+                sort_by: 'dateModified',
+                sort_order: 'desc',
+                limit: 20,
+                offset: 0,
+            } as any);
+
+            expect(response.error).toBeUndefined();
+            expect(response.items).toContainEqual(
+                expect.objectContaining({ item_id: 'u-NOTE', result_type: 'note' })
+            );
+        });
+
+        it('reports tag_not_found rather than an empty list when the tag does not resolve', async () => {
+            vi.mocked(resolveStoredTagName).mockResolvedValue({
+                found: false,
+                error: 'Tag not found: "to-red" in library "My Library"',
+            });
+
+            const response = await handleListItemsRequest({
+                type: 'list_items',
+                request_id: 'req-tag-missing',
+                library_id: 1,
+                tag: 'to-red',
+            } as any);
+
+            expect(response.error_code).toBe('tag_not_found');
+            expect(response.error).toContain('to-red');
+            expect(response.items).toEqual([]);
+            expect(response.total_count).toBe(0);
+            expect(searches[0].search).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('special_collection', () => {
+        const baseRequest = {
+            event: 'list_items_request' as const,
+            request_id: 'req-special',
+            item_category: 'regular' as const,
+            recursive: true,
+            sort_by: 'dateModified',
+            sort_order: 'desc',
+            limit: 20,
+            offset: 0,
+        };
+
+        beforeEach(() => {
+            (globalThis as any).Zotero.Libraries.userLibraryID = 1;
+        });
+
+        it('filters the listing with the view\'s search condition', async () => {
+            const item = makeItem({ id: 1, key: 'PUB1' });
+            itemsById.set(1, item);
+            searchResults.push([1]);
+
+            const response = await handleListItemsRequest({ ...baseRequest, special_collection: 'publications' });
+
+            expect(response.error).toBeUndefined();
+            expect(response.items).toHaveLength(1);
+            expect(addedConditions()).toContainEqual(['publications', 'true', '']);
+            expect(addedConditions()).not.toContainEqual(expect.arrayContaining(['collectionID']));
+            expect(response.collection_name).toBeNull();
+        });
+
+        it('walks Unfiled Items parents for child categories, scoped by the unfiled condition', async () => {
+            const parent = makeItem({ id: 1, key: 'PARENT', getNotes: vi.fn(() => [2]) });
+            const note = makeItem({
+                id: 2,
+                key: 'NOTE',
+                itemType: 'note',
+                parentItemID: 1,
+                isNote: vi.fn(() => true),
+                isRegularItem: vi.fn(() => false),
+                getDisplayTitle: vi.fn(() => 'Note'),
+            });
+            itemsById.set(1, parent);
+            itemsById.set(2, note);
+            // Main search (standalone notes only), then the parent walk.
+            searchResults.push([], [1]);
+
+            const response = await handleListItemsRequest({
+                ...baseRequest,
+                item_category: 'note',
+                special_collection: 'unfiled',
+            });
+
+            expect(response.items).toContainEqual(expect.objectContaining({ result_type: 'note' }));
+            expect(searches).toHaveLength(2);
+            expect(searches[1].addCondition.mock.calls.map(call => call.slice(0, 3)))
+                .toContainEqual(['unfiled', 'true', '']);
+        });
+
+        it('does not walk My Publications parents: unpublished children are not in the view', async () => {
+            searchResults.push([]);
+
+            await handleListItemsRequest({ ...baseRequest, item_category: 'note', special_collection: 'publications' });
+
+            expect(searches).toHaveLength(1);
+        });
+
+        it('keeps only published children when include_children lists My Publications', async () => {
+            const parent = makeItem({ id: 1, key: 'PARENT', getAttachments: vi.fn(() => [2, 3]) });
+            const published = makeItem({
+                id: 2, key: 'PUBPDF', itemType: 'attachment', parentItemID: 1,
+                isAttachment: vi.fn(() => true), isRegularItem: vi.fn(() => false),
+                inPublications: true,
+            } as any);
+            const unpublished = makeItem({
+                id: 3, key: 'PRIVPDF', itemType: 'attachment', parentItemID: 1,
+                isAttachment: vi.fn(() => true), isRegularItem: vi.fn(() => false),
+                inPublications: false,
+            } as any);
+            for (const item of [parent, published, unpublished]) itemsById.set(item.id, item);
+            searchResults.push([1]);
+
+            const response = await handleListItemsRequest({
+                ...baseRequest,
+                include_children: true,
+                special_collection: 'publications',
+            });
+
+            const ids = response.items.map((item: any) => item.attachment_id ?? item.item_id);
+            expect(ids).toContain('1-PUBPDF');
+            expect(ids).not.toContain('1-PRIVPDF');
+
+            searchResults.push([1]);
+            const nested = await handleListItemsRequest({
+                ...baseRequest,
+                include_children: true,
+                nest_children: true,
+                special_collection: 'publications',
+            });
+
+            const nestedIds = (nested.items[0] as any).attachments.map((a: any) => a.attachment_id);
+            expect(nestedIds).toEqual(['1-PUBPDF']);
+        });
+
+        it('reports My Publications as unavailable in a group library', async () => {
+            (validateLibraryAccess as any).mockReturnValue({
+                valid: true,
+                library: { libraryID: 5, name: 'Lab Group' },
+            });
+
+            const response = await handleListItemsRequest({
+                ...baseRequest,
+                library_id: 5,
+                special_collection: 'publications',
+            });
+
+            expect(response.error_code).toBe('special_collection_unavailable');
+            expect(response.error).toContain('personal library');
+            expect(searches).toHaveLength(0);
+        });
+
+        it('rejects a view it does not know', async () => {
+            const response = await handleListItemsRequest({ ...baseRequest, special_collection: 'trash' });
+
+            expect(response.error_code).toBe('invalid_special_collection');
+            expect(response.error).toContain('unfiled, publications, retracted');
+            expect(searches).toHaveLength(0);
+        });
+
+        it('rejects a view combined with a collection', async () => {
+            const response = await handleListItemsRequest({
+                ...baseRequest,
+                collection_key: 'COLLECTION',
+                special_collection: 'unfiled',
+            });
+
+            expect(response.error_code).toBe('invalid_special_collection');
+            expect(getCollectionByIdOrName).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('nest_children', () => {
+        const nestedRequest = {
+            event: 'list_items_request' as const,
+            request_id: 'req-nested',
+            item_category: 'regular' as const,
+            include_children: true,
+            nest_children: true,
+            recursive: true,
+            sort_by: 'title',
+            sort_order: 'asc',
+            limit: 1,
+            offset: 0,
+        };
+
+        function makeChild(id: number, key: string, parentItemID: number, title: string, overrides: Partial<MockItem> = {}) {
+            const isNote = overrides.itemType === 'note';
+            return makeItem({
+                id,
+                key,
+                itemType: isNote ? 'note' : 'attachment',
+                parentItemID,
+                isNote: vi.fn(() => isNote),
+                isAttachment: vi.fn(() => !isNote),
+                isRegularItem: vi.fn(() => false),
+                getField: vi.fn(() => title),
+                getDisplayTitle: vi.fn(() => title),
+                attachmentContentType: 'application/pdf',
+                ...overrides,
+            });
+        }
+
+        function setUpLibrary() {
+            const heavy = makeItem({
+                id: 1,
+                key: 'HEAVY',
+                getField: vi.fn(() => 'Heavy hitting'),
+                getAttachments: vi.fn(() => [11, 12, 13]),
+                getNotes: vi.fn(() => [14, 15]),
+            });
+            const zebra = makeItem({
+                id: 2,
+                key: 'ZEBRA',
+                getField: vi.fn(() => 'Zebra'),
+                getAttachments: vi.fn(() => [21]),
+            });
+            const children = [
+                makeChild(11, 'CATALOG', 1, 'Catalog Page', { attachmentContentType: 'text/html' }),
+                makeChild(12, 'FULLTEXT', 1, 'Full Text PDF'),
+                makeChild(13, 'APPENDIX', 1, 'Appendix PDF'),
+                makeChild(14, 'NOTEZ', 1, 'Zeta note', { itemType: 'note' }),
+                makeChild(15, 'NOTEA', 1, 'Alpha note', { itemType: 'note' }),
+                makeChild(21, 'ZEBRAPDF', 2, 'Aardvark PDF'),
+            ];
+            for (const item of [heavy, zebra, ...children]) itemsById.set(item.id, item);
+            searchResults.push([2, 1]);
+            vi.mocked(getBestAttachmentBatch).mockResolvedValue(new Map([[1, 12]]));
+        }
+
+        it('sorts and pages top-level items only, nesting the page\'s children', async () => {
+            setUpLibrary();
+
+            const response = await handleListItemsRequest(nestedRequest);
+
+            expect(response.error).toBeUndefined();
+            expect(response.total_count).toBe(2);
+            expect(response.items).toHaveLength(1);
+            const row = response.items[0] as any;
+            expect(row.item_id).toBe('u-HEAVY');
+            expect(row.attachments.map((a: any) => a.attachment_id)).toEqual(['1-FULLTEXT', '1-APPENDIX', '1-CATALOG']);
+            expect(row.attachments.map((a: any) => a.is_primary)).toEqual([true, false, false]);
+            expect(row.attachments.every((a: any) => a.parent_item_id === 'u-HEAVY')).toBe(true);
+            expect(row.notes.map((n: any) => n.title)).toEqual(['Alpha note', 'Zeta note']);
+            expect(row.notes.every((n: any) => n.parent_item_id === 'u-HEAVY')).toBe(true);
+        });
+
+        it('loads children for the page\'s parents only', async () => {
+            setUpLibrary();
+
+            await handleListItemsRequest({ ...nestedRequest, offset: 1 });
+
+            const requestedIds = vi.mocked(Zotero.Items.getAsync).mock.calls
+                .flatMap(([ids]) => (Array.isArray(ids) ? ids : [ids]));
+            expect(requestedIds).toContain(21);
+            expect(requestedIds).not.toContain(11);
+            expect(getBestAttachmentBatch).toHaveBeenCalledWith([2]);
+        });
+
+        it('gives an item without children empty lists', async () => {
+            itemsById.set(1, makeItem({ id: 1, key: 'LONE' }));
+            searchResults.push([1]);
+
+            const response = await handleListItemsRequest(nestedRequest);
+
+            expect(response.items[0]).toEqual(expect.objectContaining({ attachments: [], notes: [] }));
+        });
+
+        it('degrades an unreadable child without failing its parent row', async () => {
+            setUpLibrary();
+            const resolveInfo = vi.mocked(getAttachmentInfoForItem).getMockImplementation()!;
+            vi.mocked(getAttachmentInfoForItem).mockImplementation(async (item: any, options: any = {}) => {
+                if (item.key === 'APPENDIX') throw new Error('NS_ERROR_FILE_UNRECOGNIZED_PATH');
+                return resolveInfo(item, options);
+            });
+
+            const response = await handleListItemsRequest(nestedRequest);
+
+            const row = response.items[0] as any;
+            expect(row.title).toBe('Heavy hitting');
+            expect(row.attachments).toHaveLength(3);
+            expect(row.attachments.find((a: any) => a.attachment_id === '1-APPENDIX')).toEqual(
+                expect.objectContaining({ status: 'unreadable', parent_item_id: 'u-HEAVY' }),
+            );
+        });
+
+        it('keeps flat child rows when nest_children is not sent', async () => {
+            setUpLibrary();
+
+            const response = await handleListItemsRequest({ ...nestedRequest, nest_children: undefined, limit: 20 });
+
+            expect(response.total_count).toBe(8);
+            expect(response.items.some((item: any) => item.result_type === 'attachment')).toBe(true);
+            expect(response.items.every((item: any) => item.attachments === undefined)).toBe(true);
+        });
+
+        it('applies has_attachments to the parents', async () => {
+            setUpLibrary();
+            itemsById.get(1)!.numAttachments = vi.fn(() => 3);
+            itemsById.get(2)!.numAttachments = vi.fn(() => 0);
+
+            const response = await handleListItemsRequest({ ...nestedRequest, has_attachments: false, limit: 20 });
+
+            expect(response.total_count).toBe(1);
+            expect(response.items.map((item: any) => item.item_id)).toEqual(['u-ZEBRA']);
+        });
+    });
+
+});

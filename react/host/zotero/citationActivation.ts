@@ -1,0 +1,573 @@
+import { getContextWindow } from '../../runtime/windowRuntime';
+import { AttachmentFileUnavailableError, openNote, openNoteWindow, openReader } from '../../runtime/navigation';
+import { store } from '../../store';
+import { pageLabelsByAttachmentIdAtom } from '@astermargin/agent-core/citations/atoms';
+import { externalReferenceMappingAtom } from '@astermargin/agent-core/citations/externalReferences';
+import {
+    isExternalReferenceDetailsDialogVisibleAtom,
+    selectedExternalReferenceAtom,
+} from '../../atoms/ui';
+import {
+    getCitationPages,
+    getCitationBoundingBoxes,
+    getContentKind,
+    getSymbolicLocation,
+    type Citation,
+    type SymbolicLocation,
+} from '@astermargin/agent-core/types/citations';
+import { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import { revealSource } from '../../utils/sourceUtils';
+import { createZoteroURI } from '../../utils/zoteroURI';
+import { getCurrentReaderAndWaitForView, readerTargetOptions, waitForReaderView } from '../../utils/readerUtils';
+import {
+    AsterMarginTemporaryAnnotations,
+    createBoundingBoxHighlights,
+} from '../../utils/annotationUtils';
+import {
+    flashHighlightBoundingBoxes,
+    presentTemporaryAnnotations,
+} from '../../utils/citationNavigation';
+import { navigateToEpubCitation } from '../../utils/epubVisualizer/epubCitationNavigation';
+import { navigateToSnapshotCitation } from '../../utils/snapshotVisualizer/snapshotCitationNavigation';
+import { resolvePageLabelFromLabels } from '@astermargin/agent-ui/utils/pageLabels';
+import { getPageLabelsForItem } from './itemData';
+import { launchExternalFile, notifyReferenceUnavailable } from './sourceActions';
+import { openTableForUser } from './tables';
+import { getResolvedRef, parseTableLocator } from '@astermargin/agent-core/citations/citationGrammar';
+import { getPref } from '../../../src/utils/prefs';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { selectItemById } from '../../utils/selectItem';
+import {
+    getBestPDFAttachmentAsync,
+    getBestReadableTextAttachmentAsync,
+} from '../../../src/utils/zoteroItemHelpers';
+import { ASTERMARGIN_CITATION_ANNOTATION_AUTHOR } from '../../../src/constants/annotations';
+import { libraryRefForLibraryID, resolveItemReference } from '../../../src/utils/libraryIdentity';
+import { getParentItemAsync } from '../../../src/utils/zoteroDataLoading';
+import { isPdfDocument } from '../../../src/utils/attachmentFiles';
+import { getReadableContentKind } from '../../../src/services/documentExtraction/attachmentResolution';
+import { extractAndCacheEpubDocument } from '../../../src/services/documentExtractionCore';
+import type { CitationActivation, CitationReaderTarget } from '@astermargin/agent-ui/host/types';
+
+/**
+ * Walk to the top-level item. An annotation or attachment citation names a child
+ * row; "the item" the user wants revealed is the work it hangs off.
+ *
+ * Walks by parent *ID* rather than the `parentItem` getter: that getter resolves
+ * through `Zotero.Items.get()`, which throws `UnloadedDataException` when the
+ * parent is registered but not yet in the object cache. A child item reached
+ * directly by key — which is how a citation resolves — routinely has an
+ * unloaded parent, and `loadAllData()` only loads the child itself.
+ */
+async function topLevelItemOf(item: Zotero.Item): Promise<Zotero.Item> {
+    let current = item;
+    // Zotero nests at most annotation -> attachment -> item; the bound just
+    // stops a malformed parent cycle from spinning here.
+    for (let depth = 0; depth < 5; depth++) {
+        const parentID = current.parentItemID;
+        if (!parentID) break;
+        const parent = await Zotero.Items.getAsync(parentID);
+        if (!parent) break;
+        current = parent;
+    }
+    return current;
+}
+
+/** Reveal the cited item in the library view. */
+function revealInLibrary(libraryID: number, zoteroKey: string): void {
+    revealSource({
+        library_id: libraryID,
+        zotero_key: zoteroKey,
+        library_ref: libraryRefForLibraryID(libraryID) ?? undefined,
+    } as ZoteroItemReference);
+}
+
+/**
+ * The section and anchor of an EPUB citation that names only an extraction id
+ * (a table's evidence stores `s44-s49`, not where it is): looked up in the
+ * EPUB's extraction, from the document cache when it has one. Undefined when
+ * the citation names no id, the item is not an EPUB attachment, or the id is
+ * not in the extraction; the navigation then falls back to the passage text.
+ */
+async function epubLocationOfPart(
+    item: Zotero.Item,
+    metadata: Citation | undefined,
+): Promise<SymbolicLocation | undefined> {
+    const partId = metadata?.locations?.[0]?.part_id?.split('-')[0];
+    if (!partId || !item.isAttachment()) return undefined;
+    try {
+        const extracted = await extractAndCacheEpubDocument({
+            source: { kind: 'zotero', item },
+            resolvedKey: `${item.libraryID}-${item.key}`,
+            contentType: item.attachmentContentType,
+            maxPages: null,
+        });
+        if (extracted.kind !== 'ok') return undefined;
+        const entry = extracted.document.citationIndex?.[partId];
+        const section = entry ? extracted.document.sections.find((candidate) => candidate.index === entry.sectionIndex) : undefined;
+        if (!entry || !section) return undefined;
+        return {
+            content_kind: 'epub',
+            section_href: section.rawHref,
+            ...(entry.anchorId ? { anchor_id: entry.anchorId } : {}),
+        };
+    } catch (error) {
+        logger(`Citation activation: EPUB part lookup failed: ${error}`, 1);
+        return undefined;
+    }
+}
+
+/**
+ * Opens the table a cell or row citation names, at that cell or row, as the
+ * table is now. A row or column removed since the citation was made opens the
+ * table without a focus and says so.
+ */
+async function openCitedTable(citation: Citation, ownerDocument: Document): Promise<void> {
+    const ref = getResolvedRef(citation);
+    if (ref?.kind !== 'zotero') return;
+    const resolved = await resolveItemReference(ref);
+    if (resolved.status !== 'found') {
+        notifyReferenceUnavailable('table', resolved.status === 'library_unavailable' ? 'library_unavailable' : 'missing');
+        return;
+    }
+    const focus = parseTableLocator(ref.loc);
+    const outcome = await openTableForUser(
+        { libraryID: resolved.item.libraryID, key: resolved.item.key },
+        ownerDocument.defaultView,
+        focus ? { focus } : {},
+    );
+    if ('ok' in outcome && outcome.focus === 'missing') notifyReferenceUnavailable('table_cell');
+}
+
+/**
+ * Where a citation opens its document when the caller did not say: as a
+ * double-click in the items list does, following Zotero's "Open PDFs in a new
+ * window" setting. Always in Zotero's own reader, never an external app.
+ */
+function resolveReaderTarget(requested: CitationReaderTarget | undefined): CitationReaderTarget {
+    return requested ?? (Zotero.Prefs.get('openReaderInNewWindow') === true ? 'window' : 'tab');
+}
+
+/**
+ * The reader to show a cited passage in, with its view (and PDF) loaded. A tab
+ * target reuses the selected tab when it already shows the item; otherwise the
+ * item opens at `location` in a tab or in a separate reader window.
+ */
+async function openCitationReader(
+    itemID: number,
+    location: Record<string, any> | undefined,
+    target: CitationReaderTarget,
+): Promise<any> {
+    if (target === 'tab') {
+        const current = await getCurrentReaderAndWaitForView(undefined, true);
+        logger(`Citation activation: Current Reader (${current?.itemID})`);
+        if (current?.itemID === itemID) return current;
+    }
+    logger(`Citation activation: Opening item ${itemID} in a reader ${target}`);
+    const opened = await openReader(itemID, location, readerTargetOptions(target));
+    if (target === 'window') {
+        if (opened) await waitForReaderView(opened, true);
+        return opened;
+    }
+    // Let the newly selected tab settle before navigating it.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    return getCurrentReaderAndWaitForView(undefined, true);
+}
+
+/**
+ * Zotero implementation of citation activation: navigate to / open the cited
+ * location. Mirrors the citation click behavior across all content kinds (note,
+ * annotation, text, EPUB, PDF) and reference types (external, external file).
+ */
+export async function activateCitation(activation: CitationActivation): Promise<void> {
+    const {
+        metadata,
+        intent = 'passage',
+        readerTarget: requestedReaderTarget,
+        isExternal,
+        isExternalFile,
+        externalFileKey,
+        externalSourceId,
+        hasMappedItem,
+        effectiveLibraryID,
+        effectiveItemKey,
+        effectiveLibraryRef,
+        previewText,
+        ownerDocument,
+    } = activation;
+
+    const useTemporaryCitationAnnotations = getPref('useTemporaryCitationAnnotations') === true;
+    logger('Citation activation: handle citation click');
+
+    // External citations without Zotero mapping - open details dialog
+    if (isExternal && !hasMappedItem) {
+        logger('Citation activation: External citation - opening details dialog');
+        if (externalSourceId) {
+            const externalReference = store.get(externalReferenceMappingAtom)[externalSourceId];
+            if (externalReference) {
+                store.set(selectedExternalReferenceAtom, externalReference);
+                store.set(isExternalReferenceDetailsDialogVisibleAtom, true);
+            }
+        }
+        return;
+    }
+
+    // External-file citations: open the locally stored copy. There is no
+    // reader navigation for external files, so page/sentence clicks just
+    // launch the file; a missing local copy (file attached on another
+    // computer) is a quiet no-op.
+    if (isExternalFile) {
+        logger(`Citation activation: External file citation (ext-${externalFileKey})`);
+        if (!externalFileKey) return;
+        await launchExternalFile(externalFileKey);
+        return;
+    }
+
+    // Alternate activation reveals the table item, through the item path below.
+    if (metadata?.citation_type === 'table' && intent !== 'item') {
+        logger('Citation activation: table cell or row');
+        await openCitedTable(metadata, ownerDocument);
+        return;
+    }
+
+    // Cleanup any existing temporary annotations
+    await AsterMarginTemporaryAnnotations.cleanupAll();
+
+    if ((!effectiveLibraryID && !effectiveLibraryRef) || !effectiveItemKey) {
+        logger('Citation activation: No valid item reference');
+        return;
+    }
+
+    logger(`Citation activation: Zotero Item (${effectiveLibraryRef || effectiveLibraryID}, ${effectiveItemKey})`);
+    const resolved = await resolveItemReference({
+        library_ref: effectiveLibraryRef,
+        library_id: effectiveLibraryID,
+        zotero_key: effectiveItemKey,
+    });
+
+    if (resolved.status !== 'found') {
+        logger(`Citation activation: Failed to get Zotero item (${effectiveLibraryRef || effectiveLibraryID}, ${effectiveItemKey})`);
+        notifyReferenceUnavailable('item', resolved.status === 'library_unavailable' ? 'library_unavailable' : 'missing');
+        return;
+    }
+    const item = resolved.item;
+
+    await item.loadAllData();
+
+    // Alternate activation: the user asked for the cited work, not the cited
+    // passage. Reveal it and skip every locator-driven path below.
+    if (intent === 'item') {
+        const target = await topLevelItemOf(item);
+        logger(`Citation activation: revealing cited item in library (${target.id})`);
+        revealInLibrary(target.libraryID, target.key);
+        return;
+    }
+
+    const readerTarget = resolveReaderTarget(requestedReaderTarget);
+
+    // A citation that names no kind reads as a PDF. When it points at an
+    // attachment, the attachment says what it is: a table's evidence stores no
+    // kind, and an EPUB or snapshot passage must open in its own reader.
+    const attachmentKind = !metadata?.content_kind && item.isAttachment() ? getReadableContentKind(item) : null;
+    const contentKind = attachmentKind && attachmentKind !== 'image' ? attachmentKind : getContentKind(metadata);
+    const symbolicLocation = getSymbolicLocation(metadata);
+
+    // Handle note links using Zotero.Notes.open()
+    if (item.isNote()) {
+        logger(`Citation activation: Note Link (${item.id})`);
+        if (readerTarget === 'window') {
+            await openNoteWindow(item.id);
+        } else {
+            await openNote(item.id);
+        }
+        return;
+    }
+
+    // Handle annotation citations: open the parent attachment in the
+    // reader and navigate via annotationID
+    if (item.isAnnotation()) {
+        const parentAttachment = await getParentItemAsync(item);
+        if (!parentAttachment || !parentAttachment.isAttachment()) {
+            logger(`Citation activation: Annotation ${item.id} has no parent attachment`);
+            return;
+        }
+        try {
+            const reader = await openCitationReader(parentAttachment.id, undefined, readerTarget);
+            if (reader) {
+                setTimeout(() => {
+                    reader.navigate({ annotationID: item.key });
+                }, 100);
+            }
+        } catch (error) {
+            logger('Citation activation: Failed to open annotation: ' + error);
+        }
+        return;
+    }
+
+    if (contentKind === 'text') {
+        // Resolved text citations should normally point at the attachment;
+        // this keeps older or incomplete regular-item metadata navigable.
+        const target = item.isAttachment()
+            ? item
+            : await getBestReadableTextAttachmentAsync(item);
+        if (!target) {
+            revealInLibrary(item.libraryID, item.key);
+            return;
+        }
+        const filePath = await target.getFilePathAsync();
+        if (filePath) {
+            if (symbolicLocation?.content_kind === 'text') {
+                const lineEnd = symbolicLocation.line_end ?? symbolicLocation.line;
+                logger(
+                    `Citation activation: Opening text file at lines ${symbolicLocation.line}-${lineEnd}: ${filePath}`,
+                );
+            } else {
+                logger(`Citation activation: Opening text file: ${filePath}`);
+            }
+            Zotero.launchFile(filePath);
+        } else {
+            await selectItemById(target.id);
+        }
+        return;
+    }
+
+    if (contentKind === 'epub') {
+        // EPUB locator model: agent-facing "page N" is the 1-based spine
+        // section ordinal; the symbolic location (when present) carries the
+        // precise section href / anchor / sentence text.
+        const epubSymbolicLocation = symbolicLocation?.content_kind === 'epub'
+            ? symbolicLocation
+            : undefined;
+        const sectionOrdinals = getCitationPages(metadata);
+        const hasEpubLocator = !!epubSymbolicLocation || sectionOrdinals.length > 0;
+        logger(`Citation activation: EPUB citation (symbolic: ${!!epubSymbolicLocation}, sections: ${sectionOrdinals.length})`);
+
+        if (item.isRegularItem() && !hasEpubLocator) {
+            revealInLibrary(item.libraryID, item.key);
+            return;
+        }
+
+        const outcome = await navigateToEpubCitation({
+            item,
+            symbolicLocation: epubSymbolicLocation ?? (await epubLocationOfPart(item, metadata)),
+            sectionOrdinal: sectionOrdinals[0],
+            searchText: metadata?.preview || undefined,
+            previewText,
+            useTemporaryAnnotations: useTemporaryCitationAnnotations,
+            ownerDocument,
+            readerTarget,
+        });
+        logger(`Citation activation: EPUB navigation outcome: ${outcome}`);
+        if (outcome === 'failed') {
+            revealInLibrary(item.libraryID, item.key);
+        }
+        return;
+    }
+
+    if (contentKind === 'snapshot') {
+        // Snapshot locator model: the symbolic location carries the cited
+        // selector / anchor / passage text. There is no section/page navigation
+        // (the reader is a continuous scroll view), so a regular item with no
+        // symbolic locator just reveals in the library.
+        const snapshotSymbolicLocation = symbolicLocation?.content_kind === 'snapshot'
+            ? symbolicLocation
+            : undefined;
+        const hasSnapshotLocator = !!snapshotSymbolicLocation || !!(metadata?.preview);
+        logger(`Citation activation: snapshot citation (symbolic: ${!!snapshotSymbolicLocation})`);
+
+        if (item.isRegularItem() && !hasSnapshotLocator) {
+            revealInLibrary(item.libraryID, item.key);
+            return;
+        }
+
+        const outcome = await navigateToSnapshotCitation({
+            item,
+            symbolicLocation: snapshotSymbolicLocation,
+            searchText: metadata?.preview || undefined,
+            previewText,
+            useTemporaryAnnotations: useTemporaryCitationAnnotations,
+            ownerDocument,
+            readerTarget,
+        });
+        logger(`Citation activation: snapshot navigation outcome: ${outcome}`);
+        if (outcome === 'failed') {
+            revealInLibrary(item.libraryID, item.key);
+        }
+        return;
+    }
+
+    if (contentKind !== 'pdf') {
+        logger(`Citation activation: Non-PDF citation (${contentKind})`);
+        if (item.isRegularItem()) {
+            revealInLibrary(item.libraryID, item.key);
+            return;
+        }
+        if (item.isAttachment()) {
+            try {
+                await openReader(item.id, undefined, readerTargetOptions(readerTarget));
+            } catch (error) {
+                logger(`Citation activation: Failed to open non-PDF attachment: ${error}`);
+                await selectItemById(item.id);
+            }
+            return;
+        }
+        revealInLibrary(item.libraryID, item.key);
+        return;
+    }
+
+    // Get locator data before regular-item handling. Some citations are
+    // resolved to parent items even though the raw tag includes page
+    // locators; those should navigate to the item's PDF attachment.
+    const boundingBoxData = getCitationBoundingBoxes(metadata);
+    const pages = getCitationPages(metadata);
+    const hasPdfLocator = boundingBoxData.length > 0 || pages.length > 0;
+    let pdfItem = item;
+
+    // Handle regular items
+    if (item.isRegularItem()) {
+        if (hasPdfLocator) {
+            const attachment = await getBestPDFAttachmentAsync(item);
+            const isPdfAttachment = !!attachment && isPdfDocument(attachment);
+            if (isPdfAttachment) {
+                logger(`Citation activation: Regular item locator resolved to PDF attachment (${attachment.id})`);
+                pdfItem = attachment;
+            } else {
+                logger(`Citation activation: Regular item has locator but no PDF attachment (${item.id})`);
+                revealInLibrary(item.libraryID, item.key);
+                return;
+            }
+        } else {
+            logger(`Citation activation: Selecting regular item (${item.id})`);
+            revealInLibrary(item.libraryID, item.key);
+            return;
+        }
+    }
+
+    // Handle file links (computed lazily: rendering never needs the URI)
+    const itemUri = createZoteroURI(item);
+    if (itemUri.startsWith('file:///')) {
+        const filePath = itemUri.replace('file:///', '');
+        logger(`Citation activation: File Link (${filePath})`);
+        Zotero.launchFile(filePath);
+        return;
+    }
+
+    logger(`Citation activation: Citation Location (boundingBoxData.length: ${boundingBoxData.length}, pages.length: ${pages.length})`);
+
+    if (pdfItem.isAttachment() && boundingBoxData.length == 0 && pages.length == 0) {
+        logger(`Citation activation: Selecting attachment (${pdfItem.id})`);
+        await selectItemById(pdfItem.id);
+        return;
+    }
+
+    try {
+        // Open the PDF at the first cited page
+        const page = boundingBoxData[0]?.page ?? pages[0] ?? 1;
+        const reader = await openCitationReader(pdfItem.id, { pageIndex: page - 1 }, readerTarget);
+
+        // Handle the three scenarios
+        if (boundingBoxData.length > 0) {
+            const loadedPageLabels = getPageLabelsForItem(pdfItem, store.get(pageLabelsByAttachmentIdAtom));
+            const highlightLocations = boundingBoxData.map(({ page, bboxes, pageLabel }) => ({
+                pageIndex: page - 1,
+                boxes: bboxes,
+                pageLabel: pageLabel ?? resolvePageLabelFromLabels(loadedPageLabels, page),
+            }));
+
+            if (useTemporaryCitationAnnotations) {
+                logger(`Citation activation: Highlighting bounding boxes with temporary annotations`);
+                const annotationReferences = await createBoundingBoxHighlights(
+                    highlightLocations,
+                    previewText,
+                    ASTERMARGIN_CITATION_ANNOTATION_AUTHOR,
+                    { authorName: ASTERMARGIN_CITATION_ANNOTATION_AUTHOR, reader },
+                );
+                if (reader) {
+                    presentTemporaryAnnotations(reader, annotationReferences, {
+                        ownerDocument,
+                        logContext: 'CitationActivation',
+                    });
+                } else {
+                    // Keep created annotations tracked for cleanup even
+                    // when the reader handle is unavailable.
+                    AsterMarginTemporaryAnnotations.addToTracking(annotationReferences);
+                }
+            } else {
+                logger(`Citation activation: Flashing highlight for bounding boxes`);
+                if (reader) {
+                    await flashHighlightBoundingBoxes(reader, highlightLocations);
+                }
+            }
+        } else if (pages.length > 0) {
+            logger(`Citation activation: Navigating to page ${pages[0]}`);
+            // Scenario 2: With pages only - navigate to page
+            if (reader) {
+                reader.navigate({ pageIndex: pages[0] - 1 });
+            }
+        }
+        // Scenario 3: No locators - PDF is already open, nothing more needed
+
+    } catch (error) {
+        logger('Citation activation: Failed to handle citation click: ' + error);
+        // Zotero already told the user the file is unavailable.
+        if (error instanceof AttachmentFileUnavailableError) return;
+
+        // Fallback: try the URI-based approach from the loaded item
+        try {
+            const fallbackUri = createZoteroURI(item);
+            if (fallbackUri.includes('zotero://')) {
+                getContextWindow()?.ZoteroPane.loadURI(fallbackUri);
+            }
+        } catch {
+            // No usable fallback URI; nothing else to do.
+        }
+    }
+}
+
+/**
+ * Activates a citation stored in a table document, which carries no chat view
+ * model: identity comes straight from the citation's own refs. Resolves false
+ * when the document's own link does better, so the caller follows it instead:
+ * an invalid citation, an unmapped external work, and a PDF attachment cited
+ * without a page or passage, which activation would only select in the
+ * library while the link opens the file.
+ */
+export async function activateStoredCitation(citation: Citation, ownerDocument: Document): Promise<boolean> {
+    if (citation.invalid) return false;
+    const ref = citation.resolved_ref ?? citation.requested_ref;
+    if (!ref || ref.kind === 'external') return false;
+    if (
+        citation.citation_type === 'attachment'
+        && getContentKind(citation) === 'pdf'
+        && getCitationPages(citation).length === 0
+        && getCitationBoundingBoxes(citation).length === 0
+    ) return false;
+    const previewText = (citation.preview ?? '').replace(/\s+/g, ' ').trim();
+    if (ref.kind === 'external_file') {
+        await activateCitation({
+            metadata: citation,
+            isExternal: false,
+            isExternalFile: true,
+            externalFileKey: ref.ext_key,
+            hasMappedItem: false,
+            effectiveLibraryID: 0,
+            effectiveItemKey: '',
+            previewText,
+            ownerDocument,
+        });
+        return true;
+    }
+    await activateCitation({
+        metadata: citation,
+        isExternal: false,
+        isExternalFile: false,
+        externalFileKey: null,
+        hasMappedItem: false,
+        effectiveLibraryID: ref.library_id,
+        effectiveItemKey: ref.zotero_key,
+        effectiveLibraryRef: ref.library_ref,
+        previewText,
+        ownerDocument,
+    });
+    return true;
+}

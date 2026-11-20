@@ -1,0 +1,6601 @@
+
+
+/*
+ * AsterMargin's Zotero stylesheet.
+ *
+ * Three shared sheets from @astermargin/agent-ui are registered before this file (see
+ * GLOBAL_STYLESHEETS in `src/hooks.ts` and the `<?xml-stylesheet?>` links in
+ * `astermarginWindow.xhtml` / `astermarginPreferences.xhtml`):
+ *
+ *   agent-ui-tokens.css      AsterMargin's own custom properties, plus the documented
+ *                            contract of platform tokens Zotero supplies.
+ *   agent-ui-utilities.css   the utility layer, scoped `.astermargin-root`.
+ *   agent-ui-components.css  shared component rules — the sign-in surface, the
+ *                            link vocabulary, the composer and the bars that
+ *                            dock to it, the editor field, the tooltip family,
+ *                            and `@keyframes spin`, which the `.animate-spin`
+ *                            rule below still resolves by name.
+ *
+ * `.astermargin-root` sits on every element that carries a `astermargin-pane-*` id, so
+ * `.astermargin-root .foo` matches exactly what `[id^="astermargin-pane-"] .foo` matched.
+ * Both weigh (0,2,0); the shared sheets load first, so a rule here of equal
+ * specificity wins — that is the intended direction, and the utilities the old
+ * source order made win instead are annotated and kept below.
+ *
+ * What stays in this file: component rules, everything that touches Zotero's own
+ * chrome, and the XUL toolbar button (which is outside every React root and must
+ * stay unscoped).
+ */
+
+/* Unscoped: applied to markup outside a pane root as well. */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Separate window: sizing and constraints.
+ * Root font-size is mirrored from the main Zotero window in astermarginWindow.js
+ * so `rem` units resolve identically to the sidebar. */
+#astermargin-window {
+    min-width: 200px;
+    min-height: 300px;
+}
+
+/* Preferences window: sizing and constraints. The minimum keeps the sidebar
+ * (see .astermargin-prefs-sidebar) plus a usable settings column on screen. */
+#astermargin-preferences-window {
+    min-width: 840px;
+    min-height: 560px;
+}
+
+/* Menus and tooltips use the overlay surface, which is tuned against the
+ * sidepane; on the preferences window's plain background it reads as a dark
+ * block. Match the separate window and lift overlays to the background. */
+#astermargin-pane-preferences {
+    --astermargin-surface-overlay: var(--material-background);
+}
+
+/* AsterMargin tabs (a stored table) sit on the plain background too: their menus
+ * and tooltips lift to it, as in the preferences and the separate window. */
+.astermargin-root.astermargin-tab {
+    --astermargin-surface-overlay: var(--material-background);
+    /* Zotero's tab deck sizes a tab to its content's minimum width, so a wide
+     * table would widen the whole tab and push the header and toolbar
+     * off-screen. Its width comes from the deck instead; wide content scrolls
+     * inside its own area. */
+    contain: inline-size;
+}
+
+/* A table window shows the AsterMargin tab's surface in a window of its own:
+ * the same plain background, overlays and width containment. */
+#astermargin-pane-table-window {
+    --astermargin-surface-overlay: var(--material-background);
+    background-color: var(--material-background);
+    contain: inline-size;
+}
+
+/* Preferences window: two-column shell. The sidebar keeps the window's
+ * sidepane material; the settings column sits on the plain background so the
+ * cards read against it the way they do in Zotero's own settings. */
+#astermargin-pane-preferences .astermargin-prefs-sidebar {
+    width: 212px;
+    background-color: var(--material-sidepane);
+}
+
+#astermargin-pane-preferences .astermargin-prefs-content {
+    background-color: var(--color-background);
+}
+
+#astermargin-pane-preferences .astermargin-prefs-page {
+    max-width: 860px;
+    padding: 22px 28px 40px;
+}
+
+/* Sidebar navigation entries. Plain buttons: the chrome default look is
+ * removed so only the selected / hovered pill shows. */
+#astermargin-pane-preferences .astermargin-prefs-nav-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    margin: 0;
+    padding: 7px 10px;
+    border: none;
+    border-radius: 6px;
+    background-color: transparent;
+    color: var(--fill-primary);
+    font: inherit;
+    font-size: 1.0625rem;
+    line-height: 1.3;
+    text-align: left;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+#astermargin-pane-preferences .astermargin-prefs-nav-item:hover {
+    background-color: var(--fill-quinary);
+}
+
+#astermargin-pane-preferences .astermargin-prefs-nav-item[aria-selected="true"] {
+    background-color: var(--fill-quarternary);
+    font-weight: 500;
+}
+
+#astermargin-pane-preferences .astermargin-prefs-nav-item:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -2px;
+}
+
+#astermargin-pane-preferences .astermargin-prefs-nav-item svg {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    color: var(--fill-secondary);
+}
+
+#astermargin-pane-preferences .astermargin-prefs-nav-item[aria-selected="true"] svg {
+    color: var(--fill-primary);
+}
+
+/* Account block at the bottom of the sidebar: a button that opens Plan & Usage,
+ * styled like the navigation entries above it. */
+#astermargin-pane-preferences .astermargin-prefs-account {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 8px;
+    background-color: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+#astermargin-pane-preferences .astermargin-prefs-account:hover {
+    background-color: var(--fill-quinary);
+}
+
+#astermargin-pane-preferences .astermargin-prefs-account:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -2px;
+}
+
+/* Legal links: a footnote under the account, indented to the avatar's edge. */
+#astermargin-pane-preferences .astermargin-prefs-legal {
+    padding: 6px 8px 0;
+}
+
+#astermargin-pane-preferences .astermargin-prefs-avatar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background-color: var(--fill-quarternary);
+    color: var(--fill-primary);
+    font-size: 1.05rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+/* Floating Popup Overlay - renders over main Zotero window, bottom-right */
+#astermargin-pane-floating-popup {
+    position: fixed;
+    bottom: 2px;
+    right: 7px;
+    width: 340px;
+    max-height: 80vh;
+    z-index: 9999;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+}
+
+#astermargin-pane-floating-popup > * {
+    pointer-events: auto;
+}
+
+/* Run status popup: the open thread's run, in the corner of the main window
+ * while the sidebar is closed (react/components/runStatusPopup). Sits inside
+ * #astermargin-pane-floating-popup, under any message popups. */
+.astermargin-run-status-popup {
+    position: relative;
+    align-self: flex-end;
+    width: 324px;
+    max-width: 100%;
+    margin: 0 4px 12px 0;
+    /* Room above the card for the layers that stand for other threads. */
+    padding-top: calc(var(--astermargin-run-status-stack, 0) * 6px);
+}
+
+.astermargin-run-status-popup[data-stack-depth="1"] { --astermargin-run-status-stack: 1; }
+.astermargin-run-status-popup[data-stack-depth="2"] { --astermargin-run-status-stack: 2; }
+
+/* One sliver per further thread, narrower and higher the further back it is. */
+.astermargin-run-status-popup__layer {
+    position: absolute;
+    top: calc((var(--astermargin-run-status-stack, 0) - var(--astermargin-stack-depth)) * 6px);
+    left: calc(var(--astermargin-stack-depth) * 10px);
+    right: calc(var(--astermargin-stack-depth) * 10px);
+    height: 16px;
+    border: 1px solid var(--astermargin-border-strong);
+    border-bottom: 0;
+    border-radius: 12px 12px 0 0;
+    background: var(--astermargin-surface-overlay);
+    opacity: calc(1 - var(--astermargin-stack-depth) * 0.3);
+}
+
+.astermargin-run-status-popup__card {
+    position: relative;
+    box-sizing: border-box;
+    overflow: hidden;
+    border: 1px solid var(--astermargin-border-strong);
+    border-radius: 12px;
+    background: var(--astermargin-surface-overlay);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14), 0 1px 3px rgba(0, 0, 0, 0.08);
+    cursor: pointer;
+    transition: border-color 120ms ease;
+}
+
+.astermargin-run-status-popup__card--settled {
+    transition: border-color 120ms ease, height 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.astermargin-run-status-popup__card:hover {
+    border-color: var(--fill-tertiary);
+}
+
+.astermargin-run-status-popup__card:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
+}
+
+.astermargin-run-status-popup__content {
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px 10px 12px;
+    gap: 8px;
+    /* Bound to the floating host's own limit, less the room the frame takes,
+     * and scrolled inside: the card is sized to this element's height, so a
+     * request longer than the window — the batch approval card with both
+     * warnings — reaches its controls instead of being cut at the frame. */
+    box-sizing: border-box;
+    max-height: calc(80vh - 24px);
+    overflow-y: auto;
+}
+
+.astermargin-run-status-popup__header {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 10px;
+    min-width: 0;
+}
+
+/* The pulse and the icons share one slot so the title column lines up across states. */
+.astermargin-run-status-popup__leading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+}
+
+.astermargin-run-status-popup__text {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 2px;
+}
+
+.astermargin-run-status-popup__trailing {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    /* Pull the dismiss button flush with the padding, as on the version card. */
+    margin: -4px -6px -4px 0;
+}
+
+/* The close button only appears while the pointer or focus is on the card. */
+.astermargin-run-status-popup__dismiss {
+    opacity: 0;
+    transition: opacity 120ms ease;
+}
+
+.astermargin-run-status-popup__card:hover .astermargin-run-status-popup__dismiss,
+.astermargin-run-status-popup__card:focus-within .astermargin-run-status-popup__dismiss {
+    opacity: 1;
+}
+
+.astermargin-run-status-popup__title {
+    font-size: 0.95rem;
+    font-weight: 500;
+    line-height: 20px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-run-status-popup__detail {
+    font-size: 0.875rem;
+    line-height: 18px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-run-status-popup__error-preview {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 54px;
+    overflow: hidden;
+}
+
+.astermargin-run-status-popup__error-preview--clipped {
+    mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+}
+
+/* The shimmering status line: the text clips, and the component appends a
+ * plain ellipsis beside it. Gecko does not paint `text-overflow`'s own marker
+ * through the shimmer's transparent text fill. */
+.astermargin-run-status-popup__status {
+    display: flex;
+    flex-direction: row;
+    min-width: 0;
+}
+
+.astermargin-run-status-popup__status-text {
+    display: block;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.astermargin-run-status-popup__body {
+    font-size: 0.875rem;
+    line-height: 1.35;
+    padding-left: 30px;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* A shared card — the question card, the batch approval card — drawn inside
+ * the popup: the popup is the frame, so the card gives up its own. The
+ * padding is forced because the batch approval card sets its own inline.
+ * A card whose every click is its own (the question's options fill it) does
+ * not show the frame's pointer; one with plain copy between its controls
+ * keeps it, since that copy still opens AsterMargin. */
+.astermargin-run-status-popup__embedded--own-clicks {
+    cursor: default;
+}
+
+.astermargin-run-status-popup__embedded > .user-message-display {
+    margin: 0;
+    padding: 0 !important;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+}
+
+/* Live batch progress under the header: the composer's bar, framed like the
+ * completed card's rows instead of docked to a composer edge. The panel
+ * renders nothing without a batch in flight, and the empty wrapper hides
+ * with it so the column's gap is not paid for a slot with nothing in it. */
+.astermargin-run-status-popup__batch-progress {
+    cursor: default;
+}
+
+.astermargin-run-status-popup__batch-progress:empty {
+    display: none;
+}
+
+.astermargin-run-status-popup .astermargin-run-status-popup__batch-progress .batch-progress-bar {
+    margin: 0;
+    border: 1px solid var(--astermargin-border-subtle);
+    border-radius: 8px;
+    background: var(--astermargin-fill-subtle);
+}
+
+.astermargin-run-status-popup__footer {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding-top: 2px;
+}
+
+.astermargin-run-status-popup .astermargin-run-status-popup__footer > button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+/* Stands in for the permission menu while the run reconnects, and gives
+ * way the same way. */
+.astermargin-run-status-popup__reconnecting {
+    flex: 0 1 auto;
+    min-width: 0;
+    font-size: 0.875rem;
+}
+
+/* The permission menu gives way first: its label truncates before a
+ * decision button wraps. */
+.astermargin-run-status-popup__permission {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.astermargin-run-status-popup__permission > *,
+.astermargin-run-status-popup .astermargin-run-status-popup__permission button {
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.astermargin-run-status-popup .astermargin-run-status-popup__permission button > * {
+    min-width: 0;
+}
+
+.astermargin-run-status-popup__rows {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--astermargin-border-subtle);
+    border-radius: 8px;
+    background: var(--astermargin-fill-subtle);
+    overflow: hidden;
+}
+
+/* Doubled selector: the pane-wide `[id^="astermargin-pane-"] button { all: revert }`
+ * reset outranks a single class. */
+.astermargin-run-status-popup .astermargin-run-status-popup__row {
+    appearance: none;
+    -moz-appearance: none;
+    margin: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 5px 8px;
+    font-size: 0.875rem;
+    line-height: 18px;
+    cursor: pointer;
+}
+
+.astermargin-run-status-popup__row + .astermargin-run-status-popup__row {
+    border-top: 1px solid var(--astermargin-border-subtle);
+}
+
+.astermargin-run-status-popup__row:hover {
+    background: var(--astermargin-fill-hover);
+}
+
+.astermargin-run-status-popup__row:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+}
+
+.astermargin-run-status-popup__row-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* A fixed label keeps its width; the trail beside it truncates first. */
+.astermargin-run-status-popup__row-text--fixed {
+    flex: 0 0 auto;
+}
+
+.astermargin-run-status-popup__row-trail {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-run-status-popup__row-arrow {
+    flex: 0 0 auto;
+    opacity: 0;
+    transition: opacity 120ms ease;
+}
+
+.astermargin-run-status-popup__row:hover .astermargin-run-status-popup__row-arrow {
+    opacity: 1;
+}
+
+/* Quick prompt: a composer for a new chat, in the corner of the main window
+ * while the sidebar is closed (react/components/quickPrompt). Sits inside
+ * #astermargin-pane-floating-popup above the run status popup, in the same frame. */
+.astermargin-quick-prompt {
+    position: relative;
+    align-self: flex-end;
+    width: 324px;
+    max-width: 100%;
+    margin: 0 4px 12px 0;
+    cursor: default;
+    text-align: left;
+}
+
+.astermargin-quick-prompt__card {
+    position: relative;
+    box-sizing: border-box;
+    border: 1px solid var(--astermargin-border-strong);
+    border-radius: 12px;
+    background: var(--astermargin-surface-overlay);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14), 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.astermargin-quick-prompt__dismiss {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 120ms ease;
+}
+
+/* The close button only appears while the pointer is on the card, or when
+ * it has keyboard focus itself. */
+.astermargin-quick-prompt__card:hover .astermargin-quick-prompt__dismiss,
+.astermargin-quick-prompt__dismiss:focus-within {
+    opacity: 1;
+}
+
+/* Room in the corner for the close button: the chips wrap before it, and
+ * the text does not run under it. A margin on the scroll host, not padding
+ * on the contenteditable: that one is `width: 100%` in the content box, so
+ * padding would push it past the host and raise a horizontal scrollbar. */
+.astermargin-quick-prompt__composer .composer-attachments {
+    padding-right: 28px;
+}
+
+.astermargin-quick-prompt__composer .astermargin-lexical-scroll {
+    margin-right: 24px;
+}
+
+/* The composer's popup messages (an item removed, a summary of what was
+ * attached) anchor above the card, as they do above the sidebar's composer. */
+.astermargin-quick-prompt__composer {
+    position: relative;
+}
+
+/* The popup is the frame, so the composer gives up its own. */
+.astermargin-quick-prompt__composer > .user-message-display {
+    margin: 0;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    box-shadow: none;
+}
+
+.astermargin-quick-prompt__notice {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 10px;
+    min-width: 0;
+    padding: 10px 36px 0 12px;
+}
+
+.astermargin-quick-prompt__notice-mark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+}
+
+.astermargin-quick-prompt__notice-text {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 2px;
+    /* Lines up with the close button beside it. */
+    padding-top: 2px;
+}
+
+.astermargin-quick-prompt__notice-title {
+    font-size: 0.95rem;
+    font-weight: 500;
+    line-height: 20px;
+}
+
+.astermargin-quick-prompt__notice-detail {
+    font-size: 0.875rem;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.astermargin-quick-prompt__footer {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px 10px 12px;
+}
+
+/* The onboarding tip's visual: the real card's top-left corner, run off the
+ * tip's right edge and faded out toward the right and the bottom. */
+.astermargin-run-status-tip__preview {
+    height: 78px;
+    overflow: hidden;
+    /* Room for the card's shadow on the left and top. */
+    padding: 6px 0 0 6px;
+    margin-left: -6px;
+    mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+}
+
+.astermargin-run-status-tip__preview-clip {
+    mask-image: linear-gradient(to right, black 60%, transparent 100%);
+}
+
+.astermargin-run-status-tip__preview-card {
+    width: 324px;
+    cursor: default;
+}
+
+/* Release-note showcases (react/components/ui/popup/showcases): the corner
+ * cards drawn right on the note, from their own classes, in a slot sized for
+ * the tallest of them so the note does not jump as the scene changes; a
+ * Decorative only. */
+.astermargin-showcase {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    /* Closer to the text above than the note's own gap puts it. */
+    margin-top: -6px;
+    pointer-events: none;
+    user-select: none;
+}
+
+.astermargin-showcase__stage {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* The composer card with its two-line prompt, the tallest scene. */
+    height: 120px;
+    /* Softened toward the bottom-right, like the feature tips' previews, so
+     * the visual reads as an illustration rather than a live card. */
+    mask-image: linear-gradient(to bottom right, black 45%, rgba(0, 0, 0, 0.45) 100%);
+}
+
+.astermargin-showcase__chord {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.astermargin-showcase__key {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    min-width: 34px;
+    height: 36px;
+    padding: 0 10px;
+    border: 1px solid var(--astermargin-border-strong);
+    border-radius: 8px;
+    background: var(--astermargin-surface-overlay);
+    box-shadow: 0 2px 0 var(--fill-quarternary);
+    color: var(--fill-primary);
+    font-size: 15px;
+    font-weight: 500;
+    transition: transform 90ms ease, box-shadow 90ms ease, background-color 90ms ease;
+}
+
+/* Keycaps beside a line of text, rather than the showcase's centerpiece. */
+.astermargin-showcase__chord--small {
+    gap: 3px;
+}
+
+.astermargin-showcase__chord--small .astermargin-showcase__key {
+    min-width: 19px;
+    height: 19px;
+    padding: 0 5px;
+    border-radius: 5px;
+    box-shadow: 0 1px 0 var(--fill-quarternary);
+    font-size: 12px;
+}
+
+.astermargin-showcase__chord--pressed .astermargin-showcase__key {
+    transform: translateY(2px);
+    box-shadow: 0 0 0 var(--fill-quarternary);
+    background: var(--fill-quinary);
+}
+
+/* The wrapper also carries the real cards' container classes (for the rules
+ * scoped under them), so their corner geometry is overridden here. */
+.astermargin-showcase__card,
+.astermargin-showcase__card.astermargin-quick-prompt,
+.astermargin-showcase__card.astermargin-run-status-popup {
+    position: relative;
+    align-self: center;
+    width: 100%;
+    max-width: 324px;
+    margin: 0;
+    padding: 0;
+    animation: astermarginShowcaseCardIn 240ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes astermarginShowcaseCardIn {
+    from {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+.astermargin-showcase__run-card {
+    cursor: default;
+}
+
+/* The editor line, with the composer's typography. */
+.astermargin-showcase__editor {
+    min-height: calc(1.25em + 2px);
+    padding: 1px 0;
+    color: var(--fill-primary);
+    font-size: 13px;
+    line-height: 1.25;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.astermargin-showcase__placeholder {
+    color: var(--fill-tertiary);
+}
+
+.astermargin-showcase__caret {
+    display: inline-block;
+    width: 1px;
+    height: 1.1em;
+    margin: 0 1px;
+    vertical-align: text-bottom;
+    background: var(--fill-primary);
+    animation: astermarginShowcaseCaret 1s steps(1, end) infinite;
+}
+
+@keyframes astermarginShowcaseCaret {
+    50% {
+        opacity: 0;
+    }
+}
+
+.astermargin-showcase__model {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.9rem;
+}
+
+.astermargin-showcase__send--pressed {
+    transform: scale(0.85);
+    transition: transform 120ms ease;
+}
+
+/* The research-table showcase (showcases/ResearchTableShowcase): a small
+ * table filling in, then an answer's passage card. The cells carry the
+ * research table's own `rt-*` classes for the fill's shimmer and landing; the
+ * rules here only shrink that grid to fit the note. Sized in px like the other
+ * showcases, and scoped under `.astermargin-root` to outrank the table sheet. */
+.astermargin-table-showcase__stage {
+    position: relative;
+    /* Three rows and the top of a fourth, with room under the first row's
+     * answer for its passage card. */
+    height: 196px;
+}
+
+.astermargin-root .astermargin-table-showcase__table {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    border: 1px solid var(--fill-quinary);
+    border-radius: 8px;
+    background: var(--material-background);
+    color: var(--fill-primary);
+    font-size: 11px;
+    line-height: 14px;
+    /* The table runs on below the slot: its last row fades out. */
+    mask-image: linear-gradient(to bottom, black 82%, transparent 100%);
+}
+
+.astermargin-root .astermargin-table-showcase__bar {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 6px 0 8px;
+    border-bottom: 1px solid var(--fill-quinary);
+}
+
+.astermargin-root .astermargin-table-showcase__name {
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-root .astermargin-table-showcase__fill {
+    display: inline-flex;
+    transition: transform 120ms ease;
+}
+
+.astermargin-root .astermargin-table-showcase__fill--pressed {
+    transform: scale(0.9);
+}
+
+.astermargin-root .astermargin-table-showcase__status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding-right: 2px;
+    color: var(--fill-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.astermargin-root .astermargin-table-showcase__pulse {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-blue);
+    animation: rt-fill-pulse 1.4s ease-in-out infinite;
+}
+
+/* The fill's rule along the bar's bottom edge, as the chat's fill bar draws it. */
+.astermargin-root .astermargin-table-showcase__progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 2px;
+    background: var(--fill-quinary);
+}
+
+.astermargin-root .astermargin-table-showcase__progress > span {
+    display: block;
+    height: 100%;
+    background: var(--accent-blue);
+    transition: width 0.3s ease;
+}
+
+.astermargin-root .astermargin-table-showcase__grid {
+    display: grid;
+    grid-template-columns: 98px 60px minmax(0, 1fr);
+}
+
+.astermargin-root .astermargin-table-showcase__head {
+    padding: 5px 6px;
+    border-bottom: 1px solid var(--fill-quinary);
+    background: var(--fill-senary);
+    color: var(--fill-secondary);
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-root .astermargin-table-showcase__head:not(:nth-child(3n)),
+.astermargin-root .astermargin-table-showcase__cell:not(:nth-child(3n)) {
+    border-right: 1px solid var(--fill-quinary);
+}
+
+.astermargin-root .astermargin-table-showcase__cell {
+    box-sizing: border-box;
+    min-width: 0;
+    height: 44px;
+    padding: 7px 6px;
+    border-bottom: 1px solid var(--fill-quinary);
+    overflow: hidden;
+    cursor: default;
+}
+
+.astermargin-root .astermargin-table-showcase__item {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.astermargin-root .astermargin-table-showcase__title {
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-root .astermargin-table-showcase__byline {
+    color: var(--fill-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.astermargin-root .astermargin-table-showcase .rt-fill-lines {
+    gap: 7px;
+    padding-top: 4px;
+}
+
+.astermargin-root .astermargin-table-showcase .rt-fill-line {
+    height: 6px;
+}
+
+.astermargin-root .astermargin-table-showcase .rt-cell-body {
+    display: block;
+    max-height: none;
+}
+
+.astermargin-root .astermargin-table-showcase__pill {
+    height: 18px;
+    padding: 0 6px;
+    font-size: 10px;
+    line-height: 18px;
+}
+
+.astermargin-root .astermargin-table-showcase__finding {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.astermargin-root .astermargin-table-showcase__tag {
+    height: 14px;
+    margin: 0;
+    padding: 0 4px;
+    border-radius: 3px;
+    font-size: 10px;
+    line-height: 14px;
+    vertical-align: baseline;
+    transition: box-shadow 120ms ease;
+}
+
+.astermargin-root .astermargin-table-showcase__tag--hovered {
+    box-shadow: inset 0 0 0 1px var(--tag-blue-primary);
+}
+
+/* The page tag's passage card, open under the first row's answer. */
+.astermargin-root .astermargin-table-showcase__evidence {
+    position: absolute;
+    top: 92px;
+    left: 6px;
+    right: 6px;
+    z-index: 1;
+    max-width: none;
+    overflow: hidden;
+    animation: astermarginShowcaseCardIn 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.astermargin-root .astermargin-table-showcase__evidence .rt-evidence-card {
+    gap: 5px;
+    padding: 8px 10px;
+    font-size: 11px;
+    line-height: 15px;
+}
+
+.astermargin-root .astermargin-table-showcase__evidence .rt-card-meta,
+.astermargin-root .astermargin-table-showcase__evidence .rt-link-button {
+    font-size: 10.5px;
+}
+
+.astermargin-root .astermargin-table-showcase__evidence .rt-quote {
+    padding-left: 8px;
+    line-height: 15px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .astermargin-root .astermargin-table-showcase__pulse,
+    .astermargin-root .astermargin-table-showcase__evidence {
+        animation: none;
+    }
+}
+
+/* The export tip's visual (featureTips/NoteExportTipShowcase): the end of a
+ * response with the note's row and its export menu, then the document in Word, cross-fading in one slot
+ * sized for the open menu, with a pointer that walks through the clicks.
+ * Decorative only. */
+.astermargin-export-tip {
+    width: 100%;
+    margin-top: -2px;
+    pointer-events: none;
+    user-select: none;
+}
+
+.astermargin-export-tip__stage {
+    position: relative;
+    height: 196px;
+    overflow: hidden;
+    /* Room for the cards' shadows and the menu's. */
+    padding: 2px;
+    margin: -2px;
+}
+
+.astermargin-export-tip__layer {
+    position: absolute;
+    inset: 2px;
+    transition: opacity 360ms ease, transform 360ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.astermargin-export-tip__layer--document {
+    transform-origin: 50% 0;
+}
+
+.astermargin-export-tip__layer--hidden {
+    opacity: 0;
+    transform: scale(0.97);
+}
+
+.astermargin-export-tip__layer--document.astermargin-export-tip__layer--hidden {
+    transform: translateY(8px) scale(0.98);
+}
+
+.astermargin-export-tip__row {
+    cursor: default;
+}
+
+/* The response runs on above the slot: its tail, faded in from the top. */
+.astermargin-export-tip__run-end {
+    justify-content: flex-end;
+    height: 100%;
+}
+
+.astermargin-export-tip .astermargin-export-tip__response {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    mask-image: linear-gradient(to bottom, transparent 0%, black 65%);
+}
+
+.astermargin-export-tip .astermargin-export-tip__response p {
+    margin: 0;
+}
+
+.astermargin-export-tip__anchor {
+    position: relative;
+    display: flex;
+}
+
+.astermargin-export-tip__button {
+    transition: background-color 120ms ease, transform 90ms ease;
+}
+
+.astermargin-export-tip__button--active {
+    background: var(--fill-quinary);
+}
+
+.astermargin-export-tip__button--pressed,
+.astermargin-export-tip__item--pressed {
+    transform: scale(0.92);
+}
+
+.astermargin-export-tip__menu {
+    position: absolute;
+    bottom: calc(100% + 4px);
+    right: 0;
+    z-index: 1;
+    width: 132px;
+    animation: astermarginExportTipMenuIn 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.astermargin-export-tip__menu .astermargin-menu-item {
+    transition: background-color 120ms ease, transform 90ms ease;
+}
+
+@keyframes astermarginExportTipMenuIn {
+    from {
+        opacity: 0;
+        transform: translateY(4px);
+    }
+
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+/* Word, in its own colors in either theme. */
+.astermargin-export-tip__word {
+    height: 100%;
+    overflow: hidden;
+    /* The page runs on below the slot. */
+    mask-image: linear-gradient(to bottom, black 86%, transparent 100%);
+    border: 1px solid var(--astermargin-border-default);
+    border-radius: var(--astermargin-radius-card);
+    background: #f3f3f3;
+    color: #1f1f1f;
+    font-family: "Aptos", "Calibri", "Segoe UI", -apple-system, sans-serif;
+}
+
+.astermargin-export-tip__word-titlebar {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    height: 26px;
+    padding: 0 10px;
+    background: #185abd;
+    color: #fff;
+    font-size: 11.5px;
+}
+
+.astermargin-export-tip__word-logo {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    border-radius: 3px;
+    background: #fff;
+    color: #185abd;
+    font-size: 10.5px;
+    font-weight: 700;
+}
+
+.astermargin-export-tip__word-ribbon {
+    display: flex;
+    gap: 14px;
+    height: 24px;
+    align-items: center;
+    padding: 0 12px;
+    overflow: hidden;
+    border-bottom: 1px solid #e1e1e1;
+    background: #fff;
+    color: #424242;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.astermargin-export-tip__word-tab--zotero {
+    align-self: stretch;
+    display: inline-flex;
+    align-items: center;
+    border-bottom: 2px solid #185abd;
+    color: #185abd;
+    font-weight: 600;
+}
+
+.astermargin-export-tip__word-canvas {
+    padding: 12px 18px 0 18px;
+}
+
+.astermargin-export-tip__word-page {
+    padding: 16px 22px;
+    background: #fff;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.12);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.astermargin-export-tip__word-page p {
+    margin: 0 0 10px 0;
+}
+
+.astermargin-export-tip__word-heading {
+    margin-bottom: 4px;
+    color: #0f4761;
+    font-size: 14px;
+}
+
+.astermargin-export-tip__word-heading--minor {
+    font-size: 12px;
+}
+
+.astermargin-export-tip__word-citation {
+    border-radius: 1px;
+    transition: background-color 120ms ease;
+}
+
+/* Word's shading of a field — here, Zotero's citation field — under the caret. */
+.astermargin-export-tip__word-citation--field {
+    background: #d9d9d9;
+}
+
+.astermargin-export-tip__word-bibliography {
+    padding-left: 2em;
+    text-indent: -2em;
+}
+
+/* The mouse pointer the tip and the release-note showcases walk through their
+ * clicks (showcases/ShowcasePointer). */
+.astermargin-showcase__pointer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 2;
+    transition: transform 560ms cubic-bezier(0.45, 0, 0.2, 1), opacity 200ms ease;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.25));
+}
+
+.astermargin-showcase__pointer--hidden {
+    opacity: 0;
+}
+
+.astermargin-showcase__pointer-glyph {
+    display: flex;
+    transform-origin: 0 0;
+    transition: transform 90ms ease;
+}
+
+/* The I-beam's hotspot is its middle, not its top-left. */
+.astermargin-showcase__pointer-glyph--text {
+    margin: -9px 0 0 -5px;
+    transform-origin: 50% 50%;
+}
+
+.astermargin-showcase__pointer-glyph--pressed {
+    transform: scale(0.86);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .astermargin-export-tip__layer,
+    .astermargin-showcase__pointer,
+    .astermargin-export-tip__menu {
+        transition: none;
+        animation: none;
+    }
+}
+
+/* A working run: a dot with a ring that keeps expanding out of it and fading. */
+.astermargin-run-pulse {
+    position: relative;
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+}
+
+.astermargin-run-pulse__dot {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-blue);
+}
+
+.astermargin-run-pulse__ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 2px solid var(--accent-blue);
+    opacity: 0;
+    transform: scale(0.4);
+    animation: astermarginRunPulseRing 2.2s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+}
+
+.astermargin-run-pulse__ring:nth-child(2) {
+    animation-delay: 1.1s;
+}
+
+@keyframes astermarginRunPulseRing {
+    0% { transform: scale(0.4); opacity: 1; }
+    75% { transform: scale(1.05); opacity: 0; }
+    100% { transform: scale(1.05); opacity: 0; }
+}
+
+/* Toolbar Button */
+#zotero-astermargin-tb-chat-toggle {
+    list-style-image: url("chrome://astermargin/content/icons/toolbar-20.svg");
+    -moz-context-properties: fill, fill-opacity, stroke, stroke-opacity;
+    fill: var(--fill-secondary);
+    stroke: var(--fill-secondary);
+    width: 28px;
+    height: 28px;
+    padding: 4px;
+}
+
+#zotero-astermargin-tb-chat-toggle:hover {
+    background-color: var(--fill-quinary);
+}
+
+#zotero-astermargin-tb-chat-toggle:active,
+#zotero-astermargin-tb-chat-toggle[selected] {
+    background-color: var(--fill-quarternary);
+}
+
+#zotero-astermargin-tb-chat-toggle[disabled] {
+    opacity: .5;
+}
+
+[id^="astermargin-pane-"] button,
+[id^="astermargin-pane-"] textarea,
+[id^="astermargin-pane-"] input {
+    all: revert;
+}
+
+[id^="astermargin-pane-"] .sources-info {
+    display: inline-flex;
+    align-items: center;
+    cursor: default;
+    /* border: 1px solid var(--accent-blue10);
+    background-color: var(--accent-blue10); */
+    border: 1px solid var(--fill-quinary);
+    background-color: var(--fill-quinary);
+    border-radius: 4px;
+    color: var(--fill-secondary);
+    user-select: none;
+    line-height: 1.2;
+    font-size: 0.85rem;
+    padding-left: 0.1rem;
+    padding-right: 0.2rem;
+}
+
+[id^="astermargin-pane-"] .source-remove {
+    /* margin-left: 0.25rem; */
+    /* margin-right: 0.15rem; */
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--fill-tertiary);
+    cursor: pointer;
+    opacity: 0.6;
+    font-size: 1.1em;
+    display: inline-flex;
+    align-items: center;
+    transition: all 0.2s ease-in-out;
+}
+
+[id^="astermargin-pane-"] .source-remove:hover {
+    opacity: 1;
+    color: var(--fill-primary);
+    background-color: var(--fill-quinary);
+    border-radius: 4px;
+}
+
+/* Fixed leading-icon slot for context chips — keeps chip height/width stable when
+   the hover remove "x" overlays the normal icon instead of replacing it. */
+[id^="astermargin-pane-"] .chip-icon-slot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .chip-icon-slot-normal,
+[id^="astermargin-pane-"] .chip-icon-slot-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: none;
+}
+
+[id^="astermargin-pane-"] .chip-icon-slot-remove {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* CSS :hover on the chip — survives layout reflow under a stationary cursor
+   (React mouseenter/mouseleave does not re-fire when siblings are removed). */
+[id^="astermargin-pane-"] .source-button:hover .chip-icon-slot-normal,
+[id^="astermargin-pane-"] .chip-icon-slot-remove-open .chip-icon-slot-normal {
+    opacity: 0;
+    visibility: hidden;
+}
+
+[id^="astermargin-pane-"] .source-button:hover .chip-icon-slot-remove,
+[id^="astermargin-pane-"] .chip-icon-slot-remove-open .chip-icon-slot-remove {
+    opacity: 0.6;
+    visibility: visible;
+    pointer-events: auto;
+}
+
+/* Component: AsterMargin Chat */
+[id^="astermargin-pane-"] .chat-container {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+}
+
+/* The popup message card (PopupMessageItem), which renders either over the main
+   Zotero window or inside the pane. It floats either way, so it takes the
+   overlay surface — though the component also sets background and border
+   inline, which is what actually paints. */
+[id^="astermargin-pane-"] .source-preview {
+    background-color: var(--astermargin-surface-overlay);
+    color: var(--fill-secondary);
+    /* border: 1px solid var(--fill-quinary); */
+    border-radius: 6px;
+    user-select: text;
+    margin-bottom: 0.5rem;
+    max-height: 380px;
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    animation: fadeIn 0.3s ease-in-out forwards;
+}
+
+[id^="astermargin-pane-"] .source-preview.no-fade {
+    animation: none;
+    opacity: 1;
+}
+
+/* A release note is as tall as what it has to show — a showcase does not fit
+ * the cap above, and nothing in the card scrolls. */
+[id^="astermargin-pane-"] .source-preview.astermargin-popup-message--unbounded {
+    max-height: none;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+[id^="astermargin-pane-"] .source-content {
+    background-color: var(--astermargin-fill-subtle);
+    border-radius: 8px;
+    overflow-y: auto;
+    min-height: 1.5rem;
+}
+
+/* Bars docked to the composer's top edge. The geometry — the bleed that cancels
+   the card's padding, and the top-corner radius — comes from
+   `.composer-docked-bar` (agent-ui-components.css), which each of these also
+   wears. Only what they paint is here, because only these components are
+   Zotero's; the batch progress bar is shared, so its fill lives beside the
+   geometry. */
+
+/* Pending approvals. */
+[id^="astermargin-pane-"] .pending-actions-bar {
+    background-color: var(--astermargin-fill-bar);
+}
+
+/* High token usage warning. */
+[id^="astermargin-pane-"] .high-token-usage-warning-bar {
+    background-color: var(--tag-yellow-senary);
+    border-bottom: 1px solid var(--fill-quinary);
+}
+
+/* First-run "Next steps" panel. */
+[id^="astermargin-pane-"] .next-steps-panel {
+    border-bottom: 1px solid var(--fill-quarternary);
+}
+
+/* Offer to carry on from a run that ended unfinished. */
+[id^="astermargin-pane-"] .run-continue-panel {
+    background-color: var(--astermargin-fill-bar);
+    border-bottom: 1px solid var(--fill-quinary);
+}
+
+/* The chat is closed to this window: responding elsewhere, deleted, or its
+   history changed in another window. */
+[id^="astermargin-pane-"] .thread-presence-bar {
+    background-color: var(--astermargin-fill-bar);
+    border-bottom: 1px solid var(--fill-quinary);
+}
+
+/* A chat fill's progress. The surface is `.batch-progress-bar`'s; this lays
+   out its two lines: glyph, title and actions on the first, what is happening
+   on the second, indented under the title. The rule along the top edge draws
+   rows filled and rows that could not be read. */
+[id^="astermargin-pane-"] .table-fill-progress {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-rule {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    display: flex;
+    overflow: hidden;
+    pointer-events: none;
+    background-color: var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-filled {
+    background-color: var(--accent-blue);
+    transition: width 0.3s ease;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-failed {
+    background-color: var(--tag-orange);
+    transition: width 0.3s ease;
+}
+
+/* Stopping: the rule stays, faded, while the papers underway finish. */
+[id^="astermargin-pane-"] .table-fill-progress-rule-stopping .table-fill-progress-filled,
+[id^="astermargin-pane-"] .table-fill-progress-rule-stopping .table-fill-progress-failed {
+    opacity: 0.4;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-body {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 0.5rem;
+    row-gap: 0.1rem;
+    align-items: center;
+    padding: 0.55rem 0.75rem 0.6rem;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-glyph {
+    width: 14px;
+    height: 14px;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-head {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-weight: 600;
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-status {
+    grid-column: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 0.5rem;
+    min-width: 0;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-text {
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-warning {
+    color: var(--tag-orange-primary);
+}
+
+/* "· 2 couldn't be read" wraps as one phrase. */
+[id^="astermargin-pane-"] .table-fill-progress-text .table-fill-progress-warning {
+    white-space: nowrap;
+}
+
+/* A follow-up on line two: a link, not a button. */
+[id^="astermargin-pane-"] .table-fill-progress-link {
+    font: inherit;
+    font-weight: 600;
+    color: var(--accent-blue);
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-link:hover {
+    text-decoration: underline;
+}
+
+[id^="astermargin-pane-"] .table-fill-progress-link:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
+    border-radius: 2px;
+}
+
+/* An artifact at the end of a run, a note or a table: a glyph, two lines
+   (the artifact, then its condition) and the buttons at the right. The whole
+   card opens the artifact, so it lights up as one on hover. A running fill
+   draws the composer fill bar's progress rule along its top edge. */
+[id^="astermargin-pane-"] .run-artifact {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .run-artifact-body {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+    padding: 0.5rem 0.75rem 0.5rem 0.75rem;
+    transition: background-color 0.12s ease-in-out;
+}
+
+[id^="astermargin-pane-"] .run-artifact-interactive > .run-artifact-body {
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .run-artifact-interactive > .run-artifact-body:hover {
+    background-color: var(--fill-quinary);
+}
+
+/* The card's Open darkens with it: what a click anywhere on the card does. */
+[id^="astermargin-pane-"] .run-artifact-interactive > .run-artifact-body:hover .run-artifact-open svg {
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-target {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: inherit;
+}
+
+[id^="astermargin-pane-"] button.run-artifact-target:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+    border-radius: 3px;
+}
+
+[id^="astermargin-pane-"] .run-artifact-glyph {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    color: var(--accent-blue);
+}
+
+[id^="astermargin-pane-"] .run-artifact-lines {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .run-artifact-headline {
+    font-size: 0.95rem;
+    font-weight: 600;
+    line-height: 1.35;
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-condition {
+    font-size: 0.85rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-warning {
+    color: var(--tag-orange-primary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .run-artifact-message {
+    padding: 0 0.75rem 0.5rem;
+    font-size: 0.85rem;
+    color: var(--fill-tertiary);
+}
+
+/* The artifact is gone: the reason in grey, nothing to press. */
+[id^="astermargin-pane-"] .run-artifact-muted .run-artifact-glyph,
+[id^="astermargin-pane-"] .run-artifact-muted .run-artifact-headline {
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-muted .run-artifact-condition {
+    color: var(--fill-tertiary);
+}
+
+/* A group's cards, unfolded under it: indented so their glyphs sit under
+   the group's lines, each divided from the next. */
+[id^="astermargin-pane-"] .run-artifact-members {
+    border-top: 1px solid var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-members > .run-artifact + .run-artifact {
+    border-top: 1px solid var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .run-artifact-members .run-artifact-body {
+    padding-left: 2rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    [id^="astermargin-pane-"] .table-fill-progress-filled,
+    [id^="astermargin-pane-"] .table-fill-progress-failed {
+        transition: none;
+    }
+}
+
+/* Disclosure hover, shared by the batch progress bar and the run receipt. The
+   bar's own surface and its bleed into the composer's top edge live in
+   agent-ui-components.css, with the composer whose padding they cancel; the
+   receipt is a transcript card (`BatchDoneRows` clips its corners) and gets no
+   bleed. Skip `.batch-outcome-target` — nested buttons with their own
+   underline, not a second disclosure. */
+[id^="astermargin-pane-"] .batch-progress-bar [role="button"]:not(.batch-outcome-target):hover,
+[id^="astermargin-pane-"] .batch-run-receipt [role="button"]:not(.batch-outcome-target):hover {
+    background-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .batch-progress-bar [role="button"]:not(.batch-outcome-target):focus-visible,
+[id^="astermargin-pane-"] .batch-run-receipt [role="button"]:not(.batch-outcome-target):focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 1px var(--fill-tertiary);
+}
+
+/* Credit info bar below composer */
+[id^="astermargin-pane-"] .credit-info-bar {
+    margin-top: 0.25rem;
+    padding: 0.15rem 0.25rem;
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .credit-info-bar:hover .credit-info-bar-text {
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .credit-info-bar:hover .credit-info-bar-icon {
+    color: var(--fill-secondary);
+}
+
+/* UserRequestView - Clickable user message display */
+[id^="astermargin-pane-"] .user-request-view {
+    cursor: pointer;
+    transition: border-color 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .user-request-view-hover {
+    /* No `filter` here: a filter makes this element the containing block for
+       position:fixed descendants, which displaces the inline context menus
+       rendered by the attachment chips. */
+    border-color: var(--fill-quarternary);
+    background-color: var(--astermargin-surface-overlay);
+}
+
+[id^="astermargin-pane-"] .user-request-view-editing {
+    /* Keep it visible but dimmed when editing overlay is shown */
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Content fade effect when text is truncated */
+[id^="astermargin-pane-"] .user-request-content {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .user-request-content-fade {
+    -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+}
+
+/* Edit icon in bottom right corner */
+[id^="astermargin-pane-"] .user-request-edit-icon {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    padding: 4px;
+    border-radius: 4px;
+    /* background-color: var(--fill-quinary); */
+    color: var(--fill-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.8;
+    transition: opacity 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .user-request-view-hover .user-request-edit-icon {
+    opacity: 1;
+}
+
+/* Unsent edits: accent-colored pencil, visible without hover. */
+[id^="astermargin-pane-"] .user-request-edit-icon-stashed {
+    color: var(--accent-blue);
+    opacity: 1;
+}
+
+/* Edit overlay - positioned absolutely over the original */
+[id^="astermargin-pane-"] .user-request-edit-overlay {
+    position: absolute;
+    top: 4px;
+    left: 10px;
+    right: 10px;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+/* Edit textarea - allows larger content with scrolling */
+[id^="astermargin-pane-"] .user-request-edit-textarea {
+    max-height: unset !important;
+    overflow-y: auto;
+}
+
+[id^="astermargin-pane-"] .source-error-message {
+    background-color: var(--fill-senary);
+    border: 1px solid var(--tag-red);
+    border-radius: 4px;
+    padding: 0.5rem 1rem;
+    font-size: 0.9rem;
+    animation: fadeInShift 0.3s ease-in-out;
+}
+
+@keyframes fadeInShift {
+    from { opacity: 0; transform: translateY(-10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Attachment and Note Item Hover Effect */
+[id^="astermargin-pane-"] .attachment-item {
+    border-radius: 4px;
+    transition: background-color 0.2s ease-in-out;
+}
+
+[id^="astermargin-pane-"] .attachment-item:hover {
+    background-color: var(--fill-senary);
+    border-radius: 4px;
+}
+
+/* Optional: style for content area if needed */
+[id^="astermargin-pane-"] .source-content {
+    min-height: 1.5rem;
+}
+
+/* -----------------------------------------------------------
+ * Lexical-based rich input (replaces textarea in InputArea)
+ * --------------------------------------------------------- */
+
+[id^="astermargin-pane-"] .astermargin-lexical-root {
+    position: relative;
+    width: 100%;
+}
+
+/* Scroll host around the contenteditable. Carries the height cap + scrolling. */
+[id^="astermargin-pane-"] .astermargin-lexical-scroll {
+    position: relative;
+    max-height: 12.5em;
+    overflow-y: auto;
+}
+
+/* The contenteditable also carries `.chat-input` (agent-ui-components.css) for
+   its typography, and replaces the height band that rule sets — it grows with
+   its content and lets `.astermargin-lexical-scroll` above own the cap. This sheet
+   loads after the package sheets, so these declarations win the tie. */
+[id^="astermargin-pane-"] .astermargin-lexical-content {
+    min-height: calc(1.25em + 2px);
+    height: auto;
+    max-height: none;
+    white-space: pre-wrap;
+    word-break: break-word;
+    outline: none;
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+/* Reset the Lexical paragraph's default browser margin (1em top/bottom).
+   Without this the first line is pushed ~13px below the editor's top edge,
+   so the absolutely-positioned placeholder (and the slash/source menus that
+   anchor to the editor's bounding rect) sit too high relative to the text. */
+[id^="astermargin-pane-"] .astermargin-lexical-content p {
+    margin: 0;
+}
+
+/* Placeholder overlay - absolutely positioned and click-through. */
+[id^="astermargin-pane-"] .astermargin-lexical-placeholder {
+    position: absolute;
+    top: 1px;
+    left: 0;
+    pointer-events: none;
+    color: var(--fill-tertiary);
+    font-size: 13px;
+    line-height: 1.25;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+[id^="astermargin-pane-"] .astermargin-lexical-placeholder::before {
+    content: attr(data-placeholder);
+}
+
+[id^="astermargin-pane-"] .astermargin-lexical-scroll:not([data-placeholder-visible="true"]) .astermargin-lexical-placeholder {
+    display: none;
+}
+
+/* Argument-hint ghost text - rendered after a freshly inserted /command pill.
+   It is positioned out of flow so long hints do not resize the composer. */
+[id^="astermargin-pane-"] .astermargin-lexical-content p[data-argument-hint] {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .astermargin-lexical-content p[data-argument-hint]::after {
+    content: attr(data-argument-hint);
+    position: absolute;
+    left: var(--astermargin-argument-hint-left, 0);
+    right: 0;
+    top: var(--astermargin-argument-hint-top, 0);
+    color: var(--fill-tertiary);
+    overflow: hidden;
+    pointer-events: none;
+    text-overflow: ellipsis;
+    user-select: none;
+    -webkit-user-select: none;
+    white-space: nowrap;
+}
+
+/* Mention pill - uses the same .source-button / .variant-outline styling
+   shared with MessageItemButton so pills feel native. */
+[id^="astermargin-pane-"] .astermargin-mention-pill {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    margin: 0 1px;
+}
+
+/* Slash-command - editable colored text (behaves like normal text, so it must
+   stay `display: inline`; inline-block breaks caret placement between characters
+   in Gecko). Horizontal padding, background and radius still render inline. */
+[id^="astermargin-pane-"] .astermargin-slash-command {
+    display: inline;
+    padding: 2px 4px;
+    /* margin: 0 1px; */
+    border-radius: 6px;
+    background-color: var(--tag-blue-quarternary);
+    color: var(--tag-blue-primary);
+    line-height: 1.25;
+    transition: background-color 200ms ease-in-out;
+}
+
+/* In-input pill: clicking it opens the action in the preferences window. */
+[id^="astermargin-pane-"] .astermargin-slash-command-live {
+    cursor: pointer;
+}
+
+/* Chat-history pill: clicking it opens the action in the preferences window. */
+[id^="astermargin-pane-"] .astermargin-slash-command-clickable {
+    cursor: pointer;
+}
+
+/* Hover feedback for clickable pills (one step up the tag-blue scale). */
+[id^="astermargin-pane-"] .astermargin-slash-command-live:hover,
+[id^="astermargin-pane-"] .astermargin-slash-command-clickable:hover {
+    background-color: var(--tag-blue-tertiary);
+}
+
+/* Pill whose action no longer exists (deleted since the message was sent):
+   greyed out, no click affordance, no hover feedback. */
+[id^="astermargin-pane-"] .astermargin-slash-command-missing,
+[id^="astermargin-pane-"] .astermargin-slash-command-missing:hover {
+    background-color: var(--fill-quinary);
+    color: var(--fill-secondary);
+    cursor: default;
+}
+
+
+[id^="astermargin-pane-"] .preference-input {
+    font-family: system-ui, -apple-system, sans-serif;
+    border-radius: 0.125rem;
+    border: 1px solid var(--fill-quinary);
+    background-color: var(--fill-senary);
+    outline: none;
+}
+
+[id^="astermargin-pane-"] .preference-input:focus {
+    border-radius: 0.125rem;
+    border: 1px solid var(--fill-quinary);
+    background-color: var(--fill-senary);
+    outline: none;
+}
+
+/* Neutralize the focus background Zotero's Windows theme paints on inputs.
+ * Selects are exempt: their dropdown arrow is that background image. */
+[id^="astermargin-pane-"] .preference-input:not(select):focus {
+    background-image: none !important;
+}
+
+/* Keep the option text clear of the arrow Zotero paints at the inline end. */
+[id^="astermargin-pane-"] select.preference-input {
+    padding-inline-end: 26px;
+}
+
+[id^="astermargin-pane-"] .preference-input:hover {
+    background-color: var(--fill-senary) !important;
+}
+
+[id^="astermargin-pane-"] .preference-input::placeholder {
+    color: var(--fill-tertiary);
+}
+
+/* Compact numeric fields in SettingsRows. Keyed on a class rather than on
+ * [type="number"]: a field holding a number is not necessarily a number input,
+ * and the one here deliberately is not — see the credit limit, which needs an
+ * unparseable entry to survive to be rejected rather than be sanitized to the
+ * empty string that means "never ask". */
+[id^="astermargin-pane-"] .preference-input-numeric {
+    text-align: center;
+}
+
+
+/* Custom Prompt Card (custom instructions textarea wrapper) */
+[id^="astermargin-pane-"] .custom-prompt-card {
+    padding: 10px 12px;
+    border: 1px solid var(--fill-quinary);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .custom-prompt-card:hover:not(.custom-prompt-card-editing) {
+    background-color: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .custom-prompt-edit-textarea {
+    padding: 4px !important;
+    min-height: 80px;
+    resize: none;
+    overflow-y: auto;
+    box-sizing: border-box !important;
+}
+
+/* Action Card — standalone bordered card (view mode) */
+[id^="astermargin-pane-"] .action-card {
+    padding: 10px 12px;
+    cursor: pointer;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: background-color 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .action-card:hover:not(.action-card-editing) {
+    background-color: var(--astermargin-fill-hover);
+}
+
+/* Action Card — edit mode: header bar spans full width, so drop card padding */
+[id^="astermargin-pane-"] .action-card-editing {
+    cursor: default;
+    padding: 0;
+    background-color: transparent;
+}
+
+/* Edit header — distinct tinted bar with the Cancel/Save actions */
+[id^="astermargin-pane-"] .action-edit-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    background-color: var(--astermargin-fill-bar);
+    border-bottom: 1px solid var(--astermargin-border-strong);
+}
+
+[id^="astermargin-pane-"] .action-edit-body {
+    display: flex;
+    flex-direction: column;
+    padding: 12px 14px 14px;
+}
+
+/* Field heading (Name / Prompt / Applies to / Category) */
+[id^="astermargin-pane-"] .action-field-label {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 5px;
+}
+
+/* Inline variant — label sits to the left of its control (Applies to / Category) */
+[id^="astermargin-pane-"] .action-field-label-inline {
+    margin-bottom: 0;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+/* Bordered field container for the Name input and Prompt textarea */
+[id^="astermargin-pane-"] .action-field-box {
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 6px;
+    background-color: var(--fill-senary);
+    padding: 6px 8px;
+    box-sizing: border-box;
+    transition: border-color 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .action-field-box:focus-within {
+    border-color: var(--fill-tertiary);
+}
+
+/* Borderless control that fills a field box */
+[id^="astermargin-pane-"] .action-field-control {
+    width: 100%;
+    border: 0;
+    outline: none;
+    background-color: transparent;
+    font-family: system-ui, -apple-system, sans-serif;
+    color: var(--fill-primary);
+    padding: 0;
+    line-height: 1.35;
+    box-sizing: border-box;
+}
+
+/* Zotero's Windows input theme paints a focus indicator on every input/textarea:
+   a 2px accent-blue bar drawn as a background-image plus an accent bottom border
+   and a re-asserted 1px border. These controls are borderless by design and the
+   focus affordance is the wrapper's `.action-field-box:focus-within` border, so
+   the native treatment is neutralized here. */
+[id^="astermargin-pane-"] .action-field-control:active,
+[id^="astermargin-pane-"] .action-field-control:focus,
+[id^="astermargin-pane-"] .action-field-control:focus-visible {
+    border: 0 !important;
+    outline: none !important;
+    background-color: transparent !important;
+    background-image: none !important;
+}
+
+[id^="astermargin-pane-"] .action-field-control::placeholder {
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .action-edit-textarea {
+    display: block;
+    min-height: 76px;
+    resize: vertical;
+    overflow-y: auto;
+}
+
+/* Full-width, select-style dropdown for Applies to / Category */
+[id^="astermargin-pane-"] button.action-field-select {
+    width: 100%;
+    justify-content: space-between;
+    padding: 6px 8px !important;
+    border-radius: 6px;
+    background-color: var(--fill-senary);
+    font-size: 1rem;
+}
+
+[id^="astermargin-pane-"] button.action-field-select:hover {
+    background-color: var(--fill-quinary);
+}
+
+/* Helper line under a field */
+[id^="astermargin-pane-"] .action-field-help {
+    margin-top: 5px;
+}
+
+/* Annotation previews — clickable row hover */
+[id^="astermargin-pane-"] .create-annotations-preview-row,
+[id^="astermargin-pane-"] .edit-annotations-preview-row {
+    border-radius: 4px;
+    padding-left: 6px;
+    padding-right: 6px;
+    margin-left: -6px;
+    margin-right: -6px;
+    transition: background-color 0.15s ease;
+}
+
+/* Bordered edit list: keep hover inside the thin outline */
+[id^="astermargin-pane-"] .edit-annotations-preview-list .edit-annotations-preview-row {
+    border-radius: 0;
+    margin-left: 0;
+    margin-right: 0;
+    margin-top: 2px;
+    padding: 8px 10px;
+}
+
+[id^="astermargin-pane-"] .create-annotations-preview-row:hover,
+[id^="astermargin-pane-"] .edit-annotations-preview-row:hover {
+    background-color: var(--astermargin-fill-hover);
+}
+
+/* Preview text: 2-line clamp */
+[id^="astermargin-pane-"] .action-card-preview {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Action edit title — invisible 1px border in both states to prevent layout shift */
+[id^="astermargin-pane-"] .action-edit-title {
+    padding: 4px 6px !important;
+    margin: 0 0 4px 0 !important;
+    border: 1px solid transparent !important;
+    border-radius: 4px !important;
+    box-sizing: border-box !important;
+}
+
+[id^="astermargin-pane-"] .action-edit-title:focus {
+    border: 1px solid transparent !important;
+}
+
+/* Action target type badge — base */
+[id^="astermargin-pane-"] .action-target-badge {
+    display: inline-block;
+    font-size: 12px;
+    line-height: 1;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background-color: var(--astermargin-fill-chip);
+    color: var(--fill-secondary);
+    border: 1px solid var(--astermargin-border-subtle);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* Color-coded badges by target type */
+[id^="astermargin-pane-"] .action-target-badge[data-type="items"] {
+    background-color: var(--tag-blue-quinary);
+    color: var(--tag-blue-secondary);
+    border-color: var(--tag-blue-tertiary);
+}
+[id^="astermargin-pane-"] .action-target-badge[data-type="attachment"] {
+    background-color: var(--tag-green-quinary);
+    color: var(--tag-green-secondary);
+    border-color: var(--tag-green-tertiary);
+}
+[id^="astermargin-pane-"] .action-target-badge[data-type="note"] {
+    background-color: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+    border-color: var(--tag-orange-tertiary);
+}
+[id^="astermargin-pane-"] .action-target-badge[data-type="collection"] {
+    background-color: var(--tag-red-quinary);
+    color: var(--tag-red-secondary);
+    border-color: var(--tag-red-tertiary);
+}
+[id^="astermargin-pane-"] .action-target-badge[data-type="global"] {
+    background-color: var(--tag-purple-quinary);
+    color: var(--tag-purple-secondary);
+    border-color: var(--tag-purple-tertiary);
+}
+/* Notice badge for prompts that still contain [[ ]] placeholders */
+[id^="astermargin-pane-"] .action-target-badge[data-type="placeholder"] {
+    background-color: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+    border-color: var(--tag-orange-tertiary);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Utility classes that did NOT move into @astermargin/agent-ui.
+ *
+ * The rest of the utility layer now lives in
+ * `packages/agent-ui/src/theme/agent-ui-utilities.css`, which is registered
+ * BEFORE this file. A utility rule and a component rule scoped the same way
+ * weigh the same — `[id^="astermargin-pane-"]` is (0,1,0) and so is a class — so in
+ * one interleaved file source order decided the winner. Splitting the file
+ * turns every such tie in the utility layer's favour into a loss. The classes
+ * below are the ones that would have changed, so they stay here where their
+ * position relative to the component rules is preserved. Each is annotated with
+ * what it ties against; move one only after that tie is gone.
+ * ------------------------------------------------------------------------- */
+
+/* The `display` family, kept whole.
+ *
+ * The first three rules also style the bare pane root, which the shared package
+ * must not do. Splitting `.display-flex` out of the first one would put it
+ * before `.action-target-badge` (`display: inline-block`), which ActionCard's
+ * placeholder badge carries together with `display-flex` — the badge's icon row
+ * would collapse. `.hidden`, `.block` and `.single-line` in turn beat
+ * `.display-flex` only by sitting after it (AgentRunFooter hides itself with
+ * `display-flex … hidden` while streaming; Tooltip toggles between `block` and
+ * `display-flex`), so they cannot move while it stays. */
+[id^="astermargin-pane-"], [id^="astermargin-pane-"] .display-flex { display: flex; }
+[id^="astermargin-pane-"], [id^="astermargin-pane-"] .flex-1 { flex: 1; }
+[id^="astermargin-pane-"], [id^="astermargin-pane-"] .h-full { height: 100%; }
+[id^="astermargin-pane-"] .hidden { display: none; }
+
+[id^="astermargin-pane-"] .inline-flex { display: inline-flex; }
+[id^="astermargin-pane-"] .inline-block { display: inline-block; }
+[id^="astermargin-pane-"] .block { display: block; }
+
+[id^="astermargin-pane-"] .single-line {
+    display: inline-block;
+    white-space: nowrap;
+}
+
+/* Shimmer text. Unscoped, so it also reaches markup rendered outside a pane
+ * root; scoping it under `.astermargin-root` to share it would shrink that match
+ * set. */
+.shimmer-text {
+    background: linear-gradient(90deg,
+            var(--fill-tertiary) 30%,
+            /* var(--fill-secondary) 40%, */
+            var(--fill-primary) 50%,
+            /* var(--fill-secondary) 60%, */
+            var(--fill-tertiary) 70%
+        );
+    background-size: 200% 100%;
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shimmer 1.4s linear infinite;
+}
+
+@keyframes shimmer {
+    from {
+        background-position: 100% 0;
+    }
+
+    to {
+        background-position: -100% 0;
+    }
+}
+
+/* Spacing and type utilities that override a component's own padding or size.
+ * `.px-25` beats `.edit-annotations-preview-row` (padding 6px) on the annotation
+ * preview rows; `.px-3` / `.py-2` beat `.user-message-display`'s padding shorthand on the
+ * onboarding example prompts; `.text-base` (1rem) beats `.chat-input`'s literal
+ * 13px, and `rem` here resolves against the host's root font size, so the two
+ * are not interchangeable.
+ *
+ * `.user-message-display` and `.chat-input` live in agent-ui-components.css,
+ * which this sheet loads after, so those two ties are decided by sheet order
+ * rather than by source order within a file. */
+[id^="astermargin-pane-"] .px-25 { padding-left: 0.625rem; padding-right: 0.625rem; }
+[id^="astermargin-pane-"] .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
+[id^="astermargin-pane-"] .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+[id^="astermargin-pane-"] .text-base { font-size: 1rem; }
+
+/* Hover effects for colored icons inside buttons */
+[id^="astermargin-pane-"] .variant-ghost:hover .font-color-green,
+[id^="astermargin-pane-"] .variant-ghost-secondary:hover .font-color-green,
+[id^="astermargin-pane-"] .icon-button:hover .font-color-green { color: var(--tag-green); opacity: 1; }
+
+[id^="astermargin-pane-"] .variant-ghost:hover .font-color-red,
+[id^="astermargin-pane-"] .variant-ghost-secondary:hover .font-color-red,
+[id^="astermargin-pane-"] .icon-button:hover .font-color-red { color: var(--tag-red); opacity: 1; }
+
+[id^="astermargin-pane-"] .variant-ghost:hover .font-color-orange,
+[id^="astermargin-pane-"] .variant-ghost-secondary:hover .font-color-orange,
+[id^="astermargin-pane-"] .icon-button:hover .font-color-orange { color: var(--tag-orange); opacity: 1; }
+
+[id^="astermargin-pane-"] .variant-ghost:hover .font-color-blue,
+[id^="astermargin-pane-"] .variant-ghost-secondary:hover .font-color-blue,
+[id^="astermargin-pane-"] .icon-button:hover .font-color-blue { color: var(--tag-blue); opacity: 1; }
+
+[id^="astermargin-pane-"] .variant-ghost:hover .font-color-purple,
+[id^="astermargin-pane-"] .variant-ghost-secondary:hover .font-color-purple,
+[id^="astermargin-pane-"] .icon-button:hover .font-color-purple { color: var(--tag-purple); opacity: 1; }
+
+/* Menu items use roving focus, so replace the browser outline with AsterMargin's menu highlight. */
+[id^="astermargin-pane-"] .astermargin-menu-item:focus {
+    outline: none;
+}
+
+[id^="astermargin-pane-"] .astermargin-menu-item:focus-visible {
+    box-shadow: inset 0 0 0 1px var(--fill-tertiary);
+}
+
+
+/* Conversation prose has an explicit baseline independent of the host UI font.
+ * Only message bodies opt in; previews, exports and controls retain their layout. */
+[id^="astermargin-pane-"] .chat-prose {
+    line-height: var(--astermargin-chat-line-height, 1.5);
+}
+
+[id^="astermargin-pane-"] .markdown.chat-prose :is(p, ul, ol, li, blockquote) {
+    line-height: inherit;
+}
+
+/* Tables retain a stable density when surrounding prose spacing changes. */
+[id^="astermargin-pane-"] .markdown.chat-prose table {
+    line-height: 1.5;
+}
+
+[id^="astermargin-pane-"] .markdown p {
+    margin-block-start: 0px !important;
+    margin-block-end: 0px !important;
+}
+
+/* The review card repeats action details already shown in the conversation.
+   Keep create-note previews scannable there without changing the full inline
+   note rendered by AgentActionView. */
+[id^="astermargin-pane-"] .create-note-preview-compact {
+    max-height: 12em;
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .create-note-preview-compact.is-truncated {
+    -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 2.5em), transparent 100%);
+    mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 2.5em), transparent 100%);
+}
+
+/* Inline math must stay a plain inline box. An inline-block with non-visible
+ * overflow takes its baseline from its bottom edge, which lifts the formula
+ * above the text line, and sub/superscripts that extend a pixel past the box
+ * would show a scrollbar. Long formulas wrap at KaTeX's own break points. */
+[id^="astermargin-pane-"] .markdown .katex {
+    margin: 0 0.1em;
+    font-size: 1.1em !important;
+}
+
+[id^="astermargin-pane-"] .markdown .katex-display {
+    /* Styles for display math block */
+    padding: 0rem;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+[id^="astermargin-pane-"] .markdown .katex-display > .katex {
+    margin: 0;
+}
+
+[id^="astermargin-pane-"] .markdown a {
+    color: var(--tag-blue);
+    opacity: 0.8;
+    text-decoration: none;
+}
+
+[id^="astermargin-pane-"] .markdown a:hover {
+    text-decoration: underline;
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation {
+    cursor: pointer;
+    font-size: 0.8em;
+    margin-left: 0.15em;
+    text-decoration: none;
+    background: var(--fill-quinary);
+    padding-right: 0.35em;
+    padding-left: 0.35em;
+    border-radius: 0.25em;
+    border: 1px solid var(--fill-quinary);
+    color: var(--fill-secondary);
+    transition: all 0.2s ease-in-out;
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation:hover {
+    color: var(--fill-primary);
+    /* border: 1px solid var(--fill-quarternary); */
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.streaming {
+    cursor: default;
+    opacity: 0.4;
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.streaming:hover {
+    color: var(--fill-secondary);
+}
+
+/* Invalid citation styling - similar to streaming but with cursor help to indicate tooltip */
+[id^="astermargin-pane-"] .markdown span.zotero-citation.invalid {
+    cursor: help;
+    opacity: 0.4;
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.invalid:hover {
+    color: var(--fill-secondary);
+}
+
+/* External citation styling - slightly different color for distinction */
+[id^="astermargin-pane-"] .markdown span.zotero-citation.external-citation {
+    background: var(--tag-blue-quinary);
+    border-color: var(--tag-blue-tertiary);
+    color: var(--tag-blue);
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.external-citation:hover {
+    background: var(--tag-blue-quarternary);
+    color: var(--tag-blue-primary);
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.external-citation.streaming:hover {
+    background: var(--tag-blue-quinary);
+    color: var(--tag-blue);
+}
+
+/* With-locator citation styling - green for in-library citations that navigate to a specific location */
+[id^="astermargin-pane-"] .markdown span.zotero-citation.with-locator {
+    background: var(--tag-green-quinary);
+    border-color: var(--tag-green-tertiary);
+    color: var(--tag-green-primary);
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.with-locator:hover {
+    background: var(--tag-green-quarternary);
+    color: var(--tag-green-primary);
+}
+
+[id^="astermargin-pane-"] .markdown span.zotero-citation.with-locator.streaming:hover {
+    background: var(--tag-green-quinary);
+    color: var(--tag-green-primary);
+}
+
+[id^="astermargin-pane-"] .markdown h1,
+[id^="astermargin-pane-"] .markdown h2,
+[id^="astermargin-pane-"] .markdown h3,
+[id^="astermargin-pane-"] .markdown h4,
+[id^="astermargin-pane-"] .markdown h5,
+[id^="astermargin-pane-"] .markdown h6 {
+    margin-top: 6px;
+    margin-bottom: 6px;
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+[id^="astermargin-pane-"] .markdown h1 {
+    font-size: 1.35em;
+    padding-top: 0.3em;
+    padding-bottom: 0.2em;
+}
+
+[id^="astermargin-pane-"] .markdown h2 {
+    font-size: 1.2em;
+    font-weight: 700;
+    padding-top: 0.3em;
+    /* padding-bottom: 0.1em; */
+}
+
+[id^="astermargin-pane-"] .markdown h3 {
+    font-size: 1.1em;
+    padding-top: 0.15em;
+}
+
+[id^="astermargin-pane-"] .markdown h4 {
+    font-size: 1em;
+}
+
+[id^="astermargin-pane-"] .markdown h5 {
+    font-size: 0.9em;
+}
+
+[id^="astermargin-pane-"] .markdown h6 {
+    font-size: 0.8em;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .markdown p:not(:last-child) {
+    margin-top: 0px !important;
+    margin-bottom: 0.5em !important;
+}
+
+[id^="astermargin-pane-"] .markdown ul,
+[id^="astermargin-pane-"] .markdown ol {
+    margin: 1em 0;
+    padding-left: 2em;
+    margin-block-start: 0.75em;
+    margin-block-end: 0.75em;
+}
+
+[id^="astermargin-pane-"] .markdown ul {
+    list-style-type: disc;
+}
+
+[id^="astermargin-pane-"] .markdown ol {
+    list-style-type: decimal;
+}
+
+[id^="astermargin-pane-"] .markdown li {
+    margin-bottom: 0.5em;
+    line-height: 1.5;
+}
+
+[id^="astermargin-pane-"] .markdown ul ul,
+[id^="astermargin-pane-"] .markdown ol ul {
+    list-style-type: circle;
+    margin-top: 0.3em;
+}
+
+[id^="astermargin-pane-"] .markdown ol ol,
+[id^="astermargin-pane-"] .markdown ul ol {
+    list-style-type: lower-latin;
+    margin-top: 0.3em;
+}
+
+[id^="astermargin-pane-"] .markdown ul ul ul,
+[id^="astermargin-pane-"] .markdown ol ul ul {
+    list-style-type: square;
+}
+
+[id^="astermargin-pane-"] .markdown ol ol ol,
+[id^="astermargin-pane-"] .markdown ul ol ol {
+    list-style-type: lower-roman;
+}
+
+[id^="astermargin-pane-"] .markdown pre {
+    margin: 1.2em 0;
+    padding: 1em;
+    /* width: 100%; */
+    /* max-width: 100%; */
+    overflow-x: auto;
+    font-size: 90%;
+    line-height: 1.45;
+    background-color: var(--fill-senary) !important;
+    border: 1px solid var(--fill-quinary) !important;
+    border-radius: 2px;
+}
+
+[id^="astermargin-pane-"] .markdown :not(pre)>code {
+    font-size: 85%;
+    /* padding-top: 0.15em; */
+    /* padding-bottom: 0.15em; */
+    padding-left: 0.2em;
+    padding-right: 0.2em;
+    border-radius: 4px;
+    background-color: var(--fill-quarternary) !important;
+    border: 1px solid var(--fill-quarternary) !important;
+} 
+
+[id^="astermargin-pane-"] .markdown blockquote {
+    margin-top: 0.75em;
+    margin-bottom: 0.75em;
+    padding: 0 1em;
+    border-left: 1px solid var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .markdown img {
+    max-width: 100%;
+    box-sizing: content-box;
+    background-color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .markdown hr {
+    height: 1px;
+    margin-top: 1em;
+    margin-bottom: 1em;
+    background-color: var(--fill-tertiary);
+    border: 0;
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .markdown table {
+    padding-top: 1em;
+    padding-bottom: 1em;
+    display: block;
+    width: 100%;
+    overflow: auto;
+    border-spacing: 0;
+    border-collapse: collapse;
+}
+
+[id^="astermargin-pane-"] .markdown table th {
+    font-weight: 600;
+}
+
+[id^="astermargin-pane-"] .markdown table th,
+[id^="astermargin-pane-"] .markdown table td {
+    padding: 6px 13px;
+    border: 1px solid var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .markdown table tr {
+    border-top: 1px solid var(--fill-secondary);
+}
+
+/* ───── Find in chat ───── */
+
+/* The find bar floats over the top of the thread area rather than sitting in
+   the column, so opening it neither covers the header nor moves the thread. It
+   shrinks with a narrow sidebar; the input is what gives way. */
+[id^="astermargin-pane-"] .astermargin-find-bar {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    width: 280px;
+    max-width: calc(100% - 24px);
+    padding: 3px 4px 3px 8px;
+    background-color: var(--astermargin-surface-overlay);
+    border: 1px solid var(--astermargin-border-strong);
+    border-radius: 6px;
+    box-shadow: var(--astermargin-shadow-overlay);
+}
+
+[id^="astermargin-pane-"] .astermargin-find-bar-icon {
+    flex: none;
+    margin-right: 4px;
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .astermargin-find-bar-input {
+    flex: 1;
+    min-width: 0;
+    padding: 2px 0;
+    background: transparent;
+    border: none;
+    color: var(--fill-primary);
+    font-size: 1rem;
+    outline: none;
+}
+
+[id^="astermargin-pane-"] .astermargin-find-bar-input::placeholder {
+    color: var(--fill-tertiary);
+}
+
+/* Reserved width and tabular figures: the count changes with every keystroke,
+   and the bar must not resize under the reader's cursor. Wide enough for the
+   longest thing shown here, which is "No results" rather than a count. */
+[id^="astermargin-pane-"] .astermargin-find-bar-count {
+    flex: none;
+    width: 70px;
+    padding-right: 2px;
+    text-align: right;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--fill-tertiary);
+    white-space: nowrap;
+}
+
+/* Hover-based fade utility classes */
+[id^="astermargin-pane-"] .hover-trigger { position: relative; }
+[id^="astermargin-pane-"] .hover-fade { 
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s ease-in-out, visibility 0.2s ease-in-out;
+}
+[id^="astermargin-pane-"] .hover-trigger:hover .hover-fade { 
+    opacity: 1;
+    visibility: visible;
+}
+/* Variants with different initial opacity */
+[id^="astermargin-pane-"] .hover-fade-partial {
+    opacity: 0.2;
+    transition: opacity 0.2s ease-in-out;
+}
+[id^="astermargin-pane-"] .hover-trigger:hover .hover-fade-partial {
+    opacity: 1;
+}
+/* Delay variant */
+[id^="astermargin-pane-"] .hover-fade-delay {
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.3s ease-in-out 0.1s, visibility 0.3s ease-in-out 0.1s;
+}
+[id^="astermargin-pane-"] .hover-trigger:hover .hover-fade-delay {
+    opacity: 1;
+    visibility: visible;
+}
+
+/* Common button styles - shared across all variants */
+[id^="astermargin-pane-"] .button-base {
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .button-base:disabled {
+    cursor: not-allowed;
+}
+
+[id^="astermargin-pane-"] .button-base.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .button-base .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .button-base.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .button-base.icon-only {
+    padding: 4px;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .button-base svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+/* Button: Solid variant */
+[id^="astermargin-pane-"] .variant-solid {
+    cursor: pointer;
+    border: 1px solid var(--accent-blue);
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: var(--accent-blue);
+    color: var(--accent-white);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-solid:hover {
+    filter: brightness(1.15);
+}
+
+[id^="astermargin-pane-"] .variant-solid:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+    filter: none;
+}
+
+[id^="astermargin-pane-"] .variant-solid.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-solid .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-solid.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-solid.icon-only {
+    padding: 4px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-solid svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+/* Button: Solid Secondary variant (gray, for actions without keyboard shortcuts) */
+[id^="astermargin-pane-"] .variant-solid.button-solid-secondary {
+    border: 1px solid var(--fill-tertiary) !important;
+    background-color: var(--fill-secondary) !important;
+    color: var(--accent-white);
+}
+
+[id^="astermargin-pane-"] .variant-solid.button-solid-secondary:hover {
+    filter: brightness(1.15) !important;
+}
+
+[id^="astermargin-pane-"] .variant-solid.button-solid-secondary:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+    filter: none;
+}
+
+/* Button: Surface variant - refined from existing CSS */
+[id^="astermargin-pane-"] .variant-surface {
+    cursor: pointer;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: var(--fill-quarternary);
+    color: var(--fill-secondary);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-surface:hover {
+    color: var(--fill-primary);
+    background-color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .variant-surface:disabled {
+    cursor: not-allowed;
+    background-color: var(--fill-quinary);
+    color: var(--fill-tertiary);
+    border-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .variant-surface.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-surface .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-surface.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-surface.icon-only {
+    padding: 4px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-surface svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+/* Surface button with action-target-badge: use tag colors by data-type */
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="items"] {
+    background-color: var(--tag-blue-quinary);
+    color: var(--tag-blue-secondary);
+    border-color: var(--tag-blue-tertiary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="items"]:hover {
+    background-color: var(--tag-blue-quarternary);
+    color: var(--tag-blue-primary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="attachment"] {
+    background-color: var(--tag-green-quinary);
+    color: var(--tag-green-secondary);
+    border-color: var(--tag-green-tertiary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="attachment"]:hover {
+    background-color: var(--tag-green-quarternary);
+    color: var(--tag-green-primary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="note"] {
+    background-color: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+    border-color: var(--tag-orange-tertiary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="note"]:hover {
+    background-color: var(--tag-orange-quarternary);
+    color: var(--tag-orange-primary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="collection"] {
+    background-color: var(--tag-red-quinary);
+    color: var(--tag-red-secondary);
+    border-color: var(--tag-red-tertiary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="collection"]:hover {
+    background-color: var(--tag-red-quarternary);
+    color: var(--tag-red-primary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="global"] {
+    background-color: var(--tag-purple-quinary);
+    color: var(--tag-purple-secondary);
+    border-color: var(--tag-purple-tertiary);
+}
+[id^="astermargin-pane-"] button.variant-surface.action-target-badge[data-type="global"]:hover {
+    background-color: var(--tag-purple-quarternary);
+    color: var(--tag-purple-primary);
+}
+
+
+/* Button: Error variant */
+[id^="astermargin-pane-"] .variant-error {
+    cursor: pointer;
+    border: 1px solid var(--tag-red-tertiary);
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: transparent;
+    color: var(--tag-red);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-error:hover {
+    background-color: var(--tag-red-quarternary);
+}
+
+/* Button: Outline variant */
+[id^="astermargin-pane-"] .variant-outline {
+    cursor: pointer;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: transparent;
+    color: var(--fill-secondary);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-outline:hover {
+    /* color: var(--fill-primary); */
+    /* border-color: var(--fill-tertiary); */
+    background-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .variant-outline:disabled {
+    cursor: not-allowed;
+    color: var(--fill-tertiary);
+    border-color: var(--fill-quarternary);
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .variant-outline.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-outline .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-outline.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-outline.icon-only {
+    padding: 4px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-outline svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+/* Button: Subtle variant */
+[id^="astermargin-pane-"] .variant-subtle {
+    cursor: pointer;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: var(--fill-senary);
+    color: var(--fill-secondary);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-subtle:hover {
+    color: var(--fill-primary);
+    background-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .variant-subtle:disabled {
+    cursor: not-allowed;
+    color: var(--fill-tertiary);
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .variant-subtle.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-subtle .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-subtle.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-subtle.icon-only {
+    padding: 4px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-subtle svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+/* Button: Ghost variant */
+[id^="astermargin-pane-"] .variant-ghost {
+    cursor: pointer;
+    border: 0px solid transparent;
+    border-radius: 5px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: transparent;
+    color: var(--fill-secondary);
+    padding: 4px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-ghost:hover {
+    color: var(--fill-primary);
+    background-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .variant-ghost:disabled {
+    cursor: not-allowed;
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .variant-ghost:disabled:hover {
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .variant-ghost.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-ghost .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-ghost.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-ghost.icon-only {
+    padding: 4px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-ghost svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary {
+    cursor: pointer;
+    border: 0px solid transparent;
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: transparent;
+    color: var(--fill-secondary);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary:hover {
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary:disabled {
+    cursor: not-allowed;
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary:disabled:hover {
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary.icon-only {
+    padding: 2px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-secondary svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-tertiary {
+    cursor: pointer;
+    border: 0px solid transparent;
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: transparent;
+    color: var(--fill-tertiary);
+    padding: 2px 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-ghost-tertiary:hover {
+    color: var(--fill-secondary);
+}
+
+/* Button: Thread menu */
+[id^="astermargin-pane-"] .variant-thread-menu {
+    cursor: pointer;
+    border: 0px solid transparent;
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: transparent;
+    color: var(--fill-secondary);
+    padding: 0px;
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-thread-menu:hover {
+    color: var(--fill-primary);
+}
+
+/* Updated IconButton class - compatible with the Ghost variant */
+[id^="astermargin-pane-"] .icon-button {
+    cursor: pointer;
+    border: 0px solid transparent;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    transition: all 0.2s ease-in-out;
+    background-color: transparent;
+    color: var(--fill-secondary);
+    align-items: center;
+    padding: 4px;
+    display: inline-flex;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .icon-button svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+[id^="astermargin-pane-"] .icon-button:hover {
+    color: var(--fill-primary);
+    background-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .icon-button:disabled {
+    color: var(--fill-tertiary);
+    cursor: not-allowed;
+}
+
+[id^="astermargin-pane-"] .icon-button:disabled:hover {
+    color: var(--fill-tertiary);
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .source-button {
+    padding-right: 0.5rem;
+    line-height: 1.2;
+    font-size: 0.85rem;
+}
+
+[id^="astermargin-pane-"] .source-citation {
+    font-size: 0.8em;
+    margin-left: 0.15em;
+    text-decoration: none;
+    background: var(--fill-quinary);
+    padding-right: 0.35em;
+    padding-left: 0.35em;
+    border-radius: 0.25em;
+    border: 1px solid var(--fill-quinary);
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .source-citation-external {
+    background: var(--tag-blue-quinary) !important;
+    border-color: var(--tag-blue-tertiary) !important;
+    color: var(--tag-blue) !important;
+}
+
+/* Make disabled buttons look normal */
+[id^="astermargin-pane-"] .disabled-but-styled {
+    cursor: not-allowed;
+    pointer-events: none;
+    /* Prevents hover effects */
+}
+
+[id^="astermargin-pane-"] .variant-outline.scale-11d-but-styled:disabled {
+    cursor: not-allowed;
+    color: var(--fill-secondary);
+    border-color: var(--fill-quarternary);
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .variant-outline.disabled-but-styled:hover {
+    cursor: not-allowed;
+    background-color: transparent;
+}
+
+[id^="astermargin-pane-"] .marker-secondary>li::marker {
+    color: var(--fill-secondary);
+}
+
+/* Scroll down button */
+[id^="astermargin-pane-"] .scroll-down-button {
+    transform: translateY(-29px);
+    background: var(--astermargin-surface-overlay);
+    border: 1px solid var(--color-border50);
+    border-radius: 50%;
+    width: 2rem;
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    transition: all 0.2s ease;
+}
+
+/* Arrow and streaming dots share one grid cell so they cross-fade in place
+   rather than shifting the button's content. The dots stay mounted at opacity 0
+   when idle; only the `.is-bouncing` class (which React holds through the
+   fade-out) drives the animation. */
+[id^="astermargin-pane-"] .scroll-down-icons {
+    display: grid;
+    place-items: center;
+    line-height: 0;
+}
+
+[id^="astermargin-pane-"] .scroll-down-icon {
+    grid-area: 1 / 1;
+    transition: opacity 0.2s ease;
+}
+
+[id^="astermargin-pane-"] .scroll-down-dots {
+    opacity: 0;
+}
+
+[id^="astermargin-pane-"] .scroll-down-button.is-streaming .scroll-down-arrow {
+    opacity: 0;
+}
+
+[id^="astermargin-pane-"] .scroll-down-button.is-streaming .scroll-down-dots {
+    opacity: 1;
+}
+
+/* Hover always resolves back to the arrow: the button is a scroll affordance
+   first, a streaming cue second. */
+[id^="astermargin-pane-"] .scroll-down-button.is-streaming:hover .scroll-down-arrow {
+    opacity: 1;
+}
+
+[id^="astermargin-pane-"] .scroll-down-button.is-streaming:hover .scroll-down-dots {
+    opacity: 0;
+}
+
+[id^="astermargin-pane-"] .scroll-down-dots.is-bouncing circle {
+    animation: astermarginScrollDotBounce 1.05s cubic-bezier(0.33, 0, 0.33, 1) infinite;
+}
+
+[id^="astermargin-pane-"] .scroll-down-dots.is-bouncing circle:nth-child(2) {
+    animation-delay: 0.12s;
+}
+
+[id^="astermargin-pane-"] .scroll-down-dots.is-bouncing circle:nth-child(3) {
+    animation-delay: 0.24s;
+}
+
+/* Rests at translateY(0) for the back half of every cycle, so the dots enter and
+   leave the bounce from the steady triplet instead of jumping into it. Lengths
+   are SVG user units (viewBox is 24 wide), not CSS pixels. */
+@keyframes astermarginScrollDotBounce {
+    0%, 55%, 100% {
+        transform: translateY(0);
+    }
+
+    27.5% {
+        transform: translateY(-3.5px);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    [id^="astermargin-pane-"] .scroll-down-dots.is-bouncing circle {
+        animation: none;
+    }
+}
+
+/* Surface light variant */
+[id^="astermargin-pane-"] .variant-surface-light {
+    cursor: pointer;
+    border: 1px solid var(--fill-quinary);
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: var(--fill-quinary);
+    color: var(--fill-secondary);
+    padding: 5px 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .variant-surface-light:hover {
+    background-color: var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .variant-surface-light:disabled {
+    cursor: not-allowed;
+    background-color: var(--fill-senary);
+    color: var(--fill-tertiary);
+    border-color: var(--fill-senary);
+}
+
+[id^="astermargin-pane-"] .variant-surface-light.loading {
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .variant-surface-light .spinner {
+    color: currentColor;
+}
+
+[id^="astermargin-pane-"] .variant-surface-light.has-loading-text .spinner {
+    margin-left: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .variant-surface-light.icon-only {
+    padding: 4px;
+    align-items: center;
+    justify-content: center;
+}
+
+[id^="astermargin-pane-"] .variant-surface-light svg {
+    width: 1em;
+    height: 1em;
+    flex-shrink: 0;
+}
+
+/* Suggestion buttons (follow-up suggestions from return_suggestions tool) */
+[id^="astermargin-pane-"] .suggestion-button {
+    cursor: pointer;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 6px;
+    transition: all 0.15s ease-in-out;
+    font-size: 0.85rem;
+    background-color: transparent;
+    color: var(--fill-secondary);
+    padding: 4px 6px;
+    text-align: left;
+    line-height: 1.4;
+}
+
+[id^="astermargin-pane-"] .suggestion-button:hover {
+    background-color: var(--fill-quinary);
+    border-color: var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .suggestion-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+[id^="astermargin-pane-"] .welcome-page-button {
+    cursor: pointer;
+    border: 1px solid var(--fill-quinary);
+    border-radius: 4px;
+    transition: all 0.2s ease-in-out;
+    font-size: 0.9rem;
+    background-color: var(--fill-quinary);
+    color: var(--fill-secondary);
+    padding: 5px 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .welcome-page-button:hover {
+    background-color: var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .card {
+    border: 1px solid var(--fill-quinary);
+    border-radius: 4px;
+    font-size: 0.9rem;
+    background-color: var(--fill-quinary);
+    color: var(--fill-secondary);
+    padding: 6px 8px;
+    display: inline-flex;
+    gap: 6px;
+}
+
+[id^="astermargin-pane-"] .animate-spin {
+    animation: spin 1.2s linear infinite;
+}
+
+/* Flash animations for status updates */
+[id^="astermargin-pane-"] .astermargin-flash-bg {
+    border-radius: 6px;
+    background-color: var(--fill-quinary);
+}
+
+/* Flash animation for Stat component text */
+[id^="astermargin-pane-"] .astermargin-flash-text-normal {
+    /* Use !important to override base color during animation */
+    color: var(--accent-blue) !important; 
+}
+
+[id^="astermargin-pane-"] .astermargin-flash-text-failed {
+    /* Use !important to override base color during animation */
+    color: var(--tag-red) !important; 
+}
+
+[id^="astermargin-pane-"] .icon-css.icon-tag {
+    background: url("chrome://zotero/skin/16/universal/tag.svg") no-repeat center/contain;
+    -moz-context-properties: fill, fill-opacity;
+    fill: currentColor;
+}
+
+/* Diff view styles for metadata editing */
+[id^="astermargin-pane-"] .diff-container {
+    display: flex;
+    flex-direction: column;
+    /* gap: 2px; */
+    font-size: 0.875rem;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    border-radius: 1px;
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .diff-line {
+    display: flex;
+    align-items: flex-start;
+    padding: 4px 8px;
+    border-left: 2px solid;
+}
+
+[id^="astermargin-pane-"] .diff-deletion {
+    background-color: rgba(186, 42, 41, 0.15);
+    border-left-color: #b82A29 !important;
+    color: var(--fill-primary);
+    opacity: 0.85;
+}
+
+[id^="astermargin-pane-"] .diff-addition,.diff-addition-applied {
+    background-color: rgba(20, 135, 85, 0.15);
+    border-left-color: #148D55 !important;
+    color: var(--fill-primary);
+    opacity: 0.85;
+}
+
+[id^="astermargin-pane-"] .diff-ghosted {
+    background-color: rgba(128, 128, 128, 0.08);
+    border-left-color: #d1d5db !important;
+    color: #6b7280;
+    opacity: 0.4;
+}
+
+[id^="astermargin-pane-"] .diff-neutral {
+    background-color: rgba(128, 128, 128, 0.06);
+    border-left-color: #9ca3af !important;
+    color: var(--fill-primary);
+    opacity: 0.7;
+}
+
+[id^="astermargin-pane-"] .diff-content {
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+/* Context lines in diff - very subtle, no colored border */
+[id^="astermargin-pane-"] .diff-context {
+    background-color: rgba(128, 128, 128, 0.04);
+    border-left-color: transparent !important;
+    color: var(--fill-secondary);
+    opacity: 0.7;
+}
+
+/* Separator between non-adjacent hunks */
+[id^="astermargin-pane-"] .diff-separator {
+    background-color: transparent;
+    border-left-color: transparent !important;
+    color: var(--fill-tertiary);
+    opacity: 0.5;
+    font-size: 0.75rem;
+    padding: 1px 8px;
+}
+
+/* Character-level highlight for changed chars within deletion lines */
+[id^="astermargin-pane-"] .diff-char-del {
+    background-color: rgba(186, 42, 41, 0.35);
+    border-radius: 2px;
+    padding: 0 1px;
+}
+
+/* Character-level highlight for changed chars within addition lines */
+[id^="astermargin-pane-"] .diff-char-add {
+    background-color: rgba(20, 135, 85, 0.35);
+    border-radius: 2px;
+    padding: 0 1px;
+}
+
+/* Inline diff view — continuous text with interwoven deletions and additions */
+[id^="astermargin-pane-"] .inline-diff-container {
+    font-size: 0.875rem;
+    line-height: 1.45;
+    padding: 4px 6px;
+    word-break: break-word;
+    border-radius: 1px;
+}
+
+[id^="astermargin-pane-"] .inline-diff-para {
+    margin-top: 0.4em;
+}
+
+[id^="astermargin-pane-"] .inline-diff-heading {
+    font-weight: 600;
+}
+
+[id^="astermargin-pane-"] .inline-diff-del {
+    background-color: rgba(210, 40, 40, 0.25);
+    text-decoration: line-through;
+    border-radius: 2px;
+    padding: 1px 1px;
+    color: var(--fill-primary);
+    opacity: 0.7;
+}
+
+[id^="astermargin-pane-"] .inline-diff-add {
+    background-color: rgba(16, 150, 72, 0.25);
+    border-radius: 2px;
+    padding: 1px 1px;
+    color: var(--fill-primary);
+}
+
+/* Feature Tour Styles */
+[id^="astermargin-pane-"] .feature-tour-content {
+    max-width: 100%;
+}
+
+/* Compact prompt bubble - subtle and less dominant */
+[id^="astermargin-pane-"] .prompt-bubble-compact {
+    background-color: var(--fill-senary);
+    border: 1px solid var(--fill-quinary);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    color: var(--fill-secondary);
+    line-height: 1.35;
+    position: relative;
+}
+
+[id^="astermargin-pane-"] .prompt-highlight {
+    color: var(--tag-orange);
+    font-weight: 500;
+    opacity: 0.7;
+}
+
+/* Step indicator dots */
+[id^="astermargin-pane-"] .step-indicator-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: var(--fill-quarternary);
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: all 0.2s ease-in-out;
+}
+
+[id^="astermargin-pane-"] .step-indicator-dot:hover {
+    background-color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .step-indicator-dot.active {
+    background-color: var(--accent-blue);
+}
+
+/* ───── Thread List View ───── */
+
+[id^="astermargin-pane-"] .thread-overlay-container {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+}
+
+[id^="astermargin-pane-"] .thread-overlay-backdrop {
+    position: absolute;
+    inset: 0;
+    background: transparent;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .thread-overlay-panel {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 90%;
+    background-color: var(--astermargin-surface-ground);
+    box-shadow: -6px 0 26px rgba(0, 0, 0, 0.175);
+    border-left: 1px solid var(--astermargin-border-default);
+    display: flex;
+    flex-direction: column;
+}
+
+[id^="astermargin-pane-"] .thread-overlay-title {
+    padding: 10px 12px 4px;
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .thread-search-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+[id^="astermargin-pane-"] .thread-search-icon {
+    position: absolute;
+    left: 8px;
+    color: var(--fill-tertiary);
+    pointer-events: none;
+}
+
+[id^="astermargin-pane-"] .thread-search-input {
+    width: 100%;
+    padding: 6px 28px 6px 28px;
+    background: var(--astermargin-fill-subtle);
+    border: 1px solid var(--astermargin-border-subtle);
+    border-radius: 6px;
+    color: var(--fill-primary);
+    font-size: 1rem;
+    outline: none;
+}
+
+[id^="astermargin-pane-"] .thread-search-input:focus {
+    border-color: var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .thread-search-input::placeholder {
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .thread-search-spinner {
+    position: absolute;
+    right: 8px;
+    display: flex;
+    align-items: center;
+    color: var(--fill-tertiary);
+    pointer-events: none;
+}
+
+[id^="astermargin-pane-"] .thread-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 12px 8px;
+}
+
+[id^="astermargin-pane-"] .thread-filter-divider {
+    width: 1px;
+    height: 16px;
+    background-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .thread-filter-chip {
+    max-width: 180px;
+}
+
+/* Pushes a trailing control (e.g. the active-scope chip) to the right edge of
+   the filter row, regardless of what precedes it. Never shrinks — the item
+   filter chip beside it truncates instead, since it has a title to fall back
+   on while this chip's short label does not. */
+[id^="astermargin-pane-"] .thread-filter-row-end {
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+[id^="astermargin-pane-"] .thread-filter-chip-remove {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .thread-filter-count {
+    padding: 0 14px 6px;
+    font-size: 0.85rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .thread-filter-footer-note {
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border-top: 1px solid var(--fill-quinary);
+    font-size: 0.85rem;
+    line-height: 1.35;
+    color: var(--fill-secondary);
+    text-align: center;
+}
+
+[id^="astermargin-pane-"] .thread-group-header {
+    padding: 8px 12px 4px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--fill-primary);
+    opacity: 0.8;
+}
+
+[id^="astermargin-pane-"] .thread-list-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 6px 12px;
+    cursor: pointer;
+    border-radius: 6px;
+    margin: 0 4px;
+}
+
+[id^="astermargin-pane-"] .thread-list-item-hovered {
+    background: var(--fill-senary);
+}
+
+/* The title, and the waiting-chat dot right after it. */
+[id^="astermargin-pane-"] .thread-list-item-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .thread-list-item-title .thread-list-item-name {
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .thread-list-item-name {
+    font-size: 0.95rem;
+    color: var(--fill-secondary);
+    line-height: 1.3;
+}
+
+/* Flex so the trailing badge sits on the same baseline row as the timestamp
+   and can shrink instead of widening the item past the sidebar. */
+[id^="astermargin-pane-"] .thread-list-item-time {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 0.9rem;
+    color: var(--fill-tertiary);
+    margin-top: 1px;
+}
+
+/* Marks a chat created in a different Zotero profile. Only visible while the
+   list is showing all instances. */
+[id^="astermargin-pane-"] .thread-list-item-badge {
+    flex-shrink: 1;
+    min-width: 0;
+    padding: 0 4px;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--fill-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+[id^="astermargin-pane-"] .thread-list-item-actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+    margin-left: 4px;
+    opacity: 0;
+    pointer-events: none;
+}
+
+[id^="astermargin-pane-"] .thread-list-item-hovered .thread-list-item-actions,
+[id^="astermargin-pane-"] .thread-list-item-editing .thread-list-item-actions,
+[id^="astermargin-pane-"] .thread-list-item:focus-within .thread-list-item-actions {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+[id^="astermargin-pane-"] .thread-list-item:focus-visible,
+[id^="astermargin-pane-"] .recent-chats-item:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+}
+
+[id^="astermargin-pane-"] .thread-rename-input {
+    display: block;
+    width: 100%;
+    height: 1.17rem;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    border: 0;
+    border-width: 0;
+    color: var(--fill-secondary);
+    font-size: 0.95rem;
+    line-height: 1.3;
+    outline: none;
+    font-family: inherit;
+    box-sizing: border-box;
+    -moz-appearance: none;
+    appearance: none;
+}
+
+/* Toggle active state for chat history icon */
+[id^="astermargin-pane-"] .thread-list-toggle-active {
+    background: var(--fill-quinary);
+    border-radius: 4px;
+}
+
+/* ───── Recent Chats (Home View) ───── */
+
+[id^="astermargin-pane-"] .recent-chats-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 8px 4px;
+}
+
+[id^="astermargin-pane-"] .recent-chats-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .recent-chats-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 8px;
+    cursor: pointer;
+    border-radius: 6px;
+}
+
+[id^="astermargin-pane-"] .recent-chats-item:hover {
+    background: var(--fill-senary);
+}
+
+/* The title, and the waiting-chat dot right after it. */
+[id^="astermargin-pane-"] .recent-chats-item-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .recent-chats-item-name {
+    font-size: 0.9rem;
+    color: var(--fill-secondary);
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .recent-chats-item-time {
+    font-size: 0.85rem;
+    color: var(--fill-secondary);
+    flex-shrink: 0;
+    margin-left: 8px;
+}
+
+/* A chat whose parked run waits on the user's answers, marked after its
+   title. The wrapper widens the hover target of the dot for its tooltip. */
+[id^="astermargin-pane-"] .thread-awaiting-input {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 10px;
+    height: 12px;
+    flex-shrink: 0;
+}
+
+[id^="astermargin-pane-"] .thread-awaiting-input-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-blue);
+}
+
+[id^="astermargin-pane-"] .recent-chats {
+    transition: opacity 0.2s ease;
+}
+
+[id^="astermargin-pane-"] .recent-chats-faded {
+    opacity: 0.5;
+}
+
+/* File status bar (homepage footer indicator) */
+[id^="astermargin-pane-"] .file-status-bar {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 0px 8px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--fill-tertiary);
+    background: transparent;
+    transition: color 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .file-status-bar:hover {
+    color: var(--fill-secondary);
+}
+
+
+[id^="astermargin-pane-"] .two-line-header {
+    flex-wrap: wrap;
+    display: '-webkit-box';
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    word-break: break-word;
+}
+
+/* ───── Separate window: application shell ─────
+ * The window is a full application: a collapsible chat history sidebar, a
+ * header for the open chat, and the chat in a width-limited column. The chat
+ * itself is the same `Sidebar` the panes render. */
+
+/* Scope surfaces at the mount point so menus portaled here share the chat
+ * palette. The navigation column paints its own sidepane background. */
+#astermargin-pane-window {
+    --astermargin-surface-ground: var(--material-background);
+    --astermargin-surface-raised: var(--material-background);
+    --astermargin-surface-overlay: var(--material-background);
+}
+
+@supports (background: color-mix(in srgb, red, blue)) {
+    #astermargin-pane-window {
+        /* Mix opaque materials so cards do not show content beneath them. */
+        --astermargin-surface-raised:
+            color-mix(in srgb, var(--material-mix-quarternary) 40%, var(--material-background));
+    }
+}
+
+#astermargin-pane-window .astermargin-window-app {
+    --astermargin-window-nav-width: 264px;
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+    background-color: var(--material-sidepane);
+}
+
+/* The sidebar animates its width; its content keeps a fixed width so the
+ * rows do not reflow while it slides. */
+#astermargin-pane-window .astermargin-window-nav {
+    flex: 0 0 auto;
+    width: var(--astermargin-window-nav-width);
+    min-height: 0;
+    /* Clipped only while collapsed: expanded, the row menus may extend past
+     * the sidebar's edge. The class flips at the start of a collapse, so the
+     * slide out is clipped; the slide in is covered by the chat pane above. */
+    overflow: visible;
+    background-color: var(--material-sidepane);
+    border-right: 1px solid var(--astermargin-border-subtle);
+    transition: width 240ms cubic-bezier(0.4, 0, 0.2, 1), border-color 240ms ease;
+}
+
+#astermargin-pane-window .astermargin-window-app-nav-collapsed .astermargin-window-nav {
+    width: 0;
+    overflow: hidden;
+    border-right-color: transparent;
+}
+
+#astermargin-pane-window .astermargin-window-nav-content {
+    display: flex;
+    flex-direction: column;
+    width: var(--astermargin-window-nav-width);
+    height: 100%;
+    min-height: 0;
+    opacity: 1;
+    /* No transform while expanded: a transformed ancestor would become the
+     * containing block of the row menus, which are fixed, and let the scroll
+     * area clip them. */
+    transition: opacity 160ms ease, transform 240ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+#astermargin-pane-window .astermargin-window-app-nav-collapsed .astermargin-window-nav-content {
+    opacity: 0;
+    transform: translateX(-16px);
+    pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #astermargin-pane-window .astermargin-window-nav,
+    #astermargin-pane-window .astermargin-window-nav-content {
+        transition: none;
+    }
+}
+
+/* The chat column sits on the plain background so it reads as the working
+ * surface, with the sidebar on the sidepane material beside it. */
+#astermargin-pane-window .astermargin-window-main {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    /* Paints over the sidebar's content while it slides in or out. Menus in
+     * the sidebar are fixed and far above this, so they are unaffected. */
+    position: relative;
+    z-index: 1;
+    /* The chat column's gutters are measured against this pane, not the
+     * window, so they do not jump when the sidebar collapses. Derived from the
+     * sidebar's known width rather than a size container: containment would
+     * make this pane the containing block for the fixed-position menus inside
+     * it on older Gecko builds, shifting them by the sidebar's width. */
+    --astermargin-pane-width: calc(100vw - var(--astermargin-window-nav-width));
+}
+
+#astermargin-pane-window .astermargin-window-app-nav-collapsed .astermargin-window-main {
+    --astermargin-pane-width: 100vw;
+}
+
+#astermargin-pane-window .astermargin-window-main > [role="main"] {
+    background-color: var(--astermargin-surface-ground);
+}
+
+/* ── Header ── */
+
+#astermargin-pane-window .astermargin-window-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    height: 46px;
+    padding: 0 12px 0 8px;
+}
+
+#astermargin-pane-window .astermargin-window-header-lead {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+}
+
+#astermargin-pane-window .astermargin-window-header-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    margin-left: 4px;
+}
+
+#astermargin-pane-window .astermargin-window-header-title {
+    margin: 0;
+    min-width: 0;
+    font-size: 1.05rem;
+    font-weight: 500;
+    line-height: 1.3;
+    color: var(--fill-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#astermargin-pane-window .astermargin-window-header-trail {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex: none;
+}
+
+/* ── Sidebar content ── */
+
+#astermargin-pane-window .astermargin-window-nav-top {
+    flex: none;
+    padding: 12px 10px 0;
+}
+
+/* Base for the sidebar's plain buttons (new chat, chat rows, the account):
+ * the chrome default look removed, a rounded hover fill and a focus ring. */
+#astermargin-pane-window .astermargin-window-nav-button {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    border: none;
+    border-radius: 8px;
+    background-color: transparent;
+    color: var(--fill-primary);
+    font: inherit;
+    font-size: 1rem;
+    line-height: 1.3;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+#astermargin-pane-window .astermargin-window-nav-button:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: -2px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-item {
+    gap: 9px;
+    padding: 7px 10px;
+    white-space: nowrap;
+}
+
+#astermargin-pane-window .astermargin-window-nav-item:hover {
+    background-color: var(--fill-quinary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-item svg {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: none;
+    margin: 14px 10px 4px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-icon {
+    position: absolute;
+    left: 9px;
+    color: var(--fill-tertiary);
+    pointer-events: none;
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-input {
+    width: 100%;
+    padding: 6px 26px 6px 29px;
+    background-color: var(--astermargin-fill-subtle);
+    border: 1px solid var(--astermargin-border-subtle);
+    border-radius: 8px;
+    color: var(--fill-primary);
+    font-size: 1rem;
+    outline: none;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-input:focus {
+    border-color: var(--fill-quarternary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-input::placeholder {
+    color: var(--fill-tertiary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-trailing {
+    position: absolute;
+    right: 7px;
+    display: flex;
+    align-items: center;
+    color: var(--fill-tertiary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-clear {
+    padding: 3px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    cursor: pointer;
+}
+
+#astermargin-pane-window .astermargin-window-nav-search-clear:hover {
+    background-color: var(--fill-quinary);
+    color: var(--fill-primary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 2px 10px 8px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-group {
+    margin-top: 12px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-group-label {
+    padding: 0 8px 4px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--fill-tertiary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    border-radius: 8px;
+    transition: background-color 0.12s ease;
+}
+
+#astermargin-pane-window .astermargin-window-nav-row:hover,
+#astermargin-pane-window .astermargin-window-nav-row-menu-open,
+#astermargin-pane-window .astermargin-window-nav-row:focus-within {
+    background-color: var(--fill-quinary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-row-current,
+#astermargin-pane-window .astermargin-window-nav-row-current:hover {
+    background-color: var(--fill-quarternary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-row-button {
+    flex: 1;
+    width: auto;
+    padding: 6px 8px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-row-name {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* A truncated name scrolls to its end while hovered (the distance and pace
+ * are set inline by the row), after a short pause so a passing pointer does
+ * not set every row in motion. */
+#astermargin-pane-window .astermargin-window-nav-row-name-scrolling {
+    text-overflow: clip;
+}
+
+/* Inline until it moves: an inline-block child is clipped rather than
+ * ellipsized, and only a block can be transformed. */
+#astermargin-pane-window .astermargin-window-nav-row-name-scrolling .astermargin-window-nav-row-name-text {
+    display: inline-block;
+    transform: translateX(calc(-1 * var(--astermargin-nav-name-overflow, 0px)));
+    transition: transform var(--astermargin-nav-name-scroll-duration, 2s) linear 0.6s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #astermargin-pane-window .astermargin-window-nav-row-name-scrolling .astermargin-window-nav-row-name-text {
+        transition: none;
+    }
+}
+
+/* The row's actions appear on hover, fading the name out under them rather
+ * than pushing it. */
+#astermargin-pane-window .astermargin-window-nav-row:hover .astermargin-window-nav-row-name,
+#astermargin-pane-window .astermargin-window-nav-row-menu-open .astermargin-window-nav-row-name,
+#astermargin-pane-window .astermargin-window-nav-row:focus-within .astermargin-window-nav-row-name {
+    mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent calc(100% - 14px));
+}
+
+#astermargin-pane-window .astermargin-window-nav-row-actions {
+    position: absolute;
+    top: 0;
+    right: 4px;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+}
+
+#astermargin-pane-window .astermargin-window-nav-row:hover .astermargin-window-nav-row-actions,
+#astermargin-pane-window .astermargin-window-nav-row-menu-open .astermargin-window-nav-row-actions,
+#astermargin-pane-window .astermargin-window-nav-row:focus-within .astermargin-window-nav-row-actions {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+/* The waiting-chat dot ends the row, and moves aside for the actions. */
+#astermargin-pane-window .astermargin-window-nav-row .thread-awaiting-input {
+    margin-right: 8px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-row:hover .thread-awaiting-input,
+#astermargin-pane-window .astermargin-window-nav-row-menu-open .thread-awaiting-input,
+#astermargin-pane-window .astermargin-window-nav-row:focus-within .thread-awaiting-input {
+    margin-right: 30px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-row-menu {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+}
+
+#astermargin-pane-window .astermargin-window-nav-row-spinner {
+    display: flex;
+    align-items: center;
+    padding: 0 6px;
+    color: var(--fill-tertiary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-rename {
+    width: 100%;
+    margin: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--color-accent);
+    border-radius: 8px;
+    background-color: var(--material-background);
+    color: var(--fill-primary);
+    font: inherit;
+    font-size: 1rem;
+    line-height: 1.3;
+    outline: none;
+    box-sizing: border-box;
+}
+
+#astermargin-pane-window .astermargin-window-nav-empty {
+    display: flex;
+    justify-content: center;
+    padding: 28px 8px;
+    color: var(--fill-tertiary);
+    font-size: 0.95rem;
+    text-align: center;
+}
+
+/* ── Account footer ── */
+
+#astermargin-pane-window .astermargin-window-nav-footer {
+    flex: none;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--astermargin-border-subtle);
+}
+
+#astermargin-pane-window .astermargin-window-nav-account {
+    padding: 6px 8px;
+    border-radius: 10px;
+}
+
+#astermargin-pane-window .astermargin-window-nav-account:hover {
+    background-color: var(--fill-quinary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-account-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-width: 0;
+}
+
+#astermargin-pane-window .astermargin-window-nav-avatar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background-color: var(--fill-quarternary);
+    color: var(--fill-primary);
+    font-size: 0.95rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+#astermargin-pane-window .astermargin-window-nav-account-email {
+    font-size: 0.95rem;
+    font-weight: 500;
+    line-height: 1.3;
+    color: var(--fill-primary);
+}
+
+#astermargin-pane-window .astermargin-window-nav-account-plan {
+    font-size: 0.85rem;
+    line-height: 1.3;
+    color: var(--fill-secondary);
+}
+
+/* ── Chat column ──
+ * The chat, composer and home page share one reading column: capped in width
+ * and centered, so a wide window grows its margins, with side gutters that
+ * shrink to nothing as the window narrows. The gutter is added on top of the
+ * element's own padding (`--astermargin-column-pad`), which is otherwise lost to
+ * this rule's higher specificity. */
+#astermargin-pane-window .astermargin-content-column {
+    --astermargin-column-pad: 0px;
+    --astermargin-column-gutter: clamp(0px, calc((var(--astermargin-pane-width) - 520px) * 0.14), 72px);
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 960px;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: calc(var(--astermargin-column-pad) + var(--astermargin-column-gutter));
+    padding-right: calc(var(--astermargin-column-pad) + var(--astermargin-column-gutter));
+}
+
+#astermargin-pane-window #astermargin-prompt.astermargin-content-column {
+    --astermargin-column-pad: 0.75rem;
+}
+
+/* The popup overlay is positioned against the prompt's padding box, so it takes
+ * the prompt's padding (gutter included) to stay as wide as the composer. */
+#astermargin-pane-window #astermargin-prompt > .astermargin-popup-overlay {
+    padding-left: inherit;
+    padding-right: inherit;
+}
+
+/* ── Duplicate review: find_duplicates results ──
+ * Records are referred to by neutral letter badges so the field comparison can
+ * point back at them. */
+.astermargin-root .duplicate-member-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 3px;
+    margin-top: 1px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--fill-secondary);
+    background: var(--fill-quinary);
+    border: 1px solid var(--fill-quarternary);
+}
+
+.astermargin-root .duplicate-group-title {
+    font-size: 0.925rem;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+}
+
+/* Aligns record rows, warnings and differences under the group title text. */
+.astermargin-root .duplicate-group-body {
+    padding-left: 24px;
+}
+
+.astermargin-root .duplicate-member-row:hover {
+    background: var(--fill-quinary);
+}
+
+.astermargin-root .duplicate-member-row:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+}
+
+.astermargin-root .duplicate-differences-toggle {
+    background: none;
+    border: 0;
+    padding: 2px 0;
+    margin: 0;
+    min-width: 0;
+    text-align: left;
+    cursor: pointer;
+}
+
+.astermargin-root .duplicate-differences-toggle:hover {
+    color: var(--fill-primary);
+}
+
+.astermargin-root .duplicate-differences {
+    padding: 2px 0 4px 18px;
+}
+
+.astermargin-root .duplicate-field-value {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* ── Duplicate review: merge_items approval ──
+ * Accent color marks selection only (native radios); secondary information
+ * uses the secondary text color so it stays readable. */
+.astermargin-root .merge-section-label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--fill-primary);
+    padding: 0 8px 2px;
+}
+
+.astermargin-root .merge-record {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+}
+
+.astermargin-root .merge-record-choice {
+    cursor: pointer;
+}
+
+.astermargin-root .merge-record-choice:not(.merge-record-disabled):hover {
+    background: var(--fill-quinary);
+}
+
+.astermargin-root .merge-record-kept {
+    background: var(--fill-quinary);
+    border-color: var(--fill-quarternary);
+}
+
+.astermargin-root .merge-record-disabled {
+    cursor: default;
+}
+
+.astermargin-root .merge-radio {
+    flex-shrink: 0;
+    margin: 3px 0 0;
+    accent-color: var(--accent-blue);
+}
+
+.astermargin-root .merge-field {
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr) 18px;
+    column-gap: 8px;
+    align-items: start;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 0.875rem;
+}
+
+.astermargin-root .merge-field-label {
+    color: var(--fill-secondary);
+    overflow-wrap: anywhere;
+}
+
+.astermargin-root .merge-field-value {
+    min-width: 0;
+    color: var(--fill-primary);
+}
+
+.astermargin-root .merge-field-button {
+    display: block;
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.astermargin-root .merge-field-choosable:hover {
+    background: var(--fill-quinary);
+}
+
+.astermargin-root .merge-field-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    margin: 0;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--fill-secondary);
+    cursor: pointer;
+}
+
+.astermargin-root .merge-field-toggle:hover {
+    color: var(--fill-primary);
+}
+
+.astermargin-root .merge-field-button:focus-visible,
+.astermargin-root .merge-field-toggle:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
+    border-radius: 4px;
+}
+
+.astermargin-root .merge-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    cursor: pointer;
+}
+
+/* Import items card (create_items): expandable rows */
+
+.astermargin-root .import-item-header {
+    cursor: pointer;
+}
+
+.astermargin-root .import-item-icon {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    /* Centered on the title's first line. */
+    height: 1.34em;
+    height: 1lh;
+}
+
+.astermargin-root .import-item-reveal {
+    display: inline-flex;
+    vertical-align: middle;
+    color: var(--fill-secondary);
+    cursor: pointer;
+}
+
+.astermargin-root .import-item-reveal:hover {
+    color: var(--fill-primary);
+}
+
+.astermargin-root .import-item-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    margin: 0;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--fill-secondary);
+    cursor: pointer;
+}
+
+.astermargin-root .import-item-header:hover .import-item-toggle,
+.astermargin-root .import-item-toggle:hover {
+    color: var(--fill-primary);
+}
+
+.astermargin-root .import-item-toggle:focus-visible,
+.astermargin-root .import-item-link:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
+}
+
+.astermargin-root .import-item-details {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 6px 0 2px 24px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--fill-quinary);
+    font-size: 0.875rem;
+    cursor: auto;
+    user-select: text;
+}
+
+.astermargin-root .import-item-fields {
+    display: grid;
+    grid-template-columns: minmax(72px, max-content) minmax(0, 1fr);
+    column-gap: 12px;
+    row-gap: 4px;
+}
+
+.astermargin-root .import-item-field-label,
+.astermargin-root .import-item-section-label {
+    color: var(--fill-secondary);
+}
+
+.astermargin-root .import-item-field-label {
+    white-space: nowrap;
+}
+
+.astermargin-root .import-item-field-value {
+    min-width: 0;
+    color: var(--fill-primary);
+    overflow-wrap: anywhere;
+}
+
+.astermargin-root .import-item-link {
+    padding: 0;
+    margin: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    color: var(--accent-blue);
+    text-align: left;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+}
+
+.astermargin-root .import-item-link:hover {
+    text-decoration: underline;
+}
+
+.astermargin-root .import-item-abstract {
+    color: var(--fill-primary);
+    line-height: 1.45;
+    white-space: pre-wrap;
+}
+
+.astermargin-root .import-item-abstract-clamped {
+    display: -webkit-box;
+    -webkit-line-clamp: 6;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.astermargin-root .import-item-notes {
+    margin: 0;
+    padding-inline-start: 1.2em;
+    color: var(--fill-secondary);
+}
+
+/* Import items card: destination breadcrumb and tags */
+
+.astermargin-root .import-destination {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 4px;
+    margin-bottom: 8px;
+    font-size: 0.875rem;
+}
+
+.astermargin-root .import-crumbs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.astermargin-root .import-crumb {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    max-width: 100%;
+    padding: 1px 4px;
+    margin: 0;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
+    color: var(--fill-secondary);
+    cursor: pointer;
+}
+
+/* The first crumb's icon lines up with the item icons below it. */
+.astermargin-root .import-crumb:first-child {
+    margin-left: -4px;
+}
+
+.astermargin-root .import-crumb:last-child {
+    color: var(--fill-primary);
+}
+
+.astermargin-root .import-crumb:not(:disabled):hover {
+    background: var(--fill-quinary);
+    color: var(--fill-primary);
+}
+
+.astermargin-root .import-crumb:disabled {
+    cursor: default;
+}
+
+.astermargin-root .import-crumb:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
+}
+
+.astermargin-root .import-crumb-icon,
+.astermargin-root .import-tag-icon {
+    flex-shrink: 0;
+    transform: scale(0.85);
+}
+
+.astermargin-root .import-crumb-separator {
+    flex-shrink: 0;
+    color: var(--fill-secondary);
+    transform: scale(0.9);
+}
+
+.astermargin-root .import-destination-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+}
+
+.astermargin-root .import-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    max-width: 100%;
+    padding: 0 6px 0 3px;
+    border-radius: 10px;
+    background: var(--fill-quinary);
+    color: var(--fill-secondary);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+}
+
+/* ───── Table card (create_table) ───── */
+
+/* The card: the title row and the footer stay put, and everything between
+ * them scrolls in one area, so the card never nests a scroll inside another. */
+[id^="astermargin-pane-"] .user-message-display.table-card {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    max-height: 70vh;
+    padding: 0;
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .table-card-top {
+    flex: none;
+    padding: 0.8rem 0.8rem 0.4rem;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.15s ease;
+}
+
+/* Once the body scrolls under it, a rule separates the title row. */
+[id^="astermargin-pane-"] .table-card-top-scrolled {
+    border-bottom-color: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .table-card-body {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    overflow-y: auto;
+    padding: 0.2rem 0.8rem 0.75rem;
+}
+
+[id^="astermargin-pane-"] .table-card-footer {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    flex: none;
+    min-width: 0;
+    padding: 0.6rem 0.8rem 0.7rem;
+    border-top: 1px solid var(--fill-quinary);
+}
+
+/* The create card's footer stacks its parts, each a full-width row with its
+ * own job: a band for what the user must know first, the decision row (the run
+ * checkbox and its receipt), and the controls. */
+[id^="astermargin-pane-"] .table-card-footer-stack {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 0;
+    padding: 0;
+}
+
+[id^="astermargin-pane-"] .table-card-footer-band {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 0.45rem;
+    min-width: 0;
+    padding: 0.5rem 0.8rem;
+    border-bottom: 1px solid var(--fill-quinary);
+    font-size: 0.875rem;
+    line-height: 1.4;
+}
+
+[id^="astermargin-pane-"] .table-card-footer-band-pending {
+    align-items: center;
+    color: var(--fill-secondary);
+}
+
+/* A warning band is edged in its own color above and below: it covers the
+ * footer's top rule, and stacked bands share one line. */
+[id^="astermargin-pane-"] .table-card-footer-band-warning {
+    margin-top: -1px;
+    border-top: 1px solid var(--tag-orange-tertiary);
+    border-bottom-color: var(--tag-orange-tertiary);
+    background: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-footer-band-warning .table-card-warning-action {
+    font-weight: 600;
+}
+
+/* The decision and its price, side by side: unticking visibly changes it. */
+[id^="astermargin-pane-"] .table-card-decision {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+    padding: 0.55rem 0.8rem 0.5rem;
+    border-bottom: 1px solid var(--fill-quinary);
+    font-size: 0.925rem;
+}
+
+/* A held answer keeps the decision in view, quiet. */
+[id^="astermargin-pane-"] .table-card-decision-held {
+    opacity: 0.5;
+}
+
+[id^="astermargin-pane-"] .table-card-run-option {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--fill-primary);
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-run-option input {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: var(--accent-blue);
+    cursor: inherit;
+}
+
+[id^="astermargin-pane-"] .table-card-run-option input:disabled,
+[id^="astermargin-pane-"] .table-card-decision-held .table-card-run-option {
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .table-card-receipt {
+    flex: none;
+    color: var(--fill-primary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+[id^="astermargin-pane-"] .table-card-receipt strong {
+    font-weight: 600;
+}
+
+[id^="astermargin-pane-"] .table-card-receipt-quiet {
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-receipt-info {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    margin-inline-start: -0.2rem;
+    margin-inline-end: -4px;
+    padding: 2px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fill-secondary);
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-receipt-info svg {
+    width: 14px;
+    height: 14px;
+}
+
+[id^="astermargin-pane-"] .table-card-receipt-info:hover:not(:disabled),
+[id^="astermargin-pane-"] .table-card-receipt-info[aria-expanded="true"] {
+    background: var(--astermargin-fill-hover);
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .table-card-receipt-info:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 0;
+}
+
+[id^="astermargin-pane-"] .table-card-receipt-info:disabled {
+    cursor: default;
+}
+
+/* What is read once: papers by how they are read, and the rate. Placed in
+ * the window, since the card clips its overflow; drawn as the context's other
+ * overlays (menus, tooltips), whose surface follows the sidebar or tab. */
+[id^="astermargin-pane-"] .table-card-pricing-popover {
+    position: fixed;
+    z-index: 100000;
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(18rem, calc(100vw - 16px));
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--astermargin-border-strong);
+    border-radius: 6px;
+    background: var(--astermargin-surface-overlay);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    font-size: 0.875rem;
+    line-height: 1.4;
+}
+
+[id^="astermargin-pane-"] .table-card-pricing-rows {
+    display: grid;
+    grid-template-columns: auto auto auto;
+    column-gap: 0.9rem;
+    row-gap: 0.15rem;
+    font-variant-numeric: tabular-nums;
+}
+
+[id^="astermargin-pane-"] .table-card-pricing-label {
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .table-card-pricing-papers,
+[id^="astermargin-pane-"] .table-card-pricing-rate {
+    color: var(--fill-secondary);
+    text-align: end;
+    white-space: nowrap;
+}
+
+[id^="astermargin-pane-"] .table-card-pricing-note {
+    margin: 0;
+    color: var(--fill-secondary);
+}
+
+/* Ways out on the left, the one way forward on the right. */
+[id^="astermargin-pane-"] .table-card-controls {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.25rem;
+    min-width: 0;
+    padding: 0.55rem 0.8rem 0.65rem;
+}
+
+/* Above the footer's buttons: a held answer, on the cards whose footer is
+ * one row (the fill card, the cancel view). */
+[id^="astermargin-pane-"] .table-card-notice {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
+    flex: 1 0 100%;
+    min-width: 0;
+    margin-bottom: 0.1rem;
+    font-size: 0.875rem;
+    line-height: 1.35;
+}
+
+[id^="astermargin-pane-"] .table-card-notice-pending {
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-notice-text {
+    min-width: 0;
+    flex: 1;
+}
+
+/* The way to the fix, inside the warning: its own color, underlined on hover. */
+[id^="astermargin-pane-"] .table-card-warning-action {
+    flex: none;
+    align-self: center;
+    padding: 0 2px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    /* font-weight: 600; */
+    text-decoration: none;
+    text-underline-offset: 2px;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-warning-action:hover {
+    text-decoration: underline;
+}
+
+[id^="astermargin-pane-"] .table-card-warning-action:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 1px;
+}
+
+/* The row-cap warning, under the Sources heading. */
+[id^="astermargin-pane-"] .table-card-warning {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 0.45rem;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--tag-orange-tertiary);
+    border-radius: 6px;
+    background: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+    font-size: 0.875rem;
+    line-height: 1.4;
+}
+
+[id^="astermargin-pane-"] .table-card-warning-icon {
+    flex: none;
+    width: 15px;
+    height: 15px;
+    margin-top: 1px;
+}
+
+/* Header: title and description read as text; a pencil at the end edits them. */
+[id^="astermargin-pane-"] .table-card-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .table-card-header-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    min-width: 0;
+    /* Align with the title text, past the table icon and its gap. */
+    padding-inline-start: calc(16px + 0.45rem);
+}
+
+[id^="astermargin-pane-"] .table-card-title-icon {
+    width: 16px;
+    height: 16px;
+    margin-top: 0.15rem;
+}
+
+[id^="astermargin-pane-"] .table-card-title {
+    font-size: 1.05rem;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .table-card-description {
+    font-size: 0.95rem;
+    line-height: 1.4;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-inline {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+[id^="astermargin-pane-"] .table-card-inline-text {
+    cursor: text;
+}
+
+[id^="astermargin-pane-"] .table-card-inline-disabled .table-card-inline-text {
+    cursor: default;
+}
+
+/* The pencil flows after the last word, so it marks the end of the text. */
+[id^="astermargin-pane-"] .table-card-inline-edit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: baseline;
+    margin-inline-start: 0.3rem;
+    padding: 2px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fill-secondary);
+    font-size: 0.8em;
+    line-height: 1;
+    cursor: pointer;
+    position: relative;
+    top: 0.1em;
+}
+
+[id^="astermargin-pane-"] .table-card-inline-edit:hover,
+[id^="astermargin-pane-"] .table-card-inline-edit:focus-visible {
+    color: var(--fill-primary);
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-inline-edit:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 0;
+}
+
+/* The field keeps the text's typography and position: a hairline and a little
+ * inset (cancelled by the negative margin) are the only change. */
+[id^="astermargin-pane-"] .table-card-inline-field {
+    display: block;
+    width: calc(100% + 10px);
+    margin: -3px -5px;
+    padding: 2px 4px;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    font-family: inherit;
+    outline: none;
+    box-sizing: border-box;
+    -moz-appearance: none;
+    appearance: none;
+}
+
+[id^="astermargin-pane-"] .table-card-inline-field:focus {
+    border-color: var(--fill-quarternary);
+}
+
+/* Editing: the field takes the text's place, with discard / save after it. */
+[id^="astermargin-pane-"] .table-card-inline-editing {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-end;
+    gap: 0.35rem;
+    flex: 1;
+    min-width: 0;
+    font-size: 0.95rem !important;
+}
+
+[id^="astermargin-pane-"] .table-card-inline-editing .table-card-inline-field {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    margin: -3px 0 -3px -5px;
+}
+
+[id^="astermargin-pane-"] .table-card-inline-actions {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    flex: none;
+    margin-top: -1px;
+}
+
+[id^="astermargin-pane-"] .table-card-destination {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+    font-size: 0.875rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-destination-icon {
+    flex: none;
+    width: 14px;
+    height: 14px;
+}
+
+[id^="astermargin-pane-"] .table-card-destination-path {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A breadcrumb segment that selects its library or collection in Zotero. */
+[id^="astermargin-pane-"] .table-card-crumb {
+    display: inline;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-crumb:hover {
+    color: var(--fill-primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+[id^="astermargin-pane-"] .table-card-crumb:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
+    border-radius: 2px;
+}
+
+[id^="astermargin-pane-"] .table-card-source-icon {
+    width: 16px;
+    height: 16px;
+    color: var(--fill-secondary);
+}
+
+/* "Add source" / "Add column": a quiet action at the end of the step heading,
+ * in the secondary color like the "Edit" link of a completed step. */
+[id^="astermargin-pane-"] .table-card-head-action {
+    display: inline-flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.3rem;
+    flex: none;
+    margin-inline-end: -6px;
+    padding: 2px 6px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fill-secondary);
+    font-size: 0.925rem;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-head-action:hover:not(:disabled),
+[id^="astermargin-pane-"] .table-card-head-action[aria-expanded="true"] {
+    background: var(--astermargin-fill-hover);
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .table-card-head-action:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 0;
+}
+
+/* The credit chip, at the right under the title row, worded and drawn as the
+ * batch card's. */
+[id^="astermargin-pane-"] .table-card-credit-row {
+    display: flex;
+    flex-direction: row;
+    justify-content: flex-end;
+    margin-top: 0.3rem;
+}
+
+[id^="astermargin-pane-"] .table-card-credit-chip {
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 6px;
+    padding: 2px 7px;
+    white-space: nowrap;
+}
+
+/* The fill card's cost under its columns: what the run would fill and how. */
+[id^="astermargin-pane-"] .table-card-cost {
+    padding-top: 0.15rem;
+}
+
+[id^="astermargin-pane-"] .table-card-head-action:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
+/* Drop overlay: over the whole card while a drag is over it. */
+[id^="astermargin-pane-"] .table-card-drop-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1.5px dashed var(--accent-blue);
+    border-radius: var(--astermargin-radius-card, 8px);
+    background: color-mix(in srgb, var(--material-background, var(--color-background)) 88%, transparent);
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .table-card-drop-overlay-error {
+    border-color: var(--tag-red-tertiary, var(--fill-tertiary));
+}
+
+[id^="astermargin-pane-"] .table-card-drop-message {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0 1rem;
+    font-size: 1rem;
+    font-weight: 500;
+    color: var(--fill-primary);
+    text-align: center;
+}
+
+[id^="astermargin-pane-"] .table-card-drop-icon {
+    width: 18px;
+    height: 18px;
+    flex: none;
+}
+
+/* Steps: one part at a time, completed ones folded into a line above. */
+[id^="astermargin-pane-"] .table-card-step {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    min-width: 0;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .table-card-step-head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+}
+
+/* The stepper at the end of the title row: numbered circles joined by a line,
+ * centred on the title's first line. The current step is the only filled
+ * circle; completed steps are a blue outline with a check, steps to come a
+ * grey outline with their number. */
+[id^="astermargin-pane-"] .table-card-stepper {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: none;
+    height: calc(1.05rem * 1.3);
+    margin-inline-start: 0.25rem;
+}
+
+/* The tooltip's anchor wraps each circle; keep it from adding line height. */
+[id^="astermargin-pane-"] .table-card-stepper > span {
+    display: inline-flex;
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-step {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border-radius: 50%;
+    box-sizing: border-box;
+    font-size: 0.8rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-step-current {
+    background: var(--accent-blue);
+    color: #fff;
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-step-todo {
+    border: 1.5px solid var(--fill-tertiary);
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-step-done {
+    border: 1.5px solid var(--accent-blue);
+    background: transparent;
+    color: var(--accent-blue);
+    font-size: 0.75rem;
+    cursor: pointer;
+}
+
+/* The check is a filled glyph, thin at this size; a matching stroke gives it
+ * the weight of the step numbers. */
+[id^="astermargin-pane-"] .table-card-stepper-step-done svg path {
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linejoin: round;
+}
+
+/* A light fill on hover marks the completed step as the way back. */
+[id^="astermargin-pane-"] .table-card-stepper-step-done:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent-blue) 16%, transparent);
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-step-done:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-step-done:disabled {
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-line {
+    width: 12px;
+    height: 1.5px;
+    margin: 0 3px;
+    border-radius: 1px;
+    background: var(--fill-quarternary);
+}
+
+[id^="astermargin-pane-"] .table-card-stepper-line-done {
+    background: var(--accent-blue);
+}
+
+[id^="astermargin-pane-"] .table-card-step-done {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    width: 100%;
+    padding: 5px 8px;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 6px;
+    background: transparent;
+    font-size: 0.95rem;
+    text-align: start;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-step-done:hover:not(:disabled) {
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-step-done:disabled {
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .table-card-step-done-icon {
+    color: var(--accent-blue);
+}
+
+[id^="astermargin-pane-"] .table-card-step-edit {
+    color: var(--accent-blue);
+    /* font-weight: 500; */
+}
+
+[id^="astermargin-pane-"] .table-card-count {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 6px;
+    border-radius: 9px;
+    background: var(--fill-quinary);
+    color: var(--fill-secondary);
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* Sources */
+/* A source that alone holds more papers than a table. */
+[id^="astermargin-pane-"] .table-card-count-warning {
+    background: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+    box-shadow: inset 0 0 0 1px var(--tag-orange-tertiary);
+}
+
+[id^="astermargin-pane-"] .table-card-source {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .table-card-source-head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.25rem;
+    min-width: 0;
+    padding: 0.35rem 0.4rem 0.35rem 0;
+}
+
+[id^="astermargin-pane-"] .table-card-source-toggle {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1;
+    min-width: 0;
+    padding: 0.1rem 0.25rem 0.1rem 0.55rem;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    text-align: start;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-source-head:hover {
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-source-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    min-width: 0;
+    padding: 0.4rem 0.4rem 0.45rem;
+    border-top: 1px solid var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .table-card-item-list {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+/* Pages a long item list instead of giving it a scroll area of its own. */
+[id^="astermargin-pane-"] .table-card-show-more {
+    align-self: flex-start;
+    margin-top: 2px;
+    padding: 3px 6px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fill-primary);
+    font-size: 0.8125rem;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-show-more:hover {
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-show-more:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+}
+
+[id^="astermargin-pane-"] .table-card-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+    padding: 3px 6px;
+    border-radius: 5px;
+}
+
+[id^="astermargin-pane-"] .table-card-item-icon {
+    align-self: flex-start;
+    margin-top: 1px;
+}
+
+[id^="astermargin-pane-"] .table-card-item-link {
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .table-card-item-link:hover {
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-item-link:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+}
+
+[id^="astermargin-pane-"] .table-card-chip {
+    padding: 0 5px;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 4px;
+    color: var(--fill-secondary);
+    font-size: 0.75rem;
+    line-height: 1.45;
+    white-space: nowrap;
+}
+
+/* Columns: a summary card that opens into its editor. */
+[id^="astermargin-pane-"] .table-card-column {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-width: 0;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+[id^="astermargin-pane-"] .table-card-column:hover:not(.table-card-column-editing):not(.table-card-column-disabled) {
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-column:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: -2px;
+}
+
+[id^="astermargin-pane-"] .table-card-column-disabled {
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .table-card-column-editing {
+    gap: 0.6rem;
+    padding: 0.6rem 0.65rem 0.5rem;
+    border-color: var(--fill-tertiary);
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .table-card-column-question {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+[id^="astermargin-pane-"] .table-card-empty {
+    font-style: italic;
+}
+
+[id^="astermargin-pane-"] .table-card-type-tag-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* A long unit must not crowd out the column name. */
+[id^="astermargin-pane-"] .table-card-type-tag {
+    max-width: 11rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--fill-quinary);
+    color: var(--fill-secondary);
+    font-size: 0.75rem;
+    line-height: 1.45;
+    white-space: nowrap;
+}
+
+[id^="astermargin-pane-"] .table-card-options {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    margin-top: 0.15rem;
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .table-card-option {
+    flex: none;
+    max-width: 10rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 6px;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 9px;
+    color: var(--fill-secondary);
+    font-size: 0.85rem;
+    line-height: 1.45;
+}
+
+/* The options editor: one bordered list, a row per category. The label and
+   its definition are borderless fields; the row shows focus instead, and its
+   controls fade in on hover or focus without taking room. */
+[id^="astermargin-pane-"] .table-card-option-list {
+    display: flex;
+    flex-direction: column;
+    align-self: stretch;
+    min-width: 0;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .table-card-option-row {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 3px 3px 3px 8px;
+    transition: background-color 0.12s ease;
+}
+
+[id^="astermargin-pane-"] .table-card-option-row + .table-card-option-row {
+    border-top: 1px solid var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .table-card-option-row:focus-within {
+    background: var(--astermargin-fill-hover);
+}
+
+[id^="astermargin-pane-"] .table-card-option-line {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+    min-height: 22px;
+}
+
+[id^="astermargin-pane-"] .table-card-option-label,
+[id^="astermargin-pane-"] .table-card-option-definition {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-family: inherit;
+    box-sizing: border-box;
+    -moz-appearance: none;
+    appearance: none;
+}
+
+[id^="astermargin-pane-"] .table-card-option-label {
+    flex: 1;
+    font-size: 0.875rem;
+    line-height: 1.35;
+    color: var(--fill-primary);
+}
+
+[id^="astermargin-pane-"] .table-card-option-definition {
+    width: 100%;
+    padding: 0 26px 2px 0;
+    font-size: 0.8125rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-option-label::placeholder,
+[id^="astermargin-pane-"] .table-card-option-definition::placeholder {
+    color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .table-card-option-action {
+    flex: none;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+}
+
+[id^="astermargin-pane-"] .table-card-option-row:hover .table-card-option-action,
+[id^="astermargin-pane-"] .table-card-option-row:focus-within .table-card-option-action {
+    opacity: 1;
+}
+
+[id^="astermargin-pane-"] .table-card-badge-warning {
+    padding: 0 5px;
+    border: 1px solid var(--tag-orange-tertiary);
+    border-radius: 4px;
+    background: var(--tag-orange-quinary);
+    color: var(--tag-orange-secondary);
+    font-size: 0.75rem;
+    line-height: 1.45;
+    white-space: nowrap;
+}
+
+/* Table tool card body: the recorded table in sections — description, then
+   sources and question columns as divided lists with the create card's icons
+   and type tags, then the counts. */
+[id^="astermargin-pane-"] .table-record {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem 0.5rem;
+    line-height: 1.4;
+}
+
+[id^="astermargin-pane-"] .table-record-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .table-record-label {
+    color: var(--fill-primary);
+    font-weight: 500;
+}
+
+[id^="astermargin-pane-"] .table-record-list {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 8px;
+}
+
+[id^="astermargin-pane-"] .table-record-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-width: 0;
+    padding: 0.45rem 0.6rem;
+}
+
+[id^="astermargin-pane-"] .table-record-row + .table-record-row {
+    border-top: 1px solid var(--fill-quarternary);
+}
+
+/* A change in an edit card's list: its mark, then the sentence with its
+   effects in quieter text. The mark carries the colour; the text does not. */
+[id^="astermargin-pane-"] .table-record-change {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 0.5rem;
+}
+
+[id^="astermargin-pane-"] .table-record-mark {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 1.15rem;
+    height: 1.15rem;
+    margin-top: 0.05rem;
+    border-radius: 50%;
+}
+
+[id^="astermargin-pane-"] .table-record-mark svg {
+    width: 0.7rem;
+    height: 0.7rem;
+}
+
+[id^="astermargin-pane-"] .table-record-mark-add {
+    color: var(--tag-green-primary);
+    background: var(--tag-green-quarternary);
+}
+
+[id^="astermargin-pane-"] .table-record-mark-change {
+    color: var(--tag-orange-primary);
+    background: var(--tag-orange-quarternary);
+}
+
+[id^="astermargin-pane-"] .table-record-mark-remove {
+    color: var(--tag-red-primary);
+    background: var(--tag-red-quarternary);
+}
+
+[id^="astermargin-pane-"] .table-record-change-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+[id^="astermargin-pane-"] .table-card-problem {
+    color: var(--tag-orange-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .table-card-label > span:first-child {
+    font-size: 0.8125rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .table-card-field {
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: 3px 6px;
+    font-size: 0.875rem;
+    line-height: 1.35;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fill-primary);
+    font-family: inherit;
+    outline: none;
+    box-sizing: border-box;
+    -moz-appearance: none;
+    appearance: none;
+}
+
+/* Zotero paints its own fill on focused and hovered inputs; these fields stay
+ * on the card's surface in every state. */
+[id^="astermargin-pane-"] .table-card-field,
+[id^="astermargin-pane-"] .table-card-field:hover,
+[id^="astermargin-pane-"] .table-card-field:focus,
+[id^="astermargin-pane-"] .table-card-inline-field,
+[id^="astermargin-pane-"] .table-card-inline-field:hover,
+[id^="astermargin-pane-"] .table-card-inline-field:focus,
+[id^="astermargin-pane-"] .table-card-option-label,
+[id^="astermargin-pane-"] .table-card-option-label:hover,
+[id^="astermargin-pane-"] .table-card-option-label:focus,
+[id^="astermargin-pane-"] .table-card-option-definition,
+[id^="astermargin-pane-"] .table-card-option-definition:hover,
+[id^="astermargin-pane-"] .table-card-option-definition:focus {
+    background-color: transparent !important;
+    background-image: none !important;
+}
+
+[id^="astermargin-pane-"] .table-card-field:focus {
+    border-color: var(--fill-tertiary);
+}
+
+[id^="astermargin-pane-"] .table-card-field::placeholder,
+[id^="astermargin-pane-"] .table-card-inline-field::placeholder {
+    color: var(--fill-secondary);
+    opacity: 0.8;
+}
+
+/* ==========================================================================
+ * Table tab — structural edits: the column editor, the sources popover's
+ * entries, + Papers, the selection bar's Remove and the Undo toast.
+ * ========================================================================== */
+
+[id^="astermargin-pane-"] .column-type-segments {
+    display: flex;
+    padding: 2px;
+    border-radius: 7px;
+    background: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .column-type-segments > button {
+    flex: 1 1 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 26px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--fill-secondary);
+    font: inherit;
+    font-size: 0.8125rem;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .column-type-segments > button.column-type-segment-on {
+    background: var(--material-background);
+    color: var(--fill-primary);
+    font-weight: 600;
+    font-size: 0.925rem;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+[id^="astermargin-pane-"] .rt-dialog-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 6rem;
+    background: rgba(0, 0, 0, 0.12);
+}
+
+[id^="astermargin-pane-"] .rt-dialog {
+    width: 30rem;
+    max-width: calc(100% - 2rem);
+    max-height: calc(100% - 8rem);
+    display: flex;
+    flex-direction: column;
+    border-radius: 12px;
+    background: var(--material-background);
+    box-shadow: 0 0 0 1px var(--color-border50), 0 14px 36px rgba(0, 0, 0, 0.18);
+    overflow: hidden;
+}
+
+[id^="astermargin-pane-"] .rt-dialog-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    padding: 1rem 1rem 0.25rem;
+    overflow-y: auto;
+}
+
+[id^="astermargin-pane-"] .rt-dialog-title {
+    font-weight: 600;
+    font-size: 1rem;
+}
+
+[id^="astermargin-pane-"] .rt-dialog-warning {
+    font-size: 0.875rem;
+    color: var(--tag-orange-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-dialog-error {
+    font-size: 0.875rem;
+    color: var(--tag-red-primary);
+}
+
+[id^="astermargin-pane-"] .rt-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+}
+
+[id^="astermargin-pane-"] .rt-existing-answers {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin: 0;
+    padding: 0.75rem;
+    border: 0;
+    border-radius: 9px;
+    background: var(--fill-senary);
+    box-shadow: inset 0 0 0 1px var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .rt-existing-legend {
+    float: left;
+    padding: 0;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-existing-answers > label {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    clear: both;
+}
+
+[id^="astermargin-pane-"] .rt-existing-answers > label > span {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+[id^="astermargin-pane-"] .rt-hint {
+    font-size: 0.8125rem;
+    color: var(--fill-secondary);
+}
+
+/* Choose document…: the paper's readable attachments, one to read the row from. */
+[id^="astermargin-pane-"] .rt-document-chooser .rt-dialog-title {
+    font-size: 1.15rem;
+}
+
+[id^="astermargin-pane-"] .rt-document-paper {
+    margin-top: -0.45rem;
+    line-height: 1.4;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-document-choices {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    padding: 0.35rem;
+    border-radius: 9px;
+    background: var(--fill-senary);
+    box-shadow: inset 0 0 0 1px var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .rt-document-choice {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 2rem;
+    padding: 0 0.4rem;
+    border-radius: 6px;
+}
+
+[id^="astermargin-pane-"] .rt-document-choice:hover {
+    background: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .rt-document-choice-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0.35rem 0;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+[id^="astermargin-pane-"] .bt-fill-actions-gap {
+    flex: 1 1 auto;
+}
+
+[id^="astermargin-pane-"] .rt-add-papers,
+[id^="astermargin-pane-"] .rt-add-column-action,
+[id^="astermargin-pane-"] .rt-sources-add-menu,
+[id^="astermargin-pane-"] .rt-selection-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    height: 2.15rem;
+    padding: 0 0.7rem;
+    border: 1px solid var(--color-border50);
+    border-radius: 0.55rem;
+    background: transparent;
+    color: var(--fill-primary);
+    font: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .rt-add-papers:hover:not(:disabled),
+[id^="astermargin-pane-"] .rt-add-column-action:hover:not(:disabled),
+[id^="astermargin-pane-"] .rt-sources-add-menu:hover:not(:disabled),
+[id^="astermargin-pane-"] .rt-selection-action:hover:not(:disabled) {
+    background: var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .rt-add-papers:disabled,
+[id^="astermargin-pane-"] .rt-add-column-action:disabled,
+[id^="astermargin-pane-"] .rt-sources-add-menu:disabled,
+[id^="astermargin-pane-"] .rt-selection-action:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+[id^="astermargin-pane-"] .rt-selection-remove {
+    color: var(--tag-red-primary);
+}
+
+[id^="astermargin-pane-"] .rt-sources {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.92rem;
+}
+
+[id^="astermargin-pane-"] .rt-sources-heading {
+    padding: 0.75rem 0.9rem 0.35rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-sources-removed-heading {
+    margin: 0.4rem 0.9rem 0;
+    padding: 0.6rem 0 0;
+    border-top: 1px solid var(--fill-quinary);
+}
+
+[id^="astermargin-pane-"] .rt-sources-empty,
+[id^="astermargin-pane-"] .rt-sources-note {
+    margin: 0.2rem 0.9rem 0.35rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-source {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    margin: 0 0.5rem;
+    padding: 0.6rem;
+    border-radius: 9px;
+}
+
+[id^="astermargin-pane-"] .rt-source:hover {
+    background: var(--fill-senary);
+}
+
+[id^="astermargin-pane-"] .rt-source-icon {
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    width: 1.9rem;
+    height: 1.9rem;
+    border-radius: 7px;
+    background: var(--fill-quinary);
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-source-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+[id^="astermargin-pane-"] .rt-source-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+[id^="astermargin-pane-"] .rt-source-line {
+    font-size: 0.85rem;
+    color: var(--fill-secondary);
+}
+
+[id^="astermargin-pane-"] .rt-source-new {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.35rem;
+}
+
+[id^="astermargin-pane-"] .rt-source-new-count {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    height: 1.4rem;
+    padding: 0 0.5rem;
+    border-radius: 6px;
+    background: var(--tag-blue-quarternary);
+    color: var(--tag-blue-primary);
+    font-size: 0.85rem;
+}
+
+[id^="astermargin-pane-"] .rt-source-add {
+    height: 1.4rem;
+    padding: 0 0.5rem;
+    border: 0;
+    border-radius: 6px;
+    background: var(--accent-blue);
+    color: #fff;
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .rt-removed-list {
+    display: flex;
+    flex-direction: column;
+    margin: 0 0.5rem;
+}
+
+[id^="astermargin-pane-"] .rt-removed {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.4rem;
+}
+
+[id^="astermargin-pane-"] .rt-removed-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+[id^="astermargin-pane-"] .rt-removed-restore {
+    height: 1.55rem;
+    padding: 0 0.5rem;
+    border: 1px solid var(--color-border50);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fill-primary);
+    font: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+[id^="astermargin-pane-"] .rt-sources-footer {
+    margin-top: 0.5rem;
+    padding: 0.6rem 0.75rem;
+    border-top: 1px solid var(--fill-quinary);
+    background: var(--fill-senary);
+}
+
+[id^="astermargin-pane-"] .rt-toast {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    min-width: 0;
+}
+
+[id^="astermargin-pane-"] .rt-toast-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* External records (PubMed, ClinicalTrials.gov): tags, facts, search header, details. */
+.astermargin-root .ext-badge {
+    display: inline-block;
+    font-size: 11px;
+    line-height: 1.4;
+    padding: 0 5px;
+    border-radius: 4px;
+    white-space: nowrap;
+    color: var(--fill-secondary);
+    background-color: var(--astermargin-fill-chip);
+    border: 1px solid var(--astermargin-border-subtle);
+}
+.astermargin-root .ext-badge[data-tone="green"] {
+    color: var(--tag-green-primary);
+    background-color: var(--tag-green-quinary);
+    border-color: var(--tag-green-tertiary);
+}
+.astermargin-root .ext-badge[data-tone="blue"] {
+    color: var(--tag-blue-primary);
+    background-color: var(--tag-blue-quinary);
+    border-color: var(--tag-blue-tertiary);
+}
+.astermargin-root .ext-badge[data-tone="red"] {
+    font-weight: 600;
+    color: var(--tag-red-primary);
+    background-color: var(--tag-red-quarternary);
+    border-color: var(--tag-red-tertiary);
+}
+/* Labelled facts: a narrow label column and a value column. */
+.astermargin-root .ext-facts {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    column-gap: 10px;
+    row-gap: 3px;
+    font-size: 0.875rem;
+    line-height: 1.35;
+}
+.astermargin-root .ext-facts > .ext-fact-label {
+    color: var(--fill-secondary);
+}
+.astermargin-root .ext-facts > .ext-fact-value {
+    color: var(--fill-primary);
+    min-width: 0;
+}
+.astermargin-root .ext-chip {
+    display: inline-block;
+    font-size: 11px;
+    line-height: 1.5;
+    padding: 0 6px;
+    border-radius: 10px;
+    color: var(--fill-primary);
+    background-color: var(--astermargin-fill-chip);
+    white-space: nowrap;
+}
+.astermargin-root .ext-chip[data-muted] {
+    color: var(--fill-secondary);
+}
+.astermargin-root .ext-query-translation {
+    font-family: var(--astermargin-font-mono, monospace);
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--fill-secondary);
+    word-break: break-word;
+    white-space: pre-wrap;
+    padding-left: 8px;
+    border-left: 2px solid var(--fill-quinary);
+    /* Long field-tagged queries scroll after about eight lines. */
+    max-height: calc(1.45em * 8);
+    overflow-y: auto;
+}
+/* Details: one heading level for sections, a smaller one inside them. */
+.astermargin-root .ext-section-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--fill-primary);
+}
+.astermargin-root .ext-subheading {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fill-secondary);
+}
+/* A header button that discloses a panel looks pressed while it is open. */
+.astermargin-root .tool-header-toggle[aria-expanded="true"] {
+    background-color: var(--fill-quinary);
+}
+
+#astermargin-pane-window .markdown {
+    overflow-wrap: anywhere;
+}

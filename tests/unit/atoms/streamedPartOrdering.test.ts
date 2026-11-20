@@ -1,0 +1,217 @@
+import { setCredentialAdapter } from '@astermargin/agent-core/transport/credentials';
+/**
+ * Ordering between streamed parts and everything else on the socket.
+ *
+ * Part events are buffered for an animation frame before they reach
+ * `activeRunAtom` (see `streamingPartQueue`), so every other callback has to
+ * apply that buffer before it reads or writes run state. A tool return, a run
+ * completing, or an error that ran ahead of the buffer would archive a run
+ * missing the text the reader had already watched arrive.
+ *
+ * The frame is never allowed to run here: anything these tests observe in the
+ * run got there because a callback flushed the queue, not because time passed.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { mockSupabase, processToolReturnResults } = vi.hoisted(() => ({
+    processToolReturnResults: vi.fn(),
+    mockSupabase: {
+        auth: {
+            getSession: vi.fn(),
+            refreshSession: vi.fn(),
+        },
+    },
+}));
+
+vi.mock('../../../react/agents/toolResultProcessing', () => ({ processToolReturnResults }));
+
+vi.mock('../../../react/runtime/windowRuntime', () => ({
+    tryGetWindowRuntime: () => ({ hostWindow: frozenWindow }),
+}));
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: mockSupabase,
+}));
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({
+    logger: vi.fn(),
+}));
+
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    loadFullItemDataWithAllTypes: vi.fn(),
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test' })),
+}));
+
+vi.mock('../../../src/services/agentDataProvider', () => ({
+    handleZoteroDataRequest: vi.fn(),
+    handleExternalReferenceCheckRequest: vi.fn(),
+    handleZoteroDocumentRequest: vi.fn(),
+    handleZoteroAttachmentPageImagesRequest: vi.fn(),
+    handleZoteroAttachmentImageRequest: vi.fn(),
+    handleZoteroViewImagesRequest: vi.fn(),
+    handleZoteroAttachmentSearchRequest: vi.fn(),
+    handleItemSearchByMetadataRequest: vi.fn(),
+    handleItemSearchByTopicRequest: vi.fn(),
+    handleZoteroSearchRequest: vi.fn(),
+    handleListItemsRequest: vi.fn(),
+    handleListCollectionsRequest: vi.fn(),
+    handleListTagsRequest: vi.fn(),
+    handleListLibrariesRequest: vi.fn(),
+    handleGetMetadataRequest: vi.fn(),
+    handleGetAnnotationsRequest: vi.fn(),
+    handleFindAnnotationsRequest: vi.fn(),
+    handleAgentActionValidateRequest: vi.fn(),
+    handleAgentActionExecuteRequest: vi.fn(),
+    handleReadNoteRequest: vi.fn(),
+}));
+
+
+import type {
+    WSPartEvent,
+    WSRunCompleteEvent,
+    WSToolCallProgressEvent,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import type { AgentRun } from '@astermargin/agent-core/agents/types';
+import { activeRunAtom, threadRunsAtom } from '@astermargin/agent-core/run-state/atoms';
+import { abandonActiveRunLocallyAtom, createWSCallbacks } from '../../../react/atoms/agentRunAtoms';
+import { store } from '../../../react/store';
+
+/** A window whose animation frames never run. */
+const frozenWindow = {
+    closed: false,
+    requestAnimationFrame: () => 1,
+    cancelAnimationFrame: () => {},
+};
+
+function streamingRun(): AgentRun {
+    return {
+        id: 'run-1',
+        thread_id: 'thread-1',
+        status: 'in_progress',
+        model_messages: [],
+        user_prompt: { content: 'question', is_resume: false },
+    } as unknown as AgentRun;
+}
+
+function textPart(content: string): WSPartEvent {
+    return {
+        event: 'part',
+        run_id: 'run-1',
+        message_index: 0,
+        part_index: 0,
+        part: { part_kind: 'text', content },
+    } as unknown as WSPartEvent;
+}
+
+/** The text of the streamed response as it currently stands in the store. */
+function streamedText(run: AgentRun | null): string | undefined {
+    const message = run?.model_messages[0];
+    if (!message || message.kind !== 'response') return undefined;
+    const part = message.parts[0];
+    return part?.part_kind === 'text' ? part.content : undefined;
+}
+
+describe('streamed parts and the other WebSocket callbacks', () => {
+    let callbacks: ReturnType<typeof createWSCallbacks>;
+
+    beforeEach(() => {
+        callbacks = createWSCallbacks(store.set);
+        vi.mocked(Zotero.getMainWindow).mockReturnValue(frozenWindow as unknown as Window);
+        store.set(threadRunsAtom, []);
+        store.set(activeRunAtom, streamingRun());
+    });
+
+    it('holds a streamed part until something flushes it', async () => {
+        await callbacks.onPart(textPart('Half an ans'));
+
+        expect(streamedText(store.get(activeRunAtom))).toBeUndefined();
+    });
+
+    it('applies queued parts before a tool call progress event', async () => {
+        await callbacks.onPart(textPart('Half an ans'));
+
+        callbacks.onToolCallProgress({
+            event: 'tool_call_progress',
+            run_id: 'run-1',
+            tool_call_id: 'call-1',
+            progress: 'searching',
+        } as WSToolCallProgressEvent);
+
+        expect(streamedText(store.get(activeRunAtom))).toBe('Half an ans');
+    });
+
+    it('completes a run with the text that streamed just before it', async () => {
+        await callbacks.onPart(textPart('The whole answer.'));
+
+        await callbacks.onRunComplete({
+            event: 'run_complete',
+            run_id: 'run-1',
+            usage: null,
+            cost: null,
+            citations: null,
+            agent_actions: null,
+        } as WSRunCompleteEvent);
+
+        expect(streamedText(store.get(activeRunAtom))).toBe('The whole answer.');
+    });
+
+    it('keeps the streamed text when the user stops the run mid-response', async () => {
+        await callbacks.onPart(textPart('An answer that was cut off here'));
+
+        // Stop: the run is archived as canceled and the slot is cleared, which
+        // would leave the queued text nowhere to land.
+        store.set(abandonActiveRunLocallyAtom);
+
+        const archived = store.get(threadRunsAtom);
+        expect(archived).toHaveLength(1);
+        expect(archived[0].status).toBe('canceled');
+        expect(streamedText(archived[0])).toBe('An answer that was cut off here');
+    });
+
+    it('applies every queued part, in the order they arrived', async () => {
+        await callbacks.onPart(textPart('The'));
+        await callbacks.onPart(textPart('The whole'));
+        await callbacks.onPart(textPart('The whole answer.'));
+
+        callbacks.onToolCallProgress({
+            event: 'tool_call_progress',
+            run_id: 'run-1',
+            tool_call_id: 'call-1',
+            progress: 'searching',
+        } as WSToolCallProgressEvent);
+
+        expect(streamedText(store.get(activeRunAtom))).toBe('The whole answer.');
+    });
+});
+
+
+describe('WebSocket account lifetime', () => {
+    afterEach(() => setCredentialAdapter(undefined));
+    it('rejects a write when the account changes during an already-entered async callback', async () => {
+        let generation = 1;
+        setCredentialAdapter({auth: mockSupabase.auth as any, getGeneration: () => generation});
+        let resume!: () => void;
+        processToolReturnResults.mockImplementationOnce(async (_part, set) => {
+            await new Promise<void>(resolve => { resume = resolve; });
+            set(activeRunAtom, null);
+        });
+        const set = vi.fn();
+        const callbacks = createWSCallbacks(set as any);
+        const pending = callbacks.onToolReturn({run_id: 'run-1', part: {part_kind: 'tool-return'}} as any);
+        generation++;
+        resume();
+        await expect(pending).rejects.toMatchObject({code: 'ACCOUNT_CHANGED'});
+        expect(set).not.toHaveBeenCalled();
+    });
+    it('rejects every stale callback even if the run never emitted an error', async () => {
+        let generation = 1;
+        setCredentialAdapter({auth: mockSupabase.auth as any, getGeneration: () => generation});
+        const set = vi.fn();
+        const callbacks = createWSCallbacks(set as any);
+        generation++;
+        for (const callback of Object.values(callbacks)) {
+            if (typeof callback === 'function') await callback({});
+        }
+        expect(set).not.toHaveBeenCalled();
+    });
+});

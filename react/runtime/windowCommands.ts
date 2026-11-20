@@ -1,0 +1,232 @@
+import { isThreadListViewAtom } from "../atoms/ui";
+import { isRunActive } from "@astermargin/agent-core/agents/types";
+import { getCredentialGeneration } from "@astermargin/agent-core/transport/credentials";
+import { atom, type Getter } from "jotai";
+import { isWSChatPendingAtom } from "../atoms/agentRunAtoms";
+import { accountGenerationAtom, searchableLibraryIdsAtom } from "../atoms/profile";
+import { threadAdmissionAtom, type AdmissionSnapshot } from "./threadAdmission";
+import { threadPresenceAtom } from "./threadProjection";
+import { currentWriter } from "./threadWriter";
+import { eventManager } from "../events/eventManager";
+import {
+    hasThreadWriter,
+    isFinishedChat,
+    RESPONSE_FINISH_MESSAGE,
+} from "../../src/services/threads/finishedChat";
+
+import {
+    currentThreadIdAtom,
+    activeRunAtom,
+} from "@astermargin/agent-core/run-state/atoms";
+import {
+    addItemToCurrentMessageItemsAtom,
+    composerDraftAtom,
+    hasComposerDraftAtom,
+} from "../atoms/messageComposition";
+import { loadThreadAtom, threadNavigationSeqAtom } from "../atoms/threads";
+import { userIdAtom } from "../atoms/auth";
+import { getHostWindow } from "./windowRuntime";
+import { store } from "../store";
+
+interface FinishedChatAvailability {
+    threadId: string;
+    generation: number;
+    navigation: number;
+    admission: AdmissionSnapshot | null;
+    finished: boolean;
+}
+
+// Menu reads never advance the tail used to admit a send against displayed history.
+const finishedChatAvailabilityAtom = atom<FinishedChatAvailability | null>(
+    null,
+);
+
+function isAvailabilityCurrent(
+    get: Getter,
+    value: FinishedChatAvailability,
+): boolean {
+    return (
+        value.threadId === get(currentThreadIdAtom) &&
+        value.generation === get(accountGenerationAtom) &&
+        value.navigation === get(threadNavigationSeqAtom) &&
+        value.admission === get(threadAdmissionAtom)
+    );
+}
+
+export const refreshFinishedChatAvailabilityAtom = atom(
+    null,
+    async (get, set) => {
+        const threadId = get(currentThreadIdAtom);
+        if (!threadId) return;
+        const credentials = getCredentialGeneration();
+        const pending: FinishedChatAvailability = {
+            threadId,
+            generation: get(accountGenerationAtom),
+            navigation: get(threadNavigationSeqAtom),
+            admission: get(threadAdmissionAtom),
+            finished: false,
+        };
+        set(finishedChatAvailabilityAtom, pending);
+        const finished = await isFinishedChat(threadId);
+        if (
+            get(finishedChatAvailabilityAtom) !== pending ||
+            credentials !== getCredentialGeneration() ||
+            !isAvailabilityCurrent(get, pending)
+        )
+            return;
+        set(finishedChatAvailabilityAtom, { ...pending, finished });
+    },
+);
+
+export const canOpenFinishedChatAtom = atom((get) => {
+    const id = get(currentThreadIdAtom);
+    const admission = get(threadAdmissionAtom);
+    const availability = get(finishedChatAvailabilityAtom);
+    const finished =
+        availability && isAvailabilityCurrent(get, availability)
+            ? availability.finished
+            : admission?.threadId === id && admission.activity.state === "idle";
+    return (
+        !!id &&
+        !get(isWSChatPendingAtom) &&
+        !isRunActive(get(activeRunAtom)) &&
+        !get(threadPresenceAtom).claims.some(
+            (claim) => claim.threadId === id,
+        ) &&
+        finished
+    );
+});
+
+/** Resolve presentation waits on unload too: a closed window cannot fire its timers. */
+function waitForSurface(win: Window, delay: number): Promise<void> {
+    return new Promise((resolve) => {
+        if (win.closed) return resolve();
+        const done = () => {
+            win.clearTimeout(timer);
+            win.removeEventListener("unload", done);
+            resolve();
+        };
+        win.addEventListener("unload", done, { once: true });
+        const timer = win.setTimeout(done, delay);
+    });
+}
+
+/** Commands cross renderer boundaries as persisted ids. */
+export const windowCommands = {
+    /**
+     * Opens this window's chat with a stored table attached: "Ask AsterMargin"
+     * from a table in its own window, which has no chat. A table in an
+     * excluded library opens the chat without it.
+     */
+    "ask-about-table": async (request: { libraryID: number; key: string }) => {
+        const win = getHostWindow();
+        const item = Number.isInteger(request?.libraryID) && request?.key
+            ? await Zotero.Items.getByLibraryAndKeyAsync(request.libraryID, request.key)
+            : false;
+        if (win.closed || win.__astermarginRuntime?.status === "closing") return { ok: false, canceled: true };
+        win.focus();
+        // Only the table: the library selection is not part of this question.
+        eventManager.dispatch("toggleChat", { forceOpen: true, skipAutoPopulate: true });
+        // The chat history would cover the chat and its composer.
+        store.set(isThreadListViewAtom, false);
+        const attached = !!item && store.get(searchableLibraryIdsAtom).includes(item.libraryID);
+        if (attached) await store.set(addItemToCurrentMessageItemsAtom, item);
+        // The composer focus handler defers focus until its surface has mounted.
+        win.setTimeout(() => eventManager.dispatch("focusInput", {}), 0);
+        return { ok: true, attached };
+    },
+
+    "open-chat": async (request: { threadId: string }) => {
+        if (!request.threadId) throw new Error("A persisted chat is required");
+        const win = getHostWindow();
+        const generation = getCredentialGeneration();
+        const navigation = store.get(threadNavigationSeqAtom);
+        const destination = store.get(currentThreadIdAtom);
+        const sameChat = destination === request.threadId;
+        let draftEdited = false;
+        const unsubscribe = store.sub(composerDraftAtom, () => {
+            draftEdited = true;
+        });
+        try {
+            const current = () =>
+                !win.closed &&
+                win.__astermarginRuntime?.status !== "closing" &&
+                generation === getCredentialGeneration() &&
+                navigation === store.get(threadNavigationSeqAtom) &&
+                destination === store.get(currentThreadIdAtom);
+            const destinationBusy = () =>
+                !!currentWriter() ||
+                store.get(isWSChatPendingAtom) ||
+                isRunActive(store.get(activeRunAtom)) ||
+                (destination !== null &&
+                    (hasThreadWriter(destination) ||
+                        (store.get(threadAdmissionAtom)?.threadId ===
+                            destination &&
+                            ["active", "unknown"].includes(
+                                store.get(threadAdmissionAtom)!.activity.state,
+                            ))));
+            const decline = (message: string) => {
+                win.focus();
+                win.alert(message);
+                return { ok: false, canceled: true };
+            };
+            if (!sameChat && destinationBusy())
+                return decline(
+                    "The AsterMargin window is responding to another chat. Try again when it finishes.",
+                );
+            const finished = await isFinishedChat(request.threadId);
+            if (!current()) return { ok: false, canceled: true };
+            if (!finished) return decline(RESPONSE_FINISH_MESSAGE);
+            if (destinationBusy())
+                return decline(
+                    sameChat
+                        ? RESPONSE_FINISH_MESSAGE
+                        : "The AsterMargin window is responding to another chat. Try again when it finishes.",
+                );
+
+            win.focus();
+            store.set(isThreadListViewAtom, false);
+            // Let the thread view replace the list and reveal the composer before the native prompt.
+            await waitForSurface(win, 0);
+            if (!current() || destinationBusy())
+                return { ok: false, canceled: true };
+            eventManager.dispatch("focusInput", {});
+            const draftUnchanged = () => !draftEdited;
+            if (!sameChat && !draftUnchanged())
+                return { ok: false, canceled: true };
+            if (!sameChat && store.get(hasComposerDraftAtom)) {
+                // The composer focus handler defers focus until its surface has mounted.
+                await waitForSurface(win, 75);
+                if (!current() || destinationBusy() || !draftUnchanged())
+                    return { ok: false, canceled: true };
+                const choice = Zotero.Prompt.confirm({
+                    window: win,
+                    title: "Open chat",
+                    text: "Discard the draft in the AsterMargin window and open this chat?",
+                    button0: "Discard draft and open",
+                    button1: "Cancel",
+                    defaultButton: 1,
+                });
+                if (choice !== 0) return { ok: false, canceled: true };
+            }
+            const canCommit = () =>
+                current() &&
+                !destinationBusy() &&
+                !hasThreadWriter(request.threadId) &&
+                (sameChat || draftUnchanged());
+            if (!canCommit()) return { ok: false, canceled: true };
+            const loaded = await store.set(loadThreadAtom, {
+                threadId: request.threadId,
+                user_id: store.get(userIdAtom) ?? "",
+                window: win,
+                canCommit,
+                preserveDraft: sameChat,
+            });
+            return loaded
+                ? { ok: true, activeRunId: null }
+                : { ok: false, canceled: true };
+        } finally {
+            unsubscribe();
+        }
+    },
+};

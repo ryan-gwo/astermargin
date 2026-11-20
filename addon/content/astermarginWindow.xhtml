@@ -1,0 +1,77 @@
+<?xml version="1.0"?>
+<?xml-stylesheet href="chrome://global/skin/" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero/skin/zotero.css" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero/skin/overlay.css" type="text/css"?>
+<?xml-stylesheet href="chrome://zotero-platform/content/zotero.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-tokens.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-utilities.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-components.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/agent-ui-table.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/astermargin.css" type="text/css"?>
+<?xml-stylesheet href="chrome://astermargin/content/styles/katex-embedded.css" type="text/css"?>
+<!DOCTYPE window>
+<window
+    id="astermargin-window"
+    orient="vertical"
+    width="1040"
+    height="720"
+    minwidth="200"
+    minheight="300"
+    title="AsterMargin"
+    persist="screenX screenY width height"
+    windowtype="astermargin:window"
+    xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+    xmlns:html="http://www.w3.org/1999/xhtml"
+>
+    <linkset>
+        <html:link rel="localization" href="browser/menubar.ftl"/>
+        <html:link rel="localization" href="browser/browserSets.ftl"/>
+        <html:link rel="localization" href="astermargin-mainWindow.ftl"/>
+    </linkset>
+
+    <script type="application/javascript" src="chrome://astermargin/content/astermarginWindow.js"/>
+
+    <!-- Handlers are attached in astermarginWindow.js: the chrome CSP blocks inline
+         on* attributes. -->
+    <commandset>
+        <command id="cmd_astermarginNewChat"/>
+        <command id="cmd_astermarginSettings"/>
+        <command id="cmd_close"/>
+        <command id="minimizeWindow" data-l10n-id="window-minimize-command"/>
+        <command id="zoomWindow" data-l10n-id="window-zoom-command"/>
+    </commandset>
+    <keyset>
+        <key id="key_astermarginNewChat" key="N" modifiers="accel" command="cmd_astermarginNewChat"/>
+        <key id="key_close" key="W" modifiers="accel" command="cmd_close"/>
+    </keyset>
+    <keyset id="macKeyset">
+        <key id="key_minimizeWindow"
+             command="minimizeWindow"
+             data-l10n-id="window-minimize-shortcut"
+             modifiers="accel"
+             internal="true"/>
+    </keyset>
+    <!-- Zotero's platform keys add Library and its shortcut to this menu. -->
+    <menubar>
+        <menu id="fileMenu" data-l10n-id="menu-file">
+            <menupopup>
+                <menuitem data-l10n-id="astermargin-window-new-chat" command="cmd_astermarginNewChat" key="key_astermarginNewChat"/>
+                <menuitem data-l10n-id="astermargin-window-settings" command="cmd_astermarginSettings"/>
+                <menuseparator/>
+                <menuitem data-l10n-id="astermargin-window-close" command="cmd_close" key="key_close"/>
+            </menupopup>
+        </menu>
+        <menu id="windowMenu" data-l10n-id="menu-window-menu">
+            <menupopup id="windowPopup">
+                <menuitem command="minimizeWindow" key="key_minimizeWindow"/>
+                <menuitem command="zoomWindow"/>
+                <menuseparator id="sep-window-list"/>
+            </menupopup>
+        </menu>
+    </menubar>
+
+    <!-- React mount point. `astermargin-root` is the scoping root for the shared
+         @astermargin/agent-ui sheets, which select `.astermargin-root .foo`; it belongs on
+         every element carrying a `astermargin-pane-*` id. -->
+    <html:div id="astermargin-pane-window" class="astermargin-root display-flex flex-1 flex-col h-full w-full min-w-0" style="height: 100%; width: 100%; display: flex;"></html:div>
+</window>

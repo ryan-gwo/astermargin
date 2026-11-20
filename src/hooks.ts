@@ -1,0 +1,1238 @@
+import { InstanceLocalEndpoints } from './services/instanceLocalEndpoints';
+import { InstanceDocuments } from "./services/instanceDocuments";
+import { InstanceBackground } from "./services/instanceBackground";
+import { ZOTERO_PLUGIN_CLIENT_TYPE } from "@astermargin/agent-core/protocol/agentProtocol";
+import { setActionClient } from "@astermargin/agent-core/types/actions";
+import { version } from "../package.json";
+import { getAllVersionUpdateMessageVersions } from "../react/constants/versionUpdateMessages";
+import { disposeMuPDFWorker } from "./astermargin-extract";
+import { cleanupReaderIntegration, initReaderIntegration } from "./modules/readerIntegration";
+import { cleanupReaderToolbarMenu, initReaderToolbarMenu } from "./modules/readerToolbarMenu";
+import { cleanupNoteEditorExportMenu, initNoteEditorExportMenu } from "./modules/noteEditorExportMenu";
+import { cleanupContextMenus, initContextMenus } from "./modules/zoteroContextMenu";
+import { attachTableOpenLabels, detachTableOpenLabels } from "./modules/tableOpenMenuLabel";
+import {
+    registerTablesApi,
+    unregisterTablesApi
+} from "./services/artifacts/tablesApiHost";
+import {
+    cleanupTableReaderRedirect,
+    initTableReaderRedirect,
+} from "./services/artifacts/view/readerTableView";
+import { BackgroundExtractor } from "./services/backgroundExtractor";
+import { NewItemWatcher } from "./services/backgroundProcessing/newItemWatcher";
+import { ReconcilerService } from "./services/backgroundProcessing/reconciler";
+import { CitationService } from "./services/CitationService";
+import { AsterMarginDB } from "./services/database";
+import { DocumentCache } from "./services/documentCache";
+import { createInstanceAccount } from './services/instanceAccount';
+import { createInstanceTableFills } from './services/tableFills';
+import { InstancePreferences } from './services/instancePreferences';
+import { registerAsterMarginProtocolHandler, unregisterAsterMarginProtocolHandler } from "./services/protocolHandler";
+import { AsterMarginUIFactory } from "./ui/ui";
+import { openTable } from "./ui/openTable";
+import { prepareRendererBundle } from "./ui/rendererBundle";
+import { cleanupAsterMarginTabs, initAsterMarginTabs, recoverTabsAfterAsterMarginTabs, restoreAsterMarginTabs } from "./ui/astermarginTabs";
+import { cleanupTableTabs, initTableTabs } from "./ui/tableTab";
+import {
+    cleanupTableWindows,
+    initTableWindows,
+    onTableWindowCommand,
+    onTableWindowLoad,
+    onTableWindowMenuShowing,
+    onTableWindowUnload,
+    restoreTableWindows,
+} from "./ui/tableWindow";
+import { stopTableTabProbe } from "./ui/tableTabProbe";
+import { cancelAllActiveTasks } from "./utils/backgroundTasks";
+import { compareVersions } from "./utils/compareVersions";
+import { resolveLocalMode } from "./utils/backendConfiguration";
+import { configurePDFForAsterMargin } from "./utils/configurePDFForAsterMargin";
+import { initLocale } from "./utils/locale";
+import { clearPref, getPref, setPref } from "./utils/prefs";
+import { addPendingVersionNotification } from "./utils/versionNotificationPrefs";
+import { createZToolkit } from "./utils/ztoolkit";
+
+/** Timeout for individual async shutdown operations to prevent hangs. */
+const SHUTDOWN_TIMEOUT_MS = 3000;
+
+/**
+ * Race a promise against a timeout. Returns the promise result if it
+ * settles before the deadline, otherwise resolves with `undefined` and
+ * logs a warning.  Never rejects – callers should still wrap in try/catch
+ * for safety, but a stalled operation will not block shutdown.
+ */
+function withShutdownTimeout<T>(
+    promise: Promise<T>,
+    label: string,
+): Promise<T | undefined> {
+    let timeoutId: ReturnType<typeof setTimeout>;
+    return Promise.race([
+        promise,
+        new Promise<undefined>((resolve) => {
+            timeoutId = setTimeout(() => {
+                Zotero.debug(`[astermargin] onMainWindowUnload: ${label} timed out after ${SHUTDOWN_TIMEOUT_MS}ms, continuing shutdown`);
+                resolve(undefined);
+            }, SHUTDOWN_TIMEOUT_MS);
+        }),
+    ]).finally(() => clearTimeout(timeoutId));
+}
+
+function ensureDocumentRuntime(): void {
+    addon.documents ??= new InstanceDocuments();
+    configurePDFForAsterMargin({ onWorkerStartFailure: info => addon.runtime.publish('document-worker:failure', info) });
+}
+
+/**
+ * Stops the fill jobs and flushes their last commits. Runs before the
+ * mutation queue and the document services are disposed, which those commits
+ * and reads need.
+ */
+let tableFillsDisposal: Promise<void> | undefined;
+
+/** Whether the fill service is up, or its disposal has started and may still be flushing. */
+function tableFillsPending(): boolean {
+    return !!addon.tableFills || !!tableFillsDisposal;
+}
+
+async function disposeTableFills(): Promise<void> {
+    // Shared by every shutdown path: a second window unloading during a quit
+    // waits for the first one's flush instead of closing the queue under it.
+    if (!tableFillsDisposal) {
+        const fills = addon.tableFills;
+        addon.tableFills = undefined;
+        // `dispose` bounds itself (`shutdownFlushMs`): the last commit
+        // renders the snapshot, which a generic shutdown timeout would cut.
+        tableFillsDisposal = fills
+            ? fills.dispose().catch((error) => ztoolkit.log(`disposeTableFills: ${error}`))
+            : Promise.resolve();
+    }
+    await tableFillsDisposal;
+}
+
+function stopLocalIngress(): void {
+    const endpoints = addon.localEndpoints;
+    addon.localEndpoints = undefined;
+    try { endpoints?.dispose(); } catch (error) { ztoolkit.log(`disposeLocalEndpoints: ${error}`); }
+}
+
+async function disposeAccountServices(): Promise<void> {
+    stopLocalIngress();
+    addon.threads.dispose();
+    addon.presence.dispose();
+    try { addon.documents?.dispose(); } catch (error) { ztoolkit.log(`disposeDocuments: ${error}`); }
+    addon.documents = undefined;
+    try { if (addon.background) await withShutdownTimeout(addon.background.dispose(), "disposeBackground"); }
+    catch (error) { ztoolkit.log(`disposeBackground: ${error}`); }
+    addon.background = undefined;
+    try { addon.preferences?.dispose(); } catch (error) { ztoolkit.log(`disposePreferences: ${error}`); }
+    try { if (addon.account) await withShutdownTimeout(addon.account.dispose(), 'disposeAccount'); }
+    catch (error) { ztoolkit.log(`disposeAccount: ${error}`); }
+}
+
+let pluginDatabaseClose: Promise<void> | undefined;
+
+/**
+ * Close astermargin.sqlite. Shutdown paths overlap at a quit (each window's unload,
+ * the quit observer, APP_SHUTDOWN), so callers share a close in flight rather
+ * than closing a connection that is already closing. A failed close leaves the
+ * connection on `addon` for a later path to retry.
+ */
+function closePluginDatabase(): Promise<void> {
+    const db = addon.db;
+    if (!db) return Promise.resolve();
+    return pluginDatabaseClose ??= db.closeDatabase()
+        .then(() => { if (addon.db === db) addon.db = undefined; })
+        .finally(() => { pluginDatabaseClose = undefined; });
+}
+
+/**
+ * Close the agent connection via the window's React bundle (`agentService` is
+ * per-bundle). Synchronous and best-effort — teardown must not wait on the network.
+ */
+function closeAgentConnection(
+    win: Window | null | undefined,
+    reason: string,
+    options?: { rememberInterruptedThread?: boolean },
+): void {
+    const close = (win as any)?.AsterMarginReact?.closeAgentConnection;
+    if (typeof close !== "function") return;
+
+    try {
+        close(reason, options);
+    } catch (e) {
+        ztoolkit.log(`closeAgentConnection: ${e}`);
+    }
+}
+
+async function cleanupDevTemporaryAnnotations(
+    win: Window | null | undefined,
+): Promise<void> {
+    if (process.env.NODE_ENV !== "development") return;
+
+    const cleanup = (win as any)?.AsterMarginReact?.cleanupTemporaryAnnotations;
+    if (typeof cleanup !== "function") return;
+
+    try {
+        await withShutdownTimeout(cleanup(), "cleanupTemporaryAnnotations");
+    } catch (e) {
+        ztoolkit.log(`cleanupTemporaryAnnotations: ${e}`);
+    }
+}
+
+let isAppQuitting = false;
+/** Set once a quit's app-wide cleanup has started in a window's unload. */
+let globalCleanupStarted = false;
+let quitObserverRegistered = false;
+
+/**
+ * Holds Zotero's quit until running table fills have flushed their last
+ * commits: a blocker of the `quit-application` phase, which Gecko waits for
+ * before tearing down the profile. The quit observer disposes the account
+ * and closes the plugin database only after the same flush.
+ */
+const tableFillsQuitBlocker = (): Promise<void> => (tableFillsPending() ? disposeTableFills() : Promise.resolve());
+let quitPhase: { addBlocker(name: string, blocker: () => Promise<void>): void; removeBlocker(blocker: () => Promise<void>): void } | undefined;
+const quitObserver = {
+    observe(_subject: any, topic: string) {
+        if (topic === "quit-application-granted" || topic === "quit-application") {
+            stopLocalIngress();
+            isAppQuitting = true;
+            Zotero.__astermarginShuttingDown = true;
+        }
+        // Close astermargin.sqlite on quit-application, BEFORE the
+        // profile-before-change barrier where Sqlite.sys.mjs waits for all
+        // connections. A running table fill flushes first: its last commit
+        // needs the account and the plugin realm's services, and the quit
+        // blocker holds this phase until it has.
+        if (topic === "quit-application") {
+            const teardown = () => {
+                void disposeAccountServices();
+                try {
+                    if (addon) {
+                        closePluginDatabase().catch((error: unknown) => {
+                            Zotero.logError(error as Error);
+                        });
+                    }
+                } catch (_) {
+                    // Best-effort — process is dying
+                }
+            };
+            if (tableFillsPending()) void disposeTableFills().finally(teardown);
+            else teardown();
+        }
+    },
+};
+
+function registerQuitObserver(): void {
+    if (quitObserverRegistered) return;
+    try {
+        Services.obs.addObserver(quitObserver, "quit-application-granted");
+        Services.obs.addObserver(quitObserver, "quit-application");
+        quitObserverRegistered = true;
+    } catch (error) {
+        ztoolkit.log(`registerQuitObserver: Failed to register quit observer: ${error}`);
+    }
+    try {
+        const { AsyncShutdown } = ChromeUtils.importESModule('resource://gre/modules/AsyncShutdown.sys.mjs') as {
+            AsyncShutdown: { appShutdownConfirmed?: NonNullable<typeof quitPhase>; quitApplicationGranted?: NonNullable<typeof quitPhase> };
+        };
+        // The `quit-application` phase; older platforms only have the
+        // earlier `quitApplicationGranted`.
+        quitPhase = AsyncShutdown.appShutdownConfirmed ?? AsyncShutdown.quitApplicationGranted;
+        if (!quitPhase) throw new Error('no quit-granted shutdown phase');
+        quitPhase.addBlocker('AsterMargin: flush table fills', tableFillsQuitBlocker);
+    } catch (error) {
+        quitPhase = undefined;
+        ztoolkit.log(`registerQuitObserver: Failed to register the table fill quit blocker: ${error}`);
+    }
+}
+
+function unregisterQuitObserver(): void {
+    try {
+        quitPhase?.removeBlocker(tableFillsQuitBlocker);
+    } catch (error) {
+        ztoolkit.log(`unregisterQuitObserver: Failed to remove the table fill quit blocker: ${error}`);
+    }
+    quitPhase = undefined;
+    if (!quitObserverRegistered) return;
+    try {
+        Services.obs.removeObserver(quitObserver, "quit-application-granted");
+        Services.obs.removeObserver(quitObserver, "quit-application");
+    } catch (error) {
+        ztoolkit.log(`unregisterQuitObserver: Failed to unregister quit observer: ${error}`);
+    } finally {
+        quitObserverRegistered = false;
+    }
+}
+
+/**
+ * Handles upgrade tasks between plugin versions.
+ * @param lastVersion The previously installed version
+ * @param currentVersion The current plugin version
+ */
+async function handleUpgrade(lastVersion: string, currentVersion: string) {
+    // Mark welcome onboarding as shown for existing users who are upgrading.
+    // This prevents the first-install popup from showing to users who already have the plugin.
+    // The reader tip is intentionally NOT suppressed — existing users should see it once.
+    if (!getPref('onboardingWelcomeShown')) {
+        setPref('onboardingWelcomeShown', true);
+    }
+
+    const knownVersions = getAllVersionUpdateMessageVersions();
+    if (knownVersions.length && lastVersion) {
+        const versionsToNotify = knownVersions
+            .filter((versionToNotify) =>
+                compareVersions(lastVersion, versionToNotify) < 0 &&
+                compareVersions(currentVersion, versionToNotify) >= 0,
+            )
+            .sort(compareVersions);
+
+        versionsToNotify.forEach((versionToNotify) => {
+            addPendingVersionNotification(versionToNotify);
+            ztoolkit.log(`handleUpgrade: Queued version notification for ${versionToNotify}.`);
+        });
+    }
+
+    // Upgrade to 0.11.2 or newer: re-embed items with corrected title/date field mappings
+    if (compareVersions(lastVersion, '0.11.2') < 0 && compareVersions(currentVersion, '0.11.2') >= 0) {
+        setPref('runEmbeddingFullDiff', true);
+        ztoolkit.log(`handleUpgrade: Upgrade detected to ${currentVersion}. Flag set for embedding full diff.`);
+    }
+}
+
+/**
+ * Open the plugin database, releasing Zotero's pane lock if the open takes it.
+ *
+ * Zotero 10 runs an integrity check whenever a database's WAL file wasn't
+ * truncated by a clean shutdown (force quit, crash, `kill`). The check displays
+ * the modal pane overlay ("Checking database integrity…") and locks the pane,
+ * but only the corruption path restores the previous display — a check that
+ * passes leaves the overlay up. That is invisible for Zotero's own database,
+ * which is opened while the pane is still locked during startup and unlocked
+ * afterwards by `ZoteroPane.makeVisible()`. We open after `uiReadyPromise`, so
+ * the overlay would instead stay up for the rest of the session, with no way
+ * for the user to dismiss it.
+ *
+ * Only clears a lock that this open introduced, so a lock held by another
+ * operation is left alone. Zotero 7-9 put plugin databases in rollback-journal
+ * mode and have no such check, so the lock never appears and this is a no-op.
+ */
+async function openPluginDatabase(dbConnection: _ZoteroTypes.DB): Promise<void> {
+    const wasLocked = Zotero.locked;
+    await dbConnection.test();
+    if (!wasLocked && Zotero.locked) {
+        ztoolkit.log("Database open locked the Zotero pane (unclean shutdown integrity check) — releasing it");
+        Zotero.hideZoteroPaneOverlays();
+    }
+}
+
+async function onStartup() {
+    // -------- AsterMargin tabs: Zotero tab hooks, before any await --------
+    // A main window restores its tabs as it loads, and a saved AsterMargin tab
+    // without its `restoreState` hook costs every tab after it. The earlier the
+    // hooks are in, the fewer windows can restore without them; the first
+    // window of a cold start is repaired in `onMainWindowLoad`.
+    initAsterMarginTabs();
+    initTableTabs((ref, options) => openTable(ref, options));
+    initTableWindows((ref) => openTable(ref, { openIn: 'window' }));
+    // The first window's renderer waits for Zotero's UI; compiling its bundle
+    // now, off the main thread, overlaps the two.
+    void prepareRendererBundle();
+
+    await Promise.all([
+        Zotero.initializationPromise,
+        Zotero.unlockPromise,
+        Zotero.uiReadyPromise,
+    ]);
+
+    // If the user quit Zotero before plugins finished initializing, the
+    // promises above still resolve but the app is already tearing down.
+    // Bail out to avoid opening resources that can never be cleaned up.
+    if (Services?.startup?.shuttingDown || Zotero.__astermarginShuttingDown) {
+        ztoolkit.log("Startup aborted: app is already shutting down");
+        return;
+    }
+
+    registerQuitObserver();
+    // Times the open Zotero transaction for the busy diagnostics.
+    addon.transactionWatch.start();
+    // Capture staging diagnostics without changing the profile's logging preferences.
+    if (process.env.BUILD_ENV === 'staging' && !Zotero.Debug.storing) {
+        Zotero.Debug.setStore(true);
+    }
+    initLocale();
+    ztoolkit.log("Startup");
+
+    // Retired preferences: nothing reads them, so a value left by an earlier
+    // version is dropped rather than carried in the profile indefinitely.
+    clearPref("backgroundProcessingContinuous");
+
+    // -------- Configure the PDF package (esbuild bundle copy) --------
+    // Idempotent. Must run before any PDF op. The webpack bundle calls the
+    // same adapter from `react/index.tsx` for its own copy of the config.
+    ensureDocumentRuntime();
+
+    // -------- Declare the client actions are gated on --------
+    // Each bundle holds its own copy of this seam, so the webpack bundle
+    // registers the same value from `react/index.tsx`.
+    setActionClient(ZOTERO_PLUGIN_CLIENT_TYPE);
+
+    // -------- Store plugin version --------
+    addon.pluginVersion = version;
+    addon.preferences ??= new InstancePreferences();
+    // Fixed for this plugin load: the account and the backend access policy
+    // read this flag, never the pref, so toggling the pref takes effect on the
+    // next plugin load instead of cutting off a live session.
+    // A build without AsterMargin server settings has no backend to reach, so it
+    // always runs in local mode.
+    const localModeState = resolveLocalMode(true, false);
+    addon.localMode = localModeState.localMode;
+    addon.localModeForced = localModeState.forced;
+    addon.account ??= createInstanceAccount();
+    addon.threads.start(addon.account);
+    // The UI below must still load if the account cannot start, so the user
+    // can reach Preferences instead of seeing no AsterMargin at all.
+    try {
+        addon.account.start();
+    } catch (error) {
+        ztoolkit.log("Account failed to start", error);
+        Zotero.logError(error as Error);
+    }
+    addon.localEndpoints ??= new InstanceLocalEndpoints();
+    addon.localEndpoints.start(addon.account, addon.preferences);
+    if (!addon.tableFills) {
+        tableFillsDisposal = undefined;
+        addon.tableFills = createInstanceTableFills();
+    }
+    ztoolkit.log(`Plugin version: ${version}`);
+
+    // -------- Initialize database --------
+    // Wrap in try/catch so that if any later initialization step fails
+    // (e.g. main window already destroyed), we still close the DB
+    // connection.  An unclosed connection triggers a FATAL AsyncShutdown
+    // timeout crash in Mozilla's Sqlite.sys.mjs shutdown blocker.
+    const dbConnection = new Zotero.DBConnection("astermargin");
+    const astermarginDB = new AsterMarginDB(dbConnection);
+    addon.db = astermarginDB;
+
+    try {
+        // Test connection and initialize schema
+        await openPluginDatabase(dbConnection);
+        await astermarginDB.initDatabase(version);
+
+        // -------- Initialize Document Cache --------
+        const documentCache = new DocumentCache(astermarginDB);
+        await documentCache.init();
+        await documentCache.runStartupGC();
+        addon.documentCache = documentCache;
+        ztoolkit.log("DocumentCache initialized successfully");
+
+        // -------- Handle plugin upgrade --------
+        const lastVersion = getPref('installedVersion');
+        if (lastVersion && lastVersion !== version) {
+            await handleUpgrade(lastVersion, version);
+        }
+
+        // -------- Set installed version --------
+        setPref('installedVersion', version);
+        ztoolkit.log(`Installed version: ${getPref('installedVersion')}`);
+
+        // -------- Initialize background extraction processor --------
+        const backgroundExtractor = new BackgroundExtractor();
+        addon.backgroundExtractor = backgroundExtractor;
+        addon.background = new InstanceBackground();
+        await addon.background.start(addon.account!);
+        backgroundExtractor.start();
+        ztoolkit.log("BackgroundExtractor started");
+
+        // Whole-library producers are independently pref-gated. They only
+        // enumerate searchable libraries mirrored from the webpack profile.
+        const processingReconciler = new ReconcilerService();
+        addon.processingReconciler = processingReconciler;
+        processingReconciler.start();
+        const newItemWatcher = new NewItemWatcher();
+        addon.newItemWatcher = newItemWatcher;
+        newItemWatcher.start();
+        ztoolkit.log("Background processing producers started");
+
+        try {
+            const legacyContentCache = PathUtils.join(Zotero.Profile.dir, "astermargin", "content-cache");
+            if (await IOUtils.exists(legacyContentCache)) {
+                await IOUtils.remove(legacyContentCache, { recursive: true });
+            }
+        } catch (error) {
+            ztoolkit.log(`Legacy content-cache cleanup failed: ${error}`);
+        }
+
+        // -------- Initialize Citation Service with caching --------
+        const citationService = new CitationService(ztoolkit);
+        addon.citationService = citationService;
+        ztoolkit.log("CitationService initialized successfully");
+
+        // -------- Register keyboard shortcuts --------
+        AsterMarginUIFactory.registerShortcuts();
+
+        // -------- Register protocol handler (zotero://astermargin) --------
+        registerAsterMarginProtocolHandler();
+
+        // -------- Register Zotero 8 context menus (no-op on Zotero 7) --------
+        initContextMenus();
+
+        // -------- Register reader text selection popup & context menu --------
+        initReaderIntegration();
+
+        // -------- Register reader toolbar dropdown menu --------
+        await initReaderToolbarMenu();
+
+        // -------- "Export with AsterMargin" in the note editor's More menu --------
+        initNoteEditorExportMenu();
+
+        // -------- Readers on a stored table go to the AsterMargin tab --------
+        // A reader tab is replaced when it is added (`initTableTabs`); this
+        // catches restored reader tabs and reader windows as they load.
+        initTableReaderRedirect();
+
+        // -------- Publish the table surfaces to the other bundle --------
+        // The reader redirect and the table tabs keep module state, so they
+        // live in this bundle only. Anything on the webpack side reaches
+        // them through `Zotero.__astermarginTables` rather than importing them,
+        // which would give it a second, permanently empty copy.
+        registerTablesApi();
+
+        // -------- Register Zotero preferences pane --------
+        await Zotero.PreferencePanes.register({
+            pluginID: addon.data.config.addonID,
+            src: rootURI + 'content/astermarginZoteroPrefs.xhtml',
+            scripts: [rootURI + 'content/astermarginZoteroPrefs.js'],
+            id: 'astermargin-prefpane',
+            label: 'AsterMargin',
+            image: rootURI + 'content/icons/astermargin@0.5x.png',
+        });
+
+        // -------- Load UI for all windows --------
+        watchMainWindows();
+        const mainWindows = Zotero.getMainWindows();
+        if (mainWindows.length > 0) {
+            await Promise.all(
+                mainWindows.map((win) => onMainWindowLoad(win)),
+            );
+        }
+    } catch (error) {
+        await disposeAccountServices();
+        // If startup fails after opening the DB, close it immediately
+        // to prevent AsyncShutdown timeout → FATAL ERROR crash.
+        ztoolkit.log(`Startup failed, closing database: ${error}`);
+        // Stop the background extractor
+        try {
+            addon.newItemWatcher?.stop();
+            addon.newItemWatcher = undefined;
+            addon.processingReconciler?.stop();
+            addon.processingReconciler = undefined;
+            if (addon.backgroundExtractor) {
+                await addon.backgroundExtractor.stop();
+                addon.backgroundExtractor = undefined;
+            }
+        } catch (stopError) {
+            ztoolkit.log(`Failed to stop backgroundExtractor during startup error recovery: ${stopError}`);
+        }
+        try {
+            await closePluginDatabase();
+        } catch (closeError) {
+            ztoolkit.log(`Failed to close database during startup error recovery: ${closeError}`);
+        }
+        throw error;
+    }
+}
+
+function onStandaloneWindowLoad(win: Window): void {
+    if (win.closed || addon.runtime.getWindow(win)) return;
+    addon.runtime.attachWindow(win, "standalone");
+    registerMainWindowFtl(win);
+    AsterMarginUIFactory.registerChatPanel(win);
+}
+
+/** A table window loaded: its table (`tableWindow.ts`), and AsterMargin's shortcuts. */
+function onTableWindowLoaded(win: Window): void {
+    onTableWindowLoad(win);
+    AsterMarginUIFactory.attachShortcuts(win);
+}
+
+function onStandaloneWindowUnload(win: Window): void {
+    const runtime = addon.runtime.getWindow(win);
+    if (!runtime || !addon.runtime.markClosing(win)) return;
+    addon.mutations.cancelOwner(runtime.id);
+    void addon.notePreviews.detachOwner(runtime.id).catch(Zotero.logError);
+    closeAgentConnection(win, "AsterMargin window closed", {
+        rememberInterruptedThread: true,
+    });
+    addon.syncPause.releaseWindow(runtime.id);
+    AsterMarginUIFactory.closeWindowsRenderedBy(win);
+    AsterMarginUIFactory.removeChatPanel(win);
+    unregisterMainWindowFtl(win);
+    addon.runtime.detachWindow(win);
+}
+
+async function onMainWindowLoad(win: Window): Promise<void> {
+    // Zotero 11 calls this again for a window AsterMargin attached at startup
+    // without a library view, once its first one loads. The renderer adds the
+    // library sidebar itself when that view's tab is selected.
+    if (win.closed || addon.runtime.getWindow(win)) return;
+    const runtime = addon.runtime.attachWindow(win);
+
+    // Zotero 11 reports main windows to plugins by their library views: a
+    // window without a loaded one never reports its unload. Follow the
+    // window's own unload as well; the second call is a no-op. Earlier
+    // versions report every main window's close themselves.
+    if (Array.isArray((win as any).ZoteroPane?.libraryViews)) {
+        const onWindowUnload = () => { void onMainWindowUnload(win, { windowUnloading: true }); };
+        win.addEventListener("unload", onWindowUnload);
+        addon.runtime.addWindowCleanup(runtime, () => win.removeEventListener("unload", onWindowUnload));
+    }
+
+    // Create ztoolkit for every window
+    addon.data.ztoolkit = createZToolkit();
+
+    // Re-configure the PDF package on every main-window load. Required for
+    // the macOS close-last-window-then-reopen lifecycle (see CLAUDE.md):
+    // `onStartup()` does not re-run, but the package's module-scope config
+    // must be configured before this window can dispatch document work.
+    // Idempotent — `configurePDF()` overwrites prior config.
+    ensureDocumentRuntime();
+
+    registerMainWindowFtl(win);
+
+    // Wait for the UI to be ready
+    await Promise.all([
+        Zotero.initializationPromise,
+        Zotero.unlockPromise,
+        Zotero.uiReadyPromise,
+    ]);
+
+    if (runtime.status === 'closing' || addon.runtime.getWindow(win) !== runtime) return;
+    if (win.closed) {
+        addon.runtime.detachWindow(win);
+        return;
+    }
+
+    AsterMarginUIFactory.registerChatPanel(win);
+    attachTableOpenLabels(win, (ref) => openTable(ref, { openIn: 'window' }));
+
+    // Tabs a cold start's session restore lost to a saved AsterMargin tab, then
+    // the AsterMargin tabs a quit, plugin reload or last-window close left for this
+    // window (once its renderer can host them).
+    void recoverTabsAfterAsterMarginTabs(win)
+        .catch((error) => ztoolkit.log(`recoverTabsAfterAsterMarginTabs: ${error}`))
+        .then(() => restoreAsterMarginTabs(win))
+        .catch((error) => ztoolkit.log(`restoreAsterMarginTabs: ${error}`));
+    // Table windows a quit or a AsterMargin shutdown left open. They need no main
+    // window's renderer; the record is consumed, so only the first window to
+    // load reopens them.
+    void restoreTableWindows().catch((error) => ztoolkit.log(`restoreTableWindows: ${error}`));
+
+    ztoolkit.log("UI ready");
+    
+    // Load styles for this window
+    loadStylesheet();
+    loadKatexStylesheet(win);
+    ztoolkit.log("Styles loaded for window");
+}
+
+const MAIN_WINDOW_URL = "chrome://zotero/content/zoteroPane.xhtml";
+type WindowMediatorListener = { onOpenWindow(xulWindow: any): void; onCloseWindow(xulWindow: any): void };
+let mainWindowListener: WindowMediatorListener | null = null;
+
+/**
+ * Attach to main windows as they open. Zotero 11 reports a main window to
+ * plugins only once a library view in it has loaded, so a window opened on a
+ * reader (a tab moved to a new window) would otherwise have no AsterMargin until
+ * its library tab is shown. Zotero 7–10 report every main window themselves.
+ */
+function watchMainWindows(): void {
+    if (mainWindowListener) return;
+    const listener: WindowMediatorListener = {
+        onOpenWindow(xulWindow: any) {
+            const win = xulWindow?.docShell?.domWindow as Window | undefined;
+            win?.addEventListener("load", () => {
+                const pane = (win as any).ZoteroPane;
+                if (win.location?.href !== MAIN_WINDOW_URL || !Array.isArray(pane?.libraryViews)) return;
+                // Resolves once the window has its tabs, context pane and the
+                // tab it was opened for.
+                Promise.resolve(pane.loadedPromise)
+                    .then(() => {
+                        if (mainWindowListener !== listener || win.closed || !addon.data.alive) return;
+                        return onMainWindowLoad(win);
+                    })
+                    .catch((error: unknown) => Zotero.logError(error as Error));
+            }, { once: true });
+        },
+        onCloseWindow() {},
+    };
+    mainWindowListener = listener;
+    Services.wm.addListener(listener as any);
+}
+
+function unwatchMainWindows(): void {
+    if (!mainWindowListener) return;
+    Services.wm.removeListener(mainWindowListener as any);
+    mainWindowListener = null;
+}
+
+/**
+ * Whether Zotero reported a window unloaded only because its last library
+ * view closed. Zotero 11 does that while the window and its reader tabs stay
+ * open; AsterMargin keeps serving them and cleans up on the window's own unload.
+ * When the window itself closes, its library views are still registered.
+ */
+function onlyLibraryViewsClosed(win: Window): boolean {
+    if (win.closed || isAppQuitting || (Services?.startup?.shuttingDown ?? false)) return false;
+    const views = (win as any).ZoteroPane?.libraryViews;
+    return Array.isArray(views) && views.length === 0;
+}
+
+/**
+ * Cleanup handler for main window unload.
+ *
+ * IMPORTANT: This is where ALL cleanup must happen because:
+ * 1. onShutdown() is called AFTER Zotero's internal shutdown begins
+ * 2. By the time onShutdown() runs, the crash has already occurred
+ * 3. Cleanup must happen during window unload, before Zotero's internal cleanup
+ *
+ * The cleanup order matters to prevent SIGSEGV crashes:
+ * 1. Dispose native resources (MuPDF WASM, database)
+ * 2. Unregister Zotero.Reader event listeners
+ * 3. Restore Zotero.Reader.onChangeSidebarWidth
+ * 4. Unmount React components
+ * 5. Unload stylesheets
+ */
+async function onMainWindowUnload(
+    win: Window,
+    { windowUnloading = false }: { windowUnloading?: boolean } = {},
+): Promise<void> {
+    if (!windowUnloading && onlyLibraryViewsClosed(win)) {
+        ztoolkit.log("onMainWindowUnload: last library view closed, keeping the open window");
+        return;
+    }
+    const runtime = addon.runtime.getWindow(win);
+    if (!addon.runtime.markClosing(win)) return;
+    if (runtime) {
+        addon.mutations.cancelOwner(runtime.id);
+        void addon.notePreviews.detachOwner(runtime.id).catch(error => {
+            ztoolkit.log('Failed to restore closing window note previews', error);
+        });
+    }
+    ztoolkit.log("onMainWindowUnload: Starting cleanup");
+
+    try {
+        // Close first: later steps can await, and the window may be gone when
+        // this handler returns. Read quitting and the window count here — the
+        // later scope check runs after those awaits.
+        const appGoingAway = isAppQuitting || (Services?.startup?.shuttingDown ?? false);
+        if (appGoingAway) {
+            if (tableFillsPending()) await disposeTableFills();
+            await addon.mutations.dispose();
+        }
+        const isLastMainWindow = Zotero.getMainWindows()
+            .filter(w => w !== win && !w.closed).length === 0;
+        // Record only when AsterMargin itself is going away. Closing one of several
+        // windows also abandons the run, but AsterMargin keeps running, so a
+        // "AsterMargin closed mid-response" offer would be false — in the surviving
+        // window (which runs its own bundle) it would even appear mid-session.
+        // That thread is still in the chat history to reopen.
+        //
+        // On a quit every window is going away, and the one holding the socket
+        // is not necessarily the last to unload — the later ones have nothing
+        // left to close, so gating on "last window" alone would record nothing.
+        closeAgentConnection(
+            win,
+            appGoingAway ? "Zotero quitting" : "Main window closed",
+            { rememberInterruptedThread: true },
+        );
+
+        // Determine cleanup scope BEFORE unmounting React, so we can set
+        // the shutdown flag before React cleanup effects run.
+        const remainingWindows = Zotero.getMainWindows().filter(w => w !== win && !w.closed);
+        const isLastWindow = remainingWindows.length === 0;
+        const isAppShuttingDown = Services?.startup?.shuttingDown ?? false;
+        const shouldRunGlobalCleanup = isLastWindow && (isAppQuitting || isAppShuttingDown);
+
+        // If this is a full shutdown, signal it BEFORE React unmount.
+        // React cleanup effects (useEmbeddingIndex, etc.)
+        // check this flag to skip fire-and-forget async operations that
+        // would otherwise outlive the plugin and cause segfaults.
+        if (shouldRunGlobalCleanup) {
+            ztoolkit.log("onMainWindowUnload: Setting shutdown flag and cancelling in-flight operations");
+            Zotero.__astermarginShuttingDown = true;
+            addon.data.alive = false;
+
+            await disposeAccountServices();
+
+            // Cancel all background tasks (sync, PDF fetch, metadata enrich)
+            // and clear their 60-second cleanup timers that keep the event loop alive.
+            cancelAllActiveTasks();
+        }
+
+        // Clean up window-specific resources
+
+        // Clean up event bus for this window
+        if (win.__astermarginEventBus) {
+            win.__astermarginEventBus = null;
+        }
+
+        // Stop the busy-context heartbeat timer (registered by busyContext.ts in
+        // the webpack bundle) so it doesn't outlive the window.
+        try {
+            win.__astermarginStopBusyHeartbeat?.();
+        } catch (e) {
+            ztoolkit.log(`stopBusyHeartbeat: ${e}`);
+        }
+
+        // Resume Zotero sync suppression held by a mutating agent run before
+        // this window's timers and React cleanup are torn down.
+        try {
+            const rescheduleSync = !(isAppQuitting || isAppShuttingDown);
+            if (runtime) addon.syncPause.releaseWindow(runtime.id);
+        } catch (e) {
+            ztoolkit.log(`resumeSyncAfterRun: ${e}`);
+        }
+
+        // Preferences borrows this renderer and must unmount before its owner.
+        AsterMarginUIFactory.closeWindowsRenderedBy(win, isLastWindow);
+
+        // Dev-only: visualizer highlights are temporary reader annotations
+        // owned by the React bundle, so clear them before unmounting React.
+        await cleanupDevTemporaryAnnotations(win);
+
+        // Remove React components and DOM elements for this window.
+        // React cleanup effects run here — they will see the shutdown
+        // flag and skip any fire-and-forget DB/network operations.
+        AsterMarginUIFactory.removeChatPanel(win);
+        addon.runtime.detachWindow(win);
+        detachTableOpenLabels(win);
+
+        // Remove the <link rel="localization"> we added in onMainWindowLoad.
+        // Leaving it behind after disable causes the locale bundle to log
+        // "Missing resource" and emits an uncaught promise rejection on the
+        // next popup translation, breaking Zotero's right-click menu.
+        unregisterMainWindowFtl(win);
+
+        if (!isLastWindow) {
+            ztoolkit.log("onMainWindowUnload: Other windows remain, skipping global cleanup");
+            return;
+        }
+
+
+        if (!shouldRunGlobalCleanup) {
+            ztoolkit.log("onMainWindowUnload: Last window closed but app still running, skipping global cleanup");
+            return;
+        }
+
+        // At a quit every window can read as closed, so each unload can take
+        // itself for the last one. The app-wide cleanup disposes the window
+        // registry, which would cut short the unload of a window still
+        // attached, so it runs once, in the last window to finish its own.
+        if (addon.runtime.getSnapshot().some((other) => other.kind === "main")) {
+            ztoolkit.log("onMainWindowUnload: Other windows still closing, skipping global cleanup");
+            return;
+        }
+        if (globalCleanupStarted) return;
+        globalCleanupStarted = true;
+        ztoolkit.log("onMainWindowUnload: Last window closing, running global cleanup");
+
+        // Global cleanup - only run when last window closes
+
+        addon.newItemWatcher?.stop();
+        addon.newItemWatcher = undefined;
+        addon.processingReconciler?.stop();
+        addon.processingReconciler = undefined;
+
+        // 2. Stop the background extraction processor. It owns the
+        //    background MuPDFWorkerClient and an in-flight extraction may
+        //    still be running; the stop() call aborts it cooperatively and
+        //    disposes the worker.
+        if (addon.backgroundExtractor) {
+            await withShutdownTimeout(
+                addon.backgroundExtractor.stop(),
+                "backgroundExtractor.stop",
+            );
+            addon.backgroundExtractor = undefined;
+        }
+
+        // 3. Terminate the remaining MuPDF worker(s). Sentencex lives
+        //    inside the worker and dies with `worker.terminate()`. With
+        //    `name` omitted, disposes any slot still alive (the hot one
+        //    in the steady state; the background slot was already
+        //    disposed by step 2).
+        await withShutdownTimeout(disposeMuPDFWorker(), "disposeMuPDFWorker");
+
+        addon.documentCache = undefined;
+
+        // 4. Close database connection
+        await withShutdownTimeout(closePluginDatabase(), "closeDatabase");
+
+        // 4. Dispose CitationService
+        if (addon.citationService) {
+            addon.citationService.dispose();
+            addon.citationService = undefined;
+        }
+
+        // 5. Unregister keyboard shortcuts (clears interval, unregisters Zotero.Reader listeners)
+        AsterMarginUIFactory.unregisterShortcuts();
+
+        // Dispose the plugin-owned window registry and reader-width dispatcher.
+        addon.runtime.disposeInstance();
+
+        // 7. Unload stylesheets
+        unloadKatexStylesheet(win);
+        unloadStylesheet();
+
+        // 8. Unregister ztoolkit
+        ztoolkit.unregisterAll();
+        addon.data.dialog?.window?.close();
+
+        // 9. Close separate AsterMargin and preferences windows if any survived
+        //    (normally already closed above, before React was torn down)
+        AsterMarginUIFactory.closeAsterMarginWindow();
+        AsterMarginUIFactory.closePreferencesWindow();
+
+        // 10. Unregister quit observer and the main window watcher
+        unregisterQuitObserver();
+        unwatchMainWindows();
+
+        // 11. Unregister context menus
+        cleanupContextMenus();
+
+        // 12. Unregister reader integration listeners, including the redirect
+        //     of readers on a table.
+        cleanupReaderIntegration();
+        // The tabs close (and are remembered) while their kinds are still registered.
+        cleanupAsterMarginTabs();
+        cleanupTableTabs();
+        stopTableTabProbe();
+        unregisterTablesApi();
+        cleanupTableReaderRedirect();
+
+        // 13. Unregister reader toolbar menu and the note editor export entry
+        cleanupReaderToolbarMenu();
+        cleanupNoteEditorExportMenu();
+
+        // 14. Unregister protocol handler
+        unregisterAsterMarginProtocolHandler();
+
+        // 15. Drop React-bundle cross-bundle globals attached to Zotero
+        Zotero.__astermarginShuttingDown = undefined;
+        Zotero.__astermarginWrittenAnnotationItems = undefined;
+        Zotero.__astermarginWrittenAnnotationKeys = undefined;
+
+        ztoolkit.log("onMainWindowUnload: Cleanup completed successfully");
+    } catch (error: any) {
+        ztoolkit.log(`onMainWindowUnload: Error during cleanup: ${error.message}`);
+    } finally {
+        if (addon.runtime.getWindow(win) === runtime) {
+            AsterMarginUIFactory.closeWindowsRenderedBy(win);
+            AsterMarginUIFactory.removeChatPanel(win);
+            addon.runtime.detachWindow(win);
+        }
+    }
+}
+
+/**
+ * Global AUTHOR_SHEETs, in cascade order.
+ *
+ * The `agent-ui-*` sheets come from `packages/agent-ui/src/theme/` and are copied
+ * into `addon/content/styles/` at build time by `scripts/copy-agent-ui-css.mjs`,
+ * so they are generated, not checked in. `agent-ui-tokens.css` holds AsterMargin's own
+ * custom properties plus the documented contract of platform tokens Zotero
+ * supplies; `agent-ui-utilities.css` holds the utility layer, scoped
+ * `.astermargin-root`; `agent-ui-components.css` holds the shared component rules —
+ * the sign-in surface, the link vocabulary, the composer and the bars that dock
+ * to it, the editor field and the tooltip family.
+ *
+ * Order is the cascade. The shared sheets are registered *before* `astermargin.css` so
+ * this client's own rules win at equal specificity — the package supplies the
+ * shared baseline, this client adapts it. Tokens precede the utilities that
+ * consume them, and the components sheet follows both: it is written in that
+ * vocabulary and has to beat it where the two land on one element, which
+ * `.text-link` beside `.font-color-secondary` does.
+ *
+ * Kept as separate sheets rather than concatenated, so provenance stays readable
+ * and the shared files are byte-identical to what the Word add-in imports. Keep
+ * this list in step with the `<?xml-stylesheet?>` links in `astermarginWindow.xhtml`
+ * and `astermarginPreferences.xhtml`.
+ */
+const GLOBAL_STYLESHEETS = [
+    "agent-ui-tokens.css",
+    "agent-ui-utilities.css",
+    "agent-ui-components.css",
+    "agent-ui-table.css",
+    "astermargin.css",
+];
+
+function loadStylesheet() {
+    const ssService = Cc["@mozilla.org/content/style-sheet-service;1"]
+        .getService(Ci.nsIStyleSheetService);
+    const sheetType = Ci.nsIStyleSheetService.AUTHOR_SHEET!;
+    for (const name of GLOBAL_STYLESHEETS) {
+        const styleURI = `chrome://${addon.data.config.addonRef}/content/styles/${name}`;
+        const styleSheet = Services.io.newURI(styleURI);
+        // Per sheet, so one missing file cannot cost the others. The agent-ui
+        // sheets are copied in at build time rather than checked in, so a build
+        // that skipped `copy:agent-ui-css` would otherwise take astermargin.css down
+        // with it and render the whole plugin unstyled.
+        try {
+            if (ssService.sheetRegistered(styleSheet, sheetType)) {
+                ssService.unregisterSheet(styleSheet, sheetType);
+            }
+            ssService.loadAndRegisterSheet(styleSheet, sheetType);
+        } catch (error) {
+            Zotero.logError(
+                new Error(`AsterMargin: failed to register ${name}: ${error}`),
+            );
+        }
+    }
+}
+
+function unloadStylesheet() {
+    const ssService = Cc["@mozilla.org/content/style-sheet-service;1"]
+        .getService(Ci.nsIStyleSheetService);
+    const sheetType = Ci.nsIStyleSheetService.AUTHOR_SHEET!;
+    for (const name of GLOBAL_STYLESHEETS) {
+        const styleURI = `chrome://${addon.data.config.addonRef}/content/styles/${name}`;
+        const styleSheet = Services.io.newURI(styleURI);
+        if (ssService.sheetRegistered(styleSheet, sheetType)) {
+            ssService.unregisterSheet(styleSheet, sheetType);
+        }
+    }
+}
+
+/**
+ * Load KaTeX stylesheet as a per-document <link> element instead of a global
+ * AUTHOR_SHEET. This prevents the note editor iframe (resource://zotero/note-editor/)
+ * from attempting to load chrome://astermargin/ font resources, which its security
+ * policy blocks.
+ */
+function loadKatexStylesheet(win: Window) {
+    if (!win?.document) return;
+    const doc = win.document;
+    if (doc.getElementById("astermargin-katex-stylesheet")) return;
+    const link = doc.createElementNS("http://www.w3.org/1999/xhtml", "html:link") as HTMLLinkElement;
+    link.id = "astermargin-katex-stylesheet";
+    link.rel = "stylesheet";
+    link.type = "text/css";
+    link.href = `chrome://${addon.data.config.addonRef}/content/styles/katex-embedded.css`;
+    doc.documentElement.appendChild(link);
+}
+
+function unloadKatexStylesheet(win: Window) {
+    if (!win?.document) return;
+    const el = win.document.getElementById("astermargin-katex-stylesheet");
+    if (el) el.remove();
+}
+
+/**
+ * Register AsterMargin's mainWindow.ftl as a <link rel="localization"> in the
+ * window's DOM, mirroring MozXULElement.insertFTLIfNeeded
+ */
+function registerMainWindowFtl(win: Window): void {
+    if (!win?.document) return;
+    const doc = win.document;
+    const ftlPath = `${addon.data.config.addonRef}-mainWindow.ftl`;
+    const XUL_NS = 'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul';
+    const XHTML_NS = 'http://www.w3.org/1999/xhtml';
+    let container: Element | null = doc.head || doc.querySelector('linkset');
+    if (!container) {
+        if (doc.documentElement.namespaceURI === XUL_NS) {
+            container = doc.createXULElement('linkset');
+            doc.documentElement.appendChild(container);
+        } else {
+            container = doc.documentElement;
+        }
+    }
+    const alreadyPresent = Array.from(container.querySelectorAll('link')).some(
+        (l: any) => l?.getAttribute('href') === ftlPath,
+    );
+    if (alreadyPresent) return;
+    const link = doc.createElementNS(XHTML_NS, 'link');
+    link.setAttribute('rel', 'localization');
+    link.setAttribute('href', ftlPath);
+    container.appendChild(link);
+}
+
+function unregisterMainWindowFtl(win: Window): void {
+    if (!win?.document) return;
+    const doc = win.document;
+    const ftlPath = `${addon.data.config.addonRef}-mainWindow.ftl`;
+    const link = doc.querySelector(`link[rel="localization"][href="${ftlPath}"]`);
+    if (link) link.remove();
+}
+
+let appShutdownDisposal: Promise<void> | undefined;
+
+/** APP_SHUTDOWN runs too late to access windows, React, or reader UI. */
+function onAppShutdown(): Promise<void> {
+    return appShutdownDisposal ??= disposeAppServices();
+}
+
+async function disposeAppServices(): Promise<void> {
+    stopLocalIngress();
+    Zotero.__astermarginShuttingDown = true;
+    addon.data.alive = false;
+    const attempt = async (label: string, cleanup: () => void | Promise<unknown>) => {
+        try {
+            await withShutdownTimeout(Promise.resolve(cleanup()), label);
+        } catch (error) {
+            ztoolkit.log(`onAppShutdown: ${label} failed:`, error);
+        }
+    };
+    if (tableFillsPending()) await disposeTableFills();
+    await addon.mutations.dispose();
+    addon.syncPause.resumeSyncNow();
+    addon.transactionWatch.stop();
+    await attempt('disposeAccount', disposeAccountServices);
+    await attempt('cancelAllActiveTasks', () => cancelAllActiveTasks());
+    await attempt('newItemWatcher.stop', () => addon.newItemWatcher?.stop());
+    addon.newItemWatcher = undefined;
+    await attempt('processingReconciler.stop', () => addon.processingReconciler?.stop());
+    addon.processingReconciler = undefined;
+    await attempt('backgroundExtractor.stop', () => addon.backgroundExtractor?.stop());
+    addon.backgroundExtractor = undefined;
+    await attempt('disposeMuPDFWorker', () => disposeMuPDFWorker(undefined, { force: true }));
+    addon.documentCache = undefined;
+    // Keep a failed connection available to bootstrap's independent DB fallback.
+    await attempt('closeDatabase', closePluginDatabase);
+    await attempt('citationService.dispose', () => addon.citationService?.dispose());
+    addon.citationService = undefined;
+    await attempt('exporter.dispose', () => addon.exporter.dispose());
+    await attempt('images.dispose', () => addon.images.dispose());
+}
+
+let instanceDisposal: Promise<void> | undefined;
+
+/** Full cleanup for plugin disable/reload, while Zotero UI is still usable. */
+function onShutdown(): Promise<void> {
+    return instanceDisposal ??= disposePlugin();
+}
+
+async function disposePlugin(): Promise<void> {
+    stopLocalIngress();
+    unwatchMainWindows();
+    addon.itemImport.dispose();
+    addon.images.dispose();
+    if (tableFillsPending()) await disposeTableFills();
+    await addon.mutations.dispose();
+    addon.syncPause.resumeSyncNow();
+    addon.transactionWatch.stop();
+    Zotero.__astermarginShuttingDown = true;
+    addon.data.alive = false;
+    cancelAllActiveTasks();
+    ztoolkit.log("onShutdown: Running fallback cleanup");
+
+    try {
+        AsterMarginUIFactory.closeAsterMarginWindow();
+        // Recorded first, so the next start reopens them.
+        cleanupTableWindows();
+        const openWindows = Zotero.getMainWindows?.().filter(w => w && !w.closed) ?? [];
+        for (const win of openWindows) addon.runtime.markClosing(win);
+        for (const win of openWindows) {
+            closeAgentConnection(win as Window, "AsterMargin plugin shutting down", {
+                rememberInterruptedThread: true,
+            });
+            AsterMarginUIFactory.closeWindowsRenderedBy(win);
+            await cleanupDevTemporaryAnnotations(win as Window);
+            AsterMarginUIFactory.removeChatPanel(win as Window);
+            addon.runtime.detachWindow(win);
+        }
+
+        addon.newItemWatcher?.stop();
+        addon.newItemWatcher = undefined;
+        addon.processingReconciler?.stop();
+        addon.processingReconciler = undefined;
+
+        if (addon.backgroundExtractor) {
+            try {
+                await addon.backgroundExtractor.stop();
+            } catch (_e) { /* best-effort */ }
+            addon.backgroundExtractor = undefined;
+        }
+
+        addon.documentCache = undefined;
+        await disposeAccountServices();
+
+        await closePluginDatabase();
+
+        if (addon.citationService) {
+            addon.citationService.dispose();
+            addon.citationService = undefined;
+        }
+
+        AsterMarginUIFactory.unregisterShortcuts();
+
+        addon.runtime.disposeInstance();
+
+        AsterMarginUIFactory.closeAsterMarginWindow();
+        AsterMarginUIFactory.closePreferencesWindow();
+
+        // Remove the FTL <link> from any still-open main windows so the
+        // locale bundle doesn't try to resolve AsterMargin's FTL after disable,
+        // which breaks Zotero's right-click menu.
+        const openWins = Zotero.getMainWindows?.().filter(w => w && !w.closed) ?? [];
+        for (const w of openWins) {
+            unregisterMainWindowFtl(w as Window);
+            unloadKatexStylesheet(w as Window);
+        }
+        unloadStylesheet();
+
+        unregisterQuitObserver();
+        cleanupContextMenus();
+        cleanupReaderIntegration();
+        // Rewrites the session without AsterMargin tabs: once AsterMargin is gone,
+        // nothing could restore one. AsterMargin reopens them itself when it
+        // starts again (`restoreAsterMarginTabs`). The tabs close while their
+        // kinds are still registered.
+        cleanupAsterMarginTabs({ saveSession: true });
+        cleanupTableTabs();
+        stopTableTabProbe();
+        unregisterTablesApi();
+        cleanupTableReaderRedirect();
+        cleanupReaderToolbarMenu();
+        cleanupNoteEditorExportMenu();
+        unregisterAsterMarginProtocolHandler();
+
+        ztoolkit.unregisterAll();
+        addon.data.dialog?.window?.close();
+        addon.data.alive = false;
+
+        // Drop React-bundle cross-bundle globals so plugin disable doesn't
+        // leak the Jotai store (dead atom-keyed entries).
+        Zotero.__astermarginWrittenAnnotationItems = undefined;
+        Zotero.__astermarginWrittenAnnotationKeys = undefined;
+        // Note: the singleton is removed from Zotero in addon/bootstrap.js's
+    } catch (error) {
+        ztoolkit.log("onShutdown: Error during cleanup:", error);
+    } finally {
+        // Force-clear the cross-bundle MuPDF worker slots even if the cleanup
+        // above threw
+        try {
+            await disposeMuPDFWorker(undefined, { force: true });
+        } catch (e) {
+            ztoolkit.log("onShutdown: disposeMuPDFWorker failed:", e);
+        }
+        // Cleared even when cleanup threw: a stale flag would short-circuit
+        // the next onStartup() after a reload.
+        Zotero.__astermarginShuttingDown = undefined;
+    }
+}
+
+export default {
+    onStartup,
+    onShutdown,
+    onAppShutdown,
+    onStandaloneWindowLoad,
+    onStandaloneWindowUnload,
+    onTableWindowLoad: onTableWindowLoaded,
+    onTableWindowUnload,
+    onTableWindowCommand,
+    onTableWindowMenuShowing,
+    onMainWindowLoad,
+    onMainWindowUnload,
+};

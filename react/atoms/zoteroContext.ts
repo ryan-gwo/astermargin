@@ -1,0 +1,189 @@
+import { atom } from 'jotai';
+import { isLibraryTabAtom } from './ui';
+import { currentReaderAttachmentAtom } from './messageComposition';
+import type { CollectionTargetViewType } from '../../src/utils/zoteroSelection';
+
+// --- Selected Items (library view) ---
+// Capped at first 10 items for display; full count tracked separately
+export const selectedZoteroItemsAtom = atom<Zotero.Item[]>([]);
+export const selectedZoteroItemCountAtom = atom<number>(0);
+
+// --- Library View State (collection tree row) ---
+/**
+ * Row types the collections tree can report. Mirrors Zotero's own row types, so
+ * it includes kinds AsterMargin has no dedicated handling for yet ('recentlyRead',
+ * 'bucket').
+ *
+ * Note that a group library's root row reports 'group', not 'library'.
+ */
+export type LibraryTreeRowType =
+    | 'library' | 'group' | 'collection' | 'search' | 'duplicates'
+    | 'unfiled' | 'trash' | 'publications' | 'retracted'
+    | 'feeds' | 'feed' | 'recentlyRead' | 'bucket' | null;
+
+/** Row types that behave as a library root, whether personal or group. */
+export const LIBRARY_ROOT_TYPES: Set<LibraryTreeRowType> = new Set([
+    'library', 'group',
+]);
+
+/** A collection row within the collections-tree selection. */
+export interface SelectedCollectionInfo {
+    collectionId: number;
+    collectionName: string;
+    libraryId: number;
+}
+
+/**
+ * A saved-search or special-view row (Unfiled Items, …) within the
+ * collections-tree selection that a collection-targeted action can act on.
+ */
+export interface SelectedViewInfo {
+    type: CollectionTargetViewType;
+    /** Name as the collections pane shows it. */
+    name: string;
+    libraryId: number;
+    /** Search key, for saved searches. */
+    key?: string;
+}
+
+/**
+ * The collections-tree selection.
+ */
+export interface LibraryViewInfo {
+    treeRowType: LibraryTreeRowType;
+    libraryId: number;
+    libraryName: string;
+    collectionId: number | null;
+    collectionName: string | null;
+    searchName: string | null;
+    // --- whole selection ---
+    /** Number of selected rows of any kind (>= 1 whenever a view is reported). */
+    selectedRowCount: number;
+    /** Every selected collection row, in collections-list order. */
+    selectedCollections: SelectedCollectionInfo[];
+    /** Every selected row of a `COLLECTION_TARGET_VIEW_TYPES` kind, in collections-list order. */
+    selectedViews: SelectedViewInfo[];
+    /** Distinct library IDs spanned by the selection, in collections-list order. */
+    selectedLibraryIds: number[];
+}
+
+/** Automatic context when no main Zotero window is available. */
+export const emptyLibraryView: LibraryViewInfo = {
+    treeRowType: 'library',
+    libraryId: 0,
+    libraryName: '',
+    collectionId: null,
+    collectionName: null,
+    searchName: null,
+    selectedRowCount: 0,
+    selectedCollections: [],
+    selectedViews: [],
+    selectedLibraryIds: [],
+};
+
+const defaultLibraryView: LibraryViewInfo = {
+    treeRowType: 'library',
+    libraryId: 1,
+    libraryName: 'My Library',
+    collectionId: null,
+    collectionName: null,
+    searchName: null,
+    selectedRowCount: 1,
+    selectedCollections: [],
+    selectedViews: [],
+    selectedLibraryIds: [1],
+};
+
+export const libraryViewAtom = atom<LibraryViewInfo>(defaultLibraryView);
+
+// --- Selected Tags (tag filter in library view) ---
+export const selectedTagsAtom = atom<string[]>([]);
+
+// --- Note Tab (note open in its own tab) ---
+export const currentNoteItemAtom = atom<Zotero.Item | null>(null);
+
+// --- Recently Added Items (today) ---
+export const recentlyAddedTodayCountAtom = atom<number>(0);
+
+// --- Library item count (across non-feed libraries) ---
+export const SMALL_LIBRARY_THRESHOLD = 10;
+
+// Clamped item count: 0..SMALL_LIBRARY_THRESHOLD. `null` means the async DB
+// probe has not completed yet
+export const libraryItemCountAtom = atom<number | null>(null);
+
+// Derived: `null` while probe pending, `false` when probe found 0 items,
+// `true` for any non-zero count
+export const libraryHasItemsAtom = atom<boolean | null>((get) => {
+    const count = get(libraryItemCountAtom);
+    if (count === null) return null;
+    return count > 0;
+});
+
+// --- Derived Context ---
+export type ZoteroContextType =
+    | 'reader' | 'note' | 'items_selected' | 'tag_filtered'
+    | 'collection' | 'special_view' | 'library' | 'idle';
+
+export interface ZoteroContext {
+    type: ZoteroContextType;
+    isLibraryTab: boolean;
+    // Library view
+    selectedItemCount: number;
+    selectedItems: Zotero.Item[];
+    libraryView: LibraryViewInfo;
+    selectedTags: string[];
+    // Reader view
+    readerAttachment: Zotero.Item | null;
+    // Note tab
+    noteItem: Zotero.Item | null;
+    // Global
+    recentlyAddedTodayCount: number;
+}
+
+const SPECIAL_VIEW_TYPES: Set<LibraryTreeRowType> = new Set([
+    'duplicates', 'unfiled', 'trash', 'publications', 'retracted', 'feeds', 'feed',
+]);
+
+export const zoteroContextAtom = atom<ZoteroContext>((get) => {
+    const isLibraryTab = get(isLibraryTabAtom);
+    const selectedItems = get(selectedZoteroItemsAtom);
+    const selectedItemCount = get(selectedZoteroItemCountAtom);
+    const libraryView = get(libraryViewAtom);
+    const selectedTags = get(selectedTagsAtom);
+    const readerAttachment = get(currentReaderAttachmentAtom);
+    const noteItem = get(currentNoteItemAtom);
+    const recentlyAddedTodayCount = get(recentlyAddedTodayCountAtom);
+
+    // Determine context type by priority
+    let type: ZoteroContextType = 'idle';
+    if (!isLibraryTab && readerAttachment) {
+        type = 'reader';
+    } else if (!isLibraryTab && noteItem) {
+        type = 'note';
+    } else if (isLibraryTab) {
+        if (selectedItemCount > 0) {
+            type = 'items_selected';
+        } else if (selectedTags.length > 0) {
+            type = 'tag_filtered';
+        } else if (libraryView.treeRowType === 'collection') {
+            type = 'collection';
+        } else if (SPECIAL_VIEW_TYPES.has(libraryView.treeRowType)) {
+            type = 'special_view';
+        } else if (LIBRARY_ROOT_TYPES.has(libraryView.treeRowType)) {
+            type = 'library';
+        }
+    }
+
+    return {
+        type,
+        isLibraryTab,
+        selectedItemCount,
+        selectedItems,
+        libraryView,
+        selectedTags,
+        readerAttachment,
+        noteItem,
+        recentlyAddedTodayCount,
+    };
+});

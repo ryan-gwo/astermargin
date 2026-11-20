@@ -1,0 +1,394 @@
+import { viewAttachment } from '../../runtime/navigation';
+import { isTableAttachment } from '../../../src/services/artifacts/tableItemIdentity';
+import { getTablesApi } from '../../../src/services/artifacts/tablesApi';
+import { getContextWindow } from '../../runtime/windowRuntime';
+import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
+import React, { forwardRef } from 'react';
+import { CSSItemTypeIcon, CSSIcon, Spinner, Icon, ArrowUpRightIcon, LibraryIcon, NoteIcon, FileViewIcon } from "../icons/icons";
+import { useAtomValue } from 'jotai';
+import { useRemoveContextMenu } from '../../hooks/useRemoveContextMenu';
+import { MenuItem } from '@astermargin/agent-ui/primitives/ContextMenu';
+import { getItemValidationAtom, isHardBlockedValidation } from '../../atoms/itemValidation';
+import { getDisplayNameFromItem } from '../../utils/sourceUtils';
+import { truncateText } from '@astermargin/agent-ui/utils/stringUtils';
+import { readOrFallback } from '../../../src/utils/zoteroDataLoading';
+import { ZoteroIcon } from '../icons/ZoteroIcon';
+import { navigateToAnnotation, isItemActiveTab } from '../../utils/readerUtils';
+import { currentReaderAttachmentKeyAtom, messageItemDataRevisionAtom } from '../../atoms/messageComposition';
+import { toAnnotation } from '../../types/attachments/converters';
+import { selectItemById } from '../../utils/selectItem';
+import { openNoteById } from '../../utils/sourceUtils';
+import { ANNOTATION_ICON_BY_TYPE, ANNOTATION_TEXT_BY_TYPE } from '../../utils/annotationDisplay';
+import { ChipWithPopup, type ChipPopupContent } from '@astermargin/agent-ui/chat/ChipPopup';
+import { buildAnnotationChipPopup } from '../agentRuns/requestChips/RequestChipPrimitives';
+import { ChipButton } from '../agentRuns/requestChips/ChipButton';
+import { ChipRemovableIcon } from '../agentRuns/requestChips/ChipRemovableIcon';
+import { buildMessageItemChipPopup } from './MessageItemChipPopup';
+
+const MAX_ITEM_TEXT_LENGTH = 30;
+
+async function ensureAnnotationImageCache(item: Zotero.Item): Promise<string | null> {
+    const annotationItem = { libraryID: item.libraryID, key: item.key };
+    if (await Zotero.Annotations.hasCacheImage(annotationItem)) {
+        return Zotero.File.pathToFileURI(Zotero.Annotations.getCacheImagePath(annotationItem));
+    }
+
+    const parentID = item.parentID ?? item.parentItemID;
+    if (!parentID) return null;
+
+    await Zotero.PDFWorker.renderAttachmentAnnotations(parentID);
+    if (!(await Zotero.Annotations.hasCacheImage(annotationItem))) {
+        return null;
+    }
+
+    return Zotero.File.pathToFileURI(Zotero.Annotations.getCacheImagePath(annotationItem));
+}
+
+const AnnotationImagePopupPreview = ({ item }: { item: Zotero.Item }) => {
+    const [imageUri, setImageUri] = React.useState<string | null>(null);
+    const [imageError, setImageError] = React.useState(false);
+
+    React.useEffect(() => {
+        let isMounted = true;
+        setImageUri(null);
+        setImageError(false);
+
+        const loadImage = async () => {
+            try {
+                const uri = await ensureAnnotationImageCache(item);
+                if (!isMounted) return;
+
+                if (!uri) {
+                    setImageError(true);
+                    return;
+                }
+
+                setImageUri(uri);
+            } catch (error) {
+                console.error('Failed to load annotation image preview:', error);
+                if (isMounted) setImageError(true);
+            }
+        };
+
+        loadImage();
+        return () => {
+            isMounted = false;
+        };
+    }, [item]);
+
+    return (
+        <span
+            className="display-flex items-center justify-center overflow-hidden"
+            style={{ width: '100%', minHeight: imageUri ? undefined : '64px' }}
+        >
+            {imageUri ? (
+                <img
+                    src={imageUri}
+                    alt="Area annotation"
+                    style={{ maxWidth: '100%', maxHeight: '150px', objectFit: 'contain' }}
+                />
+            ) : (
+                <span className="font-color-secondary text-sm px-2 text-center">
+                    {imageError ? 'Image preview unavailable' : 'Loading image...'}
+                </span>
+            )}
+        </span>
+    );
+};
+
+interface MessageItemButtonProps extends Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'item'> {
+    item: Zotero.Item;
+    canEdit?: boolean;
+    disabled?: boolean;
+    onRemove?: (item: Zotero.Item) => void;
+    /**
+     * Optional callback to remove all editable context items at once.
+     * When provided (and the button is editable), long-pressing the remove "x"
+     * opens a small menu offering "Remove" and "Remove all".
+     */
+    onRemoveAll?: () => void;
+    tabContextType?: 'reader' | 'note';
+    showInvalid?: boolean;
+    /** Optional collection key to reveal the item within when clicked */
+    revealInCollectionKey?: string;
+}
+
+/**
+ * Button component for displaying a Zotero item in message composition
+ * Supports both regular items and annotations
+ * Shows validation state, item/annotation icon, and allows removal
+ */
+export const MessageItemButton = forwardRef<HTMLButtonElement, MessageItemButtonProps>(
+    function MessageItemButton(props: MessageItemButtonProps, ref: React.ForwardedRef<HTMLButtonElement>) {
+        const {
+            item,
+            className,
+            disabled = false,
+            canEdit = true,
+            onRemove,
+            onRemoveAll,
+            tabContextType,
+            showInvalid = true,
+            revealInCollectionKey,
+            onMouseEnter,
+            onMouseLeave,
+            ...rest
+        } = props;
+
+        // Check if item is an annotation
+        const isAnnotation = item.isAnnotation();
+        const annotation = isAnnotation ? toAnnotation(item) : null;
+
+        // Get current reader attachment key for annotation display
+        const currentReaderAttachmentKey = useAtomValue(currentReaderAttachmentKeyAtom);
+
+        // Get validation state
+        const getValidation = useAtomValue(getItemValidationAtom);
+        const validation = getValidation(item);
+
+        // Determine display name based on item type
+        // Falls back to a generic label while the item's data is not loaded
+        // yet; the composer loads it and bumps the revision, which re-renders
+        // the chip and rebuilds its popup.
+        const itemDataRevision = useAtomValue(messageItemDataRevisionAtom);
+        const surfaceWindow = useSurfaceWindow();
+        const displayName = isAnnotation && annotation
+            ? ANNOTATION_TEXT_BY_TYPE[annotation.annotation_type] || 'Annotation'
+            : readOrFallback(
+                () => (item.isRegularItem() || item.isNote())
+                    ? item.isRegularItem() ? truncateText(getDisplayNameFromItem(item), MAX_ITEM_TEXT_LENGTH) : getDisplayNameFromItem(item)
+                    : truncateText(item.getDisplayTitle(), MAX_ITEM_TEXT_LENGTH),
+                item.isNote() ? 'Note' : item.isAttachment() ? 'Attachment' : 'Item',
+            );
+
+        const isFileAttachment = item.isAttachment() && item.isFileAttachment();
+
+        // Reveal the item in the Zotero library pane. Works for notes,
+        // attachments, and regular items — `selectItem` highlights whichever row
+        // the item occupies.
+        const revealInLibrary = () => {
+            try {
+                // If a collection key is provided, reveal in that collection
+                if (revealInCollectionKey) {
+                    const collectionId = Zotero.Collections.getIDFromLibraryAndKey(item.libraryID, revealInCollectionKey);
+                    selectItemById(item.id, true, collectionId !== false ? collectionId : undefined);
+                } else {
+                    const win = getContextWindow();
+                    if (win && win.ZoteroPane) {
+                        win.ZoteroPane.selectItem(item.id);
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to select item:', error);
+            }
+        };
+
+        // Open the attachment file in the reader (or its external app).
+        const openAttachment = () => {
+            if (isTableAttachment(item)) {
+                void getTablesApi()?.openTable({ libraryID: item.libraryID, key: item.key }, { window: surfaceWindow });
+                return;
+            }
+            viewAttachment(item.id);
+        };
+
+        // Primary action for a left-click on the button. Annotations jump to the
+        // reader, notes open in the editor, and everything else is revealed in
+        // the Zotero library.
+        const revealItem = () => {
+            if (isTableAttachment(item)) { openAttachment(); return; }
+            if (isAnnotation) {
+                navigateToAnnotation(item);
+                return;
+            }
+            if (item.isNote()) {
+                openNoteById(item.id);
+                return;
+            }
+            revealInLibrary();
+        };
+
+        // Context-menu reveal/open actions. Most items use the shared item menu
+        // (resolved on right-click by the host). Tables open in AsterMargin's table
+        // view and a collection-scoped reveal selects the item inside that
+        // collection, so both keep their own entries: one to reveal the item in
+        // the library and one to open it, disabled only while the item's tab is
+        // the one in view.
+        const useItemMenu = !isTableAttachment(item) && !revealInCollectionKey;
+        const revealMenuItems: MenuItem[] = useItemMenu ? [] : isAnnotation
+            ? [{ label: 'Reveal in PDF', icon: FileViewIcon, onClick: () => navigateToAnnotation(item) }]
+            : item.isNote()
+                ? [
+                    { label: 'Reveal in Library', icon: LibraryIcon, onClick: revealInLibrary },
+                    { label: 'Open Note', icon: NoteIcon, onClick: () => openNoteById(item.id), disabled: isItemActiveTab(item.id) },
+                ]
+                : isFileAttachment
+                    ? [
+                        { label: 'Reveal in Library', icon: LibraryIcon, onClick: revealInLibrary },
+                        { label: 'Open Attachment', icon: FileViewIcon, onClick: openAttachment, disabled: isItemActiveTab(item.id) },
+                    ]
+                    : [{ label: 'Reveal in Library', icon: LibraryIcon, onClick: revealInLibrary }];
+
+        // Right-click "remove" menu for this button. A left-click on the "x"
+        // removes just this item; right-clicking the button opens a menu with
+        // the reveal/open actions plus "Remove" (and "Remove all" when more than
+        // one removable item is attached).
+        const { isRemoveMenuOpen, contextMenuHandlers, removeHandlers, removeMenu } = useRemoveContextMenu({
+            onRemove: () => {
+                if (onRemove) onRemove(item);
+            },
+            onRemoveAll,
+            canEdit,
+            disabled,
+            extraMenuItems: revealMenuItems,
+            itemRef: useItemMenu ? { library_id: item.libraryID, zotero_key: item.key } : null,
+        });
+
+        // Handle button click. ChipButton already swallows non-primary clicks and
+        // stops propagation, so this only runs for a left-click.
+        const handleButtonClick = () => {
+            revealItem();
+        };
+
+        const renderNormalIcon = () => {
+            if (isAnnotation && annotation) {
+                return (
+                    <ZoteroIcon icon={ANNOTATION_ICON_BY_TYPE[annotation.annotation_type]} size={14} />
+                );
+            }
+
+            try {
+                const iconName = item.getItemTypeIconName();
+                return iconName ? (
+                    <span className="scale-80">
+                        <CSSItemTypeIcon itemType={iconName} />
+                    </span>
+                ) : null;
+            } catch {
+                return null;
+            }
+        };
+
+        // Get icon element based on validation state
+        const getIconElement = () => {
+            // Show spinner during validation
+            if (validation?.isValidating) {
+                return (
+                    <CSSIcon name="spinner" className="icon-16 scale-11">
+                        <Spinner className="mt-020" />
+                    </CSSIcon>
+                );
+            }
+
+            const normalIcon = renderNormalIcon();
+
+            if (canEdit && !disabled) {
+                return (
+                    <ChipRemovableIcon
+                        normalIcon={normalIcon}
+                        removeHandlers={removeHandlers}
+                        removeMenuOpen={isRemoveMenuOpen}
+                    />
+                );
+            }
+
+            return normalIcon;
+        };
+
+        // Determine button styling based on validation state
+        const getButtonClasses = () => {
+            const classes = `${className || ''} ${disabled ? 'disabled-but-styled' : ''}`;
+
+            if (showInvalid && isHardBlockedValidation(validation)) {
+                return `${classes} border-red`;
+            }
+
+            if (
+                showInvalid
+                && validation
+                && !validation.isValidating
+                && validation.state === 'unreadable'
+            ) {
+                return `${classes} opacity-80`;
+            }
+
+            return classes;
+        };
+
+        const handleMouseEnter = (event: React.MouseEvent<HTMLButtonElement>) => {
+            onMouseEnter?.(event);
+        };
+
+        const handleMouseLeave = (event: React.MouseEvent<HTMLButtonElement>) => {
+            onMouseLeave?.(event);
+        };
+
+        const isStrongError = showInvalid && isHardBlockedValidation(validation);
+        const isUnreadable = showInvalid
+            && validation
+            && !validation.isValidating
+            && validation.state === 'unreadable';
+
+        const chipPopup = React.useMemo<ChipPopupContent>(() => {
+            if (isAnnotation && annotation) {
+                const annotationText = [annotation.text, annotation.comment]
+                    .filter(Boolean)
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                return {
+                    ...buildAnnotationChipPopup({
+                        annotationType: annotation.annotation_type,
+                        color: annotation.color,
+                        title: annotationText || undefined,
+                    }),
+                    media: annotation.annotation_type === 'image'
+                        ? <AnnotationImagePopupPreview item={item} />
+                        : null,
+                    status: validation && !validation.isValidating && validation.state !== 'readable' && validation.reason
+                        ? { label: validation.reason }
+                        : null,
+                };
+            }
+            return buildMessageItemChipPopup(item, validation, getValidation);
+            // itemDataRevision: the popup reads the item's data, which can finish
+            // loading after every other dependency has settled.
+        }, [isAnnotation, annotation, item, validation, getValidation, itemDataRevision]);
+
+        const button = (
+            <ChipButton
+                ref={ref}
+                onMouseEnter={handleMouseEnter}
+                onMouseLeave={handleMouseLeave}
+                {...contextMenuHandlers}
+                className={getButtonClasses()}
+                disabled={disabled}
+                onClick={handleButtonClick}
+                {...rest}
+            >
+                {getIconElement()}
+                <span className={`truncate ${isStrongError ? 'font-color-red' : isUnreadable ? 'font-color-secondary' : ''}`}>
+                    {tabContextType === 'reader'
+                        ? isStrongError ? 'Invalid File' : isUnreadable ? 'Unreadable File' : 'Current File'
+                        : tabContextType === 'note'
+                            ? 'Current Note'
+                            : displayName || '...'}
+                </span>
+
+                {/* Show arrow icon for annotations not in current reader */}
+                {isAnnotation && annotation && currentReaderAttachmentKey !== annotation.parent_key && (
+                    <Icon icon={ArrowUpRightIcon} className="scale-11" />
+                )}
+            </ChipButton>
+        );
+
+        return (
+            <>
+            <ChipWithPopup popup={chipPopup} suppressed={isRemoveMenuOpen}>
+                {button}
+            </ChipWithPopup>
+            {removeMenu}
+            </>
+        );
+    }
+);

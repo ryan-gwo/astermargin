@@ -1,0 +1,558 @@
+/**
+ * Agent Data Provider
+ * 
+ * This service provides WebSocket communication for agent runs,
+ * enabling bidirectional communication between the Zotero plugin and the backend.
+ * 
+ * The AsterMargin agent is the primary agent that handles chat completions and tool execution.
+ */
+
+import { CollectionResolutionError } from '../collections/collectionIdentity';
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    // Library management tools
+    WSZoteroSearchRequest,
+    WSZoteroSearchResponse,
+    ZoteroSearchCondition,
+    ZoteroSearchResultItem,
+    RegularSearchResultItem,
+    AttachmentRowResult,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import { ItemStub } from '@astermargin/agent-core/types/zotero';
+import { serializeNote, serializeItemStub } from '../../utils/zoteroSerializers';
+import { libraryRefForLibraryID, modelObjectId } from '../../utils/libraryIdentity';
+import { readWithDataReload } from '../../utils/zoteroDataLoading';
+import {
+    validateCollectionLibraryAccess,
+    extractYear,
+    formatCreatorsString,
+    getAttachmentInfoForItem,
+    degradedAttachmentRow,
+    degradedNoteRow,
+    degradedRegularRow,
+    isReadableItemField,
+    readItemField,
+    ROW_DATA_TYPES,
+} from './utils';
+import { addSearchCondition, findVacuousNegation, vacuousNegationMessage } from './searchConditions';
+
+
+/**
+ * How each `item_category` maps onto a set of Zotero item types.
+ *
+ * A Map, not an object literal: `item_category` arrives over the wire, and a
+ * plain-object lookup would resolve inherited keys ("constructor", "toString")
+ * to truthy non-filters. Unrecognized categories must degrade to "no filter".
+ */
+const ITEM_CATEGORY_TYPE_FILTERS = new Map<string, { itemTypes: string[]; mode: 'include' | 'exclude' }>([
+    ['regular', { itemTypes: ['attachment', 'note', 'annotation'], mode: 'exclude' }],
+    ['attachment', { itemTypes: ['attachment'], mode: 'include' }],
+    ['note', { itemTypes: ['note'], mode: 'include' }],
+    // 'all' is absent because it filters nothing; 'annotation' is absent because
+    // it returns early (zotero_search cannot return annotations at all).
+]);
+
+/** Search condition fields that select items by collection membership. */
+const COLLECTION_CONDITION_FIELDS = new Set(['collection', 'collectionID']);
+
+/**
+ * Whether a condition can become a collection *scope* rather than a plain
+ * condition: it must select a collection (`is` with a value), not exclude one.
+ */
+function isScopableCollectionCondition(condition: ZoteroSearchCondition): boolean {
+    return COLLECTION_CONDITION_FIELDS.has(condition.field)
+        && condition.operator === 'is'
+        && condition.value != null
+        && String(condition.value).length > 0;
+}
+
+/**
+ * Keep (`include`) or drop (`exclude`) the given itemIDs by item type,
+ * preserving the incoming order. Chunked to stay under SQLite's bound-variable
+ * limit.
+ */
+async function filterItemIdsByItemType(
+    itemIds: number[],
+    itemTypes: string[],
+    mode: 'include' | 'exclude',
+): Promise<number[]> {
+    if (itemIds.length === 0 || itemTypes.length === 0) return itemIds;
+
+    const itemTypeIDs = itemTypes
+        .map(itemType => Zotero.ItemTypes.getID(itemType))
+        .filter((id): id is number => typeof id === 'number');
+    if (itemTypeIDs.length === 0) return itemIds;
+
+    const comparison = mode === 'include' ? 'IN' : 'NOT IN';
+    const typePlaceholders = itemTypeIDs.map(() => '?').join(', ');
+    const matchingItemIds = new Set<number>();
+    const chunkSize = 500;
+
+    for (let i = 0; i < itemIds.length; i += chunkSize) {
+        const chunk = itemIds.slice(i, i + chunkSize);
+        const idPlaceholders = chunk.map(() => '?').join(', ');
+        await Zotero.DB.queryAsync(
+            `SELECT itemID FROM items WHERE itemID IN (${idPlaceholders}) `
+                + `AND itemTypeID ${comparison} (${typePlaceholders})`,
+            [...chunk, ...itemTypeIDs],
+            {
+                onRow: (row: any) => {
+                    matchingItemIds.add(row.getResultByIndex(0));
+                },
+            },
+        );
+    }
+
+    return itemIds.filter(id => matchingItemIds.has(id));
+}
+
+function filterOutAnnotationItemIds(itemIds: number[]): Promise<number[]> {
+    return filterItemIdsByItemType(itemIds, ['annotation'], 'exclude');
+}
+
+
+/**
+ * Handle zotero_search request from backend.
+ * Uses Zotero's native search API.
+ */
+export async function handleZoteroSearchRequest(
+    request: WSZoteroSearchRequest
+): Promise<WSZoteroSearchResponse> {
+    logger(`handleZoteroSearchRequest: Processing ${request.conditions.length} conditions`, 1);
+
+    try {
+        // Validate library (checks both existence and searchability)
+        const collectionReferences = request.conditions
+            .filter(condition => COLLECTION_CONDITION_FIELDS.has(condition.field))
+            .map(condition => condition.value ?? '');
+        const validation = validateCollectionLibraryAccess(request.library_id, collectionReferences);
+        if (!validation.valid) {
+            return {
+                type: 'zotero_search',
+                request_id: request.request_id,
+                items: [],
+                total_count: 0,
+                error: validation.error,
+                error_code: validation.error_code,
+                available_libraries: validation.available_libraries,
+            };
+        }
+        const library = validation.library!;
+
+        const anyItemTypeCondition = request.conditions.some((condition) => condition.field === 'itemType');
+        const itemCategory = request.item_category ?? 'regular';
+
+        // zotero_search has no annotation result shape, so annotations are always
+        // dropped from the result set. An annotation-only search can therefore
+        // never return a row: settle it here rather than running the search and
+        // handing back an empty page the model would read as "no matches".
+        if (!anyItemTypeCondition && itemCategory === 'annotation') {
+            return {
+                type: 'zotero_search',
+                request_id: request.request_id,
+                items: [],
+                total_count: 0,
+                warnings: [
+                    "item_category='annotation' returns no results because zotero_search cannot return annotations. "
+                        + 'Use find_annotations to search annotation text and comments.',
+                ],
+            };
+        }
+
+        // Create search object
+        const search = new Zotero.Search() as unknown as ZoteroSearchWritable;
+        search.libraryID = library.libraryID;
+
+        // Collection scope.
+        const scopableCollectionConditions = request.include_children && request.join_mode !== 'any'
+            ? request.conditions.filter(isScopableCollectionCondition)
+            : [];
+        let scopeSearch: Zotero.Search | null = null;
+        let scopedConditionCount = 0;
+        if (scopableCollectionConditions.length > 0) {
+            const scope = new Zotero.Search() as unknown as ZoteroSearchWritable;
+            scope.libraryID = library.libraryID;
+            if (request.recursive) {
+                scope.addCondition('recursive', 'true', '');
+            }
+            scopeSearch = scope as unknown as Zotero.Search;
+        }
+
+        // Set join mode first (if 'any')
+        if (request.join_mode === 'any') {
+            search.addCondition('joinMode', 'any', '');
+        }
+
+        // Warnings are surfaced to the backend so the agent can correct bad
+        // conditions rather than receive a silently-relaxed result set.
+        const warnings: string[] = [];
+
+        // Add search conditions
+        for (const condition of request.conditions) {
+            const isScoped = scopeSearch !== null && isScopableCollectionCondition(condition);
+            // Two calls rather than one call on a chosen target: forming the
+            // union of the two search types trips TS2589 ("type instantiation
+            // is excessively deep").
+            const added = isScoped
+                ? addSearchCondition(scopeSearch!, condition, warnings, 'handleZoteroSearchRequest', library.libraryID)
+                : addSearchCondition(search, condition, warnings, 'handleZoteroSearchRequest', library.libraryID);
+            // Only a condition Zotero accepted narrows the scope; see the
+            // scopedConditionCount guard below.
+            if (added && isScoped) {
+                scopedConditionCount++;
+            }
+        }
+
+        // A negated prose phrase that matches nothing excludes nothing, so the
+        // results below are every item the other filters allow rather than a
+        // narrowed set. A read can hand those back — it changes nothing — but
+        // it must say so, or the caller reads a library-sized answer as a
+        // filtered one and works from it. `handleResolvePopulationRequest`
+        // refuses the same condition, because its answer IS about to be mutated.
+        const vacuous = await findVacuousNegation(
+            library.libraryID, request.conditions, 'handleZoteroSearchRequest',
+        );
+        if (vacuous) {
+            warnings.push(vacuousNegationMessage(vacuous, 'applied'));
+        }
+
+        // Item category filter.
+        //
+        // Zotero ORs together every non-special condition when joinMode is 'any';
+        // only the special conditions (joinMode/noChildren/recursive/…) and the
+        // search's libraryID *property* — set above, not added as a condition —
+        // are ANDed outside the join. Adding itemType conditions there would make
+        // the category an always-true disjunct — e.g. "isNot attachment OR isNot
+        // note" holds for every item — so an 'any' search would silently match
+        // the whole library. For 'any' the category is therefore applied as a
+        // post-filter on the matched itemIDs instead; 'all' keeps the
+        // condition-based filter so Zotero's SQL does the work.
+        const categoryFilter = anyItemTypeCondition ? undefined : ITEM_CATEGORY_TYPE_FILTERS.get(itemCategory);
+        const categoryNeedsPostFilter = request.join_mode === 'any';
+
+        if (categoryFilter && !categoryNeedsPostFilter) {
+            const operator = categoryFilter.mode === 'include' ? 'is' : 'isNot';
+            for (const itemType of categoryFilter.itemTypes) {
+                search.addCondition('itemType', operator, itemType);
+            }
+        }
+
+        // Search recursively within collections (only affects collectionID conditions)
+        if (request.recursive) {
+            search.addCondition('recursive', 'true', '');
+        }
+        
+        // Exclude child items
+        if (!request.include_children) {
+            search.addCondition('noChildren', 'true', '');
+        }
+
+        // Apply the collection scope. Guarded on a condition having actually been
+        // added: a scope search with no conditions matches the whole library, so
+        // attaching an empty one would widen the search instead of narrowing it.
+        if (scopeSearch && scopedConditionCount > 0) {
+            search.setScope(scopeSearch, true);
+        }
+
+        // Execute search
+        let itemIds = await search.search();
+
+        // Apply the item category as a post-filter for 'any' searches (see above).
+        // Runs before every other filter so the cheap itemType query shrinks the
+        // set before items get loaded, and before total_count/pagination.
+        if (categoryFilter && categoryNeedsPostFilter) {
+            itemIds = await filterItemIdsByItemType(itemIds, categoryFilter.itemTypes, categoryFilter.mode);
+        }
+
+        // Post-filter by attachment status if requested
+        if (request.has_attachments != null) {
+            const allForFilter = await Zotero.Items.getAsync(itemIds);
+            const validForFilter = allForFilter.filter((item): item is Zotero.Item => item !== null);
+            if (validForFilter.length > 0) {
+                await Zotero.Items.loadDataTypes(validForFilter, ['childItems']);
+            }
+            const matchingItemIds = new Set<number>();
+            for (const item of validForFilter) {
+                // Only apply attachment filter to regular items
+                let matches = true;
+                if (item.isRegularItem()) {
+                    const hasAtt = item.numAttachments() > 0;
+                    matches = request.has_attachments ? hasAtt : !hasAtt;
+                }
+                if (matches) {
+                    matchingItemIds.add(item.id);
+                }
+            }
+            itemIds = itemIds.filter(id => matchingItemIds.has(id));
+        }
+
+        // zotero_search has no annotation result shape. When annotations can
+        // reach the result set, drop them BEFORE counting and paginating, so
+        // total_count and page boundaries reflect only returnable items.
+        // A category filter has already excluded them (as conditions or as the
+        // post-filter above); the remaining cases — an explicit itemType
+        // condition, 'all', or an unrecognized category — still need this pass.
+        const mayContainAnnotations = !categoryFilter;
+        if (mayContainAnnotations) {
+            itemIds = await filterOutAnnotationItemIds(itemIds);
+        }
+
+        const totalCount = itemIds.length;
+
+        // Apply pagination
+        const offset = request.offset || 0;
+        const limit = request.limit || 50;
+        const sortRequested = request.sort_by != null;
+
+        // When sorting is requested, we need to fetch all items to sort them
+        // before paginating. When not sorting, paginate on IDs first (faster).
+        let paginatedZoteroItems: Zotero.Item[];
+
+        if (sortRequested) {
+            // Fetch all items for sorting
+            const allItems = await Zotero.Items.getAsync(itemIds);
+            const validItems = allItems.filter((item): item is Zotero.Item => item !== null);
+
+            if (validItems.length > 0) {
+                await Zotero.Items.loadDataTypes(validItems, ['primaryData', 'creators', 'itemData']);
+            }
+
+            const sortBy = request.sort_by!;
+            const sortOrder = request.sort_order || 'desc';
+
+            // Compute sort values
+            const itemsWithSortKey: { item: Zotero.Item; sortValue: any }[] = [];
+            for (const item of validItems) {
+                let sortValue: any;
+                switch (sortBy) {
+                    case 'dateAdded':
+                        sortValue = item.dateAdded || '';
+                        break;
+                    case 'dateModified':
+                        sortValue = item.dateModified || '';
+                        break;
+                    case 'title':
+                        try {
+                            sortValue = ((item.getField('title', false, true) as string) || '').toLowerCase();
+                        } catch {
+                            sortValue = (item.getDisplayTitle?.() || '').toLowerCase();
+                        }
+                        break;
+                    case 'creator': {
+                        try {
+                            const creators = await readWithDataReload(item, ROW_DATA_TYPES, () => item.getCreators());
+                            // lastName covers both personal authors and corporate/institutional
+                            // names (fieldMode=1 stores the full name in lastName)
+                            sortValue = creators.length > 0
+                                ? (creators[0].lastName || '').toLowerCase()
+                                : '';
+                        } catch {
+                            sortValue = '';
+                        }
+                        break;
+                    }
+                    case 'year': {
+                        try {
+                            const date = item.getField('date', false, true) as string;
+                            sortValue = extractYear(date) || 0;
+                        } catch {
+                            sortValue = 0;
+                        }
+                        break;
+                    }
+                    case 'itemType':
+                        sortValue = item.itemType || '';
+                        break;
+                    default:
+                        sortValue = item.dateModified || '';
+                }
+                itemsWithSortKey.push({ item, sortValue });
+            }
+
+            // Sort
+            itemsWithSortKey.sort((a, b) => {
+                if (a.sortValue < b.sortValue) return sortOrder === 'asc' ? -1 : 1;
+                if (a.sortValue > b.sortValue) return sortOrder === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            paginatedZoteroItems = itemsWithSortKey
+                .slice(offset, offset + limit)
+                .map(({ item }) => item);
+        } else {
+            // No sorting — paginate on IDs first, then fetch only the page
+            const paginatedIds = itemIds.slice(offset, offset + limit);
+            const fetchedItems = await Zotero.Items.getAsync(paginatedIds);
+            const fetchedItemsById = new Map<number, Zotero.Item>();
+            for (const item of fetchedItems) {
+                if (item !== null) {
+                    fetchedItemsById.set(item.id, item);
+                }
+            }
+            paginatedZoteroItems = paginatedIds
+                .map(id => fetchedItemsById.get(id))
+                .filter((item): item is Zotero.Item => item != null);
+
+            if (paginatedZoteroItems.length > 0) {
+                await Zotero.Items.loadDataTypes(paginatedZoteroItems, ['primaryData', 'creators', 'itemData']);
+            }
+        }
+
+        const attachmentItems = paginatedZoteroItems.filter((item) => item.isAttachment());
+        if (attachmentItems.length) {
+            await Zotero.Items.loadDataTypes(attachmentItems, ["childItems"]);
+        }
+
+        // Batch-load parent items for child items (notes, attachments)
+        const childParentIds = new Set<number>();
+        for (const item of paginatedZoteroItems) {
+            if ((item.isNote() || item.isAttachment()) && item.parentItemID) {
+                childParentIds.add(item.parentItemID);
+            }
+        }
+        const parentMap = new Map<number, ItemStub>();
+        if (childParentIds.size > 0) {
+            const parentItems = await Zotero.Items.getAsync([...childParentIds]);
+            const validParents = parentItems.filter((p): p is Zotero.Item => p !== null);
+            if (validParents.length > 0) {
+                await Zotero.Items.loadDataTypes(validParents, ['primaryData', 'itemData', 'creators']);
+                validParents.forEach(parent => parentMap.set(parent.id, serializeItemStub(parent)));
+            }
+        }
+
+        // Validate the requested extra fields once. Readability does not depend
+        // on the item, so this must not be folded into the result loop: a search
+        // that returns no regular rows would otherwise skip the check entirely.
+        //
+        // Unreadable names are logged, not returned in `warnings`: the backend
+        // treats any warning as "conditions were dropped" and retries the whole
+        // call, and an unusable name in `fields` costs nothing but the extra
+        // column — it must not invalidate an otherwise correct result set.
+        const readableFields: string[] = [];
+        const unreadableFields: string[] = [];
+        for (const field of request.fields ?? []) {
+            if (typeof field !== 'string' || field.length === 0) continue;
+            (isReadableItemField(field) ? readableFields : unreadableFields).push(field);
+        }
+        if (unreadableFields.length > 0) {
+            logger(`handleZoteroSearchRequest: Ignored unreadable field(s): ${unreadableFields.join(', ')}`, 1);
+        }
+
+        // Build results
+        const items: ZoteroSearchResultItem[] = [];
+
+        for (const item of paginatedZoteroItems) {
+            if (item.isNote()) {
+                const parentInfo = item.parentItemID ? parentMap.get(item.parentItemID) : null;
+                try {
+                    items.push(await readWithDataReload(item, ROW_DATA_TYPES, () => serializeNote(item, parentInfo)));
+                } catch (error) {
+                    logger(`handleZoteroSearchRequest: Degrading unreadable note ${item.key}: ${error}`, 2);
+                    items.push(degradedNoteRow(item, parentInfo ?? null));
+                }
+            } else if (item.isAttachment()) {
+                const parentInfo = item.parentItemID ? parentMap.get(item.parentItemID) : null;
+                let attachmentItem: AttachmentRowResult;
+                try {
+                    const attachmentInfo = await getAttachmentInfoForItem(item, {
+                        parentItemId: parentInfo?.item_id ?? null,
+                        isPrimary: false,
+                        includeAnnotationsCount: true,
+                        skipWorkerFallback: true,
+                    });
+                    attachmentItem = {
+                        ...attachmentInfo,
+                        result_type: 'attachment',
+                        parent_title: parentInfo?.title ?? null,
+                        parent_item: parentInfo ?? null,
+                        date_modified: item.dateModified,
+                    };
+                } catch (error) {
+                    // Isolate the row: a record Zotero cannot read (e.g. a linked
+                    // file whose stored path is not valid on this platform) must
+                    // degrade to a stub, not empty the whole result page.
+                    logger(`handleZoteroSearchRequest: Degrading unreadable attachment ${item.key}: ${error}`, 2);
+                    attachmentItem = degradedAttachmentRow(item, parentInfo ?? null);
+                }
+                items.push(attachmentItem);
+            } else {
+                try {
+                    items.push(await readWithDataReload(item, ROW_DATA_TYPES, () => {
+                        // Get creators
+                        const creators = item.getCreators();
+
+                        // Get date and extract year
+                        let year: number | null = null;
+                        try {
+                            const dateStr = item.getField('date', false, true) as string;
+                            if (dateStr) {
+                                year = extractYear(dateStr);
+                            }
+                        } catch {
+                            // Date field may not exist for some item types
+                        }
+
+                        // Get title safely
+                        let title = '';
+                        try {
+                            title = (item.getField('title', false, true) as string) || '';
+                        } catch {
+                            // Some item types (like annotations) may not have title field
+                            title = item.getDisplayTitle?.() || '';
+                        }
+
+                        const resultItem: RegularSearchResultItem = {
+                            result_type: 'regular',
+                            item_id: modelObjectId(item.libraryID, item.key),
+                            library_ref: libraryRefForLibraryID(item.libraryID) ?? undefined,
+                            item_type: item.itemType,
+                            title,
+                            creators: formatCreatorsString(creators),
+                            year,
+                        };
+
+                        // Include extra fields if requested
+                        if (readableFields.length > 0) {
+                            const extraFields: Record<string, any> = {};
+                            for (const field of readableFields) {
+                                const value = readItemField(item, field);
+                                if (value !== undefined && value !== null && value !== '') {
+                                    extraFields[field] = value;
+                                }
+                            }
+                            if (Object.keys(extraFields).length > 0) {
+                                resultItem.extra_fields = extraFields;
+                            }
+                        }
+                        return resultItem;
+                    }));
+                } catch (error) {
+                    // Isolate the row so one unreadable record does not empty the page.
+                    logger(`handleZoteroSearchRequest: Degrading unreadable item ${item.key}: ${error}`, 2);
+                    items.push(degradedRegularRow(item));
+                }
+            }
+        }
+
+        logger(`handleZoteroSearchRequest: Returning ${items.length}/${totalCount} items${sortRequested ? ` (sorted by ${request.sort_by} ${request.sort_order || 'desc'})` : ''}${warnings.length ? ` with ${warnings.length} warning(s)` : ''}`, 1);
+
+        return {
+            type: 'zotero_search',
+            request_id: request.request_id,
+            items,
+            total_count: totalCount,
+            warnings: warnings.length ? warnings : undefined,
+        };
+    } catch (error) {
+        logger(`handleZoteroSearchRequest: Error: ${error}`, 1);
+        return {
+            type: 'zotero_search',
+            request_id: request.request_id,
+            items: [],
+            total_count: 0,
+            error: error instanceof Error ? error.message : String(error),
+            error_code: error instanceof CollectionResolutionError ? error.code : 'search_failed',
+        };
+    }
+}

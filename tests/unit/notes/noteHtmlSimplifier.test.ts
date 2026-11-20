@@ -1,0 +1,4853 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { maskRenderedCitationTags } from '../../../src/utils/noteCitationMask';
+import { structuredResultWithCitablePages } from '../../helpers/structuredDocuments';
+
+// Mock createCitationHTML before importing the module under test
+vi.mock('../../../src/utils/zoteroUtils', () => {
+    const embedded = (uri: string, itemData: any, page?: string, _options?: any, meta?: any) => ({
+        citation: {
+            citationItems: [{ uris: [uri], itemData, ...(page ? { locator: page } : {}), ...(meta ? { astermargin: meta } : {}) }],
+            properties: {},
+        },
+        formatted: `(<span class="citation-item">${itemData?.title ?? 'Embedded'}${page ? ', p. ' + page : ''}</span>)`,
+    });
+    const noteCitationHTML = ({ citation, formatted }: any) =>
+        `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citation))}">${formatted}</span>`;
+    return {
+        createCitationHTML: vi.fn(
+            (item: any, page?: string, _options?: any, meta?: any) =>
+                `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify({
+                    citationItems: [{
+                        uris: [`http://zotero.org/users/1/items/${item.key}`],
+                        itemData: {
+                            id: `http://zotero.org/users/1/items/${item.key}`,
+                            type: 'article-journal',
+                            author: [{ family: 'Mock', given: 'Author' }],
+                            issued: { 'date-parts': [['2024']] },
+                        },
+                        locator: page || '',
+                        ...(meta ? { astermargin: meta } : {}),
+                    }],
+                    properties: {},
+                }))}"><span class="citation-item">${item.getField?.('title') || 'Mock Title'}${page ? ', p. ' + page : ''}</span></span>`
+        ),
+        buildEmbeddedNoteCitation: vi.fn(embedded),
+        buildNoteCitation: vi.fn((item: any, page?: string, options?: any, meta?: any) =>
+            embedded(`http://zotero.org/users/1/items/${item.key}`, { title: item.getField?.('title') || 'Mock Title' }, page, options, meta)),
+        noteCitationHTML: vi.fn(noteCitationHTML),
+        getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test-user' })),
+    };
+});
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: {
+        auth: {
+            getSession: vi.fn(),
+        },
+    },
+}));
+
+// noteCitationExpand gates citation targets on the library-exclusion check,
+// which reads the Jotai store; stub it so unit tests treat every library as
+// searchable.
+vi.mock('../../../src/services/agentDataProvider/utils', () => ({
+    getAttachmentFileStatus: vi.fn().mockResolvedValue(undefined),
+    checkLibraryExcluded: vi.fn(() => null),
+}));
+
+import {
+    simplifyNoteHtml,
+    normalizeNoteHtml,
+    getOrSimplify,
+    invalidateSimplificationCache,
+    countOccurrences,
+    SimplificationMetadata,
+} from '../../../src/utils/noteHtmlSimplifier';
+import {
+    validateNewString,
+    checkDuplicateCitations,
+    enrichOldStringCitationRefs,
+    detectPartialSimplifiedTag,
+} from '../../../src/utils/editNoteValidation';
+import {
+    findUniqueRawMatchPosition,
+    captureValidatedEditTargetContext,
+    findTargetRawMatchPosition,
+    findRangeByContexts,
+} from '../../../src/utils/editNoteRawPosition';
+import {
+    expandToRawHtml,
+    translatePageNumberToLabel,
+    preloadPageLabelsForNewCitations,
+    preloadStructuralLocatorPages,
+    buildUnresolvedLocatorWarning,
+} from '../../../src/utils/noteCitationExpand';
+import { checkLibraryExcluded } from '../../../src/services/agentDataProvider/utils';
+import { citationPageLocator, translateLinkPageLabelToNumber, translatePageLabelToNumber } from '../../../src/utils/pageLabelTranslation';
+import {
+    isNoteInEditor,
+    getLatestNoteHtml,
+} from '../../../src/utils/noteEditorIO';
+import {
+    stripDataCitationItems,
+    extractDataCitationItems,
+    stripNoteWrapperDiv,
+    rebuildDataCitationItems,
+} from '../../../src/utils/noteWrapper';
+import { buildEmbeddedNoteCitation, buildNoteCitation, createCitationHTML } from '../../../src/utils/zoteroUtils';
+
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/** Decode the `data-citation` payload of the first citation span in `html`. */
+function decodeCitation(html: string): any {
+    const match = html.match(/data-citation="([^"]*)"/);
+    if (!match) throw new Error(`no citation in ${html}`);
+    return JSON.parse(decodeURIComponent(match[1]));
+}
+
+/** Build a minimal Zotero note wrapper */
+function wrap(inner: string, extraAttrs = ''): string {
+    return `<div data-schema-version="9"${extraAttrs}>${inner}</div>`;
+}
+
+/** Build a raw citation span */
+function rawCitation(key: string, libraryID = 1, page = '', label = 'Author, 2024'): string {
+    const citationData = {
+        citationItems: [{
+            uris: [`http://zotero.org/users/1/items/${key}`],
+            locator: page,
+        }],
+    };
+    return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">`
+        + `<span class="citation-item">${label}</span></span>`;
+}
+
+function rawCitationWithCSLLabel(
+    key: string,
+    libraryID = 1,
+    page = '',
+    cslLabel: string | undefined = undefined,
+    label = 'Author, 2024',
+): string {
+    const citationItem: any = {
+        uris: [`http://zotero.org/users/${libraryID}/items/${key}`],
+        locator: page,
+    };
+    if (cslLabel !== undefined) citationItem.label = cslLabel;
+    const citationData = { citationItems: [citationItem] };
+    return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">`
+        + `<span class="citation-item">${label}</span></span>`;
+}
+
+/** Build a raw compound citation span */
+function rawCompoundCitation(keys: string[], libraryID = 1, label = 'Author1; Author2'): string {
+    const citationData = {
+        citationItems: keys.map(k => ({
+            uris: [`http://zotero.org/users/1/items/${k}`],
+            locator: '',
+        })),
+    };
+    return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">`
+        + `<span class="citation-item">${label}</span></span>`;
+}
+
+/** Build a raw annotation span */
+function rawAnnotation(key: string, text: string, color = '#ffd400', pageLabel = '5'): string {
+    const annotData = { annotationKey: key, color, pageLabel };
+    return `<span class="highlight" data-annotation="${encodeURIComponent(JSON.stringify(annotData))}">${text}</span>`;
+}
+
+/** Build a raw annotation image */
+function rawAnnotationImage(annotKey: string, attKey: string, w = '200', h = '100'): string {
+    const annotData = { annotationKey: annotKey };
+    return `<img data-attachment-key="${attKey}" data-annotation="${encodeURIComponent(JSON.stringify(annotData))}" width="${w}" height="${h}" />`;
+}
+
+/** Build a raw regular image */
+function rawImage(attKey: string): string {
+    return `<img data-attachment-key="${attKey}" width="400" height="300" />`;
+}
+
+/**
+ * PM-normalized citation — what PM produces after roundtripping a citation
+ * without itemData (inner text becomes "()" since PM can't format without itemData).
+ */
+function pmNormCitation(key: string, page = ''): string {
+    const citationData = {
+        citationItems: [{ uris: [`http://zotero.org/users/1/items/${key}`], locator: page }],
+    };
+    return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">()</span>`;
+}
+
+/** PM-normalized compound citation */
+function pmNormCompoundCitation(keys: string[]): string {
+    const citationData = {
+        citationItems: keys.map(k => ({ uris: [`http://zotero.org/users/1/items/${k}`], locator: '' })),
+    };
+    return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">()</span>`;
+}
+
+/**
+ * Substring-based replace that avoids JavaScript's special $ handling in
+ * String.prototype.replace() replacement strings.  Mirrors what
+ * editNoteActions.ts does at runtime (indexOf + substring splicing).
+ */
+function replaceFirst(haystack: string, needle: string, replacement: string): string {
+    const idx = haystack.indexOf(needle);
+    if (idx === -1) throw new Error(`replaceFirst: needle not found in haystack`);
+    return haystack.substring(0, idx) + replacement + haystack.substring(idx + needle.length);
+}
+
+/** Build a raw inline math span */
+function rawInlineMath(latex: string): string {
+    return `<span class="math">$${latex}$</span>`;
+}
+
+/** Build a raw display math pre */
+function rawDisplayMath(latex: string): string {
+    return `<pre class="math">$$${latex}$$</pre>`;
+}
+
+
+// =============================================================================
+// Setup
+// =============================================================================
+
+// Capture the jsdom-backed getMainWindow from setup.ts so later tests that
+// replace Zotero.getMainWindow (e.g. getLatestNoteHtml) don't leak a stub
+// without a .document into tests that rely on ProseMirror normalization.
+const _originalGetMainWindow = (globalThis as any).Zotero.getMainWindow;
+
+beforeEach(() => {
+    vi.clearAllMocks();
+
+    // Reset Zotero globals used by expansion / rebuild
+    (globalThis as any).Zotero = {
+        ...(globalThis as any).Zotero,
+        getMainWindow: _originalGetMainWindow,
+        Items: {
+            getByLibraryAndKey: vi.fn((libId: number, key: string) => ({
+                id: `${libId}-${key}`,
+                key,
+                libraryID: libId,
+                getField: vi.fn(() => 'Mock Title'),
+                isAttachment: vi.fn(() => false),
+                isRegularItem: vi.fn(() => true),
+                getAttachments: vi.fn(() => []),
+            })),
+            // Preloads look items up asynchronously; mirror the sync mock so
+            // per-test overrides apply to both.
+            getByLibraryAndKeyAsync: vi.fn(async (libId: number, key: string) =>
+                (globalThis as any).Zotero.Items.getByLibraryAndKey(libId, key)),
+        },
+        Libraries: {
+            ...(globalThis as any).Zotero.Libraries,
+            userLibraryID: 1,
+        },
+        Groups: {
+            getLibraryIDFromGroupID: vi.fn((groupID: number) => groupID === 42 ? 7 : null),
+        },
+        URI: {
+            getURIItem: vi.fn((uri: string) => {
+                const keyMatch = uri.match(/\/items\/([A-Z0-9]+)$/i);
+                return keyMatch ? { key: keyMatch[1] } : null;
+            }),
+            getURIItemLibraryKey: vi.fn((uri: string) => {
+                const keyMatch = uri.match(/\/items\/([A-Z0-9]+)$/i);
+                return keyMatch ? { libraryID: 1, key: keyMatch[1] } : false;
+            }),
+        },
+        Utilities: {
+            Item: {
+                itemToCSLJSON: vi.fn((item: any) => ({
+                    id: item.key,
+                    type: 'article-journal',
+                    author: [{ family: 'Author', given: 'Test' }],
+                    issued: { 'date-parts': [['2024']] },
+                })),
+            },
+        },
+        EditorInstanceUtilities: {
+            formatCitation: vi.fn((citation: any) => {
+                return '(' + citation.citationItems.map((ci: any) => {
+                    const author = ci.itemData?.author?.[0]?.family || '';
+                    const year = ci.itemData?.issued?.['date-parts']?.[0]?.[0] || '';
+                    return `<span class="citation-item">${author}${year ? ', ' + year : ''}</span>`;
+                }).join('; ') + ')';
+            }),
+        },
+        Notes: {
+            _editorInstances: [],
+        },
+    };
+
+    // Clear simplification cache between tests
+    invalidateSimplificationCache('test-note');
+});
+
+
+// =============================================================================
+// simplifyNoteHtml
+// =============================================================================
+
+describe('simplifyNoteHtml', () => {
+    it('passes through plain text note (minus wrapper attributes)', () => {
+        const html = wrap('<p>Hello world</p>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('<p>Hello world</p>');
+        expect(metadata.elements.size).toBe(0);
+    });
+
+    it('replaces single citation with <citation /> tag', () => {
+        const html = wrap(`<p>${rawCitation('ABCD1234')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('ref="c_ABCD1234_0"');
+        expect(simplified).toContain('id="u-ABCD1234"');
+        expect(simplified).not.toContain('label=');
+        expect(simplified).toContain('/>');
+        expect(metadata.elements.has('c_ABCD1234_0')).toBe(true);
+        expect(metadata.elements.get('c_ABCD1234_0')!.type).toBe('citation');
+    });
+
+    it('reads a compound item\'s page from AsterMargin\'s metadata before translating its label', () => {
+        const citationData = {
+            citationItems: [
+                {
+                    uris: ['http://zotero.org/users/1/items/KEY1'],
+                    locator: '1205',
+                    astermargin: { v: 1, loc: 'page5' },
+                },
+                { uris: ['http://zotero.org/users/1/items/KEY2'], locator: '7' },
+            ],
+        };
+        const raw = `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">`
+            + '<span class="citation-item">Author1; Author2</span></span>';
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1, {
+            'u-KEY1': { 4: '1205', 9: '5' },
+            'u-KEY2': { declared: { 6: '7' }, locator: { 6: '1207' } },
+        });
+        expect(simplified).toContain('items="u-KEY1:page=5, u-KEY2:page=7"');
+    });
+
+    it('reads a native citation without AsterMargin\'s metadata in declared labels, not printed ones', () => {
+        // Declared labels 1..8; printed body labels 1..6 from physical page 3.
+        // An older AsterMargin wrote locator "5" for physical page 5.
+        const labels = {
+            declared: { 0: '1', 1: '2', 2: '3', 3: '4', 4: '5', 5: '6', 6: '7', 7: '8' },
+            locator: { 0: '1', 1: '2', 2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6' },
+        };
+        const html = wrap(`<p>${rawCitation('ABCD1234', 1, '5')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1, { 'u-ABCD1234': labels });
+        expect(simplified).toContain('loc="page5"');
+    });
+
+    it('reads a citation Zotero wrote beside an annotation as the annotation\'s page', () => {
+        // "Add to Note" on a AsterMargin annotation that carries the printed label
+        // 1205 on physical page 5; the PDF declares 1..10.
+        const uri = 'http://zotero.org/users/1/items/ABCD1234';
+        const annotation = {
+            attachmentURI: 'http://zotero.org/users/1/items/ATTACH01',
+            annotationKey: 'ANNOT001',
+            pageLabel: '1205',
+            position: { pageIndex: 4, rects: [[0, 0, 10, 10]] },
+            citationItem: { uris: [uri], locator: '1205' },
+        };
+        const declared = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [i, String(i + 1)]));
+        const html = wrap(`<p><span class="highlight" data-annotation="${encodeURIComponent(JSON.stringify(annotation))}">`
+            + `"Text"</span> ${rawCitation('ABCD1234', 1, '1205')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1, { 'u-ABCD1234': declared });
+        expect(simplified).toContain('id="u-ABCD1234" loc="page5"');
+    });
+
+    it('pairs a citation with the annotation right before it', () => {
+        const uri = 'http://zotero.org/users/1/items/ABCD1234';
+        const annotation = (pageIndex: number) => encodeURIComponent(JSON.stringify({
+            annotationKey: `ANNOT00${pageIndex}`,
+            pageLabel: '5',
+            position: { pageIndex, rects: [[0, 0, 10, 10]] },
+            citationItem: { uris: [uri], locator: '5' },
+        }));
+        const html = wrap(`<p><span class="highlight" data-annotation="${annotation(4)}">"A"</span> `
+            + `<span class="highlight" data-annotation="${annotation(6)}">"B"</span> ${rawCitation('ABCD1234', 1, '5')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1, { 'u-ABCD1234': { 2: '5' } });
+        expect(simplified).toContain('id="u-ABCD1234" loc="page7"');
+    });
+
+    it('does not pair an annotation with a citation in a later paragraph', () => {
+        // The annotation's own citation was deleted; a later citation of declared
+        // page 5 must keep its reading.
+        const uri = 'http://zotero.org/users/1/items/ABCD1234';
+        const annotation = encodeURIComponent(JSON.stringify({
+            annotationKey: 'ANNOT007',
+            pageLabel: '5',
+            position: { pageIndex: 6, rects: [[0, 0, 10, 10]] },
+            citationItem: { uris: [uri], locator: '5' },
+        }));
+        const declared = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [i, String(i + 1)]));
+        const html = wrap(`<p><span class="highlight" data-annotation="${annotation}">"B"</span></p>`
+            + '<p>Between.</p><p>More.</p>'
+            + `<p>Later ${rawCitation('ABCD1234', 1, '5')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1, { 'u-ABCD1234': declared });
+        expect(simplified).toContain('id="u-ABCD1234" loc="page5"');
+    });
+
+    it('leaves an unrelated citation with the same item and label to declared labels', () => {
+        // An older citation of declared page 5 (physical 5), then an annotation
+        // imported later whose own label "5" is printed on physical page 7.
+        const uri = 'http://zotero.org/users/1/items/ABCD1234';
+        const annotation = encodeURIComponent(JSON.stringify({
+            annotationKey: 'ANNOT007',
+            pageLabel: '5',
+            position: { pageIndex: 6, rects: [[0, 0, 10, 10]] },
+            citationItem: { uris: [uri], locator: '5' },
+        }));
+        const declared = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [i, String(i + 1)]));
+        const html = wrap(`<p>Earlier ${rawCitation('ABCD1234', 1, '5')}</p>`
+            + `<p><span class="highlight" data-annotation="${annotation}">"B"</span> ${rawCitation('ABCD1234', 1, '5')}</p>`
+            + `<p>Later ${rawCitation('ABCD1234', 1, '5')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1, { 'u-ABCD1234': declared });
+        const locs = [...simplified.matchAll(/id="u-ABCD1234" loc="(page\d+)"/g)].map((m) => m[1]);
+        expect(locs).toEqual(['page5', 'page7', 'page5']);
+    });
+
+    it('replaces compound citation with items attribute', () => {
+        const html = wrap(`<p>${rawCompoundCitation(['KEY1', 'KEY2'])}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('ref="c_KEY1+KEY2_0"');
+        expect(simplified).toContain('items="u-KEY1, u-KEY2"');
+        expect(simplified).not.toContain('label=');
+        const stored = metadata.elements.get('c_KEY1+KEY2_0');
+        expect(stored!.type).toBe('compound-citation');
+        expect(stored!.isCompound).toBe(true);
+    });
+
+    it('replaces Zotero note and annotation links with citation tags', () => {
+        const noteLink = '<a href="zotero://select/library/items/NOTE1234">Note: Project note</a>';
+        const annotationLink = '<a href="zotero://open-pdf/groups/42/items/ATTACH12?annotation=ANNOT123">Annotation: Highlight</a>';
+        const html = wrap(`<p>${noteLink} ${annotationLink}</p>`);
+
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('<citation id="u-NOTE1234" ref="c_NOTE1234_0"/>');
+        // Group 42 has no reverse lookup mocked (getGroupIDFromLibraryID), so
+        // its portable ref can't be computed here and it falls back to the
+        // legacy numeric local library id (7).
+        expect(simplified).toContain('<citation id="7-ANNOT123" ref="c_ANNOT123_0"/>');
+        expect(metadata.elements.get('c_NOTE1234_0')).toMatchObject({
+            type: 'citation',
+            originalAttrs: { item_id: 'u-NOTE1234' },
+        });
+        expect(metadata.elements.get('c_ANNOT123_0')).toMatchObject({
+            type: 'citation',
+            originalAttrs: { item_id: '7-ANNOT123' },
+        });
+    });
+
+    it('expands unchanged Zotero link citations back to their normalized anchors', () => {
+        const html = wrap('<p>Before <a href="zotero://select/library/items/NOTE1234">Note: Project note</a> after.</p>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+
+        expect(expanded).toContain(
+            '<a href="zotero://select/library/items/NOTE1234" rel="noopener noreferrer nofollow">Note: Project note</a>'
+        );
+    });
+
+    it('absorbs the parentheses AsterMargin writes around a link citation', () => {
+        const html = wrap('<p>Source (<a href="zotero://select/library/items/NOTE1234">Note: Project note</a>)</p>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('<p>Source <citation id="u-NOTE1234" ref="c_NOTE1234_0"/></p>');
+        expect(expandToRawHtml(simplified, metadata, 'old')).toContain(
+            'Source (<a href="zotero://select/library/items/NOTE1234" rel="noopener noreferrer nofollow">Note: Project note</a>)'
+        );
+    });
+
+    it.each([
+        ['a parenthesis that is not part of the citation', 'Text (see LINK) after.'],
+        ['prose that is not a page locator', 'Text (LINK, see also the appendix) after.'],
+        ['a locator the agent may still edit as text', 'Text LINK, p. 6 after.'],
+    ])('leaves %s outside the citation token', (_label, template) => {
+        const link = '<a href="zotero://select/library/items/NOTE1234">Note: Project note</a>';
+        const text = template.replace('LINK', link);
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${text}</p>`), 1);
+
+        expect(simplified).toContain('<citation id="u-NOTE1234" ref="c_NOTE1234_0"/>');
+        expect(simplified).toContain(template.replace('LINK', '<citation id="u-NOTE1234" ref="c_NOTE1234_0"/>'));
+        expect(expandToRawHtml(simplified, metadata, 'old')).toContain(
+            text.replace('">Note', '" rel="noopener noreferrer nofollow">Note')
+        );
+    });
+
+    it('preserves Zotero citation link hrefs during an unrelated str_replace edit', () => {
+        const noteLink = '<a href="zotero://select/library/items/NOTE1234">Note: Project note</a>';
+        const annotationLink = '<a href="zotero://open-pdf/library/items/ATTACH12?annotation=ANNOT123">Annotation: Highlight</a>';
+        const html = wrap(`<p>${noteLink} ${annotationLink}</p><p>Replace this sentence.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const oldString = '<p>Replace this sentence.</p>';
+        const newString = '<p>Replacement sentence.</p>';
+
+        const strippedHtml = stripDataCitationItems(normalizeNoteHtml(html));
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+        const savedHtml = replaceFirst(strippedHtml, expandedOld, expandedNew);
+
+        expect(savedHtml).toContain('href="zotero://select/library/items/NOTE1234"');
+        expect(savedHtml).toContain('href="zotero://open-pdf/library/items/ATTACH12?annotation=ANNOT123"');
+        expect(savedHtml).toContain('<p>Replacement sentence.</p>');
+        expect(simplified).toContain('<citation id="u-NOTE1234"');
+        expect(simplified).toContain('<citation id="u-ANNOT123"');
+    });
+
+    it('replaces annotation with <annotation> tag', () => {
+        const html = wrap(`<p>${rawAnnotation('ANN1', 'highlighted text')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('<annotation id="a_ANN1"');
+        expect(simplified).toContain('key="ANN1"');
+        expect(simplified).toContain('color="#ffd400"');
+        expect(simplified).toContain('page="5"');
+        expect(simplified).toContain('>highlighted text</annotation>');
+        expect(metadata.elements.get('a_ANN1')!.type).toBe('annotation');
+        expect(metadata.elements.get('a_ANN1')!.originalText).toBe('highlighted text');
+    });
+
+    it('replaces annotation image with <annotation-image /> tag', () => {
+        const html = wrap(rawAnnotationImage('AIMG1', 'ATT1'));
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('<annotation-image id="ai_AIMG1"');
+        expect(simplified).toContain('key="AIMG1"');
+        expect(simplified).toContain('attachment="ATT1"');
+        expect(simplified).toContain('width="200"');
+        expect(simplified).toContain('height="100"');
+        expect(metadata.elements.get('ai_AIMG1')!.type).toBe('annotation-image');
+    });
+
+    it('replaces regular image with <image /> tag', () => {
+        const html = wrap(rawImage('IMG1'));
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('<image id="i_IMG1"');
+        expect(simplified).toContain('attachment="IMG1"');
+        expect(metadata.elements.get('i_IMG1')!.type).toBe('image');
+    });
+
+    it('strips data-citation-items from wrapper div', () => {
+        const html = wrap('<p>text</p>', ' data-citation-items="encoded-stuff"');
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).not.toContain('data-citation-items');
+    });
+
+    it('strips the outer wrapper div from simplified output', () => {
+        const html = wrap('<h1>Title</h1>\n<p>Content</p>');
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).not.toContain('<div');
+        expect(simplified).not.toContain('</div>');
+        expect(simplified).not.toContain('data-schema-version');
+        expect(simplified).toBe('<h1>Title</h1>\n<p>Content</p>\n');
+    });
+
+    it('strips wrapper div even without data-schema-version', () => {
+        const html = '<div><p>Legacy note</p></div>';
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toBe('<p>Legacy note</p>\n');
+    });
+
+    it('preserves HTML when not wrapped in a div (PM adds wrapper then strips)', () => {
+        const html = '<p>Bare paragraph</p>';
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toBe('<p>Bare paragraph</p>\n');
+    });
+
+    it('handles mixed content with all element types', () => {
+        const inner = `<p>Intro</p>`
+            + `<p>${rawCitation('C1', 1, '', 'Smith, 2020')}</p>`
+            + `<p>${rawAnnotation('A1', 'quote')}</p>`
+            + rawAnnotationImage('AI1', 'AT1')
+            + rawImage('IM1');
+        const html = wrap(inner);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('ref="c_C1_0"');
+        expect(simplified).toContain('<annotation id="a_A1"');
+        expect(simplified).toContain('<annotation-image id="ai_AI1"');
+        expect(simplified).toContain('<image id="i_IM1"');
+        expect(metadata.elements.size).toBe(4);
+    });
+
+    it('assigns unique ids to duplicate citations', () => {
+        const html = wrap(`<p>${rawCitation('DUP')}</p><p>${rawCitation('DUP')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('c_DUP_0');
+        expect(simplified).toContain('c_DUP_1');
+        expect(metadata.elements.has('c_DUP_0')).toBe(true);
+        expect(metadata.elements.has('c_DUP_1')).toBe(true);
+    });
+
+    it('includes page locator in citation', () => {
+        const html = wrap(`<p>${rawCitation('PG1', 1, '42')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('loc="page42"');
+    });
+
+    it('translates cached page labels to physical page numbers for page citations', () => {
+        const html = wrap(`<p>${rawCitation('ROMANPG1', 1, 'xiv')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1, {
+            'u-ROMANPG1': { 13: 'xiv' },
+        });
+
+        expect(simplified).toContain('loc="page14"');
+        expect(metadata.elements.get('c_ROMANPG1_0')!.originalAttrs).toEqual({
+            item_id: 'u-ROMANPG1',
+            page: '14',
+            pageConvention: 'number',
+        });
+    });
+
+    it('re-simplifies the same note when page labels are seeded', () => {
+        const noteId = 'test-note-page-label-seed';
+        const html = wrap(`<p>${rawCitation('LABELPG1', 1, '341')}</p>`);
+        invalidateSimplificationCache(noteId);
+
+        const cold = getOrSimplify(noteId, html, 1);
+        const seeded = getOrSimplify(noteId, html, 1, {
+            'u-LABELPG1': { 0: '341' },
+        });
+
+        expect(cold.simplified).toContain('loc="page341"');
+        expect(seeded.simplified).toContain('loc="page1"');
+    });
+
+    it('does not translate non-page CSL locators', () => {
+        const html = wrap(`<p>${rawCitationWithCSLLabel('CHAPTER1', 1, 'xiv', 'chapter')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1, {
+            'u-CHAPTER1': { 13: 'xiv' },
+        });
+
+        expect(simplified).toContain('loc="pagexiv"');
+        expect(metadata.elements.get('c_CHAPTER1_0')!.originalAttrs).toEqual({
+            item_id: 'u-CHAPTER1',
+            page: 'xiv',
+            pageConvention: 'label',
+            cslLabel: 'chapter',
+        });
+    });
+
+    it('prefixes roman page locators with page in citation loc', () => {
+        const html = wrap(`<p>${rawCitation('ROMAN1', 1, 'iv')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('loc="pageiv"');
+    });
+
+    it('escapes page locator values in citation loc', () => {
+        const html = wrap(`<p>${rawCitation('ESCLOC1', 1, '5" & <x>')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('loc="page5&quot; &amp; &lt;x&gt;"');
+    });
+
+    it('omits label when visible text is empty parentheses "()"', () => {
+        // Simulates ProseMirror round-trip: atom nodes regenerate visible text
+        // from data-citation attrs, producing "()" when itemData is missing
+        const citationData = {
+            citationItems: [{
+                uris: ['http://zotero.org/users/1/items/ABCD1234'],
+            }],
+        };
+        const emptyCitation = `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">()</span>`;
+        const html = wrap(`<p>${emptyCitation}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('id="u-ABCD1234"');
+        expect(simplified).not.toContain('label="()"');
+        expect(simplified).not.toContain('label=');
+    });
+
+    it('leaves malformed citation JSON unchanged (PM normalizes to empty citation)', () => {
+        const badCitation = '<span class="citation" data-citation="not%20valid%20json"><span class="citation-item">Bad</span></span>';
+        const html = wrap(`<p>${badCitation}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        // PM normalizes malformed data-citation to empty citationItems, so it passes through
+        expect(simplified).toContain('class="citation"');
+        expect(simplified).toContain('()</span>');
+    });
+
+    it('leaves citation with empty citationItems unchanged (PM normalizes inner text)', () => {
+        const citationData = { citationItems: [] };
+        const html = wrap(`<p><span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}"><span class="citation-item">Empty</span></span></p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        // PM normalizes inner text to "()" and simplification leaves empty citations unchanged
+        expect(simplified).toContain('class="citation"');
+        expect(simplified).toContain('()</span>');
+    });
+
+    it('does not emit a label attribute from citation visible text', () => {
+        const label = 'Author "2024" & co.';
+        const html = wrap(`<p>${rawCitation('ESC1', 1, '', label)}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('id="u-ESC1"');
+        expect(simplified).not.toContain('label=');
+    });
+});
+
+
+// =============================================================================
+// expandToRawHtml
+// =============================================================================
+
+describe('cross-library citations', () => {
+    const GROUP_ID = 6073928;
+    const GROUP_LIBRARY_ID = 7;
+
+    /** A citation span whose URIs name each item's own library. */
+    function rawCitationForUris(uris: string[], page = ''): string {
+        const citationData = {
+            citationItems: uris.map(uri => ({ uris: [uri], locator: page })),
+        };
+        return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">`
+            + '<span class="citation-item">Author, 2024</span></span>';
+    }
+
+    const groupUri = (key: string) => `http://zotero.org/groups/${GROUP_ID}/items/${key}`;
+    const userUri = (key: string) => `http://zotero.org/users/1/items/${key}`;
+
+    beforeEach(() => {
+        const Z = (globalThis as any).Zotero;
+        Z.Groups.getLibraryIDFromGroupID = vi.fn((groupID: number) => groupID === GROUP_ID ? GROUP_LIBRARY_ID : false);
+        Z.Groups.getGroupIDFromLibraryID = vi.fn((libraryID: number) => {
+            if (libraryID === GROUP_LIBRARY_ID) return GROUP_ID;
+            throw new Error(`Not a group library: ${libraryID}`);
+        });
+        // Mirrors Zotero: every users/<id> URI is the personal library, a
+        // group URI is that group's library (false when not on this computer).
+        Z.URI.getURIItemLibraryKey = vi.fn((uri: string) => {
+            const m = uri.match(/^http:\/\/zotero\.org\/(users|groups)\/(\d+)\/items\/([A-Z0-9]+)$/);
+            if (!m) throw new Error(`Could not parse object URI ${uri}`);
+            if (m[1] === 'users') return { libraryID: 1, key: m[3] };
+            return Number(m[2]) === GROUP_ID ? { libraryID: GROUP_LIBRARY_ID, key: m[3] } : false;
+        });
+    });
+
+    it('ids a group item cited from a My Library note by its own library', () => {
+        const html = wrap(`<p>${rawCitationForUris([groupUri('JLIWC45M')])}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('<citation id="g6073928-JLIWC45M" ref="c_JLIWC45M_0"/>');
+        expect(metadata.elements.get('c_JLIWC45M_0')?.originalAttrs?.item_id).toBe('g6073928-JLIWC45M');
+    });
+
+    it('ids each item of a compound citation by its own library', () => {
+        const html = wrap(`<p>${rawCitationForUris([userUri('KEY1'), groupUri('KEY2')])}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('items="u-KEY1, g6073928-KEY2"');
+    });
+
+    it('rebuilds an edited cross-library citation against the cited item\'s library', () => {
+        const html = wrap(`<p>${rawCitationForUris([groupUri('JLIWC45M')], '3')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const edited = simplified.replace('loc="page3"', 'loc="page5"');
+
+        expandToRawHtml(edited, metadata, 'new');
+
+        expect((globalThis as any).Zotero.Items.getByLibraryAndKey).toHaveBeenCalledWith(GROUP_LIBRARY_ID, 'JLIWC45M');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ libraryID: GROUP_LIBRARY_ID, key: 'JLIWC45M' }),
+            '5',
+            undefined,
+            undefined,
+        );
+    });
+
+    it('leaves an untouched cross-library citation byte-identical', () => {
+        const html = wrap(`<p>${rawCitationForUris([groupUri('JLIWC45M')], '3')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+
+        expect(expanded).toContain(encodeURIComponent(groupUri('JLIWC45M')));
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    it('ids a My Library item cited from a group note as u-KEY', () => {
+        const html = wrap(`<p>${rawCitationForUris(['http://zotero.org/users/12345/items/MINE0001'])}</p>`);
+        const { simplified } = simplifyNoteHtml(html, GROUP_LIBRARY_ID);
+
+        expect(simplified).toContain('<citation id="u-MINE0001" ref="c_MINE0001_0"/>');
+    });
+
+    it('names an embedded work in a multi-item citation the same way in its ref and items', () => {
+        const html = wrap(`<p>${rawCitationForUris([userUri('KEY1'), 'https://doi.org/10.1234/items/ABCD1234'])}</p>`);
+        const { simplified } = simplifyNoteHtml(html, GROUP_LIBRARY_ID);
+
+        expect(simplified).toContain('<citation items="u-KEY1, g6073928-unknown" ref="c_KEY1+unknown_0"/>');
+    });
+
+    it('falls back to the note\'s library for a group not on this computer', () => {
+        const html = wrap(`<p>${rawCitationForUris(['http://zotero.org/groups/111/items/FOREIGN1'])}</p>`);
+        const { simplified } = simplifyNoteHtml(html, GROUP_LIBRARY_ID);
+
+        expect(simplified).toContain('<citation id="g6073928-FOREIGN1" ref="c_FOREIGN1_0"/>');
+    });
+
+    it.each([
+        'https://example.org/library/items/FOREIGN1',
+        // Zotero writes and parses item URIs only with the http prefix.
+        'https://zotero.org/groups/111/items/FOREIGN1',
+    ])('never reads %s as a library item', (uri) => {
+        const html = wrap(`<p>${rawCitationForUris([uri])}</p>`);
+        const { simplified } = simplifyNoteHtml(html, GROUP_LIBRARY_ID);
+
+        expect(simplified).toContain(`<citation ref="c_embedded_0" url="${uri}"/>`);
+        expect(simplified).not.toContain('id="');
+    });
+});
+
+describe('expandToRawHtml', () => {
+    function makeMetadata(): { metadata: SimplificationMetadata; rawCit: string; rawAnnot: string; rawAI: string; rawImg: string } {
+        const rawCit = rawCitation('EX1');
+        const rawAnnot = rawAnnotation('EA1', 'text here');
+        const rawAI = rawAnnotationImage('EAI1', 'EATT1');
+        const rawImg = rawImage('EIMG1');
+
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_EX1_0', { rawHtml: rawCit, type: 'citation' as const, originalAttrs: { item_id: 'u-EX1' } }],
+                ['c_EX1_1', { rawHtml: rawCitation('EX1', 1, '10'), type: 'citation' as const, originalAttrs: { item_id: 'u-EX1', page: '10' } }],
+                ['c_K1+K2_0', { rawHtml: rawCompoundCitation(['K1', 'K2']), type: 'compound-citation' as const, isCompound: true }],
+                ['a_EA1', { rawHtml: rawAnnot, type: 'annotation' as const, originalText: 'text here' }],
+                ['ai_EAI1', { rawHtml: rawAI, type: 'annotation-image' as const }],
+                ['i_EIMG1', { rawHtml: rawImg, type: 'image' as const }],
+            ]),
+        };
+
+        return { metadata, rawCit, rawAnnot, rawAI, rawImg };
+    }
+
+    // ---- Existing citation: unchanged ----
+
+    it('restores existing citation with unchanged attrs', () => {
+        const { metadata, rawCit } = makeMetadata();
+        const input = '<citation item_id="1-EX1" label="Author, 2024" ref="c_EX1_0"/>';
+        expect(expandToRawHtml(input, metadata, 'old')).toBe(rawCit);
+    });
+
+    it('restores existing citation without item_id (just ref)', () => {
+        const { metadata, rawCit } = makeMetadata();
+        const input = '<citation label="Author, 2024" ref="c_EX1_0"/>';
+        expect(expandToRawHtml(input, metadata, 'old')).toBe(rawCit);
+    });
+
+    it('restores existing citation in new context too', () => {
+        const { metadata, rawCit } = makeMetadata();
+        const input = '<citation item_id="1-EX1" label="Author, 2024" ref="c_EX1_0"/>';
+        expect(expandToRawHtml(input, metadata, 'new')).toBe(rawCit);
+    });
+
+    // ---- Existing citation: page locator update ----
+
+    it('rebuilds existing citation when page is added', () => {
+        const { metadata } = makeMetadata();
+        const input = '<citation item_id="1-EX1" page="99" label="Author, 2024" ref="c_EX1_0"/>';
+        const result = expandToRawHtml(input, metadata, 'old');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            '99',
+            undefined,
+            { v: 1, loc: 'page99' },
+        );
+        expect(result).toContain('data-citation=');
+    });
+
+    it('rebuilds existing citation when page locator changes', () => {
+        const { metadata } = makeMetadata();
+        // c_EX1_1 originally has page="10" — change to "25"
+        const input = '<citation item_id="1-EX1" page="25" label="Author, 2024, p. 10" ref="c_EX1_1"/>';
+        expandToRawHtml(input, metadata, 'old');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            '25',
+            undefined,
+            undefined,
+        );
+    });
+
+    it('keeps the CSL label, prefix and suffix when an edit moves the locator', () => {
+        const { metadata } = makeMetadata();
+        const citationData = {
+            citationItems: [{
+                uris: ['http://zotero.org/users/1/items/EX1'],
+                locator: '3', label: 'chapter', prefix: 'see', suffix: 'emphasis added',
+            }],
+        };
+        metadata.elements.set('c_EX1_2', {
+            rawHtml: `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">(x)</span>`,
+            type: 'citation',
+            originalAttrs: { item_id: 'u-EX1', page: '3', pageConvention: 'label', cslLabel: 'chapter' },
+        });
+
+        expandToRawHtml('<citation id="1-EX1" loc="page4" ref="c_EX1_2"/>', metadata, 'new');
+
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            '4',
+            { label: 'chapter', prefix: 'see', suffix: 'emphasis added' },
+            undefined,
+        );
+    });
+
+    it('drops the stored CSL options when an edit swaps the cited item', () => {
+        const { metadata } = makeMetadata();
+        const citationData = { citationItems: [{ uris: ['http://zotero.org/users/1/items/EX1'], locator: '3', label: 'chapter' }] };
+        metadata.elements.set('c_EX1_2', {
+            rawHtml: `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citationData))}">(x)</span>`,
+            type: 'citation',
+            originalAttrs: { item_id: 'u-EX1', page: '3', pageConvention: 'label', cslLabel: 'chapter' },
+        });
+
+        expandToRawHtml('<citation id="1-OTHER1" loc="page3" ref="c_EX1_2"/>', metadata, 'new');
+
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'OTHER1' }),
+            '3',
+            undefined,
+            undefined,
+        );
+    });
+
+    it('expands a single-quoted external reference once masking has canonicalized it', () => {
+        const { metadata } = makeMetadata();
+        const [tag] = maskRenderedCitationTags(`Claim <citation external_id='W1' loc='page7'/>`).tags;
+
+        expandToRawHtml(tag, metadata, 'new', {
+            externalRefs: {},
+            externalItemMapping: { W1: { library_id: 1, zotero_key: 'MAPPED01' } },
+        });
+
+        expect(createCitationHTML).toHaveBeenCalledWith(expect.objectContaining({ key: 'MAPPED01' }), '7', undefined, { v: 1, loc: 'page7' });
+    });
+
+    it('names a malformed citation id in the error', () => {
+        const { metadata } = makeMetadata();
+        expect(() => expandToRawHtml('<citation id="ABCD1234"/>', metadata, 'new'))
+            .toThrow('Invalid citation id "ABCD1234"');
+    });
+
+    it('refuses an edited compound citation instead of silently keeping it', () => {
+        const { metadata } = makeMetadata();
+        metadata.elements.get('c_K1+K2_0')!.originalItems = 'u-K1, u-K2';
+
+        expect(() => expandToRawHtml('<citation items="u-K1:page=5, u-K2" ref="c_K1+K2_0"/>', metadata, 'new'))
+            .toThrow('compound citation, which cannot be edited');
+        expect(() => expandToRawHtml('<citation id="1-K1" ref="c_K1+K2_0"/>', metadata, 'new'))
+            .toThrow('compound citation, which cannot be edited');
+    });
+
+    it('compares compound items by identity, so a legacy id for the same item is no change', () => {
+        const { metadata } = makeMetadata();
+        metadata.elements.get('c_K1+K2_0')!.originalItems = 'u-K1:page=5, u-K2';
+        const raw = rawCompoundCitation(['K1', 'K2']);
+
+        expect(expandToRawHtml('<citation items="1-K1:page=5, 1-K2" ref="c_K1+K2_0"/>', metadata, 'new')).toBe(raw);
+        expect(() => expandToRawHtml('<citation items="1-K1:page=6, 1-K2" ref="c_K1+K2_0"/>', metadata, 'new'))
+            .toThrow('compound citation, which cannot be edited');
+        expect(() => expandToRawHtml('<citation items="u-K2, u-K1:page=5" ref="c_K1+K2_0"/>', metadata, 'new'))
+            .toThrow('compound citation, which cannot be edited');
+    });
+
+    it('restores a compound citation left as read, including whitespace drift', () => {
+        const { metadata } = makeMetadata();
+        metadata.elements.get('c_K1+K2_0')!.originalItems = 'u-K1, u-K2';
+        const raw = rawCompoundCitation(['K1', 'K2']);
+
+        expect(expandToRawHtml('<citation items="u-K1,u-K2" ref="c_K1+K2_0"/>', metadata, 'new')).toBe(raw);
+        expect(expandToRawHtml('<citation ref="c_K1+K2_0"/>', metadata, 'new')).toBe(raw);
+        // old_string only locates text, so attribute drift there is tolerated.
+        expect(expandToRawHtml('<citation items="u-K1:page=5, u-K2" ref="c_K1+K2_0"/>', metadata, 'old')).toBe(raw);
+    });
+
+    it('rebuilds existing citation when page locator is removed', () => {
+        const { metadata } = makeMetadata();
+        // c_EX1_1 originally has page="10" — remove page attr
+        const input = '<citation item_id="1-EX1" label="Author, 2024, p. 10" ref="c_EX1_1"/>';
+        expandToRawHtml(input, metadata, 'old');
+        // page is now undefined vs original "10" → attrs changed → rebuild
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            undefined,
+            undefined,
+            undefined,
+        );
+    });
+
+    it('does not rebuild when page locator is unchanged', () => {
+        const { metadata } = makeMetadata();
+        const input = '<citation item_id="1-EX1" page="10" label="Author, 2024" ref="c_EX1_1"/>';
+        expandToRawHtml(input, metadata, 'old');
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    // ---- Structural (non-page) locator resolution ----
+
+    it('substitutes a resolved page for a new structural locator', () => {
+        const { metadata } = makeMetadata();
+        // Sentence locator s4 was pre-resolved to page "9".
+        const input = '<citation id="1-EX1" loc="s4" label="(Author, 2024)" ref="c_EX1_new"/>';
+        const resolvedLocatorPages = { 'zotero:u-EX1:s4': { label: '9', page: 9, locator: '9' } };
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            '9',
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    it('drops the locator for a structural locator with no resolved page', () => {
+        const { metadata } = makeMetadata();
+        // No resolvedLocatorPages entry → structural locator can't be stored.
+        const input = '<citation id="1-EX1" loc="s4" label="(Author, 2024)" ref="c_EX1_new"/>';
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, {});
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            undefined,
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    it('does not translate a resolved structural page through the page-label map', () => {
+        const { metadata } = makeMetadata();
+        // pageLabels would map 1-based page 9 → some label, but a structural
+        // page is already a final label and must be stored verbatim.
+        const input = '<citation id="1-EX1" loc="s4" label="(Author, 2024)" ref="c_EX1_new"/>';
+        const pageLabels = { '1-EX1': { 8: 'ix' } };
+        const resolvedLocatorPages = { 'zotero:u-EX1:s4': { label: '9', page: 9, locator: '9' } };
+        expandToRawHtml(input, metadata, 'new', undefined, pageLabels as any, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            '9',
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    it('cites no page for a structural locator on a page that prints none', () => {
+        const { metadata } = makeMetadata();
+        const input = '<citation id="1-EX1" loc="s1.2" ref="c_EX1_new"/>';
+        // The resolver labels the passage for links but gives native citations no locator.
+        const resolvedLocatorPages = { 'zotero:u-EX1:s1.2': { label: '1', page: 1, pages: '1' } };
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            undefined,
+            undefined,
+            { v: 1, loc: 's1.2' },
+        );
+    });
+
+    it('cites no page for a page locator on a page that prints none, keeping the page in metadata', () => {
+        const attachment = {
+            id: 77, key: 'ATT77', libraryID: 1, parentID: 5,
+            isAttachment: () => true, isAnnotation: () => false, isNote: () => false,
+            isFileAttachment: () => true, isPDFAttachment: () => true,
+            attachmentContentType: 'application/pdf',
+        };
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue(attachment as any);
+        const labels = { 77: { 1: '1', 2: '2' } };
+        expandToRawHtml('<citation id="1-ATT77" loc="page1"/>', { elements: new Map() }, 'new', undefined, labels as any);
+        expect(createCitationHTML).toHaveBeenLastCalledWith(attachment, undefined, undefined, { v: 1, loc: 'page1', att: 'ATT77' });
+        expandToRawHtml('<citation id="1-ATT77" loc="page2"/>', { elements: new Map() }, 'new', undefined, labels as any);
+        expect(createCitationHTML).toHaveBeenLastCalledWith(attachment, '1', undefined, { v: 1, loc: 'page2', att: 'ATT77' });
+    });
+
+    it('resolves a structural locator when editing an existing citation', () => {
+        const { metadata } = makeMetadata();
+        // c_EX1_1 originally has page="10"; change its locator to sentence s4.
+        const input = '<citation id="1-EX1" loc="s4" label="(Author, 2024, p. 10)" ref="c_EX1_1"/>';
+        const resolvedLocatorPages = { 'zotero:u-EX1:s4': { label: '3', page: 3, locator: '3' } };
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'EX1' }),
+            '3',
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    it('substitutes a resolved page for a legacy att_id structural locator', () => {
+        const { metadata } = makeMetadata();
+        const input = '<citation att_id="1-ATT1" loc="s4" label="(Author, 2024)"/>';
+        const resolvedLocatorPages = { 'zotero:u-ATT1:s4': { label: '9', page: 9, locator: '9' } };
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'ATT1' }),
+            '9',
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    it('substitutes a resolved page for a legacy sid structural locator', () => {
+        const { metadata } = makeMetadata();
+        // The `sid` attribute is the legacy alias for a structural locator.
+        const input = '<citation att_id="1-ATT1" sid="s4" label="(Author, 2024)"/>';
+        const resolvedLocatorPages = { 'zotero:u-ATT1:s4': { label: '9', page: 9, locator: '9' } };
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'ATT1' }),
+            '9',
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    it('drops the locator for an att_id structural locator with no resolved page', () => {
+        const { metadata } = makeMetadata();
+        const input = '<citation att_id="1-ATT1" loc="s4" label="(Author, 2024)"/>';
+        expandToRawHtml(input, metadata, 'new', undefined, undefined, {});
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'ATT1' }),
+            undefined,
+            undefined,
+            { v: 1, loc: 's4' },
+        );
+    });
+
+    // ---- Compound citation ----
+
+    it('restores compound citation (always immutable)', () => {
+        const { metadata } = makeMetadata();
+        const input = '<citation items="1-K1, 1-K2" label="Author1; Author2" ref="c_K1+K2_0"/>';
+        const result = expandToRawHtml(input, metadata, 'old');
+        expect(result).toContain('data-citation=');
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    it('compound citation ignores attribute changes (immutable)', () => {
+        const { metadata } = makeMetadata();
+        // Even with altered label, compound uses stored rawHtml
+        const input = '<citation items="1-K1, 1-K2" label="CHANGED" ref="c_K1+K2_0"/>';
+        const result = expandToRawHtml(input, metadata, 'new');
+        expect(result).toContain('data-citation=');
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    // ---- New citation: item_id ----
+
+    it('creates new citation from item_id in new context', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-NEW1" label="New Ref"/>';
+        const result = expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'NEW1' }),
+            undefined,
+            undefined,
+            undefined,
+        );
+        expect(result).toContain('data-citation=');
+    });
+
+    it('creates new citation from item_id with page', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-NEW1" page="42" label="New Ref, p. 42"/>';
+        expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'NEW1' }),
+            '42',
+            undefined,
+            { v: 1, loc: 'page42' },
+        );
+    });
+
+    it.each(['id', 'att_id'])('creates note and annotation citation links from %s in new context', (attrName) => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const note = {
+            key: 'NOTE1234',
+            libraryID: 1,
+            isNote: vi.fn(() => true),
+            getNoteTitle: vi.fn(() => 'Project note'),
+        };
+        const annotation = {
+            key: 'ANNOT123',
+            libraryID: 1,
+            itemType: 'annotation',
+            isAnnotation: vi.fn(() => true),
+            isNote: vi.fn(() => false),
+            annotationText: 'Highlighted text',
+            annotationPageLabel: '12',
+            parentItem: {
+                key: 'ATTACH12',
+                isFileAttachment: vi.fn(() => true),
+                parentItem: {
+                    firstCreator: 'Smith',
+                    getField: vi.fn((field: string) => field === 'date' ? '2019-04-01' : ''),
+                },
+            },
+        };
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn((libId: number, key: string) => {
+            if (key === 'NOTE1234') return note;
+            if (key === 'ANNOT123') return annotation;
+            return null;
+        });
+        (globalThis as any).Zotero.Libraries.get = vi.fn(() => ({ isGroup: false }));
+
+        const result = expandToRawHtml(
+            `<citation ${attrName}="1-NOTE1234"/> <citation ${attrName}="1-ANNOT123"/>`,
+            metadata,
+            'new'
+        );
+
+        expect(result).toContain(
+            '(<a href="zotero://select/library/items/NOTE1234" rel="noopener noreferrer nofollow">Note: Project note</a>)'
+        );
+        expect(result).toContain(
+            '(<a href="zotero://open-pdf/library/items/ATTACH12?annotation=ANNOT123" rel="noopener noreferrer nofollow">Annotation in Smith 2019, page 12</a>)'
+        );
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['id="u-ATTACH12" loc="page6-8"', ', p. 6-8', '?page=6#astermargin-pages=6-8', ' loc="page6-8"'],
+        ['att_id="1-ATTACH12" page="6"', ', p. 6', '?page=6', ' loc="page6"'],
+        ['attachment_id="1-ATTACH12" loc="s4"', '', '', ''],
+        ['item_id="1-ATTACH12"', '', '', ''],
+    ])('stores standalone attachment %s as an editable link', (attrs, suffix, pageQuery, loc) => {
+        const item = {
+            key: 'ATTACH12', libraryID: 1, parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            getField: () => 'Report & findings.pdf',
+        };
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue(item as any);
+        (Zotero.Libraries as any).get = vi.fn(() => ({ isGroup: false }));
+        const html = expandToRawHtml(`<citation ${attrs}/>`, { elements: new Map() }, 'new');
+        expect(html).toBe(`(<a href="zotero://open/library/items/ATTACH12${pageQuery}" rel="noopener noreferrer nofollow">Report &amp; findings.pdf</a>${suffix})`);
+        expect(createCitationHTML).not.toHaveBeenCalled();
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${html}</p>`), 1);
+        // The locator lives in the token, not as text the agent can edit apart
+        // from the link, and the parentheses come back with it.
+        expect(simplified).toContain(`<p><citation id="u-ATTACH12"${loc} ref="c_ATTACH12_0"/></p>`);
+        const saved = expandToRawHtml(simplified, metadata, 'new');
+        expect(saved).toContain(`Report &amp; findings.pdf</a>${suffix})`);
+        expect(expandToRawHtml(simplified, metadata, 'old')).toBe(saved);
+    });
+
+    it('adds a physical-page locator to an existing standalone attachment link', () => {
+        const labels = { 5: '4', 7: '6' };
+        const item = {
+            id: 42, key: 'ATTACH12', libraryID: 1, parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            getField: () => 'Report.pdf',
+        };
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue(item as any);
+        (Zotero.Libraries as any).get = vi.fn(() => ({ isGroup: false }));
+        const saved = '(<a href="zotero://open/library/items/ATTACH12"'
+            + ' rel="noopener noreferrer nofollow">Report.pdf</a>)';
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${saved}</p>`), 1, { 'u-ATTACH12': labels });
+        expect(simplified).toContain('<citation id="u-ATTACH12" ref="c_ATTACH12_0"/>');
+
+        const edited = expandToRawHtml(
+            simplified.replace(' ref=', ' loc="page6" ref='), metadata, 'new', undefined, { 42: labels },
+        );
+        expect(edited).toContain('<a href="zotero://open/library/items/ATTACH12?page=6"'
+            + ' rel="noopener noreferrer nofollow">Report.pdf</a>, p. 4)');
+    });
+
+    it('reads a link citation\'s page from the page its link opens, without labels', () => {
+        const item = {
+            id: 42, key: 'ATTACH12', libraryID: 1, parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            getField: () => 'Report.pdf',
+        };
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue(item as any);
+        (Zotero.Libraries as any).get = vi.fn(() => ({ isGroup: false }));
+        const saved = '(<a href="zotero://open/library/items/ATTACH12?page=5"'
+            + ' rel="noopener noreferrer nofollow">Report.pdf</a>, p. 1203)';
+
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${saved}</p>`), 1);
+        expect(simplified).toContain('<citation id="u-ATTACH12" loc="page5" ref="c_ATTACH12_0"/>');
+    });
+
+    it('keeps the physical-page convention for a link citation whose labels are offset', () => {
+        // Front matter puts printed page 3 on physical page 5. The agent works
+        // in physical pages, so that is what the simplified locator must show,
+        // and an edit to it must land on the physical page it names.
+        const labels = { 4: '3', 5: '4' };
+        const item = {
+            id: 42, key: 'ATTACH12', libraryID: 1, parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            getField: () => 'Report.pdf',
+        };
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue(item as any);
+        (Zotero.Libraries as any).get = vi.fn(() => ({ isGroup: false }));
+        const saved = '(<a href="zotero://open/library/items/ATTACH12?page=5"'
+            + ' rel="noopener noreferrer nofollow">Report.pdf</a>, p. 3)';
+
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${saved}</p>`), 1, { 'u-ATTACH12': labels });
+        expect(simplified).toContain('<citation id="u-ATTACH12" loc="page5" ref="c_ATTACH12_0"/>');
+
+        const edited = expandToRawHtml(
+            simplified.replace('loc="page5"', 'loc="page6"'), metadata, 'new', undefined, { 42: labels },
+        );
+        expect(edited).toContain('<a href="zotero://open/library/items/ATTACH12?page=6"'
+            + ' rel="noopener noreferrer nofollow">Report.pdf</a>, p. 4)');
+    });
+
+    it.each(['id', 'att_id'])('rejects excluded attachment %s before looking up its metadata', (attribute) => {
+        vi.mocked(checkLibraryExcluded).mockReturnValueOnce({ message: 'Library excluded' });
+        expect(() => expandToRawHtml(`<citation ${attribute}="1-ATTACH12" loc="page6"/>`,
+            { elements: new Map() }, 'new')).toThrow('Library excluded');
+        expect(Zotero.Items.getByLibraryAndKey).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('resolves standalone spans across three pages (labels: %s) for both ID spellings', async (withLabels) => {
+        const previousAsterMargin = Zotero.AsterMargin;
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue({
+            id: 42, key: 'ATTACH12', libraryID: 1, parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            getField: () => 'Report.pdf',
+            getFilePathAsync: async () => '/report.pdf',
+        } as any);
+        (Zotero.Libraries as any).get = vi.fn(() => ({ isGroup: false }));
+        (Zotero as any).AsterMargin = { documentCache: {
+            getMetadata: async () => ({ pageLabels: { 1: 'iv', 2: 'v' } }),
+            getResult: async () => structuredResultWithCitablePages(4, [
+                { index: 1, label: withLabels ? 'iv' : undefined, items: [{ id: 'p2.1', sentences: ['s2.1', 's2.2'] }] },
+                { index: 2, label: 'v', items: [{ id: 'p3.1', sentences: ['s3.1', 's3.2'] }] },
+                { index: 3, label: withLabels ? 'vi' : undefined, items: [{ id: 'p4.1', sentences: ['s4.1'] }] },
+            ]),
+        } };
+        try {
+            for (const attribute of ['id', 'att_id']) {
+                const input = `<citation ${attribute}="1-ATTACH12" loc="s2.1-s4.1"/>`;
+                const resolved = await preloadStructuralLocatorPages(input);
+                expect(resolved.unresolved).toEqual([]);
+                const html = expandToRawHtml(input, { elements: new Map() }, 'new', undefined, undefined, resolved.pages);
+                expect(html).toContain(`Report.pdf</a>, p. ${withLabels ? 'iv-vi' : '2-4'})`);
+                // The span displays labels, opens the first physical page and
+                // records all physical pages it cites.
+                expect(html).toContain('href="zotero://open/library/items/ATTACH12?page=2#astermargin-pages=2-4"');
+                expect(html).not.toContain('sentence');
+                // The recorded pages read back exactly, whatever the labels.
+                const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${html}</p>`), 1);
+                expect(simplified).toContain('loc="page2-4"');
+                expect(expandToRawHtml(simplified, metadata, 'old')).toContain(html);
+            }
+            const input = '<citation id="1-ATTACH12" loc="page2-3"/>';
+            const labels = await preloadPageLabelsForNewCitations(input);
+            const pageHtml = expandToRawHtml(input, { elements: new Map() }, 'new', undefined, labels);
+            expect(pageHtml).toContain('Report.pdf</a>, p. iv-v)');
+            expect(pageHtml).toContain('href="zotero://open/library/items/ATTACH12?page=2#astermargin-pages=2-3"');
+        } finally {
+            (Zotero as any).AsterMargin = previousAsterMargin;
+        }
+    });
+
+    it('throws for new citation with item_id in old context', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-NEW1" label="New Ref"/>';
+        expect(() => expandToRawHtml(input, metadata, 'old')).toThrow(/old_string/);
+    });
+
+    it('names the offending item_id in the old-context error message', () => {
+        // The error must quote the offending tag so the model knows which
+        // citation in old_string couldn't be resolved.
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-NEW1" page="42" label="New Ref"/>';
+        expect(() => expandToRawHtml(input, metadata, 'old'))
+            .toThrow(/item_id="1-NEW1"/);
+        expect(() => expandToRawHtml(input, metadata, 'old'))
+            .toThrow(/page="42"/);
+    });
+
+    // ---- New citation: att_id ----
+
+    it('creates new citation from att_id in new context', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation att_id="1-ATT1" label="From Attachment"/>';
+        expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'ATT1' }),
+            undefined,
+            undefined,
+            undefined,
+        );
+    });
+
+    it('creates new citation from att_id with page', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation att_id="1-ATT1" page="7" label="From Attachment"/>';
+        expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'ATT1' }),
+            '7',
+            undefined,
+            { v: 1, loc: 'page7' },
+        );
+    });
+
+    it('throws for new citation with att_id in old context', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation att_id="1-ATT1" label="From Attachment"/>';
+        expect(() => expandToRawHtml(input, metadata, 'old')).toThrow(/old_string/);
+    });
+
+    it('names the offending att_id in the old-context error message', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation att_id="1-ATT1" label="From Attachment"/>';
+        expect(() => expandToRawHtml(input, metadata, 'old'))
+            .toThrow(/att_id="1-ATT1"/);
+    });
+
+    // ---- New citation: error cases ----
+
+    it('throws for unknown citation ref in old context', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-NONEXIST" label="?" ref="c_NONEXIST_0"/>';
+        // The thrown message names the offending ref so the model can self-correct.
+        expect(() => expandToRawHtml(input, metadata, 'old'))
+            .toThrow(/ref="c_NONEXIST_0"/);
+    });
+
+    it('treats fabricated ref as new citation in new context', () => {
+        // The model may increment from an existing ref (c_KEY_4 → c_KEY_5).
+        // In new_string context, this should fall through to new-citation
+        // handling instead of throwing.
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-FQSW6YKU" page="222" label="(Author, 2024)" ref="c_FQSW6YKU_5"/>';
+        const result = expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalled();
+        expect(result).toContain('data-citation=');
+    });
+
+    it('throws for new compound citation (items without id)', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation items="1-A, 1-B" label="Multi"/>';
+        expect(() => expandToRawHtml(input, metadata, 'new')).toThrow(/compound/i);
+    });
+
+    it('throws for citation missing id and legacy identity attrs', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation label="Nothing"/>';
+        expect(() => expandToRawHtml(input, metadata, 'new')).toThrow(/id/);
+    });
+
+    it('throws when item not found for new citation via item_id', () => {
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn(() => null);
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-MISSING" label="Missing"/>';
+        expect(() => expandToRawHtml(input, metadata, 'new')).toThrow(/Item not found/);
+    });
+
+    it('throws when attachment not found for new citation via att_id', () => {
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn(() => null);
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation att_id="1-MISSING" label="Missing"/>';
+        expect(() => expandToRawHtml(input, metadata, 'new')).toThrow(/Attachment not found/);
+    });
+
+    it('throws for a new citation into an excluded library without a Zotero lookup', async () => {
+        const { checkLibraryExcluded } = await import('../../../src/services/agentDataProvider/utils');
+        vi.mocked(checkLibraryExcluded).mockReturnValueOnce({
+            message: 'The library "Private" is excluded from AsterMargin, so AsterMargin cannot read or modify its items.',
+        });
+        const lookup = vi.fn(() => null);
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = lookup;
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-ABCD1234" label="Private item"/>';
+        // The gate must fire before the item lookup so no metadata of the
+        // excluded library's item is read or embedded.
+        expect(() => expandToRawHtml(input, metadata, 'new')).toThrow(/excluded from AsterMargin/);
+        expect(lookup).not.toHaveBeenCalled();
+    });
+
+    // ---- external_id citations ----
+    //
+    // `external_id` is the chat-side citation format used by search tools
+    // (OpenAlex, Semantic Scholar) for works that may not be in the user's
+    // Zotero library. Expansion:
+    //   1. Auto-resolves to a Zotero `item_id` if `externalItemMapping` has a hit
+    //   2. Otherwise cites the work as an embedded item built from `externalRefs`
+    //   3. Throws a helpful error when neither map has data for the id
+
+    it('external_id auto-resolves to item_id citation when in mapping', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W1234567890" page="15"/>';
+        const externalRefContext = {
+            externalRefs: {
+                W1234567890: {
+                    source: 'openalex' as const,
+                    source_id: 'W1234567890',
+                    title: 'Mapped Work',
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {
+                W1234567890: { library_id: 1, zotero_key: 'MAPPED1' },
+            },
+        };
+        const result = expandToRawHtml(input, metadata, 'new', externalRefContext);
+        // Auto-resolve goes through buildCitation → real Zotero citation
+        expect(createCitationHTML).toHaveBeenCalled();
+        expect(result).toContain('data-citation=');
+        // Confirm Items.getByLibraryAndKey was called with the mapped key
+        expect((globalThis as any).Zotero.Items.getByLibraryAndKey).toHaveBeenCalledWith(1, 'MAPPED1');
+    });
+
+    it('external_id without a library item becomes a native citation of an embedded work', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W1975284160"/>';
+        const externalRefContext = {
+            externalRefs: {
+                W1975284160: {
+                    source: 'openalex' as const,
+                    source_id: 'W1975284160',
+                    title: 'Lithium-ion battery cathodes',
+                    authors: ['Smith, John', 'Doe, Jane', 'Roe, Mary'],
+                    year: 2020,
+                    identifiers: { doi: '10.1234/lib.2020.001' },
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const result = expandToRawHtml(input, metadata, 'new', externalRefContext);
+        const uri = 'https://doi.org/10.1234/lib.2020.001';
+        const csl = expect.objectContaining({ title: 'Lithium-ion battery cathodes', DOI: '10.1234/lib.2020.001' });
+        expect(buildEmbeddedNoteCitation).toHaveBeenCalledWith(
+            uri,
+            csl,
+            undefined,
+            undefined,
+            { v: 1, ext: 'W1975284160', src: 'openalex', csl },
+        );
+        const citation = decodeCitation(result);
+        expect(citation.citationItems[0].uris).toEqual([uri]);
+        expect(citation.citationItems[0].astermargin).toEqual({ v: 1, ext: 'W1975284160', src: 'openalex', csl });
+        // Zotero's own item data slot stays empty; the note's cache holds it.
+        expect(citation.citationItems[0].itemData).toBeUndefined();
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    it('stores an embedded work in the rebuilt citation cache', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const externalRefContext = {
+            externalRefs: {
+                W1975284160: {
+                    source: 'openalex' as const,
+                    source_id: 'W1975284160',
+                    title: 'Lithium-ion battery cathodes',
+                    authors: ['Smith, John', 'Doe, Jane', 'Roe, Mary'],
+                    year: 2020,
+                    identifiers: { doi: '10.1234/lib.2020.001' },
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const html = wrap(`<p>${expandToRawHtml('<citation external_id="W1975284160"/>', metadata, 'new', externalRefContext)}</p>`);
+        const cache = extractDataCitationItems(rebuildDataCitationItems(html));
+        expect(cache).toEqual([{
+            uris: ['https://doi.org/10.1234/lib.2020.001'],
+            itemData: expect.objectContaining({ title: 'Lithium-ion battery cathodes' }),
+        }]);
+    });
+
+    it('reads an embedded work back as external_id and keeps it byte for byte', () => {
+        const externalRefContext = {
+            externalRefs: {
+                W1975284160: {
+                    source: 'openalex' as const,
+                    source_id: 'W1975284160',
+                    title: 'Lithium-ion battery cathodes',
+                    authors: ['Smith, John', 'Doe, Jane', 'Roe, Mary'],
+                    year: 2020,
+                    identifiers: { doi: '10.1234/lib.2020.001' },
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const raw = expandToRawHtml(
+            '<citation external_id="W1975284160" loc="page4"/>', { elements: new Map() }, 'new', externalRefContext,
+        );
+        const note = rebuildDataCitationItems(wrap(`<p>See ${raw}.</p>`));
+        const { simplified, metadata } = simplifyNoteHtml(note, 1);
+        const tag = '<citation external_id="W1975284160" loc="page4" ref="c_ext_W1975284160_0"'
+            + ' label="Smith et al. 2020, Lithium-ion battery cathodes" url="https://doi.org/10.1234/lib.2020.001"/>';
+        expect(simplified.trim()).toBe(`<p>See ${tag}.</p>`);
+        const stored = metadata.elements.get('c_ext_W1975284160_0')!.rawHtml;
+        expect(decodeCitation(stored)).toEqual(decodeCitation(raw));
+        expect(expandToRawHtml(tag, metadata, 'old')).toBe(stored);
+        expect(expandToRawHtml(tag, metadata, 'new')).toBe(stored);
+
+        // Moving the locator rebuilds the citation from the thread's metadata.
+        const moved = expandToRawHtml(tag.replace('page4', 'page9'), metadata, 'new', externalRefContext);
+        expect(decodeCitation(moved).citationItems[0]).toMatchObject({
+            locator: '9',
+            astermargin: { v: 1, loc: 'page9', ext: 'W1975284160' },
+        });
+        // The cache is rebuilt from the citation alone, e.g. after an undo
+        // that restores a citation the current note no longer caches.
+        const restored = rebuildDataCitationItems(wrap(`<p>${moved}</p>`), []);
+        expect(extractDataCitationItems(restored)).toEqual([{
+            uris: ['https://doi.org/10.1234/lib.2020.001'],
+            itemData: expect.objectContaining({ title: 'Lithium-ion battery cathodes' }),
+        }]);
+        // Another chat has no data for the work; the citation carries it.
+        const movedElsewhere = expandToRawHtml(tag.replace('page4', 'page9'), metadata, 'new');
+        expect(decodeCitation(movedElsewhere).citationItems[0]).toEqual(decodeCitation(moved).citationItems[0]);
+
+        // So does a new citation of the work, written without a ref.
+        const citedAgain = expandToRawHtml('<citation external_id="W1975284160" loc="page9"/>', metadata, 'new');
+        expect(decodeCitation(citedAgain).citationItems[0]).toEqual(decodeCitation(moved).citationItems[0]);
+
+        // And old_string may name the citation without its ref.
+        expect(enrichOldStringCitationRefs('See <citation external_id="W1975284160" loc="page4"/>.', metadata))
+            .toBe('See <citation external_id="W1975284160" loc="page4" ref="c_ext_W1975284160_0"/>.');
+        expect(enrichOldStringCitationRefs('<citation external_id="W1975284160" loc="page5"/>', metadata)).toBeNull();
+    });
+
+    it('rebuilds a moved external citation from its own data, not another citation of the work', () => {
+        const embedded = (uri: string, title: string) => {
+            const data = { citationItems: [{ uris: [uri], locator: '4', astermargin: { v: 1, loc: 'page4', ext: 'W42', csl: { title } } }], properties: {} };
+            return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(data))}">(${title})</span>`;
+        };
+        const html = wrap(`<p>${embedded('https://openalex.org/W42', 'First')}</p><p>${embedded('https://doi.org/10.1/w42', 'Second')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const second = simplified.match(/<citation [^>]*ref="c_ext_W42_1"[^>]*\/>/)![0];
+
+        const moved = expandToRawHtml(second.replace('page4', 'page9'), metadata, 'new');
+        expect(decodeCitation(moved).citationItems[0]).toMatchObject({
+            uris: ['https://doi.org/10.1/w42'],
+            locator: '9',
+            astermargin: { loc: 'page9', ext: 'W42', csl: { title: 'Second' } },
+        });
+    });
+
+    it('external_id without a DOI is cited under its source URI', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W1"/>';
+        const externalRefContext = {
+            externalRefs: {
+                W1: {
+                    source: 'openalex' as const,
+                    source_id: 'W1',
+                    title: 'No-DOI Work',
+                    authors: ['Singleton, Solo'],
+                    year: 2019,
+                    publication_url: 'https://example.org/paper/123',
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const result = expandToRawHtml(input, metadata, 'new', externalRefContext);
+        expect(decodeCitation(result).citationItems[0].uris).toEqual(['https://openalex.org/W1']);
+    });
+
+    it('external_id keeps a page locator', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W3" page="42"/>';
+        const externalRefContext = {
+            externalRefs: {
+                W3: {
+                    source: 'openalex' as const,
+                    source_id: 'W3',
+                    authors: ['Zhang, Wei'],
+                    year: 2023,
+                    identifiers: { doi: '10.1/abc' },
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const result = expandToRawHtml(input, metadata, 'new', externalRefContext);
+        expect(decodeCitation(result).citationItems[0]).toMatchObject({
+            locator: '42',
+            astermargin: { v: 1, loc: 'page42', ext: 'W3', src: 'openalex' },
+        });
+    });
+
+    it('external_id with no DOI or URL is still cited', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W5"/>';
+        const externalRefContext = {
+            externalRefs: {
+                W5: {
+                    source: 'openalex' as const,
+                    source_id: 'W5',
+                    title: 'URL-less Work',
+                    authors: ['Nobody'],
+                    year: 2024,
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const result = expandToRawHtml(input, metadata, 'new', externalRefContext);
+        expect(decodeCitation(result).citationItems[0].uris).toEqual(['https://openalex.org/W5']);
+    });
+
+    it('external_id throws helpful error when not in any mapping', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W_NOT_IN_THREAD"/>';
+        const externalRefContext = {
+            externalRefs: {},
+            externalItemMapping: {},
+        };
+        expect(() => expandToRawHtml(input, metadata, 'new', externalRefContext))
+            .toThrow(/external reference cache/);
+    });
+
+    it('external_id throws when externalRefContext is omitted entirely', () => {
+        // No externalRefContext = legacy behaviour. external_id is unrecognized
+        // and falls through to the generic missing-id error.
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W6"/>';
+        expect(() => expandToRawHtml(input, metadata, 'new'))
+            .toThrow(/external reference cache/);
+    });
+
+    it('external_id throws in old_string context (cannot match retroactively)', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation external_id="W7"/>';
+        const externalRefContext = {
+            externalRefs: {
+                W7: {
+                    source: 'openalex' as const,
+                    source_id: 'W7',
+                    identifiers: { doi: '10.1/old' },
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        // 'old' context routes through the no-ref branch, which always rejects
+        // any citation that wasn't in the original metadata map.
+        expect(() => expandToRawHtml(input, metadata, 'old', externalRefContext))
+            .toThrow(/old_string/);
+    });
+
+    it('external_id mixed with item_id citations expands both correctly', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input =
+            'See <citation item_id="1-REAL" page="5"/> and '
+            + '<citation external_id="W9"/> for details.';
+        const externalRefContext = {
+            externalRefs: {
+                W9: {
+                    source: 'openalex' as const,
+                    source_id: 'W9',
+                    authors: ['Tester'],
+                    year: 2024,
+                    identifiers: { doi: '10.1/mix' },
+                    library_items: [],
+                },
+            },
+            externalItemMapping: {},
+        };
+        const result = expandToRawHtml(input, metadata, 'new', externalRefContext);
+        // Both become native citations: the item, and the work as an embedded item.
+        expect(createCitationHTML).toHaveBeenCalledTimes(1);
+        expect(result.match(/data-citation=/g)).toHaveLength(2);
+        expect(result).toContain(encodeURIComponent('https://doi.org/10.1/mix'));
+    });
+
+    // ---- extractAttr word-boundary correctness ----
+
+    it('extractAttr distinguishes ref from item_id (no false match)', () => {
+        // With the word-boundary fix, extractAttr('ref') should NOT match inside unrelated attrs
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation item_id="1-ONLY" label="Only item_id"/>';
+        // ref should be undefined → new citation path → builds from item_id
+        const result = expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalled();
+        expect(result).toContain('data-citation=');
+    });
+
+    it('extractAttr distinguishes ref from att_id (no false match)', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<citation att_id="1-ONLY" label="Only att_id"/>';
+        expandToRawHtml(input, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalled();
+    });
+
+    // ---- Multiple citations in one string ----
+
+    it('expands multiple citations in a single string', () => {
+        const { metadata, rawCit } = makeMetadata();
+        const input = 'See <citation item_id="1-EX1" label="A" ref="c_EX1_0"/> and <citation item_id="1-NEW2" label="B"/>.';
+        const result = expandToRawHtml(input, metadata, 'new');
+        // First citation restored from metadata
+        expect(result).toContain(rawCit);
+        // Second citation built fresh
+        expect(createCitationHTML).toHaveBeenCalled();
+    });
+
+    // ---- Annotations ----
+
+    it('restores existing annotation unchanged', () => {
+        const { metadata, rawAnnot } = makeMetadata();
+        const input = '<annotation id="a_EA1" key="EA1" color="#ffd400" page="5">text here</annotation>';
+        expect(expandToRawHtml(input, metadata, 'old')).toBe(rawAnnot);
+    });
+
+    it('throws when annotation text is modified', () => {
+        const { metadata } = makeMetadata();
+        const input = '<annotation id="a_EA1" key="EA1">CHANGED TEXT</annotation>';
+        expect(() => expandToRawHtml(input, metadata, 'old')).toThrow(/cannot be modified/i);
+    });
+
+    it('accepts annotation with whitespace normalization', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['a_WS1', { rawHtml: rawAnnotation('WS1', 'some  text'), type: 'annotation', originalText: 'some  text' }],
+            ]),
+        };
+        const input = '<annotation id="a_WS1" key="WS1">some text</annotation>';
+        expect(expandToRawHtml(input, metadata, 'old')).toBe(rawAnnotation('WS1', 'some  text'));
+    });
+
+    it('throws for unknown annotation id', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<annotation id="a_NOPE" key="NOPE">text</annotation>';
+        expect(() => expandToRawHtml(input, metadata, 'old')).toThrow(/Unknown annotation id/);
+    });
+
+    // ---- Annotation-images & images ----
+
+    it('restores annotation-image from metadata', () => {
+        const { metadata, rawAI } = makeMetadata();
+        const input = '<annotation-image id="ai_EAI1" key="EAI1" attachment="EATT1" />';
+        expect(expandToRawHtml(input, metadata, 'old')).toBe(rawAI);
+    });
+
+    it('throws for unknown annotation-image id', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<annotation-image id="ai_NOPE" key="NOPE" attachment="X" />';
+        expect(() => expandToRawHtml(input, metadata, 'old')).toThrow(/Unknown annotation-image id/);
+    });
+
+    it('restores regular image from metadata', () => {
+        const { metadata, rawImg } = makeMetadata();
+        const input = '<image id="i_EIMG1" attachment="EIMG1" />';
+        expect(expandToRawHtml(input, metadata, 'old')).toBe(rawImg);
+    });
+
+    it('throws for unknown image id', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const input = '<image id="i_NOPE" attachment="X" />';
+        expect(() => expandToRawHtml(input, metadata, 'old')).toThrow(/Unknown image id/);
+    });
+
+    // ---- Plain text passthrough ----
+
+    it('passes through plain text unchanged', () => {
+        const { metadata } = makeMetadata();
+        expect(expandToRawHtml('Just plain text.', metadata, 'old')).toBe('Just plain text.');
+    });
+});
+
+
+// =============================================================================
+// Citation Round-Trips: simplify → expand
+// =============================================================================
+
+describe('citation round-trips', () => {
+    it('single citation: simplify then expand restores PM-normalized raw HTML', () => {
+        const raw = rawCitation('RT1', 1, '', 'Smith, 2020');
+        const html = wrap(`<p>See ${raw} for details.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // Simplified form should have the clean tag
+        expect(simplified).toContain('ref="c_RT1_0"');
+        expect(simplified).not.toContain('data-citation=');
+
+        // Expanding old_string with the simplified citation should restore the PM-normalized HTML
+        const citationTag = simplified.match(/<citation [^/]*\/>/)?.[0];
+        expect(citationTag).toBeTruthy();
+        const expanded = expandToRawHtml(citationTag!, metadata, 'old');
+        expect(expanded).toBe(pmNormCitation('RT1'));
+    });
+
+    it('portable-id citation: simplify emits the portable form and expand round-trips it unchanged', () => {
+        // The personal library (userLibraryID) always has a computable
+        // portable ref, so simplifyNoteHtml must emit "u-KEY" rather than
+        // the legacy device-local "1-KEY".
+        const raw = rawCitation('PORT0001', 1, '', 'Author, 2024');
+        const html = wrap(`<p>See ${raw} for details.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        const citationTag = simplified.match(/<citation [^/]*\/>/)?.[0];
+        expect(citationTag).toBe('<citation id="u-PORT0001" ref="c_PORT0001_0"/>');
+
+        // The model copies this tag verbatim into old_string; expansion must
+        // reproduce the exact stored raw HTML for the edit to apply cleanly.
+        const expanded = expandToRawHtml(citationTag!, metadata, 'old');
+        expect(expanded).toBe(pmNormCitation('PORT0001'));
+
+        // A legacy numeric id for the same item is also accepted (parsers
+        // support both forms indefinitely) and resolves to the same entry.
+        const legacyTag = '<citation id="1-PORT0001" ref="c_PORT0001_0"/>';
+        expect(expandToRawHtml(legacyTag, metadata, 'old')).toBe(expanded);
+    });
+
+    it('single citation with page: round-trip preserves page locator', () => {
+        const raw = rawCitation('RT2', 1, '42', 'Jones, 2021, p. 42');
+        const html = wrap(`<p>${raw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('loc="page42"');
+        const citationTag = simplified.match(/<citation [^/]*\/>/)?.[0];
+        const expanded = expandToRawHtml(citationTag!, metadata, 'old');
+        expect(expanded).toBe(pmNormCitation('RT2', '42'));
+    });
+
+    it('compound citation: round-trip restores PM-normalized original', () => {
+        const raw = rawCompoundCitation(['C1', 'C2'], 1, 'Author1; Author2');
+        const html = wrap(`<p>${raw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('ref="c_C1+C2_0"');
+        expect(simplified).toContain('items=');
+        const citationTag = simplified.match(/<citation [^/]*\/>/)?.[0];
+        const expanded = expandToRawHtml(citationTag!, metadata, 'old');
+        expect(expanded).toBe(pmNormCompoundCitation(['C1', 'C2']));
+    });
+
+    it('duplicate citations: each gets unique id and round-trips correctly', () => {
+        const raw = rawCitation('DRT', 1, '', 'Same, 2024');
+        const html = wrap(`<p>${raw}</p><p>${raw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // Two distinct ids
+        expect(simplified).toContain('c_DRT_0');
+        expect(simplified).toContain('c_DRT_1');
+
+        // Both expand back to the same PM-normalized raw HTML
+        const tags = [...simplified.matchAll(/<citation [^/]*\/>/g)].map(m => m[0]);
+        expect(tags).toHaveLength(2);
+        const pmNorm = pmNormCitation('DRT');
+        expect(expandToRawHtml(tags[0], metadata, 'old')).toBe(pmNorm);
+        expect(expandToRawHtml(tags[1], metadata, 'old')).toBe(pmNorm);
+    });
+
+    it('expand-before position: disambiguates 12 identical duplicate citations', () => {
+        // 12 identical citations — same item, no page locator
+        const raw = rawCitation('DUP', 1, '', '(Hommel et al., 2022)');
+        const paragraphs = Array.from({ length: 12 }, () => `<p>${raw}</p>`).join('');
+        const html = wrap(paragraphs);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        // Use PM-normalized content without wrapper (same as what simplified represents)
+        const contentHtml = stripNoteWrapperDiv(stripDataCitationItems(normalizeNoteHtml(html)));
+
+        // All 12 have distinct refs
+        for (let i = 0; i < 12; i++) {
+            expect(simplified).toContain(`ref="c_DUP_${i}"`);
+        }
+
+        // All expand to identical raw HTML
+        const expandedOld = expandToRawHtml(
+            '<citation id="1-DUP" ref="c_DUP_0"/>', metadata, 'old'
+        );
+        expect(countOccurrences(contentHtml, expandedOld)).toBe(12);
+
+        // Each ref is unique in simplified HTML, so expand-before gives the correct raw position
+        for (let i = 0; i < 12; i++) {
+            const oldStr = `<citation id="u-DUP" ref="c_DUP_${i}"/>`;
+            const pos = simplified.indexOf(oldStr);
+            expect(pos).toBeGreaterThanOrEqual(0); // unique match
+
+            // Expand text before the match → its length is the content-level raw position
+            const expandedBefore = expandToRawHtml(
+                simplified.substring(0, pos), metadata, 'old'
+            );
+            const rawPos = expandedBefore.length;
+
+            // Verify correct citation is at this position
+            expect(contentHtml.substring(rawPos, rawPos + expandedOld.length)).toBe(expandedOld);
+
+            // Verify it's the right occurrence (i-th) by counting matches before rawPos
+            expect(countOccurrences(contentHtml.substring(0, rawPos), expandedOld)).toBe(i);
+        }
+    });
+
+    it('findUniqueRawMatchPosition stays conservative for ref-only duplicate citation matches', () => {
+        const raw = rawCitation('DUP', 1, '', '(Hommel et al., 2022)');
+        const html = wrap(Array.from({ length: 12 }, () => `<p>${raw}</p>`).join(''));
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const strippedHtml = stripDataCitationItems(normalizeNoteHtml(html));
+        for (const ref of ['c_DUP_5', 'c_DUP_10'] as const) {
+            const oldStr = `<citation id="1-DUP" ref="${ref}"/>`;
+            const expandedOld = expandToRawHtml(oldStr, metadata, 'old');
+
+            expect(findUniqueRawMatchPosition(
+                strippedHtml,
+                simplified,
+                oldStr,
+                expandedOld,
+                metadata
+            )).toBeNull();
+        }
+    });
+
+    it('findUniqueRawMatchPosition returns null when simplified match is still ambiguous', () => {
+        const raw = rawCitation('AMB', 1, '', 'Author, 2024');
+        const html = wrap(`<p>${raw}</p><p>${raw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const strippedHtml = stripDataCitationItems(normalizeNoteHtml(html));
+        const expandedOld = expandToRawHtml(
+            '<citation id="1-AMB" ref="c_AMB_0"/>', metadata, 'old'
+        );
+
+        expect(findUniqueRawMatchPosition(
+            strippedHtml,
+            simplified,
+            'Author, 2024',
+            expandedOld,
+            metadata
+        )).toBeNull();
+    });
+
+    it('validation target context can relocate the intended duplicate citation after refs shift', () => {
+        const raw = rawCitation('DUP', 1, '', '(Hommel et al., 2022)');
+        const originalHtml = wrap(`<p>alpha</p><p>${raw}</p><p>${raw}</p><p>omega</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(originalHtml, 1);
+        const strippedOriginal = stripDataCitationItems(normalizeNoteHtml(originalHtml));
+        const oldStr = '<citation id="u-DUP" ref="c_DUP_1"/>';
+        const expandedOriginal = expandToRawHtml(oldStr, metadata, 'old');
+
+        const targetContext = captureValidatedEditTargetContext(
+            strippedOriginal,
+            simplified,
+            oldStr,
+            expandedOriginal,
+            metadata
+        );
+        expect(targetContext).not.toBeNull();
+
+        const shiftedHtml = wrap(`<p>${raw}</p><p>alpha</p><p>${raw}</p><p>${raw}</p><p>omega</p>`);
+        const { metadata: shiftedMetadata } = simplifyNoteHtml(shiftedHtml, 1);
+        const strippedShifted = stripDataCitationItems(normalizeNoteHtml(shiftedHtml));
+        const expandedShifted = expandToRawHtml(oldStr, shiftedMetadata, 'old');
+
+        const rawPos = findTargetRawMatchPosition(
+            strippedShifted,
+            expandedShifted,
+            targetContext!.beforeContext,
+            targetContext!.afterContext
+        );
+
+        expect(rawPos).not.toBeNull();
+        expect(strippedShifted.substring(rawPos!, rawPos! + expandedShifted.length)).toBe(expandedShifted);
+        expect(countOccurrences(strippedShifted.substring(0, rawPos!), expandedShifted)).toBe(2);
+    });
+
+    it('expand-before position: works with mixed page locators', () => {
+        const rawNoPage = rawCitation('MIX', 1, '', 'Author, 2024');
+        const rawPage10 = rawCitation('MIX', 1, '10', 'Author, 2024, p. 10');
+        const html = wrap(
+            `<p>${rawNoPage}</p><p>${rawPage10}</p><p>${rawNoPage}</p><p>${rawNoPage}</p>`
+        );
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const contentHtml = stripNoteWrapperDiv(stripDataCitationItems(normalizeNoteHtml(html)));
+
+        // Each citation ref is unique in simplified, so each resolves to a distinct raw position
+        const refs = ['c_MIX_0', 'c_MIX_1', 'c_MIX_2', 'c_MIX_3'];
+        const rawPositions: number[] = [];
+        for (const ref of refs) {
+            const tagRe = new RegExp(`<citation [^/]*ref="${ref}"[^/]*/>`);
+            const match = simplified.match(tagRe);
+            expect(match).toBeTruthy();
+            const pos = simplified.indexOf(match![0]);
+            const expandedBefore = expandToRawHtml(simplified.substring(0, pos), metadata, 'old');
+            rawPositions.push(expandedBefore.length);
+        }
+
+        // Positions should be strictly increasing (document order)
+        for (let i = 1; i < rawPositions.length; i++) {
+            expect(rawPositions[i]).toBeGreaterThan(rawPositions[i - 1]);
+        }
+
+        // Each position should point to a citation in contentHtml
+        for (const pos of rawPositions) {
+            expect(contentHtml.substring(pos, pos + 30)).toContain('class="citation"');
+        }
+    });
+
+    it('expand-before position: handles citation with surrounding text context', () => {
+        const raw = rawCitation('CTX', 1, '', 'Author, 2024');
+        const html = wrap(
+            `<p>foo ${raw} bar</p><p>baz ${raw} qux</p><p>foo ${raw} bar</p>`
+        );
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const contentHtml = stripNoteWrapperDiv(stripDataCitationItems(normalizeNoteHtml(html)));
+
+        const expandedRaw = expandToRawHtml(
+            '<citation id="1-CTX" ref="c_CTX_0"/>', metadata, 'old'
+        );
+        const expandedFooBar = `foo ${expandedRaw} bar`;
+
+        // "foo <rawHtml> bar" appears twice (c_CTX_0 and c_CTX_2), not c_CTX_1
+        expect(countOccurrences(contentHtml, expandedFooBar)).toBe(2);
+
+        // old_string for c_CTX_2 with surrounding text — unique in simplified
+        const oldStr = 'foo <citation id="u-CTX" ref="c_CTX_2"/> bar';
+        const pos = simplified.indexOf(oldStr);
+        expect(pos).toBeGreaterThanOrEqual(0);
+
+        // Expand-before gives the content-level position of the second "foo ... bar" match
+        const expandedBefore = expandToRawHtml(simplified.substring(0, pos), metadata, 'old');
+        const rawPos = expandedBefore.length;
+        expect(contentHtml.substring(rawPos, rawPos + expandedFooBar.length)).toBe(expandedFooBar);
+
+        // It's the second occurrence (one "foo ... bar" before it)
+        expect(countOccurrences(contentHtml.substring(0, rawPos), expandedFooBar)).toBe(1);
+    });
+
+    it('round-trip fidelity: expandToRawHtml(simplified) matches PM-normalized content without wrapper', () => {
+        const cit1 = rawCitation('FID1', 1, '', 'Author, 2024');
+        const cit2 = rawCitation('FID2', 1, '42', 'Other, 2023, p. 42');
+        const html = wrap(`<p>Text ${cit1} middle ${cit2} end</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        // Simplified HTML has the wrapper stripped; expanding should match PM-normalized content without wrapper
+        const contentHtml = stripNoteWrapperDiv(stripDataCitationItems(normalizeNoteHtml(html)));
+
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toBe(contentHtml);
+    });
+
+    it('updating page locator: simplify then expand with changed page rebuilds', () => {
+        const raw = rawCitation('PU1', 1, '10', 'Author, 2024, p. 10');
+        const html = wrap(`<p>${raw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // Change page from 10 to 99 in the simplified tag
+        const modified = simplified.replace('loc="page10"', 'loc="page99"');
+        const citationTag = modified.match(/<citation [^/]*\/>/)?.[0];
+        const expanded = expandToRawHtml(citationTag!, metadata, 'old');
+        // Should have called createCitationHTML with the new page
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'PU1' }),
+            '99',
+            undefined,
+            undefined,
+        );
+        expect(expanded).toContain('data-citation=');
+    });
+
+    it('mixed content: citations + annotations + text all round-trip', () => {
+        const cit = rawCitation('MIX1', 1, '', 'Ref');
+        const ann = rawAnnotation('MIXANN', 'highlight');
+        const html = wrap(`<p>Before ${cit} middle ${ann} after</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // Both should be simplified
+        expect(simplified).toContain('ref="c_MIX1_0"');
+        expect(simplified).toContain('<annotation id="a_MIXANN"');
+
+        // Expanding the full simplified string should restore PM-normalized raw elements
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(pmNormCitation('MIX1'));
+        expect(expanded).toContain('highlight');
+        expect(expanded).toContain('Before');
+        expect(expanded).toContain('after');
+    });
+
+    it('new citation inserted alongside existing ones in new_string context', () => {
+        const existingRaw = rawCitation('EXI1', 1, '', 'Existing');
+        const html = wrap(`<p>${existingRaw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // Build a new_string that keeps the existing citation and adds a new one
+        const existingTag = simplified.match(/<citation [^/]*\/>/)?.[0];
+        const newString = `${existingTag} and <citation id="1-BRAND" label="Brand New"/>`;
+        const expanded = expandToRawHtml(newString, metadata, 'new');
+        // Existing citation restored from metadata (PM-normalized version)
+        expect(expanded).toContain(pmNormCitation('EXI1'));
+        // New citation built via createCitationHTML
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'BRAND' }),
+            undefined,
+            undefined,
+            undefined,
+        );
+    });
+});
+
+
+// =============================================================================
+// getOrSimplify (caching)
+// =============================================================================
+
+describe('getOrSimplify', () => {
+    it('cache miss: simplifies and stores', () => {
+        const html = wrap('<p>hello</p>');
+        const result = getOrSimplify('test-note', html, 1);
+        expect(result.simplified).toContain('<p>hello</p>');
+        expect(result.isStale).toBe(false);
+    });
+
+    it('cache hit: returns cached, isStale: false', () => {
+        const html = wrap('<p>hello</p>');
+        getOrSimplify('test-note', html, 1);
+        const result2 = getOrSimplify('test-note', html, 1);
+        expect(result2.isStale).toBe(false);
+    });
+
+    it('keeps labeled and unlabeled simplifications separate in cache', () => {
+        const html = wrap(rawCitation('ABC12345', 1, 'xiv'));
+        const labels = { 'u-ABC12345': { 13: 'xiv' } };
+
+        const labeled = getOrSimplify('label-cache-note', html, 1, labels);
+        const unlabeled = getOrSimplify('label-cache-note', html, 1);
+        const labeledAgain = getOrSimplify('label-cache-note', html, 1, labels);
+
+        expect(labeled.simplified).toContain('loc="page14"');
+        expect(unlabeled.simplified).toContain('loc="pagexiv"');
+        expect(labeledAgain.simplified).toContain('loc="page14"');
+    });
+
+    it('keeps unlabeled and labeled simplifications separate in cache', () => {
+        const html = wrap(rawCitation('DEF12345', 1, 'xiv'));
+        const labels = { 'u-DEF12345': { 13: 'xiv' } };
+
+        const unlabeled = getOrSimplify('label-cache-note-reverse', html, 1);
+        const labeled = getOrSimplify('label-cache-note-reverse', html, 1, labels);
+        const unlabeledAgain = getOrSimplify('label-cache-note-reverse', html, 1);
+
+        expect(unlabeled.simplified).toContain('loc="pagexiv"');
+        expect(labeled.simplified).toContain('loc="page14"');
+        expect(unlabeledAgain.simplified).toContain('loc="pagexiv"');
+    });
+
+    it('cache stale: re-simplifies when content changes, isStale: true', () => {
+        const html1 = wrap('<p>version1</p>');
+        const html2 = wrap('<p>version2</p>');
+        getOrSimplify('test-note', html1, 1);
+        const result2 = getOrSimplify('test-note', html2, 1);
+        expect(result2.simplified).toContain('version2');
+        expect(result2.isStale).toBe(true);
+    });
+
+    it('evicts oldest entry when cache is full', () => {
+        // Fill cache to MAX_CACHE_SIZE (50)
+        for (let i = 0; i < 50; i++) {
+            getOrSimplify(`note-${i}`, wrap(`<p>${i}</p>`), 1);
+        }
+        // Add one more — should evict note-0
+        getOrSimplify('note-50', wrap('<p>50</p>'), 1);
+
+        // note-0 should be evicted (fresh simplification = isStale false)
+        const result = getOrSimplify('note-0', wrap('<p>0</p>'), 1);
+        expect(result.isStale).toBe(false); // Was evicted, so treated as cache miss
+
+        // note-1 should still be cached
+        const result1 = getOrSimplify('note-1', wrap('<p>1</p>'), 1);
+        expect(result1.isStale).toBe(false); // Still cached, same content
+    });
+});
+
+
+// =============================================================================
+// stripDataCitationItems / rebuildDataCitationItems
+// =============================================================================
+
+describe('stripDataCitationItems', () => {
+    it('removes data-citation-items attribute', () => {
+        const html = '<div data-schema-version="9" data-citation-items="something">content</div>';
+        expect(stripDataCitationItems(html)).toBe('<div data-schema-version="9">content</div>');
+    });
+
+    it('is a noop when attribute is absent', () => {
+        const html = '<div data-schema-version="9">content</div>';
+        expect(stripDataCitationItems(html)).toBe(html);
+    });
+});
+
+describe('stripNoteWrapperDiv', () => {
+    it('strips wrapper with data-schema-version', () => {
+        expect(stripNoteWrapperDiv('<div data-schema-version="9"><p>content</p></div>'))
+            .toBe('<p>content</p>');
+    });
+
+    it('strips bare wrapper div', () => {
+        expect(stripNoteWrapperDiv('<div><p>content</p></div>'))
+            .toBe('<p>content</p>');
+    });
+
+    it('preserves inner whitespace', () => {
+        expect(stripNoteWrapperDiv('<div data-schema-version="9">\n<h1>Title</h1>\n<p>Text</p>\n</div>'))
+            .toBe('\n<h1>Title</h1>\n<p>Text</p>\n');
+    });
+
+    it('is a no-op for non-div HTML', () => {
+        expect(stripNoteWrapperDiv('<p>just a paragraph</p>'))
+            .toBe('<p>just a paragraph</p>');
+    });
+
+    it('is a no-op for empty string', () => {
+        expect(stripNoteWrapperDiv('')).toBe('');
+    });
+
+    it('does not strip if inner divs are unbalanced', () => {
+        const html = '<div><div><p>nested</p></div></div>';
+        // Inner has 1 open and 1 close — balanced, so it strips the outer
+        expect(stripNoteWrapperDiv(html)).toBe('<div><p>nested</p></div>');
+    });
+});
+
+describe('rebuildDataCitationItems', () => {
+    it('rebuilds data-citation-items from citations', () => {
+        const html = wrap(`<p>${rawCitation('RB1')}</p>`);
+        const stripped = stripDataCitationItems(html);
+        const rebuilt = rebuildDataCitationItems(stripped);
+        expect(rebuilt).toContain('data-citation-items=');
+    });
+
+    it('deduplicates URIs', () => {
+        const html = wrap(`<p>${rawCitation('RB2')}</p><p>${rawCitation('RB2')}</p>`);
+        const stripped = stripDataCitationItems(html);
+        const rebuilt = rebuildDataCitationItems(stripped);
+        // The data-citation-items should contain the item only once
+        const match = rebuilt.match(/data-citation-items="([^"]*)"/);
+        expect(match).toBeTruthy();
+        const decoded = JSON.parse(decodeURIComponent(match![1]));
+        expect(decoded.length).toBe(1);
+    });
+
+    it('skips malformed citation data', () => {
+        const html = wrap('<span class="citation" data-citation="not%20valid%20json">text</span>');
+        // Should not throw
+        expect(() => rebuildDataCitationItems(html)).not.toThrow();
+    });
+
+    // Regression: notes whose citations reference items outside the current
+    // user's library (shared notes, foreign userIDs, test URIs) lost all
+    // citation labels on edit because `Zotero.URI.getURIItemLibraryKey`
+    // returned false and rebuild emitted no data-citation-items, so
+    // ProseMirror re-serialised every citation as `()` on save.
+    it('preserves itemData from existing cache when URI resolution fails', () => {
+        // Simulate a URI that does not resolve in the current library.
+        (globalThis as any).Zotero.URI.getURIItemLibraryKey = vi.fn(() => false);
+
+        const existingCache = [{
+            uris: ['http://zotero.org/users/1/items/FOREIGN1'],
+            itemData: {
+                id: 'FOREIGN1',
+                type: 'article-journal',
+                title: 'Foreign Work',
+                author: [{ family: 'Smith', given: 'John' }],
+                issued: { 'date-parts': [['2023']] },
+            },
+        }];
+
+        const html = wrap(`<p>${rawCitation('FOREIGN1')}</p>`);
+        const stripped = stripDataCitationItems(html);
+        const rebuilt = rebuildDataCitationItems(stripped, existingCache);
+
+        expect(rebuilt).toContain('data-citation-items=');
+        const match = rebuilt.match(/data-citation-items="([^"]*)"/);
+        const decoded = JSON.parse(decodeURIComponent(match![1]));
+        expect(decoded).toHaveLength(1);
+        expect(decoded[0].uris).toEqual(['http://zotero.org/users/1/items/FOREIGN1']);
+        expect(decoded[0].itemData.title).toBe('Foreign Work');
+    });
+
+    it('prefers existing cache over fresh URI lookup for matching URIs', () => {
+        const existingCache = [{
+            uris: ['http://zotero.org/users/1/items/RB_CACHED'],
+            itemData: { id: 'RB_CACHED', title: 'Cached Item' },
+        }];
+
+        const html = wrap(`<p>${rawCitation('RB_CACHED')}</p>`);
+        const stripped = stripDataCitationItems(html);
+        const rebuilt = rebuildDataCitationItems(stripped, existingCache);
+
+        // itemToCSLJSON must not be invoked when the cache already has this URI.
+        expect((globalThis as any).Zotero.Utilities.Item.itemToCSLJSON).not.toHaveBeenCalled();
+        const match = rebuilt.match(/data-citation-items="([^"]*)"/);
+        const decoded = JSON.parse(decodeURIComponent(match![1]));
+        expect(decoded[0].itemData.title).toBe('Cached Item');
+    });
+
+    it('falls back to fresh lookup for new URIs not in the cache', () => {
+        const existingCache = [{
+            uris: ['http://zotero.org/users/1/items/EXISTING1'],
+            itemData: { id: 'EXISTING1', title: 'Existing' },
+        }];
+
+        // Note also cites a newly-added item (NEW1) which is not in the cache —
+        // it must be resolved via URI lookup so Zotero can render it too.
+        const html = wrap(`<p>${rawCitation('EXISTING1')} ${rawCitation('NEW1')}</p>`);
+        const stripped = stripDataCitationItems(html);
+        const rebuilt = rebuildDataCitationItems(stripped, existingCache);
+
+        const match = rebuilt.match(/data-citation-items="([^"]*)"/);
+        const decoded = JSON.parse(decodeURIComponent(match![1]));
+        expect(decoded).toHaveLength(2);
+        const uris = decoded.map((d: any) => d.uris[0]);
+        expect(uris).toContain('http://zotero.org/users/1/items/EXISTING1');
+        expect(uris).toContain('http://zotero.org/users/1/items/NEW1');
+    });
+});
+
+describe('extractDataCitationItems', () => {
+    it('returns null when attribute is missing', () => {
+        expect(extractDataCitationItems('<div data-schema-version="9"><p>no cache</p></div>'))
+            .toBeNull();
+    });
+
+    it('parses the cached array from the wrapper div', () => {
+        const cache = [{
+            uris: ['http://zotero.org/users/1/items/X1'],
+            itemData: { id: 'X1', title: 'Foo' },
+        }];
+        const html = `<div data-schema-version="9" data-citation-items="${encodeURIComponent(JSON.stringify(cache))}"></div>`;
+        const extracted = extractDataCitationItems(html);
+        expect(extracted).toEqual(cache);
+    });
+
+    it('returns null for malformed attribute content', () => {
+        const html = '<div data-schema-version="9" data-citation-items="not%20json"></div>';
+        expect(extractDataCitationItems(html)).toBeNull();
+    });
+});
+
+
+// =============================================================================
+// validateNewString
+// =============================================================================
+
+describe('validateNewString', () => {
+    const metaWithElements: SimplificationMetadata = {
+        elements: new Map([
+            ['a_A1', { rawHtml: '', type: 'annotation', originalText: 'text' }],
+            ['ai_AI1', { rawHtml: '', type: 'annotation-image' }],
+            ['i_I1', { rawHtml: '', type: 'image' }],
+        ]),
+    };
+
+    it('accepts plain text', () => {
+        expect(validateNewString('Just text', metaWithElements)).toBeNull();
+    });
+
+    it('accepts existing annotation by id', () => {
+        const str = '<annotation id="a_A1" key="A1">text</annotation>';
+        expect(validateNewString(str, metaWithElements)).toBeNull();
+    });
+
+    it('accepts new single citation (no ref)', () => {
+        const str = '<citation id="1-NEW" label="Test"/>';
+        expect(validateNewString(str, metaWithElements)).toBeNull();
+    });
+
+    it('rejects fabricated annotation without id', () => {
+        const str = '<annotation key="FAKE">fake text</annotation>';
+        expect(validateNewString(str, metaWithElements)).toContain('cannot be created');
+    });
+
+    it('rejects fabricated annotation with unknown id', () => {
+        const str = '<annotation id="a_UNKNOWN" key="UNKNOWN">fake</annotation>';
+        expect(validateNewString(str, metaWithElements)).toContain('cannot be created');
+    });
+
+    it('rejects fabricated image', () => {
+        const str = '<image id="i_FAKE" attachment="X" />';
+        expect(validateNewString(str, metaWithElements)).toContain('cannot be inserted');
+    });
+
+    it('rejects fabricated annotation-image', () => {
+        const str = '<annotation-image id="ai_FAKE" attachment="X" />';
+        expect(validateNewString(str, metaWithElements)).toContain('cannot be created');
+    });
+
+    it('rejects new compound citation (items attr without ref)', () => {
+        const str = '<citation items="1-A, 1-B" label="Multi"/>';
+        expect(validateNewString(str, metaWithElements)).toContain('compound');
+    });
+});
+
+
+// =============================================================================
+// countOccurrences
+// =============================================================================
+
+describe('countOccurrences', () => {
+    it('returns 0 for no match', () => {
+        expect(countOccurrences('hello world', 'xyz')).toBe(0);
+    });
+
+    it('returns 1 for single match', () => {
+        expect(countOccurrences('hello world', 'world')).toBe(1);
+    });
+
+    it('returns correct count for multiple matches', () => {
+        expect(countOccurrences('abcabcabc', 'abc')).toBe(3);
+    });
+
+    it('returns 0 for empty needle', () => {
+        expect(countOccurrences('hello', '')).toBe(0);
+    });
+});
+
+
+// =============================================================================
+// checkDuplicateCitations
+// =============================================================================
+
+describe('checkDuplicateCitations', () => {
+    it('returns null when no new citations', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_EX_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-EX' } }],
+            ]),
+        };
+        expect(checkDuplicateCitations('<p>plain text</p>', metadata)).toBeNull();
+    });
+
+    it('returns null when new citation references a different item', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_EX_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-EX' } }],
+            ]),
+        };
+        const newStr = '<citation id="1-OTHER" label="Other"/>';
+        expect(checkDuplicateCitations(newStr, metadata)).toBeNull();
+    });
+
+    it('returns warning when new citation duplicates existing', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_DUP_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-DUP' } }],
+            ]),
+        };
+        const newStr = '<citation id="1-DUP" label="Dup"/>';
+        const result = checkDuplicateCitations(newStr, metadata);
+        expect(result).toContain('already cited');
+        expect(result).toContain('c_DUP_0');
+    });
+
+    it('does not report a citation the edit keeps from its old_string', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_DUP_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-DUP', loc: 's5.6' } }],
+            ]),
+        };
+        const newStr = 'Revised claim <citation id="u-DUP" loc="s5.6"/>.';
+        // Matched without a ref, or after enrichment added one.
+        expect(checkDuplicateCitations(newStr, metadata, 'Claim <citation id="u-DUP" loc="s5.6"/>.')).toBeNull();
+        expect(checkDuplicateCitations(newStr, metadata, 'Claim <citation id="u-DUP" loc="s5.6" ref="c_DUP_0"/>.'))
+            .toBeNull();
+        // A second, new citation of the same item is still reported.
+        expect(checkDuplicateCitations(`${newStr} Again <citation id="u-DUP" loc="s5.6"/>`, metadata,
+            'Claim <citation id="u-DUP" loc="s5.6"/>.')).toContain('already cited');
+    });
+
+    it('does not report a citation the edit moves to another locator', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_DUP_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-DUP', loc: 's3.1' } }],
+            ]),
+        };
+        const old = 'Claim <citation id="u-DUP" loc="s3.1"/>.';
+        expect(checkDuplicateCitations('Claim <citation id="u-DUP" loc="s3.2"/>.', metadata, old)).toBeNull();
+        // Also when old_string names it by its ref alone, or by the legacy numeric id.
+        expect(checkDuplicateCitations('Claim <citation id="1-DUP" loc="s3.2"/>.', metadata,
+            'Claim <citation ref="c_DUP_0"/>.')).toBeNull();
+    });
+
+    it('reports a new duplicate when the edit also keeps the original by its ref', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                ['c_DUP_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-DUP', loc: 's5.6' } }],
+            ]),
+        };
+        const old = 'Claim <citation id="u-DUP" loc="s5.6" ref="c_DUP_0"/>.';
+        const added = ' Again <citation id="u-DUP" loc="s5.6"/>.';
+        expect(checkDuplicateCitations(`${old}${added}`, metadata, old)).toContain('already cited');
+        // Also when the kept citation is named by its ref alone.
+        expect(checkDuplicateCitations(`Claim <citation ref="c_DUP_0"/>.${added}`, metadata, old))
+            .toContain('already cited');
+        expect(checkDuplicateCitations(`${old}${added}`, metadata, 'Claim <citation ref="c_DUP_0"/>.'))
+            .toContain('already cited');
+    });
+});
+
+
+// =============================================================================
+// enrichOldStringCitationRefs
+// =============================================================================
+
+describe('enrichOldStringCitationRefs', () => {
+    /** Convenience: build metadata with a single citation entry. */
+    function makeCitationMetadata(
+        entries: Array<[string, { item_id: string; page?: string; rawHtml?: string }]>,
+    ): SimplificationMetadata {
+        return {
+            elements: new Map(
+                entries.map(([ref, attrs]) => [
+                    ref,
+                    {
+                        rawHtml: attrs.rawHtml ?? '',
+                        type: 'citation' as const,
+                        originalAttrs: {
+                            item_id: attrs.item_id,
+                            ...(attrs.page ? { page: attrs.page } : {}),
+                        },
+                    },
+                ]),
+            ),
+        };
+    }
+
+    it('returns null when old_string is empty', () => {
+        const metadata = makeCitationMetadata([['c_X_0', { item_id: 'u-X' }]]);
+        expect(enrichOldStringCitationRefs('', metadata)).toBeNull();
+    });
+
+    it('returns null when old_string has no citation tags', () => {
+        const metadata = makeCitationMetadata([['c_X_0', { item_id: 'u-X' }]]);
+        expect(enrichOldStringCitationRefs('<p>no citations here</p>', metadata)).toBeNull();
+    });
+
+    it('returns null when every citation already has a ref', () => {
+        const metadata = makeCitationMetadata([['c_X_0', { item_id: 'u-X' }]]);
+        const input = '<p>See <citation item_id="1-X" label="X" ref="c_X_0"/></p>';
+        expect(enrichOldStringCitationRefs(input, metadata)).toBeNull();
+    });
+
+    it('enriches a single no-ref citation when exactly one metadata candidate exists', () => {
+        const metadata = makeCitationMetadata([['c_HPDPU3J5_0', { item_id: 'u-HPDPU3J5' }]]);
+        const input = '<p>See <citation item_id="1-HPDPU3J5"/></p>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        expect(result).toBe('<p>See <citation item_id="1-HPDPU3J5" ref="c_HPDPU3J5_0"/></p>');
+    });
+
+    it('preserves surrounding whitespace and attribute ordering', () => {
+        const metadata = makeCitationMetadata([['c_X_0', { item_id: 'u-X' }]]);
+        const input = '<li>\n<strong>Parabolic pattern</strong>: <citation item_id="1-X"/>\n</li>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        expect(result).toBe(
+            '<li>\n<strong>Parabolic pattern</strong>: <citation item_id="1-X" ref="c_X_0"/>\n</li>',
+        );
+    });
+
+    it('enriches multiple no-ref citations in a single old_string', () => {
+        const metadata = makeCitationMetadata([
+            ['c_HPDPU3J5_0', { item_id: 'u-HPDPU3J5' }],
+            ['c_78XAANZP_0', { item_id: 'u-78XAANZP' }],
+            ['c_VIAT6WU4_0', { item_id: 'u-VIAT6WU4' }],
+        ]);
+        const input =
+            '<li>first <citation item_id="1-HPDPU3J5"/></li>' +
+            '<li>second <citation item_id="1-78XAANZP"/></li>' +
+            '<li>third <citation item_id="1-VIAT6WU4"/></li>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        expect(result).toContain('<citation item_id="1-HPDPU3J5" ref="c_HPDPU3J5_0"/>');
+        expect(result).toContain('<citation item_id="1-78XAANZP" ref="c_78XAANZP_0"/>');
+        expect(result).toContain('<citation item_id="1-VIAT6WU4" ref="c_VIAT6WU4_0"/>');
+    });
+
+    it('leaves ref-ful citations untouched while enriching sibling no-ref ones', () => {
+        const metadata = makeCitationMetadata([
+            ['c_A_0', { item_id: 'u-A' }],
+            ['c_B_0', { item_id: 'u-B' }],
+        ]);
+        const input =
+            '<p><citation item_id="1-A" label="A" ref="c_A_0"/> and <citation item_id="1-B"/></p>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        // Ref-ful citation unchanged
+        expect(result).toContain('<citation item_id="1-A" label="A" ref="c_A_0"/>');
+        // No-ref citation enriched
+        expect(result).toContain('<citation item_id="1-B" ref="c_B_0"/>');
+    });
+
+    it('returns null when multiple metadata entries share the same item_id and page', () => {
+        // Two entries with same originalAttrs → ambiguous, leave unchanged.
+        const metadata = makeCitationMetadata([
+            ['c_X_0', { item_id: 'u-X' }],
+            ['c_X_1', { item_id: 'u-X' }],
+        ]);
+        const input = '<p><citation item_id="1-X"/></p>';
+        expect(enrichOldStringCitationRefs(input, metadata)).toBeNull();
+    });
+
+    it('returns null when no metadata candidate exists for the item_id', () => {
+        const metadata = makeCitationMetadata([['c_Y_0', { item_id: 'u-Y' }]]);
+        const input = '<p><citation item_id="1-MISSING"/></p>';
+        expect(enrichOldStringCitationRefs(input, metadata)).toBeNull();
+    });
+
+    it('only matches when page attribute agrees (both absent)', () => {
+        const metadata = makeCitationMetadata([
+            ['c_X_paged', { item_id: 'u-X', page: '5' }],
+        ]);
+        // old_string citation has no page, metadata has page=5 → no match.
+        const input = '<p><citation item_id="1-X"/></p>';
+        expect(enrichOldStringCitationRefs(input, metadata)).toBeNull();
+    });
+
+    it('only matches when page attribute agrees (both present and equal)', () => {
+        const metadata = makeCitationMetadata([
+            ['c_X_paged', { item_id: 'u-X', page: '5' }],
+        ]);
+        const input = '<p><citation item_id="1-X" page="5"/></p>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        expect(result).toBe('<p><citation item_id="1-X" page="5" ref="c_X_paged"/></p>');
+    });
+
+    it('disambiguates by page when two entries share an item_id', () => {
+        const metadata = makeCitationMetadata([
+            ['c_X_0', { item_id: 'u-X' }],              // no page
+            ['c_X_1', { item_id: 'u-X', page: '10' }], // page=10
+        ]);
+        // Model's old_string has page=10 → matches c_X_1 uniquely.
+        const pagedInput = '<p><citation item_id="1-X" page="10"/></p>';
+        expect(enrichOldStringCitationRefs(pagedInput, metadata)).toBe(
+            '<p><citation item_id="1-X" page="10" ref="c_X_1"/></p>',
+        );
+
+        // Model's old_string has no page → matches c_X_0 uniquely.
+        const unpagedInput = '<p><citation item_id="1-X"/></p>';
+        expect(enrichOldStringCitationRefs(unpagedInput, metadata)).toBe(
+            '<p><citation item_id="1-X" ref="c_X_0"/></p>',
+        );
+    });
+
+    it('skips att_id citations (reverse lookup not supported)', () => {
+        // att_id maps to parent item_id during simplification, so enrichment
+        // cannot uniquely resolve back. We leave them alone.
+        const metadata = makeCitationMetadata([['c_X_0', { item_id: 'u-X' }]]);
+        const input = '<p><citation att_id="1-ATT1"/></p>';
+        expect(enrichOldStringCitationRefs(input, metadata)).toBeNull();
+    });
+
+    it('ignores non-citation metadata entries (annotations, images)', () => {
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                // item_id here doesn't exist on annotations, but be robust anyway.
+                ['a_A1', { rawHtml: '', type: 'annotation', originalText: 'foo' }],
+                ['c_X_0', { rawHtml: '', type: 'citation', originalAttrs: { item_id: 'u-X' } }],
+            ]),
+        };
+        const input = '<p><citation item_id="1-X"/></p>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        expect(result).toBe('<p><citation item_id="1-X" ref="c_X_0"/></p>');
+    });
+
+    it('partially enriches: unique citations get refs, ambiguous ones are left alone', () => {
+        const metadata = makeCitationMetadata([
+            ['c_UNIQUE_0', { item_id: 'u-UNIQUE' }],
+            ['c_DUP_0', { item_id: 'u-DUP' }],
+            ['c_DUP_1', { item_id: 'u-DUP' }],
+        ]);
+        const input =
+            '<p><citation item_id="1-UNIQUE"/> and <citation item_id="1-DUP"/></p>';
+        const result = enrichOldStringCitationRefs(input, metadata);
+        // Unique citation enriched
+        expect(result).toContain('<citation item_id="1-UNIQUE" ref="c_UNIQUE_0"/>');
+        // Ambiguous citation left as-is (no ref injected)
+        expect(result).toContain('<citation item_id="1-DUP"/>');
+    });
+
+    it('integration: enriched old_string roundtrips through expandToRawHtml', () => {
+        // Simulates the full flow: the model writes old_string without a ref,
+        // enrichment injects the ref, then expandToRawHtml uses the ref to
+        // look up the stored rawHtml instead of throwing.
+        const storedRaw = rawCitation('EX1', 1, '', 'Author, 2024');
+        const metadata: SimplificationMetadata = {
+            elements: new Map([
+                [
+                    'c_EX1_0',
+                    {
+                        rawHtml: storedRaw,
+                        type: 'citation',
+                        originalAttrs: { item_id: 'u-EX1' },
+                    },
+                ],
+            ]),
+        };
+
+        // Without enrichment: expansion throws.
+        const bareOld = '<p>See <citation item_id="1-EX1"/></p>';
+        expect(() => expandToRawHtml(bareOld, metadata, 'old'))
+            .toThrow(/old_string/);
+
+        // With enrichment: expansion succeeds and returns the stored raw HTML.
+        const enriched = enrichOldStringCitationRefs(bareOld, metadata);
+        expect(enriched).not.toBeNull();
+        const expanded = expandToRawHtml(enriched!, metadata, 'old');
+        expect(expanded).toContain(storedRaw);
+    });
+});
+
+
+// =============================================================================
+// isNoteInEditor
+// =============================================================================
+
+describe('isNoteInEditor', () => {
+    const connectedInstance = (id: number) => ({
+        _item: { id },
+        _iframeWindow: { frameElement: { isConnected: true } },
+    });
+
+    const disconnectedInstance = (id: number) => ({
+        _item: { id },
+        _iframeWindow: { frameElement: { isConnected: false } },
+    });
+
+    it('returns true when note is in a connected editor', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = [connectedInstance(42)];
+        expect(isNoteInEditor(42)).toBe(true);
+    });
+
+    it('returns false when note is not in editor', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = [connectedInstance(99)];
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+
+    it('returns false when editor instances is empty', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = [];
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+
+    it('returns false when _editorInstances is undefined', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = undefined;
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+
+    it('returns false for stale instance (iframe disconnected from DOM)', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = [disconnectedInstance(42)];
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+
+    it('returns false when _iframeWindow is null (destroyed editor)', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = [
+            { _item: { id: 42 }, _iframeWindow: null },
+        ];
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+
+    it('returns false when frameElement is missing', () => {
+        (globalThis as any).Zotero.Notes._editorInstances = [
+            { _item: { id: 42 }, _iframeWindow: {} },
+        ];
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+
+    it('returns false when accessing _iframeWindow throws', () => {
+        const instance = {
+            _item: { id: 42 },
+            get _iframeWindow() { throw new Error('dead object'); },
+        };
+        (globalThis as any).Zotero.Notes._editorInstances = [instance];
+        expect(isNoteInEditor(42)).toBe(false);
+    });
+});
+
+
+// =============================================================================
+// getLatestNoteHtml
+// =============================================================================
+
+describe('getLatestNoteHtml', () => {
+    const mockItem = (id: number, noteHtml: string) => ({
+        id,
+        getNote: vi.fn(() => noteHtml),
+    });
+
+    it('returns editor HTML when note is open in a connected editor', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        const editorHtml = '<p>editor version with unsaved changes</p>';
+        (globalThis as any).Zotero.Notes._editorInstances = [{
+            _item: { id: 42 },
+            _iframeWindow: {
+                frameElement: { isConnected: true },
+                wrappedJSObject: {
+                    getDataSync: vi.fn(() => ({ html: editorHtml })),
+                },
+            },
+        }];
+        expect(getLatestNoteHtml(item)).toBe(editorHtml);
+    });
+
+    it('prefers the selected tab editor when multiple live instances exist', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        const staleWindowHtml = '<p>window copy</p>';
+        const selectedTabHtml = '<p>selected tab copy</p>';
+        (globalThis as any).Zotero.getMainWindow = vi.fn(() => ({
+            Zotero_Tabs: {
+                selectedID: 'tab-123',
+            },
+        }));
+        (globalThis as any).Zotero.Notes._editorInstances = [
+            {
+                _item: { id: 42 },
+                viewMode: 'window',
+                _iframeWindow: {
+                    frameElement: { isConnected: true },
+                    wrappedJSObject: {
+                        getDataSync: vi.fn(() => ({ html: staleWindowHtml })),
+                    },
+                },
+            },
+            {
+                _item: { id: 42 },
+                viewMode: 'tab',
+                tabID: 'tab-123',
+                _iframeWindow: {
+                    frameElement: { isConnected: true },
+                    wrappedJSObject: {
+                        getDataSync: vi.fn(() => ({ html: selectedTabHtml })),
+                    },
+                },
+            },
+        ];
+
+        expect(getLatestNoteHtml(item)).toBe(selectedTabHtml);
+    });
+
+    it('falls back to saved HTML when multiple live instances disagree and none is preferred', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.getMainWindow = vi.fn(() => ({
+            Zotero_Tabs: {
+                selectedID: 'other-tab',
+            },
+        }));
+        (globalThis as any).Zotero.Notes._editorInstances = [
+            {
+                _item: { id: 42 },
+                viewMode: 'window',
+                _iframeWindow: {
+                    frameElement: { isConnected: true },
+                    wrappedJSObject: {
+                        getDataSync: vi.fn(() => ({ html: '<p>stale window copy</p>' })),
+                    },
+                },
+            },
+            {
+                _item: { id: 42 },
+                viewMode: 'window',
+                _iframeWindow: {
+                    frameElement: { isConnected: true },
+                    wrappedJSObject: {
+                        getDataSync: vi.fn(() => ({ html: '<p>saved version</p>' })),
+                    },
+                },
+            },
+        ];
+
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when note is not in any editor', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = [{
+            _item: { id: 99 },
+            _iframeWindow: {
+                frameElement: { isConnected: true },
+                wrappedJSObject: {
+                    getDataSync: vi.fn(() => ({ html: '<p>other note</p>' })),
+                },
+            },
+        }];
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when editor instances is empty', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = [];
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when _editorInstances is undefined', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = undefined;
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when iframe is disconnected (dead wrapper)', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = [{
+            _item: { id: 42 },
+            _iframeWindow: {
+                frameElement: { isConnected: false },
+                wrappedJSObject: {
+                    getDataSync: vi.fn(() => ({ html: '<p>stale</p>' })),
+                },
+            },
+        }];
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when getDataSync returns null', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = [{
+            _item: { id: 42 },
+            _iframeWindow: {
+                frameElement: { isConnected: true },
+                wrappedJSObject: {
+                    getDataSync: vi.fn(() => null),
+                },
+            },
+        }];
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when getDataSync throws', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = [{
+            _item: { id: 42 },
+            _iframeWindow: {
+                frameElement: { isConnected: true },
+                wrappedJSObject: {
+                    getDataSync: vi.fn(() => { throw new Error('dead object'); }),
+                },
+            },
+        }];
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+
+    it('falls back to item.getNote() when _iframeWindow access throws', () => {
+        const item = mockItem(42, '<p>saved version</p>');
+        (globalThis as any).Zotero.Notes._editorInstances = [{
+            _item: { id: 42 },
+            get _iframeWindow() { throw new Error('dead object'); },
+        }];
+        expect(getLatestNoteHtml(item)).toBe('<p>saved version</p>');
+    });
+});
+
+
+// =============================================================================
+// findRangeByContexts
+// =============================================================================
+
+describe('findRangeByContexts', () => {
+    const html = '<div><p>First paragraph.</p><p>Second paragraph.</p><p>Third paragraph.</p></div>';
+
+    it('returns range between both anchors', () => {
+        const result = findRangeByContexts(html, '<p>First paragraph.</p>', '<p>Third paragraph.</p>');
+        expect(result).not.toBeNull();
+        expect(html.substring(result!.start, result!.end)).toBe('<p>Second paragraph.</p>');
+    });
+
+    it('returns range from before anchor to end when no after anchor', () => {
+        const result = findRangeByContexts(html, '<p>Second paragraph.</p>');
+        expect(result).not.toBeNull();
+        expect(html.substring(result!.start, result!.end)).toBe('<p>Third paragraph.</p></div>');
+    });
+
+    it('returns range from before anchor to end when after anchor is empty string', () => {
+        // Empty string has length 0, so hasAfter = false → edit-at-end-of-note branch
+        const result = findRangeByContexts(html, '<p>Second paragraph.</p>', '');
+        expect(result).not.toBeNull();
+        expect(html.substring(result!.start, result!.end)).toBe('<p>Third paragraph.</p></div>');
+    });
+
+    it('returns range from start to after anchor when no before anchor', () => {
+        const result = findRangeByContexts(html, undefined, '<p>Second paragraph.</p>');
+        expect(result).not.toBeNull();
+        expect(html.substring(result!.start, result!.end)).toBe('<div><p>First paragraph.</p>');
+    });
+
+    it('returns range from start to after anchor when before anchor is empty string', () => {
+        // Empty string has length 0, so hasBefore = false → edit-at-start-of-note branch
+        const result = findRangeByContexts(html, '', '<p>Second paragraph.</p>');
+        expect(result).not.toBeNull();
+        expect(html.substring(result!.start, result!.end)).toBe('<div><p>First paragraph.</p>');
+    });
+
+    it('returns null when neither anchor provided', () => {
+        expect(findRangeByContexts(html)).toBeNull();
+    });
+
+    it('returns null when both anchors are undefined', () => {
+        expect(findRangeByContexts(html, undefined, undefined)).toBeNull();
+    });
+
+    it('returns null when both anchors are empty strings', () => {
+        expect(findRangeByContexts(html, '', '')).toBeNull();
+    });
+
+    it('returns null when before anchor not found', () => {
+        expect(findRangeByContexts(html, 'nonexistent text')).toBeNull();
+    });
+
+    it('returns null when after anchor not found', () => {
+        expect(findRangeByContexts(html, undefined, 'nonexistent text')).toBeNull();
+    });
+
+    it('returns null when before anchor exists but after anchor not found', () => {
+        expect(findRangeByContexts(html, '<p>First paragraph.</p>', 'nonexistent')).toBeNull();
+    });
+
+    it('returns empty range when anchors are adjacent', () => {
+        const result = findRangeByContexts(html,
+            '<p>First paragraph.</p>',
+            '<p>Second paragraph.</p>');
+        expect(result).not.toBeNull();
+        expect(html.substring(result!.start, result!.end)).toBe('');
+    });
+
+    it('handles before anchor that appears multiple times (uses first valid pair)', () => {
+        const repeated = '<p>A</p><p>B</p><p>A</p><p>C</p>';
+        const result = findRangeByContexts(repeated, '<p>A</p>', '<p>C</p>');
+        expect(result).not.toBeNull();
+        // First <p>A</p> to <p>C</p>
+        expect(repeated.substring(result!.start, result!.end)).toBe('<p>B</p><p>A</p>');
+    });
+
+    it('with expectedLength, picks the (before, after) pair whose range is closest in length', () => {
+        // beforeCtx="<p>A</p>" appears 3 times; afterCtx="<p>D</p>" is unique.
+        // Without expectedLength → first match spans B+C+A (large range).
+        // With expectedLength ≈ length of "<p>C</p><p>A</p>" → picks second match (shorter).
+        // With expectedLength ≈ length of "" → picks third match (empty, adjacent).
+        const html = '<p>A</p><p>B</p><p>C</p><p>A</p><p>C</p><p>A</p><p>D</p>';
+
+        // Without hint: first pair (legacy behavior)
+        const noHint = findRangeByContexts(html, '<p>A</p>', '<p>D</p>');
+        expect(noHint).not.toBeNull();
+        expect(html.substring(noHint!.start, noHint!.end)).toBe('<p>B</p><p>C</p><p>A</p><p>C</p><p>A</p>');
+
+        // With expectedLength=0: prefer shortest range (third A, adjacent to D)
+        const shortest = findRangeByContexts(html, '<p>A</p>', '<p>D</p>', 0);
+        expect(shortest).not.toBeNull();
+        expect(html.substring(shortest!.start, shortest!.end)).toBe('');
+
+        // With expectedLength matching the middle range
+        const midLen = '<p>C</p><p>A</p>'.length;
+        const mid = findRangeByContexts(html, '<p>A</p>', '<p>D</p>', midLen);
+        expect(mid).not.toBeNull();
+        expect(html.substring(mid!.start, mid!.end)).toBe('<p>C</p><p>A</p>');
+    });
+
+    it('expectedLength disambiguates repeating citation suffixes (production bug scenario)', () => {
+        // Simulates the note structure where each <li> ends with the same citation suffix.
+        // beforeCtx = citation suffix (repeated); afterCtx = unique next-item start.
+        const citeSuffix = '<span class="cite">Author, 2024</span></li>\n';
+        const html =
+            '<li>Item 1 ' + citeSuffix
+            + '<li>Item 2 ' + citeSuffix
+            + '<li>Item 3 ' + citeSuffix
+            + '<li>Item 4 ' + citeSuffix
+            + '<li>Item 5</li>\n';
+
+        const beforeCtx = citeSuffix;
+        const afterCtx = '<li>Item 5</li>';
+
+        // Without hint: first occurrence of citeSuffix → spans items 2-4
+        const noHint = findRangeByContexts(html, beforeCtx, afterCtx);
+        expect(noHint).not.toBeNull();
+        const noHintFragment = html.substring(noHint!.start, noHint!.end);
+        expect(noHintFragment).toContain('Item 2');
+        expect(noHintFragment).toContain('Item 4');
+
+        // With expectedLength matching single item: should pick the last citeSuffix before afterCtx
+        const singleItemLen = ('<li>Item 4 ' + citeSuffix).length;
+        const withHint = findRangeByContexts(html, beforeCtx, afterCtx, singleItemLen);
+        expect(withHint).not.toBeNull();
+        const hintFragment = html.substring(withHint!.start, withHint!.end);
+        expect(hintFragment).toContain('Item 4');
+        expect(hintFragment).not.toContain('Item 2');
+        expect(hintFragment).not.toContain('Item 3');
+    });
+
+    describe('policy parameter', () => {
+        it("policy='first' (legacy default) returns the first valid pair", () => {
+            const html = '<p>A</p>X<p>B</p>Y<p>A</p>Z<p>B</p>';
+            const result = findRangeByContexts(
+                html, '<p>A</p>', '<p>B</p>', undefined, 'first',
+            );
+            // First valid pair: starts after first <p>A</p>, ends at first <p>B</p>
+            expect(result).toEqual({
+                start: '<p>A</p>'.length,
+                end: '<p>A</p>X'.length,
+            });
+        });
+
+        it("policy='best-length' is auto-selected when expectedLength provided", () => {
+            const html = '<p>A</p>XX<p>B</p>YY<p>A</p>X<p>B</p>';
+            // Length-1 target — should pick the second pair (gap = 1 char) over first (gap = 2)
+            const result = findRangeByContexts(html, '<p>A</p>', '<p>B</p>', 1);
+            expect(result).not.toBeNull();
+            expect(result!.end - result!.start).toBe(1);
+        });
+    });
+});
+
+
+// =============================================================================
+// Math Simplification
+// =============================================================================
+
+describe('Math simplification', () => {
+    it('preserves inline math with its wrapper', () => {
+        const html = wrap(`<p>The formula ${rawInlineMath('E=mc^2')} is famous.</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('$E=mc^2$');
+        expect(simplified).toContain('class="math"');
+        expect(simplified).toContain('<span');
+    });
+
+    it('preserves display math with its wrapper', () => {
+        const html = wrap(`<p>Consider:</p>${rawDisplayMath('\\int_0^1 f(x) dx')}`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('$$\\int_0^1 f(x) dx$$');
+        expect(simplified).toContain('class="math"');
+        expect(simplified).toContain('<pre');
+    });
+
+    it('preserves multiple inline math expressions', () => {
+        const html = wrap(`<p>Given ${rawInlineMath('x')} and ${rawInlineMath('y')}, then ${rawInlineMath('x+y')}.</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('$x$');
+        expect(simplified).toContain('$y$');
+        expect(simplified).toContain('$x+y$');
+        expect(simplified).toContain('class="math"');
+    });
+
+    it('preserves mixed inline and display math', () => {
+        const html = wrap(
+            `<p>Inline ${rawInlineMath('a^2+b^2=c^2')} and display:</p>`
+            + rawDisplayMath('\\sum_{i=1}^n i = \\frac{n(n+1)}{2}')
+        );
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('$a^2+b^2=c^2$');
+        expect(simplified).toContain('$$\\sum_{i=1}^n i = \\frac{n(n+1)}{2}$$');
+        expect(simplified).toContain('<span');
+        expect(simplified).toContain('<pre');
+    });
+
+    it('preserves math with HTML entities', () => {
+        const html = wrap(`<p>${rawInlineMath('x &lt; y')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('$x &lt; y$');
+        expect(simplified).toContain('class="math"');
+    });
+
+    it('preserves math alongside citations', () => {
+        const cit = rawCitation('MC1', 1, '', 'Author, 2024');
+        const html = wrap(`<p>As shown by ${cit}, ${rawInlineMath('p < 0.05')}.</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        // PM encodes < as &lt; in text content
+        expect(simplified).toContain('$p &lt; 0.05$');
+        expect(simplified).toContain('ref="c_MC1_0"');
+    });
+
+    it('does not affect non-math spans', () => {
+        const html = wrap('<p><span class="highlight">text</span> and <span style="color:red">red</span></p>');
+        const { simplified } = simplifyNoteHtml(html, 1);
+        // PM drops class="highlight" without data-annotation; style gets trailing semicolon
+        expect(simplified).toContain('text');
+        expect(simplified).toContain('style="color: red;"');
+    });
+
+    it('handles math without dollar delimiters (PM adds them)', () => {
+        // PM normalizes math spans by adding $ delimiters
+        const html = wrap('<p><span class="math">x^2</span></p>');
+        const { simplified } = simplifyNoteHtml(html, 1);
+        // PM adds $ delimiters; simplification preserves the wrapper.
+        expect(simplified).toContain('$x^2$');
+    });
+
+    it('preserves math with LaTeX backslash commands', () => {
+        const html = wrap(`<p>${rawInlineMath('\\alpha + \\beta')}</p>`);
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('$\\alpha + \\beta$');
+    });
+});
+
+
+// =============================================================================
+// Math Expansion
+// =============================================================================
+
+describe('Math expansion', () => {
+    function emptyMetadata(): SimplificationMetadata {
+        return { elements: new Map() };
+    }
+
+    it.each([
+        '$a<em>b</em>c$',
+        '$$a<em>b</em>c$$',
+        '$$a\n<em>b</em>\nc$$',
+        '$x < y$',
+        '$$x < y$$',
+        String.raw`$x\<y$`,
+        String.raw`$$x\<y$$`,
+        String.raw`<p>$x\<y$</p>`,
+    ])('preserves old math anchors containing < verbatim: %s', (input) => {
+        expect(expandToRawHtml(input, emptyMetadata(), 'old')).toBe(input);
+    });
+
+    it('expands ordinary math in new context', () => {
+        const input = String.raw`Inline $a b$ and $\$5$; display $$a
+b$$; inequality $x &lt; y$.`;
+        expect(expandToRawHtml(input, emptyMetadata(), 'new')).toBe(
+            `Inline ${rawInlineMath('a b')} and ${rawInlineMath(String.raw`\$5`)}; display ${rawDisplayMath('a\nb')}; inequality ${rawInlineMath('x &lt; y')}.`
+        );
+    });
+
+    it.each([
+        ['$x < y$', rawInlineMath('x < y')],
+        ['$$x < y$$', rawDisplayMath('x < y')],
+    ])('expands new math containing < : %s', (input, expected) => {
+        expect(expandToRawHtml(input, emptyMetadata(), 'new')).toBe(expected);
+    });
+
+    it('preserves markup and adjacent literal dollars in an old anchor', () => {
+        const input = `$a<em>b</em>c$ and $x$; $$d<em>e</em>f$$ then $$y$$`;
+        expect(expandToRawHtml(input, emptyMetadata(), 'old')).toBe(
+            input
+        );
+    });
+
+    it('expands inline math to span.math', () => {
+        const input = 'The formula $E=mc^2$ is famous.';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`The formula ${rawInlineMath('E=mc^2')} is famous.`);
+    });
+
+    it('expands display math to pre.math', () => {
+        const input = '<p>Consider:</p>$$\\int_0^1 f(x) dx$$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`<p>Consider:</p>${rawDisplayMath('\\int_0^1 f(x) dx')}`);
+    });
+
+    it('expands multiple inline math expressions', () => {
+        const input = 'Given $x$ and $y$, then $x+y$.';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`Given ${rawInlineMath('x')} and ${rawInlineMath('y')}, then ${rawInlineMath('x+y')}.`);
+    });
+
+    it('expands mixed inline and display math', () => {
+        const input = '<p>Inline $a^2$ and display:</p>$$E=mc^2$$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`<p>Inline ${rawInlineMath('a^2')} and display:</p>${rawDisplayMath('E=mc^2')}`);
+    });
+
+    it('does not expand lone dollar signs (no closing pair)', () => {
+        const input = 'The price is $5,000 and rising.';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input); // unchanged
+    });
+
+    it('does not expand dollar with leading space in content', () => {
+        const input = '$ not math$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input); // unchanged — content starts with space
+    });
+
+    it('does not expand dollar with trailing space in content', () => {
+        const input = '$not math $';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input); // unchanged — content ends with space
+    });
+
+    it('does not expand empty dollar pair', () => {
+        const input = 'empty $$ here';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input); // unchanged — $$ needs content for display math
+    });
+
+    it('handles math with LaTeX commands', () => {
+        const input = '$\\frac{a}{b}$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawInlineMath('\\frac{a}{b}'));
+    });
+
+    it('handles math with backslash-escaped dollar', () => {
+        const input = '$\\$5$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawInlineMath('\\$5'));
+    });
+
+    it('handles display math with multiline content', () => {
+        const input = '$$\\begin{align}\n  x &= 1 \\\\\n  y &= 2\n\\end{align}$$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`<pre class="math">${input}</pre>`);
+    });
+
+    it('preserves already-wrapped math in old context', () => {
+        const input = `<p>Inline <span class="math">$x$</span></p><pre class="math">$$y$$</pre>`;
+        const result = expandToRawHtml(input, emptyMetadata(), 'old');
+        expect(result).toBe(input);
+    });
+
+    it('preserves already-wrapped math while expanding bare math in new context', () => {
+        const input = '<p>Keep <span class="math">$x$</span> and add $y$.</p><pre class="math">$$z$$</pre>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(
+            '<p>Keep <span class="math">$x$</span> and add <span class="math">$y$</span>.</p><pre class="math">$$z$$</pre>'
+        );
+    });
+
+    it('fills empty display math placeholder without nesting when wrapper is preserved', () => {
+        const html = wrap('<h3>Theorem 3</h3><pre class="math">$$$$</pre><p>Next section.</p>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const edited = simplified.replace(
+            '<pre class="math">$$$$</pre>',
+            () => '<pre class="math">$$x^2 + y^2 = z^2$$</pre>'
+        );
+
+        const expanded = expandToRawHtml(edited, metadata, 'new');
+
+        expect(expanded).toContain('<pre class="math">$$x^2 + y^2 = z^2$$</pre>');
+        expect(expanded).not.toContain('<pre class="math"><pre class="math">');
+    });
+
+    it('fills empty inline math placeholder without nesting when wrapper is preserved', () => {
+        const html = wrap('<p>Entropy: <span class="math">$$</span>.</p>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const edited = simplified.replace(
+            '<span class="math">$$</span>',
+            '<span class="math">$H(p)$</span>'
+        );
+
+        const expanded = expandToRawHtml(edited, metadata, 'new');
+
+        expect(expanded).toContain('<span class="math">$H(p)$</span>');
+        expect(expanded).not.toContain('<span class="math"><span class="math">');
+    });
+
+    it('passes through plain text without math unchanged', () => {
+        const input = 'Just plain text with no math.';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+    });
+
+    it('single character inline math', () => {
+        const input = '$x$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawInlineMath('x'));
+    });
+
+    it('does not expand adjacent $$ as inline', () => {
+        // $$ without content after should not trigger inline or display
+        const input = 'See $$ for prices';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+    });
+
+    // ---- Standalone math in paragraph → display math ----
+
+    it('converts standalone inline math in <p> to display math', () => {
+        const input = '<p>$E=mc^2$</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawDisplayMath('E=mc^2'));
+    });
+
+    it('converts standalone display math in <p> (unwraps paragraph)', () => {
+        const input = '<p>$$E=mc^2$$</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawDisplayMath('E=mc^2'));
+    });
+
+    it('converts standalone math with LaTeX commands in <p> to display', () => {
+        const input = '<p>$\\hat{\\beta} = (X\'X)^{-1}X\'Y$</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawDisplayMath('\\hat{\\beta} = (X\'X)^{-1}X\'Y'));
+    });
+
+    it('keeps inline math as span when paragraph has other content', () => {
+        const input = '<p>The formula $E=mc^2$ is famous.</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`<p>The formula ${rawInlineMath('E=mc^2')} is famous.</p>`);
+    });
+
+    it('converts standalone math in <p> with style attribute to display', () => {
+        const input = '<p style="text-align: center;">$\\hat{\\beta} = (X\'X)^{-1}X\'y$</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawDisplayMath('\\hat{\\beta} = (X\'X)^{-1}X\'y'));
+    });
+
+    it('converts standalone display math in <p> with attributes (unwraps)', () => {
+        const input = '<p style="text-align: center;">$$E=mc^2$$</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(rawDisplayMath('E=mc^2'));
+    });
+
+    it('mixed: standalone equation + inline math in separate paragraphs', () => {
+        const input = '<p>$E=mc^2$</p>\n<p>Where $E$ is energy.</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(`${rawDisplayMath('E=mc^2')}\n<p>Where ${rawInlineMath('E')} is energy.</p>`);
+    });
+});
+
+
+// =============================================================================
+// Math Round-Trips: simplify → expand
+// =============================================================================
+
+describe('Math round-trips', () => {
+    it('inline math: simplify then expand restores original raw HTML', () => {
+        const raw = rawInlineMath('E=mc^2');
+        const html = wrap(`<p>The formula ${raw} is famous.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // The read representation preserves the math wrapper.
+        expect(simplified).toContain('$E=mc^2$');
+        expect(simplified).toContain('class="math"');
+
+        // Expanding should restore the raw HTML
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(raw);
+    });
+
+    it('display math: simplify then expand restores original raw HTML', () => {
+        const raw = rawDisplayMath('\\frac{a}{b}');
+        const html = wrap(`<p>Consider:</p>${raw}<p>where a,b are integers.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('$$\\frac{a}{b}$$');
+        expect(simplified).toContain('<pre');
+
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(raw);
+    });
+
+    it('empty display math round-trips (kept as raw HTML)', () => {
+        // Empty placeholders retain the same explicit representation as other math.
+        const raw = '<pre class="math">$$$$</pre>';
+        const html = wrap(`<h3>Theorem 3</h3>${raw}<p>Next section.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // Simplifier must keep the empty block wrapped — not produce a
+        // bare `$$$$` that edit_note's expander would then fail to rewrap.
+        expect(simplified).toContain('<pre class="math">$$$$</pre>');
+
+        // Round-trip through expand leaves it unchanged.
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(raw);
+    });
+
+    it('empty inline math round-trips (kept as raw HTML)', () => {
+        // Mirror of the display-math case for `<span class="math">$$</span>`.
+        const raw = '<span class="math">$$</span>';
+        const html = wrap(`<p>Placeholder: ${raw}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('<span class="math">$$</span>');
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(raw);
+    });
+
+    it('multiple math expressions round-trip', () => {
+        const inline1 = rawInlineMath('x');
+        const inline2 = rawInlineMath('y');
+        const display = rawDisplayMath('x + y = z');
+        const html = wrap(`<p>${inline1} and ${inline2}</p>${display}`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(inline1);
+        expect(expanded).toContain(inline2);
+        expect(expanded).toContain(display);
+    });
+
+    it('mixed math and citations round-trip', () => {
+        const cit = rawCitation('MRT1', 1, '', 'Author, 2024');
+        const math = rawInlineMath('p < 0.05');
+        const html = wrap(`<p>As shown by ${cit}, ${math} is significant.</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        // PM encodes < as &lt; in text content
+        expect(simplified).toContain('$p &lt; 0.05$');
+        expect(simplified).toContain('ref="c_MRT1_0"');
+
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain(pmNormCitation('MRT1'));
+        // PM normalizes math: <span class="math">$p &lt; 0.05$</span>
+        expect(expanded).toContain('class="math"');
+    });
+
+    it('agent modifies existing math: expanded old matches raw, expanded new wraps correctly', () => {
+        const html = wrap(`<p>The formula ${rawInlineMath('E=mc^2')} is famous.</p>`);
+        const strippedHtml = stripDataCitationItems(html);
+        const { metadata } = simplifyNoteHtml(html, 1);
+
+        // Agent proposes changing E=mc^2 to E=mc^3
+        const expandedOld = expandToRawHtml(rawInlineMath('E=mc^2'), metadata, 'old');
+        const expandedNew = expandToRawHtml('$E=mc^3$', metadata, 'new');
+
+        expect(expandedOld).toBe(rawInlineMath('E=mc^2'));
+        expect(expandedNew).toBe(rawInlineMath('E=mc^3'));
+
+        // Expanded old should be findable in the raw HTML
+        expect(strippedHtml).toContain(expandedOld);
+    });
+
+    it('agent removes math: expanded old_string matches raw HTML', () => {
+        const html = wrap(`<p>Remove ${rawInlineMath('x^2')} here.</p>`);
+        const strippedHtml = stripDataCitationItems(html);
+        const { metadata } = simplifyNoteHtml(html, 1);
+
+        const expandedOld = expandToRawHtml(`${rawInlineMath('x^2')} `, metadata, 'old');
+        expect(expandedOld).toBe(`${rawInlineMath('x^2')} `);
+        expect(strippedHtml).toContain(rawInlineMath('x^2'));
+    });
+
+    it('agent adds math to note without math', () => {
+        const html = wrap('<p>Plain text note.</p>');
+        const { metadata } = simplifyNoteHtml(html, 1);
+
+        // Agent adds math in new_string
+        const expandedNew = expandToRawHtml('Plain text note with $x^2$.', metadata, 'new');
+        expect(expandedNew).toBe(`Plain text note with ${rawInlineMath('x^2')}.`);
+    });
+
+    it('new display math in new_string expands correctly', () => {
+        const html = wrap('<p>Some text.</p>');
+        const { metadata } = simplifyNoteHtml(html, 1);
+
+        const expandedNew = expandToRawHtml(
+            '<p>Some text.</p>$$\\int_0^\\infty e^{-x} dx = 1$$',
+            metadata,
+            'new'
+        );
+        expect(expandedNew).toContain(rawDisplayMath('\\int_0^\\infty e^{-x} dx = 1'));
+    });
+});
+
+
+// =============================================================================
+// Math Apply-Undo-Apply Cycle
+// =============================================================================
+
+describe('Math apply-undo-apply cycle', () => {
+    it('full cycle: apply math edit, undo restores, re-apply succeeds', () => {
+        // --- Original note with inline math ---
+        const noteHtml = wrap(`<p>The formula ${rawInlineMath('E=mc^2')} is famous.</p>`);
+        const strippedHtml = stripDataCitationItems(noteHtml);
+
+        // --- Step 1: Simplify ---
+        const { simplified, metadata } = simplifyNoteHtml(noteHtml, 1);
+        expect(simplified).toContain('$E=mc^2$');
+        expect(simplified).toContain('class="math"');
+
+        // --- Step 2: Agent proposes edit ---
+        const oldString = rawInlineMath('E=mc^2');
+        const newString = '$E=mc^3$';
+
+        // --- Step 3: Expand ---
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+        expect(expandedOld).toBe(rawInlineMath('E=mc^2'));
+        expect(expandedNew).toBe(rawInlineMath('E=mc^3'));
+
+        // --- Step 4: Apply (use replaceFirst to avoid $ interpretation in .replace()) ---
+        expect(strippedHtml).toContain(expandedOld);
+        const afterApply = replaceFirst(strippedHtml, expandedOld, expandedNew);
+        expect(afterApply).toContain(rawInlineMath('E=mc^3'));
+        expect(afterApply).not.toContain(rawInlineMath('E=mc^2'));
+
+        // --- Step 5: Undo data (as stored by executeEditNoteAction) ---
+        const undoOldHtml = expandedOld;
+        const undoNewHtml = expandedNew;
+
+        // --- Step 6: Undo (find undoNewHtml, replace with undoOldHtml) ---
+        const afterUndoStripped = stripDataCitationItems(afterApply);
+        expect(afterUndoStripped).toContain(undoNewHtml);
+        const afterUndo = replaceFirst(afterUndoStripped, undoNewHtml, undoOldHtml);
+        expect(afterUndo).toBe(strippedHtml); // restored to original
+
+        // --- Step 7: Re-apply (same edit on restored note) ---
+        invalidateSimplificationCache('test-note');
+        const { simplified: simplified2, metadata: metadata2 } = simplifyNoteHtml(afterUndo, 1);
+        const expandedOld2 = expandToRawHtml(oldString, metadata2, 'old');
+        const expandedNew2 = expandToRawHtml(newString, metadata2, 'new');
+        expect(afterUndo).toContain(expandedOld2);
+        const afterReapply = replaceFirst(afterUndo, expandedOld2, expandedNew2);
+        expect(afterReapply).toBe(afterApply); // same result as first apply
+    });
+
+    it('full cycle with display math', () => {
+        const noteHtml = wrap(`<p>Proof:</p>${rawDisplayMath('a^2 + b^2 = c^2')}<p>QED</p>`);
+        const strippedHtml = stripDataCitationItems(noteHtml);
+
+        // Simplify
+        const { simplified, metadata } = simplifyNoteHtml(noteHtml, 1);
+        expect(simplified).toContain('$$a^2 + b^2 = c^2$$');
+
+        // Agent changes the equation
+        const oldString = rawDisplayMath('a^2 + b^2 = c^2');
+        const newString = '$$a^n + b^n = c^n$$';
+
+        // Expand
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+        expect(expandedOld).toBe(rawDisplayMath('a^2 + b^2 = c^2'));
+        expect(expandedNew).toBe(rawDisplayMath('a^n + b^n = c^n'));
+
+        // Apply (use replaceFirst to avoid $$ interpretation in .replace())
+        expect(strippedHtml).toContain(expandedOld);
+        const afterApply = replaceFirst(strippedHtml, expandedOld, expandedNew);
+
+        // Undo
+        const afterUndo = replaceFirst(afterApply, expandedNew, expandedOld);
+        expect(afterUndo).toBe(strippedHtml);
+
+        // Re-apply
+        invalidateSimplificationCache('test-note');
+        const { metadata: metadata2 } = simplifyNoteHtml(afterUndo, 1);
+        const expandedOld2 = expandToRawHtml(oldString, metadata2, 'old');
+        const expandedNew2 = expandToRawHtml(newString, metadata2, 'new');
+        const afterReapply = replaceFirst(afterUndo, expandedOld2, expandedNew2);
+        expect(afterReapply).toBe(afterApply);
+    });
+
+    it('full cycle: add math to plain text note', () => {
+        const noteHtml = wrap('<p>Plain text.</p>');
+        const strippedHtml = stripDataCitationItems(noteHtml);
+
+        const { metadata } = simplifyNoteHtml(noteHtml, 1);
+
+        // Agent adds math
+        const oldString = 'Plain text.';
+        const newString = 'Plain text with $x^2$.';
+
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+
+        expect(expandedOld).toBe('Plain text.');
+        expect(expandedNew).toBe(`Plain text with ${rawInlineMath('x^2')}.`);
+
+        // Apply
+        const afterApply = replaceFirst(strippedHtml, expandedOld, expandedNew);
+        expect(afterApply).toContain(rawInlineMath('x^2'));
+
+        // Undo
+        const afterUndo = replaceFirst(afterApply, expandedNew, expandedOld);
+        expect(afterUndo).toBe(strippedHtml);
+    });
+
+    it('full cycle: delete math from note', () => {
+        const noteHtml = wrap(`<p>Text ${rawInlineMath('x^2')} end.</p>`);
+        const strippedHtml = stripDataCitationItems(noteHtml);
+
+        const { metadata } = simplifyNoteHtml(noteHtml, 1);
+
+        // Agent removes math (include enough surrounding context for unique match)
+        const oldString = `Text ${rawInlineMath('x^2')} end.`;
+        const newString = 'Text end.';
+
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+
+        expect(expandedOld).toBe(`Text ${rawInlineMath('x^2')} end.`);
+        expect(expandedNew).toBe('Text end.');
+
+        // Apply
+        expect(strippedHtml).toContain(expandedOld);
+        const afterApply = replaceFirst(strippedHtml, expandedOld, expandedNew);
+        expect(afterApply).not.toContain('class="math"');
+
+        // Undo
+        const afterUndo = replaceFirst(afterApply, expandedNew, expandedOld);
+        expect(afterUndo).toBe(strippedHtml);
+    });
+
+    it('full cycle with math alongside citations', () => {
+        const cit = rawCitation('CYC1', 1, '', 'Author, 2024');
+        const noteHtml = wrap(`<p>As ${cit} shows, ${rawInlineMath('p=0.01')}.</p>`);
+        const pmNormHtml = normalizeNoteHtml(noteHtml);
+        const strippedHtml = stripDataCitationItems(pmNormHtml);
+
+        const { simplified, metadata } = simplifyNoteHtml(noteHtml, 1);
+        const citTag = simplified.match(/<citation [^/]*\/>/)?.[0];
+        expect(citTag).toBeTruthy();
+
+        // Agent modifies the math but keeps the citation
+        const oldString = `${citTag} shows, ${rawInlineMath('p=0.01')}.`;
+        const newString = `${citTag} shows, $p=0.001$.`;
+
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+
+        // Citation should be restored (PM-normalized), math should be wrapped
+        expect(expandedOld).toContain(pmNormCitation('CYC1'));
+        expect(expandedOld).toContain('class="math"');
+        expect(expandedNew).toContain(pmNormCitation('CYC1'));
+        expect(expandedNew).toContain('class="math"');
+
+        // Apply
+        expect(strippedHtml).toContain(expandedOld);
+        const afterApply = replaceFirst(strippedHtml, expandedOld, expandedNew);
+
+        // Undo
+        const afterUndo = replaceFirst(afterApply, expandedNew, expandedOld);
+        expect(afterUndo).toBe(strippedHtml);
+    });
+
+    it('full cycle: add standalone equation (paragraph-to-display)', () => {
+        // Simulates the real scenario: agent adds a standalone equation in its
+        // own <p> alongside inline math in running text.
+        const noteHtml = wrap('<p>Some existing text.</p>\n</div>');
+        const strippedHtml = stripDataCitationItems(noteHtml);
+
+        const { metadata } = simplifyNoteHtml(noteHtml, 1);
+
+        const oldString = '<p>Some existing text.</p>\n</div>';
+        const newString = '<p>Some existing text.</p>\n'
+            + '<p>The estimator is:</p>\n'
+            + '<p>$\\hat{\\beta} = (X\'X)^{-1}X\'Y$</p>\n'
+            + '<p>Where $X$ is the design matrix.</p>\n'
+            + '</div>';
+
+        const expandedOld = expandToRawHtml(oldString, metadata, 'old');
+        const expandedNew = expandToRawHtml(newString, metadata, 'new');
+
+        // Standalone equation → display math (no <p> wrapper)
+        expect(expandedNew).toContain('<pre class="math">$$\\hat{\\beta} = (X\'X)^{-1}X\'Y$$</pre>');
+        expect(expandedNew).not.toContain('<p><span class="math">');
+        expect(expandedNew).not.toContain('<p><pre');
+        // Inline math in running text → inline math
+        expect(expandedNew).toContain('<span class="math">$X$</span>');
+
+        // Apply
+        expect(strippedHtml).toContain(expandedOld);
+        const afterApply = replaceFirst(strippedHtml, expandedOld, expandedNew);
+
+        // Undo
+        const afterUndo = replaceFirst(afterApply, expandedNew, expandedOld);
+        expect(afterUndo).toBe(strippedHtml);
+
+        // Re-apply
+        invalidateSimplificationCache('test-note');
+        const { metadata: m2 } = simplifyNoteHtml(afterUndo, 1);
+        const expandedOld2 = expandToRawHtml(oldString, m2, 'old');
+        const expandedNew2 = expandToRawHtml(newString, m2, 'new');
+        const afterReapply = replaceFirst(afterUndo, expandedOld2, expandedNew2);
+        expect(afterReapply).toBe(afterApply);
+    });
+});
+
+
+// =============================================================================
+// Code shielding: literal dollars inside <pre>/<code> are never treated as math
+// =============================================================================
+
+describe('Code shielding', () => {
+    function emptyMetadata(): SimplificationMetadata {
+        return { elements: new Map() };
+    }
+
+    it('keeps literal dollars in a shell code block', () => {
+        const input = '<pre>export PATH=$HOME/bin:$PATH</pre>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+        expect(result).not.toContain('class="math"');
+    });
+
+    it('keeps literal dollars in an inline code span', () => {
+        const input = '<p>Use <code>df$a + df$b</code> in R</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+        expect(result).not.toContain('class="math"');
+    });
+
+    it('keeps literal $schema in adjacent JSON code blocks and leaves prose untouched', () => {
+        const input = '<pre>{ "$schema": "a" }</pre><p>between</p><pre>{ "$schema": "b" }</pre>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+        expect(result).not.toContain('class="math"');
+    });
+
+    it('expands prose math alongside a shielded code block', () => {
+        const input = '<p>Energy $E=mc^2$ is key.</p><pre>echo $x</pre><p>Also $y+z$ holds.</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(
+            `<p>Energy ${rawInlineMath('E=mc^2')} is key.</p>`
+            + '<pre>echo $x</pre>'
+            + `<p>Also ${rawInlineMath('y+z')} holds.</p>`
+        );
+        expect(result).toContain('<pre>echo $x</pre>');
+    });
+
+    it('wraps display math adjacent to a shielded code block', () => {
+        const input = '$$\\int x$$<pre>echo $a</pre>$$\\sum y$$';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(
+            `${rawDisplayMath('\\int x')}<pre>echo $a</pre>${rawDisplayMath('\\sum y')}`
+        );
+        expect(result).toContain('<pre>echo $a</pre>');
+    });
+
+    it('does not pair dollars across a code block boundary', () => {
+        // The closing dollar must directly follow non-whitespace so an
+        // unsegmented inline pass would pair the two dollars across the block.
+        const input = '<p>cost $5</p><pre>echo hi</pre><p>$10 more</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+        expect(result).not.toContain('class="math"');
+    });
+
+    it('shields code elements with mixed-case tag names', () => {
+        const input = '<p>Note:</p><PRE>export PATH=$HOME/bin:$PATH</PRE><p>Or <Code>df$a + df$b</Code> inline.</p>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(input);
+        expect(result).not.toContain('class="math"');
+    });
+
+    it('restores math wrappers and links nested inside a shielded code block', () => {
+        const input = '<pre><span class="math">$x$</span> and <link href="https://example.com/a?b=1"/></pre>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        expect(result).toBe(
+            '<pre><span class="math">$x$</span> and '
+            + '<a href="https://example.com/a?b=1" rel="noopener noreferrer nofollow">https://example.com/a?b=1</a></pre>'
+        );
+        // No placeholder tokens leak into the output.
+        expect(result).not.toContain('__ASTERMARGIN_RAW_');
+    });
+
+    it('preserves literal placeholder text while still restoring a real code block', () => {
+        const input = '<p>Literal token __ASTERMARGIN_RAW_CODE_0__ here.</p><pre>echo $a</pre>';
+        const result = expandToRawHtml(input, emptyMetadata(), 'new');
+        // The literal placeholder text survives byte-for-byte (nonce bump avoids
+        // colliding with the real code placeholder) and the code block is restored.
+        expect(result).toContain('__ASTERMARGIN_RAW_CODE_0__');
+        expect(result).toContain('<pre>echo $a</pre>');
+        expect(result).toBe(input);
+    });
+
+    it('round-trips a code block with literal dollars through simplify then expand', () => {
+        const html = wrap('<p>Shell:</p><pre>export PATH=$HOME/bin:$PATH</pre>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toBe(stripNoteWrapperDiv(stripDataCitationItems(normalizeNoteHtml(html))));
+        expect(expanded).toContain('<pre>export PATH=$HOME/bin:$PATH</pre>');
+        expect(expanded).not.toContain('class="math"');
+    });
+});
+
+
+// =============================================================================
+// translatePageNumberToLabel
+// =============================================================================
+
+describe('translatePageNumberToLabel', () => {
+    function pageLabelsFromList(labels: readonly string[]): Record<string, string> {
+        return Object.fromEntries(labels.map((label, index) => [String(index), label]));
+    }
+
+    it('returns as-is when labels are null', () => {
+        expect(translatePageNumberToLabel(null, '15')).toBe('15');
+    });
+
+    it('returns as-is when labels are empty', () => {
+        expect(translatePageNumberToLabel({}, '15')).toBe('15');
+    });
+
+    it('translates 1-based page number to label with offset labels', () => {
+        // Journal article starting at page 338 (28 pages: 338-365)
+        const labels = pageLabelsFromList(Array.from({ length: 28 }, (_, i) => String(338 + i)));
+        // Page 15 → pageLabels[14] = "352"
+        expect(translatePageNumberToLabel(labels, '15')).toBe('352');
+    });
+
+    it('translates correctly for sequential labels (identity case)', () => {
+        // Sequential labels [1..100]
+        const labels = pageLabelsFromList(Array.from({ length: 100 }, (_, i) => String(i + 1)));
+        // Page 15 → pageLabels[14] = "15" (identity mapping)
+        expect(translatePageNumberToLabel(labels, '15')).toBe('15');
+    });
+
+    it('translates correctly for mixed roman/arabic labels', () => {
+        // [i, ii, iii, 1, 2, ..., 100]
+        const labels = pageLabelsFromList(['i', 'ii', 'iii', ...Array.from({ length: 100 }, (_, i) => String(i + 1))]);
+        // Page 2 → pageLabels[1] = "ii" (not label "2")
+        expect(translatePageNumberToLabel(labels, '2')).toBe('ii');
+        // Page 15 → pageLabels[14] = "12"
+        expect(translatePageNumberToLabel(labels, '15')).toBe('12');
+    });
+
+    it('falls back for out-of-range offset label values', () => {
+        // Labels [338..365] (28 pages)
+        const labels = pageLabelsFromList(Array.from({ length: 28 }, (_, i) => String(338 + i)));
+        // "340" as page number → pageLabels[339] = undefined → fallback "340"
+        expect(translatePageNumberToLabel(labels, '340')).toBe('340');
+    });
+
+    it('falls back to original value when page number is out of range', () => {
+        // Labels [338..342] (5 pages)
+        const labels = pageLabelsFromList(Array.from({ length: 5 }, (_, i) => String(338 + i)));
+        // "100" is not a label, and pageLabels[99] is undefined → fallback
+        expect(translatePageNumberToLabel(labels, '100')).toBe('100');
+    });
+
+    it('handles page ranges', () => {
+        const labels = pageLabelsFromList(Array.from({ length: 28 }, (_, i) => String(338 + i)));
+        // "15-17" → "352-354"
+        expect(translatePageNumberToLabel(labels, '15-17')).toBe('352-354');
+    });
+
+    it('handles non-numeric strings gracefully', () => {
+        const labels = pageLabelsFromList(['i', 'ii', 'iii']);
+        expect(translatePageNumberToLabel(labels, 'intro')).toBe('intro');
+    });
+
+    it('does not translate structured locators like §3.2', () => {
+        const labels = pageLabelsFromList(Array.from({ length: 100 }, (_, i) => String(i + 1)));
+        expect(translatePageNumberToLabel(labels, '§3.2')).toBe('§3.2');
+    });
+
+    it('does not translate footnote locators like fn. 5', () => {
+        const labels = pageLabelsFromList(Array.from({ length: 100 }, (_, i) => String(i + 1)));
+        expect(translatePageNumberToLabel(labels, 'fn. 5')).toBe('fn. 5');
+    });
+
+    it('does not translate roman numeral locators', () => {
+        const labels = pageLabelsFromList(Array.from({ length: 100 }, (_, i) => String(i + 1)));
+        expect(translatePageNumberToLabel(labels, 'xii')).toBe('xii');
+    });
+
+    it('translates comma-separated page lists', () => {
+        const labels = pageLabelsFromList(Array.from({ length: 28 }, (_, i) => String(338 + i)));
+        // "3, 5" → "340, 342"
+        expect(translatePageNumberToLabel(labels, '3, 5')).toBe('340, 342');
+    });
+});
+
+describe('translatePageLabelToNumber', () => {
+    function pageLabelsFromList(labels: readonly string[]): Record<string, string> {
+        return Object.fromEntries(labels.map((label, index) => [String(index), label]));
+    }
+
+    it('returns as-is when labels are null or empty', () => {
+        expect(translatePageLabelToNumber(null, 'xiv')).toBe('xiv');
+        expect(translatePageLabelToNumber({}, 'xiv')).toBe('xiv');
+    });
+
+    it('translates a whole page label to a 1-based page number', () => {
+        const labels = pageLabelsFromList(['i', 'ii', 'iii', 'xiv']);
+        expect(translatePageLabelToNumber(labels, 'xiv')).toBe('4');
+    });
+
+    it('translates ranges and comma-separated lists token by token', () => {
+        const labels = pageLabelsFromList(['xiii', 'xiv', 'xv', 'xvi', 'S5']);
+        expect(translatePageLabelToNumber(labels, 'xiv-xvi, S5')).toBe('2-4, 5');
+    });
+
+    it('leaves unknown labels and free-text locators unchanged', () => {
+        const labels = pageLabelsFromList(['i', 'ii', 'iii']);
+        expect(translatePageLabelToNumber(labels, '§3.2')).toBe('§3.2');
+        expect(translatePageLabelToNumber(labels, 'xiv')).toBe('xiv');
+        expect(translatePageLabelToNumber(labels, 'ii-xiv')).toBe('ii-xiv');
+    });
+
+    it('uses the first physical page for duplicate labels when no run is longer', () => {
+        const labels = pageLabelsFromList(['1', '2', '2', '3']);
+        expect(translatePageLabelToNumber(labels, '2')).toBe('2');
+    });
+
+    it('prefers the main-body page for a label on several pages', () => {
+        // A cover sheet printing "5" ahead of a body run 1..6.
+        const labels = pageLabelsFromList(['5', '1', '2', '3', '4', '5', '6']);
+        expect(translatePageLabelToNumber(labels, '5')).toBe('6');
+    });
+
+});
+
+describe('citationPageLocator', () => {
+    // Physical page 1 prints no number; the numbering starts on page 2 with "1".
+    const labels = { 1: '1', 2: '2', 3: '3' };
+
+    it('cites the labels of the cited pages', () => {
+        expect(citationPageLocator(labels, '2')).toBe('1');
+        expect(citationPageLocator(labels, '2-4')).toBe('1-3');
+        expect(citationPageLocator(labels, '2, 4')).toBe('1, 3');
+    });
+
+    it('leaves out pages without a label in a labelled document', () => {
+        expect(citationPageLocator(labels, '1')).toBeUndefined();
+        expect(citationPageLocator(labels, '1-3')).toBe('1-2');
+        expect(citationPageLocator(labels, '1, 3')).toBe('2');
+    });
+
+    it('never mixes numberings in a range', () => {
+        // An unnumbered cover that declares "1", then printed pages 813-814.
+        expect(citationPageLocator({ 0: '1', 1: '813', 2: '814' }, '1-3')).toBe('813-814');
+        // Two one-page runs: a tie takes the later run (covers and front matter come first).
+        expect(citationPageLocator({ 0: '1', 1: '813', 2: '814' }, '1-2')).toBe('813');
+        // The cover alone still cites the label it has.
+        expect(citationPageLocator({ 0: '1', 1: '813', 2: '814' }, '1')).toBe('1');
+        // Roman front matter then Arabic body: the longer run wins.
+        expect(citationPageLocator({ 0: 'i', 1: '1', 2: '2', 3: '3' }, '1-4')).toBe('1-3');
+    });
+
+    it('keeps ranges in alphabetic and unrecognized label styles whole', () => {
+        expect(citationPageLocator({ 0: 'A', 1: 'B', 2: 'C', 3: 'D' }, '1-4')).toBe('A-D');
+        expect(citationPageLocator({ 0: 'Z', 1: 'AA' }, '1-2')).toBe('Z-AA');
+        expect(citationPageLocator({ 0: 'α', 1: 'β' }, '1-2')).toBe('α-β');
+    });
+
+    it('keeps the labelled pages of a long range whose endpoints print none', () => {
+        expect(citationPageLocator({ 1: '1', 1999: '1999' }, '1-2002')).toBe('1-1999');
+    });
+
+    it('translates a long consecutive range in linear time', () => {
+        const many = Object.fromEntries(Array.from({ length: 30000 }, (_, i) => [i, String(i + 1)]));
+        const started = performance.now();
+        expect(citationPageLocator(many, '1-30000')).toBe('1-30000');
+        expect(performance.now() - started).toBeLessThan(500);
+    });
+
+    it('returns promptly for page numbers beyond the safe integer range', () => {
+        expect(citationPageLocator(labels, '9007199254740992')).toBeUndefined();
+        expect(citationPageLocator(labels, '1-9007199254740993')).toBe('1-3');
+    });
+
+    it('keeps physical pages, and non-page locators, when the document has no labels', () => {
+        expect(citationPageLocator(null, '1')).toBe('1');
+        expect(citationPageLocator({}, '2–4')).toBe('2-4');
+        expect(citationPageLocator(labels, 'xii')).toBe('xii');
+    });
+});
+
+describe('translateLinkPageLabelToNumber', () => {
+    // Declared labels 1..8; printed body labels 1..6 from physical page 3.
+    const labels = {
+        declared: { 0: '1', 1: '2', 2: '3', 3: '4', 4: '5', 5: '6', 6: '7', 7: '8' },
+        locator: { 0: '1', 1: '2', 2: '1', 3: '2', 4: '3', 5: '4', 6: '5', 7: '6' },
+    };
+
+    it('reads a range in the labels that agree with the page the link opens', () => {
+        expect(translateLinkPageLabelToNumber(labels, '3-4', 5)).toBe('5-6');
+        expect(translateLinkPageLabelToNumber(labels, '3-4', 3)).toBe('3-4');
+    });
+
+    it('reads a range in declared labels when no labels agree or the link names no page', () => {
+        expect(translateLinkPageLabelToNumber(labels, '3-4', null)).toBe('3-4');
+        expect(translateLinkPageLabelToNumber(labels, '3-4', 8)).toBe('3-4');
+        expect(translateLinkPageLabelToNumber({ 0: 'i', 1: 'ii' }, 'i-ii', null)).toBe('1-2');
+    });
+
+    it('accepts a map only when it resolves the whole range', () => {
+        // An older link citing declared "1-3" (physical 1-2); the locator labels
+        // know "1" but not "3", so their partial result must not be taken.
+        const older = { declared: { 0: '1', 1: '3' }, locator: { 0: '1', 1: '1202' } };
+        expect(translateLinkPageLabelToNumber(older, '1-3', 1)).toBe('1-2');
+    });
+
+    it('reads a range that mixes a physical number and a label, as the writers produce it', () => {
+        // No /PageLabels; physical page 1 prints nothing, page 2 prints 1202.
+        const mixed = { declared: null, locator: { 1: '1202' } };
+        expect(translateLinkPageLabelToNumber(mixed, '1-1202', 1)).toBe('1-2');
+        expect(translatePageLabelToNumber({ 1: '1202' }, '1-1202')).toBe('1-2');
+        // A number that another page carries as its label is not read as physical.
+        expect(translatePageLabelToNumber({ 0: 'x', 1: '1202' }, '1-1202')).toBe('1-1202');
+    });
+
+    it('reads a link range back from the physical pages it records, not its labels', () => {
+        // Locator labels restart at physical page 3 (1, 2, 1, 2, 3, 4), so pages
+        // 1-4 display as "1-2"; the link records 1-4.
+        const item = {
+            id: 42, key: 'ATTACH12', libraryID: 1, parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            getField: () => 'Report.pdf',
+        };
+        vi.mocked(Zotero.Items.getByLibraryAndKey).mockReturnValue(item as any);
+        (Zotero.Libraries as any).get = vi.fn(() => ({ isGroup: false }));
+        const labels = {
+            declared: { 0: '1', 1: '2', 2: '3', 3: '4', 4: '5', 5: '6' },
+            locator: { 0: '1', 1: '2', 2: '1', 3: '2', 4: '3', 5: '4' },
+        };
+        const html = expandToRawHtml('<citation id="u-ATTACH12" loc="page1-4"/>', { elements: new Map() }, 'new',
+            undefined, { 42: labels.locator } as any);
+        expect(html).toContain('href="zotero://open/library/items/ATTACH12?page=1#astermargin-pages=1-4"');
+        expect(html).toContain('Report.pdf</a>, p. 1-2)');
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${html}</p>`), 1, { 'u-ATTACH12': labels });
+        expect(simplified).toContain('loc="page1-4"');
+    });
+
+    it('keeps a suffix that already names the page the link opens', () => {
+        expect(translateLinkPageLabelToNumber(labels, '9', 9)).toBe('9');
+    });
+
+    it('reads a link without a page in declared labels only', () => {
+        // A select link (file missing) writes its suffix in declared labels; a
+        // printed label that names another page must not capture it.
+        expect(translateLinkPageLabelToNumber(labels, '5', null)).toBe('5');
+        expect(translateLinkPageLabelToNumber(labels, '1203', null)).toBe('1203');
+    });
+});
+
+
+// =============================================================================
+// decodeHtmlEntities
+// =============================================================================
+
+import { decodeHtmlEntities } from '../../../src/utils/noteHtmlEntities';
+
+describe('decodeHtmlEntities', () => {
+    it('decodes &#x27; to apostrophe', () => {
+        expect(decodeHtmlEntities("Dashti&#x27;s")).toBe("Dashti's");
+    });
+
+    it('decodes &#39; (decimal) to apostrophe', () => {
+        expect(decodeHtmlEntities("Dashti&#39;s")).toBe("Dashti's");
+    });
+
+    it('decodes &apos; to apostrophe', () => {
+        expect(decodeHtmlEntities("Dashti&apos;s")).toBe("Dashti's");
+    });
+
+    it('decodes &quot; in text content but not in attributes', () => {
+        const input = 'said &quot;hello&quot; <a title="a &quot;b&quot;">link</a>';
+        const expected = 'said "hello" <a title="a &quot;b&quot;">link</a>';
+        expect(decodeHtmlEntities(input)).toBe(expected);
+    });
+
+    it('decodes numeric quote entities in text content but not in attributes', () => {
+        const input = 'said &#34;hello&#34; and &#x22;goodbye&#x22; <a title="a &#34;b&#34; and &#x22;c&#x22;">link</a>';
+        const expected = 'said "hello" and "goodbye" <a title="a &#34;b&#34; and &#x22;c&#x22;">link</a>';
+        expect(decodeHtmlEntities(input)).toBe(expected);
+    });
+
+    it('preserves &lt; &gt; &amp; (structural entities)', () => {
+        expect(decodeHtmlEntities('&lt;b&gt;bold&lt;/b&gt;')).toBe('&lt;b&gt;bold&lt;/b&gt;');
+        expect(decodeHtmlEntities('Smith &amp; Jones')).toBe('Smith &amp; Jones');
+    });
+
+    it('preserves numeric refs for structural chars (&#x3C; &#x3E; &#x26;)', () => {
+        expect(decodeHtmlEntities('&#x3C;b&#x3E;')).toBe('&#x3C;b&#x3E;');
+        expect(decodeHtmlEntities('&#60;b&#62;')).toBe('&#60;b&#62;');
+        expect(decodeHtmlEntities('&#x26;amp;')).toBe('&#x26;amp;');
+    });
+
+    it('handles supplementary-plane characters (above U+FFFF)', () => {
+        // 💡 = U+1F4A1
+        expect(decodeHtmlEntities('idea &#x1F4A1; here')).toBe('idea 💡 here');
+        // 😀 = U+1F600
+        expect(decodeHtmlEntities('&#x1F600;')).toBe('😀');
+    });
+
+    it('handles mixed entities in a realistic context anchor', () => {
+        const input = 'Dashti&#x27;s &quot;memoir&quot; and &#34;notes&#34;</p>\n<p><a href="link" title="a &quot;b&quot; and &#34;c&#34;">text</a>';
+        const expected = "Dashti's \"memoir\" and \"notes\"</p>\n<p><a href=\"link\" title=\"a &quot;b&quot; and &#34;c&#34;\">text</a>";
+        expect(decodeHtmlEntities(input)).toBe(expected);
+    });
+});
+
+
+// =============================================================================
+// encodeTextEntities
+// =============================================================================
+
+import { encodeTextEntities } from '../../../src/utils/noteHtmlEntities';
+
+describe('encodeTextEntities', () => {
+    it('encodes apostrophe to &#x27; in text', () => {
+        expect(encodeTextEntities("Dashti's")).toBe("Dashti&#x27;s");
+    });
+
+    it('encodes double quote to &quot; in text', () => {
+        expect(encodeTextEntities('said "hello"')).toBe('said &quot;hello&quot;');
+    });
+
+    it('does not encode quotes inside HTML tags', () => {
+        const input = "Dashti's <a href=\"link\" title=\"thing\">text</a>";
+        const expected = "Dashti&#x27;s <a href=\"link\" title=\"thing\">text</a>";
+        expect(encodeTextEntities(input)).toBe(expected);
+    });
+
+    it('roundtrips with decodeHtmlEntities for text content', () => {
+        const original = "Dashti&#x27;s &quot;memoir&quot;";
+        const decoded = decodeHtmlEntities(original);
+        expect(decoded).toBe("Dashti's \"memoir\"");
+        const reencoded = encodeTextEntities(decoded);
+        expect(reencoded).toBe(original);
+    });
+
+    it('encodes literal & to &amp; in text segments', () => {
+        expect(encodeTextEntities('Smith & Jones')).toBe('Smith &amp; Jones');
+    });
+
+    it('does not double-encode known entities in text segments', () => {
+        const known = 'a &amp; b &lt; c &gt; d &quot; e &apos; f &nbsp; g &#x27; h &#39; i &#34;';
+        expect(encodeTextEntities(known)).toBe(known);
+    });
+
+    it('encodes & in unknown entity-like sequences (e.g., &foo;)', () => {
+        // PM serialization encodes `&` in `&foo;` as `&amp;foo;`. We mirror
+        // that so the matcher can bridge the drift.
+        expect(encodeTextEntities('see &foo; here')).toBe('see &amp;foo; here');
+    });
+
+    it('does not touch & inside HTML tag attributes', () => {
+        const input = '<a href="?a=1&b=2">link</a>';
+        // The `&` is inside the tag, so the tag-skip behavior preserves it.
+        expect(encodeTextEntities(input)).toBe(input);
+    });
+
+    it('encodes & alongside apostrophe in the same text segment', () => {
+        expect(encodeTextEntities("R&D's plan"))
+            .toBe('R&amp;D&#x27;s plan');
+    });
+});
+
+
+// =============================================================================
+// simplifyNoteHtml with pre-normalization
+// =============================================================================
+
+describe('simplifyNoteHtml with pre-normalization', () => {
+    it('hex colors are converted to rgb before simplification', () => {
+        const rawHtml = wrap('<p style="color: #ff0000">Red text</p>');
+        const { simplified } = simplifyNoteHtml(rawHtml, 1);
+        expect(simplified).toContain('rgb(255, 0, 0)');
+        expect(simplified).not.toContain('#ff0000');
+    });
+
+    it('combined-style spans are split before citation extraction', () => {
+        const citation = rawCitation('ABC');
+        const rawHtml = wrap(
+            '<span style="color: #ff0000; background-color: #00ff00">'
+            + `Text with ${citation}`
+            + '</span>'
+        );
+        const { simplified } = simplifyNoteHtml(rawHtml, 1);
+        // Styles should be split (PM adds trailing semicolons)
+        expect(simplified).toContain('style="color: rgb(255, 0, 0);"');
+        expect(simplified).toContain('style="background-color: rgb(0, 255, 0);"');
+        // Citation should be simplified
+        expect(simplified).toContain('<citation');
+    });
+
+    it('legacy <b>/<i> converted before simplification', () => {
+        const rawHtml = wrap('<p><b>bold</b> and <i>italic</i></p>');
+        const { simplified } = simplifyNoteHtml(rawHtml, 1);
+        expect(simplified).toContain('<strong>bold</strong>');
+        expect(simplified).toContain('<em>italic</em>');
+        expect(simplified).not.toContain('<b>');
+        expect(simplified).not.toContain('<i>');
+    });
+
+    it('<font> tags stripped before simplification', () => {
+        const rawHtml = wrap('<h1><font size="6">Title</font></h1>');
+        const { simplified } = simplifyNoteHtml(rawHtml, 1);
+        expect(simplified).toContain('<h1>Title</h1>');
+        expect(simplified).not.toContain('<font');
+    });
+
+    it('normalization + simplification roundtrip preserves citations', () => {
+        const citation = rawCitation('KEY1', 1, '5', 'Author, 2024');
+        const rawHtml = wrap(`<p style="color: #ff0000">Text ${citation} more</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(rawHtml, 1);
+        // Citation simplified
+        expect(simplified).toContain('<citation');
+        // Expand back
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        // Should contain the citation data
+        expect(expanded).toContain('data-citation=');
+    });
+
+    it('normalization + simplification roundtrip preserves annotations', () => {
+        const annotation = rawAnnotation('ANN1', 'ATT1', 'highlighted text');
+        const rawHtml = wrap(`<p>${annotation}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(rawHtml, 1);
+        // Annotation simplified
+        expect(simplified).toContain('<annotation');
+        expect(simplified).toContain('highlighted text');
+        // Expand back
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).toContain('data-annotation=');
+    });
+});
+
+// =============================================================================
+// self-linking anchor collapse (<link/> token)
+// =============================================================================
+
+describe('self-linking anchor collapse', () => {
+    it('collapses a self-linking http anchor to a <link/> token', () => {
+        const url = 'https://example.com/page';
+        const html = wrap(`<p><a href="${url}">${url}</a></p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain(`<link href="${url}"/>`);
+        expect(simplified).not.toContain('<a ');
+        const stored = metadata.elements.get(`link:${url}`);
+        expect(stored).toBeDefined();
+        expect(stored?.type).toBe('link');
+    });
+
+    it('round-trips a self-linking anchor back to the exact raw HTML', () => {
+        const url = 'https://example.com/page';
+        const html = wrap(`<p><a href="${url}">${url}</a></p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const stored = metadata.elements.get(`link:${url}`);
+        expect(stored).toBeDefined();
+        // The stored raw anchor is a verbatim slice of the matchable note HTML.
+        expect(normalizeNoteHtml(html)).toContain(stored!.rawHtml);
+        // Expanding the simplified note restores that exact raw anchor.
+        expect(expandToRawHtml(simplified, metadata, 'old')).toContain(stored!.rawHtml);
+    });
+
+    it('leaves a labeled (non-self-linking) anchor verbatim', () => {
+        const html = wrap('<p><a href="https://doi.org/10.1/x">Smith 2020</a></p>');
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).not.toContain('<link ');
+        expect(simplified).toContain('<a href="https://doi.org/10.1/x"');
+        expect([...metadata.elements.keys()].some((k) => k.startsWith('link:'))).toBe(false);
+    });
+
+    it('does not collapse mailto: or relative self-links', () => {
+        const mailto = wrap('<p><a href="mailto:a@b.com">mailto:a@b.com</a></p>');
+        expect(simplifyNoteHtml(mailto, 1).simplified).not.toContain('<link ');
+        const relative = wrap('<p><a href="#section">#section</a></p>');
+        expect(simplifyNoteHtml(relative, 1).simplified).not.toContain('<link ');
+    });
+
+    it('keeps a single &amp; in the token for a URL with an ampersand', () => {
+        const html = wrap(
+            '<p><a href="https://example.com/?a=1&amp;b=2">https://example.com/?a=1&amp;b=2</a></p>'
+        );
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('<link href="https://example.com/?a=1&amp;b=2"/>');
+        expect(simplified).not.toContain('&amp;amp;');
+        // Metadata is keyed by the decoded (bare-&) URL.
+        const stored = metadata.elements.get('link:https://example.com/?a=1&b=2');
+        expect(stored).toBeDefined();
+        expect(expandToRawHtml(simplified, metadata, 'old')).toContain(stored!.rawHtml);
+    });
+
+    it('does not corrupt a URL containing $...$ during expansion', () => {
+        const url = 'https://example.com/a$b$c';
+        const html = wrap(`<p><a href="${url}">${url}</a></p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain(`<link href="${url}"/>`);
+        const expanded = expandToRawHtml(simplified, metadata, 'old');
+        expect(expanded).not.toContain('class="math"');
+        expect(expanded).toContain(metadata.elements.get(`link:${url}`)!.rawHtml);
+    });
+
+    it('reconstructs a canonical anchor for an unknown <link/> in new_string', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        const result = expandToRawHtml('<link href="https://new.com/p"/>', metadata, 'new');
+        expect(result).toBe(
+            '<a href="https://new.com/p" rel="noopener noreferrer nofollow">https://new.com/p</a>'
+        );
+    });
+
+    it('reconstructs a canonical single &amp; for an unknown <link/> URL', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        // Model wrote a bare `&` in the token — expansion must emit canonical
+        // `&amp;` (and never double-escaped `&amp;amp;`).
+        const result = expandToRawHtml('<link href="https://new.com/?a=1&b=2"/>', metadata, 'new');
+        expect(result).toBe(
+            '<a href="https://new.com/?a=1&amp;b=2" rel="noopener noreferrer nofollow">'
+            + 'https://new.com/?a=1&amp;b=2</a>'
+        );
+        expect(result).not.toContain('&amp;amp;');
+        // A token that already carried `&amp;` converges on the same output.
+        const fromEncoded = expandToRawHtml(
+            '<link href="https://new.com/?a=1&amp;b=2"/>', metadata, 'new'
+        );
+        expect(fromEncoded).toBe(result);
+    });
+
+    it('does not throw for an unknown <link/> in old_string context', () => {
+        const metadata: SimplificationMetadata = { elements: new Map() };
+        expect(() => expandToRawHtml('<link href="https://x.com/q"/>', metadata, 'old')).not.toThrow();
+        expect(expandToRawHtml('<link href="https://x.com/q"/>', metadata, 'old')).toBe(
+            '<a href="https://x.com/q" rel="noopener noreferrer nofollow">https://x.com/q</a>'
+        );
+    });
+
+    it('collapses a self-link while leaving annotations intact (shielding round-trip)', () => {
+        const html = wrap(
+            `<p>${rawAnnotation('ANN1', 'highlighted text')}</p>`
+            + '<p><a href="https://example.com/p">https://example.com/p</a></p>'
+        );
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        expect(simplified).toContain('<link href="https://example.com/p"/>');
+        expect(simplified).toContain('<annotation id="a_ANN1"');
+        // The annotation token still expands — shield placeholders fully restored.
+        expect(() => expandToRawHtml(simplified, metadata, 'old')).not.toThrow();
+    });
+
+    it('does not collapse a self-link that carries a title attribute', () => {
+        const html = wrap('<p><a href="https://x.com/p" title="tip">https://x.com/p</a></p>');
+        const { simplified } = simplifyNoteHtml(html, 1);
+        expect(simplified).not.toContain('<link ');
+        expect(simplified).toContain('<a href="https://x.com/p"');
+    });
+
+    it('leaves a literal raw <a> in old_string untouched (backward compatible)', () => {
+        const url = 'https://example.com/p';
+        const html = wrap(`<p><a href="${url}">${url}</a></p>`);
+        const { metadata } = simplifyNoteHtml(html, 1);
+        const rawAnchor = metadata.elements.get(`link:${url}`)!.rawHtml;
+        // A verbose raw <a> (no <link/> token) passes through expansion unchanged
+        // and is a verbatim slice of the matchable note HTML — so the matcher's
+        // exact strategy still works if the model copies the legacy form.
+        expect(expandToRawHtml(rawAnchor, metadata, 'old')).toBe(rawAnchor);
+        expect(normalizeNoteHtml(html)).toContain(rawAnchor);
+    });
+});
+
+describe('detectPartialSimplifiedTag — <link>', () => {
+    it('flags a truncated <link href= opener', () => {
+        const result = detectPartialSimplifiedTag('see <link href="https://y.com');
+        expect(result?.kind).toBe('link');
+    });
+
+    it('returns null for a complete <link/> tag', () => {
+        expect(detectPartialSimplifiedTag('see <link href="https://y.com/p"/> ok')).toBeNull();
+    });
+});
+
+describe('buildUnresolvedLocatorWarning', () => {
+    it('returns null when nothing was dropped', () => {
+        expect(buildUnresolvedLocatorWarning([])).toBeNull();
+    });
+
+    it('lists the unresolved locators in a single warning string', () => {
+        const warning = buildUnresolvedLocatorWarning([
+            'id="1-AAA" loc="s4"',
+            'id="2-BBB" loc="p7"',
+        ]);
+        expect(warning).toContain('id="1-AAA" loc="s4"');
+        expect(warning).toContain('id="2-BBB" loc="p7"');
+        expect(warning).toMatch(/page numbers only/i);
+        expect(warning).not.toMatch(/can't be loaded/);
+    });
+
+    it('tells the model to re-read pages for locators that can never resolve', () => {
+        const warning = buildUnresolvedLocatorWarning(['id="1-AAA" loc="s4"'], ['id="1-AAA" loc="s5.6"']);
+        expect(warning).toContain('extraction is available');
+        expect(warning).toContain('can\'t be loaded, so their citations show no page number: id="1-AAA" loc="s5.6"');
+        expect(warning).toContain('Re-read the cited pages');
+        expect(buildUnresolvedLocatorWarning([], ['id="1-AAA" loc="s5.6"'])).not.toContain('extraction is available');
+    });
+});
+
+describe('detectPartialSimplifiedTag — citation attributes', () => {
+    it.each([
+        'loc="page3"', ' ref="c_X_0"/>', 'loc="page1" ref="c_X_0"',
+        'id="u-ABCDEFGH"', 'label="Example">', ' item_id = "u-ABCDEFGH" ',
+        'att_id="u-ABCDEFGH"', 'external_id="ext-example"',
+        'items="u-AAAAAAAA; u-BBBBBBBB"', 'items="u-AAAAAAAA" ref="c_X_0"/>',
+    ])('flags an attribute-only anchor: %s', (anchor) => {
+        expect(detectPartialSimplifiedTag(anchor)).toEqual({
+            kind: 'citation', snippet: anchor.trim(),
+        });
+    });
+
+    it.each([
+        'The attribute loc="page3" identifies a page.',
+        '<citation id="u-ABCDEFGH" loc="page3" ref="c_X_0"/>',
+        '<p id="example">Text</p>',
+        'class="example"',
+    ])('leaves prose and complete tags alone: %s', (anchor) => {
+        expect(detectPartialSimplifiedTag(anchor)).toBeNull();
+    });
+});
+
+
+// =============================================================================
+// Key-less highlights
+// =============================================================================
+
+describe('highlights without an annotation key', () => {
+    /** A highlight as Zotero writes it for a reader text selection: no key, no color. */
+    function keylessHighlight(text: string, pageIndex: number): string {
+        const data = {
+            attachmentURI: 'http://zotero.org/users/1/items/ATTACH01',
+            pageLabel: String(pageIndex + 1),
+            position: { pageIndex, rects: [[10, 10, 100, 20]] },
+        };
+        return `<span class="highlight" data-annotation="${encodeURIComponent(JSON.stringify(data))}">“${text}”</span>`;
+    }
+
+    it('gives each highlight its own id, so each one round-trips', () => {
+        const first = keylessHighlight('first quote', 0);
+        const second = keylessHighlight('second quote', 1);
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${first}</p><p>${second}</p>`), 1);
+        const tags = simplified.match(/<annotation\b[^>]*>[^<]*<\/annotation>/g)!;
+
+        expect(tags).toEqual([
+            '<annotation id="a_nokey" page="1">“first quote”</annotation>',
+            '<annotation id="a_nokey_2" page="2">“second quote”</annotation>',
+        ]);
+        expect(expandToRawHtml(tags[0], metadata, 'old')).toBe(metadata.elements.get('a_nokey')!.rawHtml);
+        expect(expandToRawHtml(tags[1], metadata, 'old')).toBe(metadata.elements.get('a_nokey_2')!.rawHtml);
+        expect(metadata.elements.get('a_nokey')!.rawHtml).toContain('first quote');
+    });
+
+    it('keeps two highlights of the same annotation apart', () => {
+        const html = wrap(`<p>${rawAnnotation('SAME1', 'one')}</p><p>${rawAnnotation('SAME1', 'two')}</p>`);
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+
+        expect(simplified).toContain('<annotation id="a_SAME1" key="SAME1"');
+        expect(simplified).toContain('<annotation id="a_SAME1_2" key="SAME1"');
+        expect(metadata.elements.get('a_SAME1')!.originalText).toBe('one');
+        expect(metadata.elements.get('a_SAME1_2')!.originalText).toBe('two');
+    });
+});
+
+// =============================================================================
+// AsterMargin citation metadata
+// =============================================================================
+
+describe('AsterMargin citation metadata', () => {
+    /** A native citation span carrying AsterMargin's private metadata. */
+    function metaCitation(key: string, locator: string | undefined, astermargin: Record<string, unknown>): string {
+        const citation = {
+            citationItems: [{
+                uris: [`http://zotero.org/users/1/items/${key}`],
+                ...(locator ? { locator } : {}),
+                astermargin,
+            }],
+            properties: {},
+        };
+        return `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citation))}">`
+            + `(<span class="citation-item">Author, 2024, p. ${locator ?? ''}</span>)</span>`;
+    }
+
+    it('reads a citation back as the attachment and locator AsterMargin wrote', () => {
+        const raw = metaCitation('PARENT1', '12', { v: 1, loc: 's5.6-s5.9', att: 'ATTACH01' });
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>Claim ${raw}.</p>`), 1);
+        const tag = '<citation id="u-ATTACH01" loc="s5.6-s5.9" ref="c_ATTACH01_0"/>';
+
+        expect(simplified.trim()).toBe(`<p>Claim ${tag}.</p>`);
+        const stored = metadata.elements.get('c_ATTACH01_0')!.rawHtml;
+        expect(expandToRawHtml(tag, metadata, 'old')).toBe(stored);
+        expect(expandToRawHtml(tag, metadata, 'new')).toBe(stored);
+        expect(createCitationHTML).not.toHaveBeenCalled();
+    });
+
+    it('reads a citation of a deleted attachment back as the parent item and the page it recorded', () => {
+        // s5.6 is on physical page 5; the stored locator is its label.
+        const raw = metaCitation('PARENT1', '12', { v: 1, loc: 's5.6', att: 'GONE0001' });
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn((_lib: number, key: string) =>
+            key === 'GONE0001' ? null : { key, libraryID: 1 });
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        expect(simplified).toContain('<citation id="u-PARENT1" loc="page5" ref="c_PARENT1_0"/>');
+    });
+
+    it('keeps the recorded physical page of a deleted child over its printed locator', () => {
+        const declared = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [i, String(i + 1)]));
+        const gone = (key: string) => (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn(
+            (_lib: number, k: string) => k === key ? null : { key: k, libraryID: 1 });
+        gone('GONE0003');
+        const attachment = metaCitation('PARENT1', '1205', { v: 1, loc: 'page5', att: 'GONE0003' });
+        expect(simplifyNoteHtml(wrap(`<p>${attachment}</p>`), 1, { 'u-PARENT1': declared }).simplified)
+            .toContain('<citation id="u-PARENT1" loc="page5" ref="c_PARENT1_0"/>');
+        gone('ANNOTGON');
+        const annotation = metaCitation('PARENT1', '1205', { v: 1, loc: 'page5', ann: 'ANNOTGON' });
+        expect(simplifyNoteHtml(wrap(`<p>${annotation}</p>`), 1, { 'u-PARENT1': declared }).simplified)
+            .toContain('<citation id="u-PARENT1" loc="page5" ref="c_PARENT1_0"/>');
+    });
+
+    it('shows the stored page of a citation whose metadata records only the attachment', () => {
+        const raw = metaCitation('PARENT1', '100', { v: 1, att: 'ATTACH01' });
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        const tag = '<citation id="u-ATTACH01" loc="page100" ref="c_ATTACH01_0"/>';
+        expect(simplified).toContain(tag);
+        expect(expandToRawHtml(tag, metadata, 'new')).toBe(metadata.elements.get('c_ATTACH01_0')!.rawHtml);
+    });
+
+    it('translates the stored page of an attachment-only citation with its labels', () => {
+        const raw = metaCitation('PARENT1', '100', { v: 1, att: 'ATTACH01' });
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1, { 'u-ATTACH01': { 1: '100' } });
+        expect(simplified).toContain('<citation id="u-ATTACH01" loc="page2" ref="c_ATTACH01_0"/>');
+    });
+
+    it('adds the ref to a legacy att_id tag in old_string', () => {
+        const raw = metaCitation('PARENT1', '5', { v: 1, loc: 'page5', att: 'ATTACH01' });
+        const { metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        expect(enrichOldStringCitationRefs('<citation att_id="1-ATTACH01" page="5"/>', metadata))
+            .toBe('<citation att_id="1-ATTACH01" page="5" ref="c_ATTACH01_0"/>');
+    });
+
+    it('names a cited work that is neither a library item nor carries AsterMargin metadata', () => {
+        const uri = 'https://doi.org/10.1/edited';
+        const citation = { citationItems: [{ uris: [uri], locator: '4' }], properties: {} };
+        const span = `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citation))}">(Doe, 2019, p. 4)</span>`;
+        const cache = [{ uris: [uri], itemData: { title: 'Edited Work', author: [{ family: 'Doe' }], issued: { 'date-parts': [[2019]] } } }];
+        const html = `<div data-schema-version="9" data-citation-items="${encodeURIComponent(JSON.stringify(cache))}"><p>${span}</p></div>`;
+        const { simplified, metadata } = simplifyNoteHtml(html, 1);
+        const tag = '<citation ref="c_embedded_0" label="Doe 2019, Edited Work" url="https://doi.org/10.1/edited"/>';
+
+        expect(simplified).toContain(tag);
+        expect(simplified).not.toContain('unknown');
+        const stored = metadata.elements.get('c_embedded_0')!.rawHtml;
+        expect(expandToRawHtml(tag, metadata, 'old')).toBe(stored);
+        expect(expandToRawHtml(tag, metadata, 'new')).toBe(stored);
+    });
+
+    it('re-simplifies a cached note once a cited attachment is gone', () => {
+        const raw = metaCitation('PARENT1', '12', { v: 1, loc: 's5.6', att: 'GONE0002' });
+        const html = wrap(`<p>${raw}</p>`);
+        invalidateSimplificationCache('child-note');
+        expect(getOrSimplify('child-note', html, 1).simplified).toContain('id="u-GONE0002"');
+
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn((_lib: number, key: string) =>
+            key === 'GONE0002' ? null : { key, libraryID: 1 });
+        const again = getOrSimplify('child-note', html, 1);
+        expect(again.simplified).toContain('<citation id="u-PARENT1" loc="page5" ref="c_PARENT1_0"/>');
+        expect(again.isStale).toBe(true);
+
+        // And back once the attachment is available again (e.g. after a sync).
+        (globalThis as any).Zotero.Items.getByLibraryAndKey = vi.fn((_lib: number, key: string) => ({ key, libraryID: 1 }));
+        expect(getOrSimplify('child-note', html, 1).simplified).toContain('id="u-GONE0002" loc="s5.6"');
+    });
+
+    it('reads an embedded work whose DOI ends like a Zotero item URI as the work', () => {
+        const uri = 'https://doi.org/10.1234/items/ABCD1234';
+        const citation = { citationItems: [{ uris: [uri], astermargin: { v: 1, ext: 'W7', csl: { title: 'DOI Work' } } }], properties: {} };
+        const span = `<span class="citation" data-citation="${encodeURIComponent(JSON.stringify(citation))}">(DOI Work)</span>`;
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${span}</p>`), 1);
+        expect(simplified).toContain(`<citation external_id="W7" ref="c_ext_W7_0" label="DOI Work" url="${uri}"/>`);
+        expect(simplified).not.toContain('u-ABCD1234');
+    });
+
+    it('ignores metadata of another version', () => {
+        const raw = metaCitation('PARENT1', '12', { v: 2, loc: 's5.6' });
+        const { simplified } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        expect(simplified).toContain('<citation id="u-PARENT1" loc="page12" ref="c_PARENT1_0"/>');
+    });
+
+    it('rebuilds the citation when its locator changes', () => {
+        const raw = metaCitation('PARENT1', '12', { v: 1, loc: 's5.6' });
+        const { metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        const edited = '<citation id="u-PARENT1" loc="s7.1" ref="c_PARENT1_0"/>';
+        const resolvedLocatorPages = { 'zotero:u-PARENT1:s7.1': { label: '7', page: 7, locator: '7' } };
+
+        expandToRawHtml(edited, metadata, 'new', undefined, undefined, resolvedLocatorPages);
+        expect(createCitationHTML).toHaveBeenCalledWith(
+            expect.objectContaining({ key: 'PARENT1' }), '7', undefined, { v: 1, loc: 's7.1' },
+        );
+    });
+
+    it('keeps a citation whose locator is only spelled differently', () => {
+        const raw = metaCitation('PARENT1', '12', { v: 1, loc: 'page12' });
+        const { metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        const stored = metadata.elements.get('c_PARENT1_0')!.rawHtml;
+        expect(expandToRawHtml('<citation id="u-PARENT1" page="12" ref="c_PARENT1_0"/>', metadata, 'new'))
+            .toBe(stored);
+    });
+
+    it('cites an annotation as its parent item, at the annotation page', () => {
+        const parent = { id: 30, key: 'PARENT1', libraryID: 1, isRegularItem: () => true, isAttachment: () => false, getField: () => 'Parent' };
+        const attachment = { id: 40, key: 'ATTACH01', libraryID: 1, parentID: 30, isAttachment: () => true };
+        const annotation = {
+            id: 50, key: 'ANNOT001', libraryID: 1, parentID: 40, annotationPageLabel: '7',
+            isAnnotation: () => true, isAttachment: () => false, isNote: () => false, isRegularItem: () => false,
+        };
+        const zotero = (globalThis as any).Zotero;
+        zotero.Items.getByLibraryAndKey = vi.fn((_lib: number, key: string) =>
+            ({ ANNOT001: annotation, PARENT1: parent } as any)[key] ?? null);
+        zotero.Items.get = vi.fn((id: number) => ({ 30: parent, 40: attachment } as any)[id] ?? null);
+
+        const raw = expandToRawHtml('<citation id="1-ANNOT001"/>', { elements: new Map() }, 'new');
+        expect(buildNoteCitation).toHaveBeenCalledWith(parent, '7', undefined, { v: 1, ann: 'ANNOT001' });
+        expect(decodeCitation(raw).citationItems[0]).toMatchObject({
+            uris: ['http://zotero.org/users/1/items/PARENT1'],
+            locator: '7',
+            astermargin: { v: 1, ann: 'ANNOT001' },
+        });
+        expect(decodeCitation(raw).citationItems[0].itemData).toBeUndefined();
+
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        const tag = '<citation id="u-ANNOT001" ref="c_ANNOT001_0"/>';
+        expect(simplified.trim()).toBe(`<p>${tag}</p>`);
+        expect(expandToRawHtml(tag, metadata, 'new')).toBe(metadata.elements.get('c_ANNOT001_0')!.rawHtml);
+    });
+
+    it('cites an annotation labelled "-" without a page', () => {
+        const parent = { id: 30, key: 'PARENT1', libraryID: 1, isRegularItem: () => true, isAttachment: () => false, getField: () => 'Parent' };
+        const attachment = { id: 40, key: 'ATTACH01', libraryID: 1, parentID: 30, isAttachment: () => true };
+        const annotation = {
+            id: 50, key: 'ANNOT001', libraryID: 1, parentID: 40, annotationPageLabel: '-',
+            annotationPosition: JSON.stringify({ pageIndex: 0, rects: [[0, 0, 1, 1]] }),
+            isAnnotation: () => true, isAttachment: () => false, isNote: () => false, isRegularItem: () => false,
+        };
+        const zotero = (globalThis as any).Zotero;
+        zotero.Items.getByLibraryAndKey = vi.fn((_lib: number, key: string) =>
+            ({ ANNOT001: annotation, PARENT1: parent } as any)[key] ?? null);
+        zotero.Items.get = vi.fn((id: number) => ({ 30: parent, 40: attachment } as any)[id] ?? null);
+
+        expandToRawHtml('<citation id="1-ANNOT001"/>', { elements: new Map() }, 'new');
+        expect(buildNoteCitation).toHaveBeenCalledWith(parent, undefined, undefined, { v: 1, loc: 'page1', ann: 'ANNOT001' });
+    });
+
+    it('records the physical page of a cited annotation without showing it as a locator', () => {
+        const parent = { id: 30, key: 'PARENT1', libraryID: 1, isRegularItem: () => true, isAttachment: () => false, getField: () => 'Parent' };
+        const attachment = { id: 40, key: 'ATTACH01', libraryID: 1, parentID: 30, isAttachment: () => true };
+        const annotation = {
+            id: 50, key: 'ANNOT001', libraryID: 1, parentID: 40, annotationPageLabel: '1205',
+            annotationPosition: JSON.stringify({ pageIndex: 4, rects: [[0, 0, 1, 1]] }),
+            isAnnotation: () => true, isAttachment: () => false, isNote: () => false, isRegularItem: () => false,
+        };
+        const zotero = (globalThis as any).Zotero;
+        zotero.Items.getByLibraryAndKey = vi.fn((_lib: number, key: string) =>
+            ({ ANNOT001: annotation, PARENT1: parent } as any)[key] ?? null);
+        zotero.Items.get = vi.fn((id: number) => ({ 30: parent, 40: attachment } as any)[id] ?? null);
+
+        const raw = expandToRawHtml('<citation id="1-ANNOT001"/>', { elements: new Map() }, 'new');
+        expect(buildNoteCitation).toHaveBeenCalledWith(parent, '1205', undefined, { v: 1, loc: 'page5', ann: 'ANNOT001' });
+        // While the annotation exists, its citation reads back without a locator.
+        expect(simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1).simplified.trim())
+            .toBe('<p><citation id="u-ANNOT001" ref="c_ANNOT001_0"/></p>');
+    });
+
+    it('adds the ref to an old_string citation by the locator it was shown with', () => {
+        const raw = metaCitation('PARENT1', '12', { v: 1, loc: 's5.6', att: 'ATTACH01' });
+        const { metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+
+        expect(enrichOldStringCitationRefs('<citation id="u-ATTACH01" loc="s5.6"/>', metadata))
+            .toBe('<citation id="u-ATTACH01" loc="s5.6" ref="c_ATTACH01_0"/>');
+        expect(enrichOldStringCitationRefs('<citation id="u-ATTACH01" loc="s5.7"/>', metadata)).toBeNull();
+    });
+
+    it('does not match a structural locator to a citation shown without one', () => {
+        const { metadata } = simplifyNoteHtml(wrap(`<p>${rawCitation('PLAIN1')}</p>`), 1);
+        expect(enrichOldStringCitationRefs('<citation id="u-PLAIN1" loc="s5.6"/>', metadata)).toBeNull();
+        expect(enrichOldStringCitationRefs('<citation id="u-PLAIN1"/>', metadata))
+            .toBe('<citation id="u-PLAIN1" ref="c_PLAIN1_0"/>');
+    });
+
+    it('gives a citation of an EPUB no page, but keeps the locator', () => {
+        const epub = {
+            id: 60, key: 'EPUB0001', libraryID: 1, isAttachment: () => true,
+            attachmentContentType: 'application/epub+zip', attachmentLinkMode: 0,
+        };
+        const book = {
+            id: 61, key: 'BOOK0001', libraryID: 1, isAttachment: () => false, isRegularItem: () => true,
+            getAttachments: () => [60], getField: () => 'Book',
+        };
+        const zotero = (globalThis as any).Zotero;
+        zotero.Items.getByLibraryAndKey = vi.fn(() => book);
+        zotero.Items.get = vi.fn((id: number) => (id === 60 ? epub : null));
+
+        expandToRawHtml('<citation id="1-BOOK0001" loc="page3"/>', { elements: new Map() }, 'new');
+        expect(createCitationHTML).toHaveBeenCalledWith(book, undefined, undefined, { v: 1, loc: 'page3' });
+    });
+
+    it('keeps a chapter locator on an item whose only attachment is an EPUB', () => {
+        const epub = {
+            id: 60, key: 'EPUB0001', libraryID: 1, isAttachment: () => true,
+            attachmentContentType: 'application/epub+zip', attachmentLinkMode: 0,
+        };
+        const book = {
+            id: 61, key: 'BOOK0001', libraryID: 1, isAttachment: () => false, isRegularItem: () => true,
+            getAttachments: () => [60], getField: () => 'Book',
+        };
+        const zotero = (globalThis as any).Zotero;
+        zotero.Items.getByLibraryAndKey = vi.fn(() => book);
+        zotero.Items.get = vi.fn((id: number) => (id === 60 ? epub : null));
+        const raw = rawCitationWithCSLLabel('BOOK0001', 1, '3', 'chapter');
+        const { simplified, metadata } = simplifyNoteHtml(wrap(`<p>${raw}</p>`), 1);
+        const edited = simplified.match(/<citation [^>]*\/>/)![0].replace('loc="page3"', 'loc="page4"');
+
+        expandToRawHtml(edited, metadata, 'new');
+        expect(createCitationHTML).toHaveBeenCalledWith(book, '4', { label: 'chapter' }, undefined);
+    });
+});
+

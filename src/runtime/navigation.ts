@@ -1,0 +1,100 @@
+type MainWindow = ReturnType<typeof Zotero.getMainWindow>;
+
+export class WindowUnavailableError extends Error {
+    readonly code = 'window_unavailable';
+    constructor() { super('The destination Zotero window is unavailable'); }
+}
+
+export function isMainWindow(win: Window | null | undefined): win is MainWindow {
+    return !!win && !win.closed && !!(win as MainWindow).ZoteroPane
+        && !!(win as MainWindow).Zotero_Tabs;
+}
+
+/** Resolve borrowed UI hosts without confusing reader windows with chat runtimes. */
+export function contextMainWindow(origin?: Window | null): MainWindow | null {
+    if (!origin || origin.closed) return null;
+    const runtime = origin.__astermarginRuntime;
+    if (runtime?.status === 'closing') return null;
+    if (runtime && isMainWindow(runtime.contextWindow)) return runtime.contextWindow;
+    if (isMainWindow(origin)) return origin;
+    const owner = origin.__astermarginOwnerWindowRef?.deref();
+    return owner && owner !== origin ? contextMainWindow(owner) : null;
+}
+
+/** Originless user commands choose once; local commands never fall through to another chat. */
+export async function resolveNavigationWindow(origin?: Window | null): Promise<MainWindow> {
+    let target: MainWindow | null;
+    if (origin) {
+        target = contextMainWindow(origin);
+        if (!target) throw new WindowUnavailableError();
+    }
+    else {
+        target = Zotero.getMainWindow();
+        if (!target || target.closed) {
+            // Zotero opens asynchronously and does not return the new window.
+            (Zotero as any).openMainWindow();
+            target = null;
+        }
+    }
+    const deadline = Date.now() + 15000;
+    for (;;) {
+        // Reacquire until a window appears, then retain that command's target.
+        if (!target) target = Zotero.getMainWindow();
+        if (target && (target.closed || target.__astermarginRuntime?.status === 'closing')) throw new WindowUnavailableError();
+        if (isMainWindow(target) && target.ZoteroPane.itemsView && target.ZoteroPane.collectionsView) {
+            // The items view exists before the collections tree restores its initial
+            // selection. Wait for that restoration before navigating or scrolling.
+            await target.ZoteroPane.collectionsView.waitForLoad();
+            if (contextMainWindow(target) !== target) throw new WindowUnavailableError();
+            await target.ZoteroPane.itemsView.waitForLoad();
+            if (contextMainWindow(target) !== target) throw new WindowUnavailableError();
+            return target;
+        }
+        if (Date.now() >= deadline) throw new WindowUnavailableError();
+        await Zotero.Promise.delay(50);
+    }
+}
+
+/** Main origins stay local; standalone reader/note commands choose a live chat. */
+export async function resolveChatWindow(
+    origin?: Window | null,
+): Promise<MainWindow> {
+    if (origin?.closed) throw new WindowUnavailableError();
+    const own = origin && Zotero.AsterMargin?.runtime.resolveWindowFrom(origin);
+    // A table window has no chat: its commands choose one as originless ones do.
+    if (own?.kind === 'table') return resolveChatWindow();
+    if (own) return own.hostWindow as MainWindow;
+    const hasLocalOwner = origin && (isMainWindow(origin) || origin.__astermarginRuntime || origin.__astermarginOwnerWindowRef);
+    const win = await resolveNavigationWindow(hasLocalOwner ? origin : undefined);
+    const deadline = Date.now() + 15000;
+    while (!win.closed && win.__astermarginRuntime?.status !== 'ready') {
+        if (win.__astermarginRuntime?.status === 'closing' || Date.now() >= deadline) throw new WindowUnavailableError();
+        await Zotero.Promise.delay(50);
+    }
+    if (win.closed || win.__astermarginRuntime?.status === 'closing' || !win.__astermarginEventBus) {
+        throw new WindowUnavailableError();
+    }
+    return win;
+}
+
+/** Tagged notifications are filtered; legacy notifications require reading local tab state. */
+export function acceptsTabEvent(win: MainWindow, ids: readonly (string | number)[], extraData: any): boolean {
+    const tabs = win?.Zotero_Tabs as any;
+    if (!tabs || win.closed) return false;
+    return ids.some(id => {
+        if (typeof tabs.isOwnTabEvent === 'function') return tabs.isOwnTabEvent(extraData, id);
+        const windowID = extraData?.[id]?.windowID;
+        return windowID == null || tabs.windowID == null || windowID === tabs.windowID;
+    });
+}
+
+/** Untagged events are hints: always read the receiving window's actual selection. */
+export function selectedTabIfAccepted(win: MainWindow, ids: readonly (string | number)[], extraData: any) {
+    if (!acceptsTabEvent(win, ids, extraData)) return undefined;
+    return win.Zotero_Tabs._tabs.find(tab => tab.id === win.Zotero_Tabs.selectedID);
+}
+
+/** Reader saves carry their instance ID; sync/background writes must not stage draft items. */
+export function isReaderAnnotationEvent(reader: { _instanceID?: string } | null, id: string | number, extraData: any): boolean {
+    return reader?._instanceID != null && extraData?.[id]?.instanceID === reader._instanceID;
+}

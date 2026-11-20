@@ -1,0 +1,426 @@
+import React from 'react';
+import { Icon, TickIcon, CSSItemTypeIcon, CSSIcon } from '../../../icons/icons';
+import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
+import { getDisplayNameFromItem, isValidZoteroItem } from '../../../../utils/sourceUtils';
+import { ZoteroTag } from '@astermargin/agent-core/types/zotero';
+import { ThreadItemFilter } from '../../../../atoms/ui';
+import { highlightQuery } from './highlightQuery';
+import { normalizeQuickSearchQuery } from '../../../../utils/search';
+import { unrankedMatch, type UnrankedMatchField } from '../../../../../src/services/librarySearch/ranking';
+
+/** How a row introduces the field it matched on, when that is not its title or authors. */
+const UNRANKED_MATCH_PREFIX: Record<UnrankedMatchField, string> = {
+    publicationTitle: 'in ',
+    shortTitle: 'Short title: ',
+    court: 'Court: ',
+    citationKey: 'Citation key: ',
+    key: 'Item key: ',
+};
+
+/**
+ * Context for creating source menu items
+ */
+export interface SourceMenuItemContext {
+    /**
+     * Whether the item is already attached. A predicate rather than the attached
+     * list: the message-edit overlay's attachments are wire records, not
+     * `Zotero.Item`s. Keep it referentially stable across keystrokes — the menu
+     * hooks use the containing context as a fetch-effect dependency.
+     */
+    isAttached: (item: Zotero.Item) => boolean;
+    /** Whether `onAdd` can take the item; rows it refuses are not offered. */
+    canAdd?: (item: Zotero.Item) => boolean;
+    /** The item a row offers in a candidate's place, or null to leave it out (see `AddSourcesTarget`). */
+    asSourceItem?: (item: Zotero.Item) => Zotero.Item | null;
+    onAdd: (item: Zotero.Item) => void;
+    onRemove: (item: Zotero.Item) => void;
+}
+
+/**
+ * Context for creating thread filter menu items
+ */
+export interface ThreadFilterMenuItemContext {
+    activeFilter: ThreadItemFilter | null;
+    onSelect: (item: Zotero.Item) => void;
+}
+
+/**
+ * Context for creating library menu items
+ */
+export interface LibraryMenuItemContext {
+    currentLibraryIds: number[];
+    onSelect: (libraryId: number) => void;
+}
+
+/**
+ * Context for creating collection menu items
+ */
+export interface CollectionMenuItemContext {
+    currentCollectionIds: number[];
+    onSelect: (collectionId: number) => void;
+}
+
+/**
+ * Context for creating tag menu items
+ */
+export interface TagMenuItemContext {
+    currentTags: ZoteroTag[];
+    onSelect: (tag: ZoteroTag) => void;
+}
+
+/**
+ * Context for creating saved-search menu items
+ */
+export interface SavedSearchMenuItemContext {
+    /** Whether the target already has the saved search, for its checkmark. */
+    isPicked: (search: Zotero.Search) => boolean;
+    onSelect: (search: Zotero.Search) => void;
+}
+
+/**
+ * Create a menu item from a Zotero item (for sources mode)
+ */
+export async function createSourceMenuItem(
+    item: Zotero.Item,
+    context: SourceMenuItemContext,
+    /** Active search query, for highlighting what matched. */
+    searchQuery = ''
+): Promise<SearchMenuItem> {
+    const { isAttached, onAdd, onRemove } = context;
+    
+    const title = item.getDisplayTitle();
+    // A search hit found only through a field the row does not otherwise show
+    // (its journal, its citation key) names that field, so the row explains
+    // why it is listed.
+    const match = searchQuery ? unrankedMatch(item, normalizeQuickSearchQuery(searchQuery)) : null;
+
+    // Determine item status
+    const { valid: isValid } = await isValidZoteroItem(item);
+    const isInCurrentMessageItems = isAttached(item);
+
+    // Handle menu item click
+    const handleMenuItemClick = async () => {
+        if (!isValid) return;
+        
+        // Check if source already exists
+        const exists = isAttached(item);
+        
+        // Add or remove source
+        if (!exists) {
+            onAdd(item);
+        } else {
+            onRemove(item);
+        }
+    };
+
+    // Get the icon element for the item
+    const getIconElement = (item: Zotero.Item) => {
+        const iconName = item.getItemTypeIconName();
+        const iconElement = iconName ? (
+            <span className="scale-80">
+                <CSSItemTypeIcon itemType={iconName} />
+            </span>
+        ) : null;
+        return iconElement;
+    };
+    
+    // Create the menu item
+    return {
+        label: getDisplayNameFromItem(item) + " " + title,
+        onClick: handleMenuItemClick,
+        customContent: (
+            <div className={`display-flex flex-row gap-2 items-start min-w-0 ${!isValid ? 'opacity-70' : ''}`}>
+                {getIconElement(item)}
+                <div className="display-flex flex-col gap-2 min-w-0 font-color-secondary">
+                    <div className="display-flex flex-row justify-between min-w-0">
+                        <span className={`truncate ${isValid ? 'font-color-secondary' : 'font-color-red'}`}>
+                            {highlightQuery(getDisplayNameFromItem(item), searchQuery)}
+                        </span>
+                        {isInCurrentMessageItems && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                    </div>
+                    <span className={`truncate text-sm ${isValid ? 'font-color-tertiary' : 'font-color-red'} min-w-0`}>
+                        {highlightQuery(title, searchQuery)}
+                    </span>
+                    {match && (
+                        <span className="truncate text-sm font-color-tertiary min-w-0">
+                            {UNRANKED_MATCH_PREFIX[match.field]}{highlightQuery(match.value, searchQuery)}
+                        </span>
+                    )}
+                </div>
+            </div>
+        ),
+    };
+}
+
+/**
+ * Create a menu item from a Zotero item for the thread filter menu
+ * (`ThreadFilterMenu`). Unlike `createSourceMenuItem`, selecting a row
+ * replaces the active thread filter rather than toggling an "attached"
+ * state, and the tick mark reflects whether this item is the current filter.
+ */
+export function createThreadFilterMenuItem(
+    item: Zotero.Item,
+    context: ThreadFilterMenuItemContext
+): SearchMenuItem {
+    const { activeFilter, onSelect } = context;
+
+    const title = item.getDisplayTitle();
+    const displayName = getDisplayNameFromItem(item);
+    const isActiveFilter = Boolean(
+        activeFilter &&
+        activeFilter.libraryId === item.libraryID &&
+        activeFilter.itemKey === item.key
+    );
+
+    const iconName = item.getItemTypeIconName();
+    const iconElement = iconName ? (
+        <span className="scale-80">
+            <CSSItemTypeIcon itemType={iconName} />
+        </span>
+    ) : null;
+
+    return {
+        label: displayName + " " + title,
+        onClick: () => onSelect(item),
+        customContent: (
+            <div className="display-flex flex-row gap-2 items-start min-w-0">
+                {iconElement}
+                <div className="display-flex flex-col gap-2 min-w-0 font-color-secondary">
+                    <div className="display-flex flex-row justify-between min-w-0">
+                        <span className="truncate font-color-secondary">
+                            {displayName}
+                        </span>
+                        {isActiveFilter && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                    </div>
+                    {title && title !== displayName && (
+                        <span className="truncate text-sm font-color-tertiary min-w-0">
+                            {title}
+                        </span>
+                    )}
+                </div>
+            </div>
+        ),
+    };
+}
+
+/**
+ * Create a menu item from a Zotero library (for libraries mode)
+ */
+export function createLibraryMenuItem(
+    library: _ZoteroTypes.Library.LibraryLike,
+    context: LibraryMenuItemContext,
+    /** Active search query, for highlighting what matched. */
+    searchQuery = ''
+): SearchMenuItem {
+    const { currentLibraryIds, onSelect } = context;
+    const isSelected = currentLibraryIds.includes(library.libraryID);
+
+    const getIconElement = (library: _ZoteroTypes.Library.LibraryLike) => {
+        return (
+            <span className="scale-90">
+                <CSSIcon name={library.isGroup ? "library-group" : "library"} className="icon-16" />
+            </span>
+        );
+    };
+    
+    return {
+        label: library.name,
+        onClick: () => onSelect(library.libraryID),
+        customContent: (
+            <div className={'display-flex flex-row gap-2 items-start min-w-0'}>
+                {getIconElement(library)}
+                <div className="display-flex flex-row justify-between flex-1 min-w-0 font-color-secondary">
+                    <span className="truncate">
+                        {highlightQuery(library.name, searchQuery)}
+                    </span>
+                    {isSelected && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                </div>
+            </div>
+        ),
+    };
+}
+
+/**
+ * Create a menu item from a Zotero collection (for collections mode)
+ */
+export function createCollectionMenuItem(
+    collection: Zotero.Collection,
+    context: CollectionMenuItemContext,
+    /** Active search query, for highlighting what matched. */
+    searchQuery = ''
+): SearchMenuItem {
+    const { currentCollectionIds, onSelect } = context;
+    const isSelected = currentCollectionIds.includes(collection.id);
+
+    return {
+        label: collection.name,
+        onClick: () => onSelect(collection.id),
+        customContent: (
+            <div className={'display-flex flex-row gap-2 items-start min-w-0'}>
+                <CSSIcon name="collection" className="icon-16 scale-90" />
+                <div className="display-flex flex-row justify-between flex-1 min-w-0 font-color-secondary">
+                    <span className="truncate">
+                        {highlightQuery(collection.name, searchQuery)}
+                    </span>
+                    {isSelected && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                </div>
+            </div>
+        ),
+    };
+}
+
+/**
+ * Create a menu item from a Zotero saved search (for saved-searches mode)
+ */
+export function createSavedSearchMenuItem(
+    search: Zotero.Search,
+    context: SavedSearchMenuItemContext,
+    /** Active search query, for highlighting what matched. */
+    searchQuery = ''
+): SearchMenuItem {
+    const isSelected = context.isPicked(search);
+    return {
+        label: search.name,
+        onClick: () => context.onSelect(search),
+        customContent: (
+            <div className={'display-flex flex-row gap-2 items-start min-w-0'}>
+                <CSSIcon name="search" className="icon-16 scale-90" />
+                <div className="display-flex flex-row justify-between flex-1 min-w-0 font-color-secondary">
+                    <span className="truncate">
+                        {highlightQuery(search.name, searchQuery)}
+                    </span>
+                    {isSelected && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                </div>
+            </div>
+        ),
+    };
+}
+
+/**
+ * Create a menu item from a Zotero note item (for notes mode)
+ */
+export async function createNoteMenuItem(
+    note: Zotero.Item,
+    context: SourceMenuItemContext,
+    /** Active search query, for highlighting what matched. */
+    searchQuery = ''
+): Promise<SearchMenuItem> {
+    const { isAttached, onAdd, onRemove } = context;
+
+    const title = note.getNoteTitle() || 'Untitled Note';
+    const isInCurrentMessageItems = isAttached(note);
+
+    // Get secondary text: parent info for child notes, content snippet for standalone
+    let secondaryText = '';
+    try {
+        if (note.parentItem) {
+            const parent = note.parentItem;
+            const firstCreator = parent.firstCreator || '';
+            const year = parent.getField('date')?.match(/\d{4}/)?.[0] || '';
+            secondaryText = firstCreator
+                ? `Note on ${firstCreator}${year ? ` ${year}` : ''}`
+                : `Note on ${parent.getDisplayTitle() || 'item'}`;
+        } else {
+            const noteContent = note.getNote() || '';
+            const textContent = noteContent.replace(/<[^>]*>/g, '').trim();
+            const afterTitle = textContent.startsWith(title)
+                ? textContent.slice(title.length).trim()
+                : textContent;
+            if (afterTitle) {
+                secondaryText = afterTitle.slice(0, 80) + (afterTitle.length > 80 ? '\u2026' : '');
+            } else {
+                secondaryText = 'Standalone note';
+            }
+        }
+    } catch {
+        secondaryText = '';
+    }
+
+    const handleMenuItemClick = async () => {
+        const exists = isAttached(note);
+        if (!exists) {
+            onAdd(note);
+        } else {
+            onRemove(note);
+        }
+    };
+
+    const iconName = note.getItemTypeIconName();
+    const iconElement = iconName ? (
+        <span className="scale-80">
+            <CSSItemTypeIcon itemType={iconName} />
+        </span>
+    ) : null;
+
+    return {
+        label: title + ' ' + secondaryText,
+        onClick: handleMenuItemClick,
+        customContent: (
+            <div className="display-flex flex-row gap-2 items-start min-w-0">
+                {iconElement}
+                <div className="display-flex flex-col gap-2 min-w-0 font-color-secondary">
+                    <div className="display-flex flex-row justify-between min-w-0">
+                        <span className="truncate font-color-secondary">
+                            {highlightQuery(title, searchQuery)}
+                        </span>
+                        {isInCurrentMessageItems && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                    </div>
+                    {secondaryText && (
+                        <span className="truncate text-sm font-color-tertiary min-w-0">
+                            {highlightQuery(secondaryText, searchQuery)}
+                        </span>
+                    )}
+                </div>
+            </div>
+        ),
+    };
+}
+
+/**
+ * Create a menu item from a Zotero tag (for tags mode)
+ */
+export function createTagMenuItem(
+    tag: ZoteroTag,
+    context: TagMenuItemContext,
+    /** Active search query, for highlighting what matched. */
+    searchQuery = ''
+): SearchMenuItem {
+    const { currentTags, onSelect } = context;
+    const isSelected = currentTags.some((selected) => selected.id === tag.id);
+
+    // Render colored dot if tag has a color, otherwise use tag icon
+    const tagIndicator = tag.color ? (
+        <span
+            className="tag-color-dot mt-15"
+            style={{
+                display: 'inline-block',
+                width: '0.72em',
+                height: '0.72em',
+                marginRight: '0.27em',
+                borderRadius: '50%',
+                backgroundColor: tag.color,
+                verticalAlign: '-0.36em',
+                flexShrink: 0,
+            }}
+        />
+    ) : (
+        // <CSSIcon name="tag" className="icon-16 scale-90" />
+        null
+    );
+
+    return {
+        label: tag.tag,
+        onClick: () => onSelect(tag),
+        customContent: (
+            <div className={'display-flex flex-row gap-05 items-start min-w-0'}>
+                {tagIndicator}
+                <div className={`display-flex flex-row justify-between flex-1 min-w-0 font-color-secondary ${tag.type === 0 ? 'font-semibold' : ''}`}>
+                    <span className="truncate">
+                        {highlightQuery(tag.tag, searchQuery)}
+                    </span>
+                    {isSelected && <Icon icon={TickIcon} className="scale-12 ml-2" />}
+                </div>
+            </div>
+        ),
+    };
+}

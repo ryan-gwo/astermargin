@@ -1,0 +1,62 @@
+import type { ReaderActionLocation } from '../../src/runtime/readerActionLocation';
+import type { ActionTargetType } from '@astermargin/agent-core/types/actions';
+
+export interface AsterMarginEvents {
+    toggleChat: {
+        forceOpen?: boolean;
+        skipAutoPopulate?: boolean;
+    };
+    loadThread: {
+        threadId: string;
+        runId?: string;
+    };
+    contextMenuAction: {
+        actionId: string;
+        /** Action title at dispatch time; fallback for the /command token when
+         *  the action can't be found in the store (e.g. deleted mid-flight). */
+        actionTitle: string;
+        targetType: ActionTargetType;
+        itemIds: number[];
+        /** Every collection the action targets. Empty for non-collection
+         *  dispatches and whenever the selection is not purely collections and
+         *  collection-like views.
+         *  Carries each collection's library so the receiver can apply
+         *  library-exclusion filtering before looking the collection up. */
+        collections: { libraryId: number; collectionId: number }[];
+        /** Every saved search or special view (Unfiled Items, …) the action
+         *  targets, with its library for the same exclusion filtering. `type`
+         *  is the collections-tree row type; `key` is set for saved searches. */
+        views: { libraryId: number; type: string; name: string; key?: string }[];
+    };
+    readerSelectionAction: {
+        action: 'explain' | 'ask';
+        text: string;
+        page?: number;
+        readerItemID: number;
+        readerLocation?: ReaderActionLocation;
+    };
+    readerAnnotationAction: {
+        action: 'explain' | 'ask';
+        annotationIds: string[];
+        readerItemID: number;
+        readerLocation?: ReaderActionLocation;
+    };
+    readerVisualizerAction: {
+        readerInstanceID: string;
+        action:
+            | 'items'
+            | 'sentences'
+            | 'clear'
+            | 'copy-extract-fixture-command'
+            | 'copy-ocr-fixture-command';
+    };
+    focusInput: Record<string, never>;
+    /** The quick prompt shortcut: open or close the closed-sidebar composer. */
+    toggleQuickPrompt: Record<string, never>;
+    'background-worker:status': {
+        running: boolean;
+    };
+}
+
+export type AsterMarginEventName = keyof AsterMarginEvents;
+export type AsterMarginEventDetail<T extends AsterMarginEventName> = AsterMarginEvents[T]; 

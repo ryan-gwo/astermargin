@@ -1,0 +1,685 @@
+const previewRuntime = vi.hoisted(() => ({ id: 'preview-test', contextWindow: {} }));
+vi.mock('../../../react/runtime/windowRuntime', () => ({ tryGetWindowRuntime: () => previewRuntime }));
+import { beforeEach } from 'vitest';
+import { installMutationInstance } from '../../helpers/mutationInstance';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({ logger: vi.fn() }));
+
+vi.mock('../../../react/store', () => ({
+    store: { get: vi.fn(() => null) },
+}));
+
+vi.mock('@astermargin/agent-core/citations/externalReferences', () => ({
+    externalReferenceMappingAtom: Symbol('externalReferenceMappingAtom'),
+    externalReferenceItemMappingAtom: Symbol('externalReferenceItemMappingAtom'),
+}));
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: {
+        auth: {
+            getSession: vi.fn(),
+        },
+    },
+}));
+
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test-user' })),
+}));
+
+vi.mock('../../../react/agents/agentActions', () => ({}));
+
+// Partial mocks for the showDiffPreview flow tests: normalizeNoteHtml needs a
+// DOM (identity is fine for already-normalized fixtures), and the preload
+// helpers hit Zotero. Everything else (expandToRawHtml and countOccurrences)
+// stays real so expansion behaves like production.
+vi.mock('../../../src/utils/noteHtmlSimplifier', async () => {
+    const actual = await vi.importActual<typeof import('../../../src/utils/noteHtmlSimplifier')>(
+        '../../../src/utils/noteHtmlSimplifier'
+    );
+    return {
+        ...actual,
+        normalizeNoteHtml: vi.fn((html: string) => html),
+        getOrSimplify: vi.fn((_noteId: string, html: string) => ({
+            simplified: html,
+            metadata: { elements: new Map() },
+            isStale: false,
+        })),
+    };
+});
+
+vi.mock('../../../src/utils/noteCitationExpand', async () => {
+    const actual = await vi.importActual<typeof import('../../../src/utils/noteCitationExpand')>(
+        '../../../src/utils/noteCitationExpand'
+    );
+    return {
+        ...actual,
+        preloadNotePageLabels: vi.fn(async () => ({})),
+        preloadStructuralLocatorPages: vi.fn(async () => ({ pages: {}, unresolved: [] })),
+        preloadPageLabelsForNewCitations: vi.fn(async () => ({})),
+    };
+});
+
+import {
+    constructMultiDiffHtml,
+    hashPreviewContent,
+    noteContentDriftedFromPreview,
+    showDiffPreview,
+    dismissDiffPreview,
+    setOnBannerAction,
+    isDiffPreviewPendingFor,
+    isDiffPreviewPending,
+} from '../../../react/utils/noteEditorDiffPreview';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { store } from '../../../react/store';
+import { searchableLibraryIdsAtom } from '../../../react/atoms/profile';
+import { preloadNotePageLabels } from '../../../src/utils/noteCitationExpand';
+
+describe('constructMultiDiffHtml', () => {
+    it('renders multiple append edits at the append point in edit order', () => {
+        const footer = '<p><span style="color: #aaa;"><strong>Created by AsterMargin</strong> \u00b7 <a href="zotero://astermargin/thread/t0/run/r0">Open Message</a></span></p>';
+        const html = `<div data-schema-version="9"><p>Existing</p>${footer}</div>`;
+        const result = constructMultiDiffHtml(html, [
+            { expandedOld: '', expandedNew: '<p>First append</p>', operation: 'append' },
+            { expandedOld: '', expandedNew: '<p>Second append</p>', operation: 'append' },
+        ]);
+
+        expect(result).not.toBeNull();
+        const firstIndex = result!.indexOf('First append');
+        const secondIndex = result!.indexOf('Second append');
+        expect(firstIndex).toBeGreaterThan(result!.indexOf('Existing'));
+        expect(secondIndex).toBeGreaterThan(firstIndex);
+        expect(secondIndex).toBeLessThan(result!.indexOf('Created by AsterMargin'));
+        expect(result!.indexOf('</div>')).toBeGreaterThan(secondIndex);
+    });
+
+    it('uses target anchors to preview the disambiguated repeated occurrence', () => {
+        const html = '<div><p>Repeat</p><p>Middle</p><p>Repeat</p></div>';
+        const secondStart = html.lastIndexOf('Repeat');
+        const result = constructMultiDiffHtml(html, [{
+            expandedOld: 'Repeat',
+            expandedNew: 'Changed',
+            operation: 'str_replace',
+            targetBeforeContext: html.substring(0, secondStart),
+            targetAfterContext: html.substring(secondStart + 'Repeat'.length),
+        }]);
+
+        expect(result).not.toBeNull();
+        expect(result).toContain('<p>Repeat</p><p>Middle</p>');
+        expect(result!.indexOf('Changed')).toBeGreaterThan(result!.indexOf('Middle'));
+    });
+
+    it('does not fall back to the first occurrence when target anchors are stale', () => {
+        const html = '<div><p>Repeat</p><p>Repeat</p></div>';
+        const result = constructMultiDiffHtml(html, [{
+            expandedOld: 'Repeat',
+            expandedNew: 'Changed',
+            operation: 'str_replace',
+            targetBeforeContext: '<p>missing context</p>',
+            targetAfterContext: '<p>also missing</p>',
+        }]);
+
+        expect(result).toBeNull();
+    });
+
+    it('previews the surviving occurrence when the validated occurrence was removed', () => {
+        // Validation disambiguated between two identical occurrences and
+        // anchored the SECOND one; the note then lost that occurrence. The
+        // survivor is now the unique match — which is exactly where execute
+        // would apply (matchCount === 1 short-circuits before anchors in
+        // resolveSingleTarget), so the preview must show it there rather
+        // than suppress the preview and let the user approve blind.
+        const originalHtml = '<div><p>Repeat</p><p>Middle</p><p>Repeat</p></div>';
+        const secondStart = originalHtml.lastIndexOf('Repeat');
+        const driftedHtml = '<div><p>Repeat</p><p>Middle</p><p>Changed already</p></div>';
+        const result = constructMultiDiffHtml(driftedHtml, [{
+            expandedOld: 'Repeat',
+            expandedNew: 'Changed',
+            operation: 'str_replace',
+            // Anchors captured against the ORIGINAL note's second occurrence.
+            targetBeforeContext: originalHtml.substring(0, secondStart),
+            targetAfterContext: originalHtml.substring(secondStart + 'Repeat'.length),
+        }]);
+
+        expect(result).not.toBeNull();
+        expect(result).toContain('Changed');
+        // The preview lands on the surviving first occurrence.
+        expect(result!.indexOf('Changed')).toBeLessThan(result!.indexOf('Middle'));
+    });
+
+    it('treats a self-overlapping needle as unique, matching executor counting', () => {
+        // "aa" occurs once in "aaa" by the executor's advance-by-length
+        // counting (countOccurrences); the fallback must agree or the
+        // preview suppresses an edit the executor happily applies.
+        const html = '<div><p>aaa</p></div>';
+        const result = constructMultiDiffHtml(html, [{
+            expandedOld: 'aa',
+            expandedNew: 'bb',
+            operation: 'str_replace',
+            targetBeforeContext: '<p>missing context</p>',
+            targetAfterContext: '<p>also missing</p>',
+        }]);
+
+        expect(result).not.toBeNull();
+        expect(result).toContain('bb');
+    });
+
+    it('previews the only occurrence when anchors are stale but old_string is unique', () => {
+        // Apply → undo round-trips re-serialize the note, so validation-time
+        // anchors routinely go stale; a unique target has no ambiguity for
+        // the anchors to guard against and must still preview.
+        const html = '<div><p>Alpha</p><p>Repeat</p><p>Omega</p></div>';
+        const result = constructMultiDiffHtml(html, [{
+            expandedOld: 'Repeat',
+            expandedNew: 'Changed',
+            operation: 'str_replace',
+            targetBeforeContext: '<p>missing context</p>',
+            targetAfterContext: '<p>also missing</p>',
+        }]);
+
+        expect(result).not.toBeNull();
+        expect(result).toContain('Changed');
+        expect(result!.indexOf('Alpha')).toBeLessThan(result!.indexOf('Changed'));
+        expect(result!.indexOf('Changed')).toBeLessThan(result!.indexOf('Omega'));
+    });
+});
+
+describe('preview revision guard', () => {
+    it('hashPreviewContent is stable for identical content and differs on change', () => {
+        const html = '<div data-schema-version="9"><p>Alpha content here.</p></div>';
+        expect(hashPreviewContent(html)).toBe(hashPreviewContent(html));
+        expect(hashPreviewContent(html)).not.toBe(hashPreviewContent(html + ' '));
+        expect(hashPreviewContent(html)).not.toBe(
+            hashPreviewContent(html.replace('Alpha', 'Beta')),
+        );
+    });
+
+    it('detects drift when the stored note no longer matches the preview snapshot', () => {
+        const previewedHtml = '<div><p>Original body</p></div>';
+        // No editor instances registered → getLatestNoteHtml falls back to
+        // the item's saved note, which is what the guard must compare.
+        (globalThis as any).Zotero = {
+            ...(globalThis as any).Zotero,
+            Items: { get: vi.fn(() => ({ getNote: () => '<div><p>Drifted body</p></div>' })) },
+            Notes: {},
+        };
+        const snapshot = hashPreviewContent(previewedHtml);
+        expect(noteContentDriftedFromPreview(1, snapshot)).toBe(true);
+    });
+
+    it('does not report drift when the stored note is unchanged', () => {
+        const previewedHtml = '<div><p>Original body</p></div>';
+        (globalThis as any).Zotero = {
+            ...(globalThis as any).Zotero,
+            Items: { get: vi.fn(() => ({ getNote: () => previewedHtml })) },
+            Notes: {},
+        };
+        const snapshot = hashPreviewContent(previewedHtml);
+        expect(noteContentDriftedFromPreview(1, snapshot)).toBe(false);
+    });
+
+    it('never blocks on read failure (missing item)', () => {
+        (globalThis as any).Zotero = {
+            ...(globalThis as any).Zotero,
+            Items: { get: vi.fn(() => null) },
+            Notes: {},
+        };
+        expect(noteContentDriftedFromPreview(1, 'anything')).toBe(false);
+    });
+});
+
+describe('showDiffPreview approveAll revision-guard flow', () => {
+    const NOTE = '<div data-schema-version="9"><p>Alpha paragraph body text.</p></div>';
+    const EDITS = [{
+        oldString: 'Alpha paragraph body text.',
+        newString: 'Alpha paragraph CHANGED text.',
+    }];
+
+    function makeHarness(initialHtml: string, opts?: { liveHtml?: string; otherEditorHtml?: string }) {
+        let noteHtml = initialHtml;
+        const liveHtml = opts?.liveHtml;
+        let otherHtml = opts?.otherEditorHtml;
+        const viewDom = { querySelector: vi.fn(() => null), contentEditable: 'true' };
+        const wrapped: any = {
+            _currentEditorInstance: { _editorCore: { view: { dom: viewDom } } },
+        };
+        installMutationInstance();
+        const iframeWindow: any = {
+            top: previewRuntime.contextWindow,
+            frameElement: { isConnected: true },
+            wrappedJSObject: wrapped,
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn(),
+        };
+        const applyIncrementalUpdate = vi.fn();
+        const inst: any = {
+            itemID: 42,
+            _viewMode: 'tab',
+            _iframeWindow: iframeWindow,
+            applyIncrementalUpdate,
+            _disableSaving: false,
+        };
+        const item = {
+            id: 42,
+            getNote: vi.fn(() => noteHtml),
+            loadDataType: vi.fn(async () => {}),
+        };
+        if (liveHtml !== undefined) {
+            // Register the editor as a LIVE candidate for getLatestNoteHtml:
+            // unsaved editor content that differs from the stored note.
+            inst._item = item;
+            iframeWindow.frameElement = { isConnected: true };
+            wrapped.getDataSync = vi.fn(() => ({ html: liveHtml }));
+        }
+        const editorInstances: any[] = [inst];
+        if (otherHtml !== undefined) {
+            // A SECOND, non-preview editor (e.g. the note open in a separate
+            // window) holding an unsaved snapshot. It stays a live candidate
+            // while the preview editor is frozen, and execute's
+            // flushLiveEditorToDB would promote its content.
+            editorInstances.push({
+                itemID: 42,
+                _item: item,
+                _viewMode: 'window',
+                _iframeWindow: {
+                    wrappedJSObject: {
+                        getDataSync: vi.fn(() => ({ html: otherHtml })),
+                        _currentEditorInstance: { _editorCore: { view: { dom: {} } } },
+                    },
+                    frameElement: { isConnected: true },
+                    addEventListener: vi.fn(),
+                    removeEventListener: vi.fn(),
+                },
+                applyIncrementalUpdate: vi.fn(),
+                _disableSaving: false,
+            });
+        }
+        (globalThis as any).Zotero = {
+            ...(globalThis as any).Zotero,
+            Notes: { open: vi.fn(), _editorInstances: editorInstances },
+            Items: {
+                getIDFromLibraryAndKey: vi.fn(() => 42),
+                getAsync: vi.fn(async () => item),
+                get: vi.fn(() => item),
+            },
+        };
+        return {
+            wrapped,
+            applyIncrementalUpdate,
+            setNoteHtml: (h: string) => { noteHtml = h; },
+            setOtherEditorHtml: (h: string) => { otherHtml = h; },
+            /** Renders that injected diff markup (vs. plain restores). */
+            diffRenderCount: () => applyIncrementalUpdate.mock.calls
+                .filter((c: any[]) => String(c[0]?.html ?? '').includes('rgba(210,40,40')).length,
+        };
+    }
+
+    afterEach(async () => {
+        setOnBannerAction(null);
+        try {
+            const p = dismissDiffPreview();
+            if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(2000);
+            await p;
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('uses the chrome embedder to select its editor when iframe top is a content window', async () => {
+        vi.useFakeTimers();
+        makeHarness(NOTE, { otherEditorHtml: NOTE });
+        const [own] = (Zotero as any).Notes._editorInstances;
+        own._iframeWindow.top = {};
+        (Zotero as any).AsterMargin.runtime = {
+            resolveWindowFrom: (win: unknown) => win === own._iframeWindow ? previewRuntime : undefined,
+        };
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+    });
+
+    it('preloads a standalone attachment title before rendering the proposed edit', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const previousLibraries = Zotero.Libraries;
+        const previousAsterMargin = Zotero.AsterMargin;
+        (Zotero as any).AsterMargin = { ...(Zotero as any).AsterMargin, ...previousAsterMargin, searchableLibraryIds: [1], libraryScopeInitialized: true };
+        let titleLoaded = false;
+        const attachment = {
+            libraryID: 1, key: 'ATTACH12', parentID: false,
+            isAttachment: () => true, isFileAttachment: () => true, isPDFAttachment: () => true,
+            attachmentFilename: 'fallback.pdf',
+            getField: vi.fn(() => {
+                if (!titleLoaded) throw new Error('Item data not loaded');
+                return 'Full report title';
+            }),
+        };
+        (Zotero as any).Libraries = { userLibraryID: 1, get: () => ({ isGroup: false }) };
+        (Zotero.Items as any).getByLibraryAndKey = vi.fn(() => attachment);
+        (Zotero.Items as any).getByLibraryAndKeyAsync = vi.fn(async () => attachment);
+        (Zotero.Items as any).loadDataTypes = vi.fn(async () => {
+            await Promise.resolve();
+            titleLoaded = true;
+        });
+        try {
+            const shown = await showDiffPreview(1, 'NOTE0001', [{
+                operation: 'append', oldString: '',
+                newString: '<p><citation id="u-ATTACH12" loc="page6"/></p>',
+            }]);
+            expect(shown, JSON.stringify(vi.mocked(logger).mock.calls)).toBe(true);
+            expect(Zotero.Items.loadDataTypes).toHaveBeenCalledWith([attachment], ['itemData']);
+            const html = h.applyIncrementalUpdate.mock.calls[0][0].html;
+            expect(html).toContain('zotero://open/library/items/ATTACH12?page=6');
+            expect(html).toContain('Full report title');
+            expect(html).toContain(', p. 6');
+            expect(html).not.toContain('fallback.pdf');
+        } finally {
+            (Zotero as any).Libraries = previousLibraries;
+            (Zotero as any).AsterMargin = previousAsterMargin;
+        }
+    });
+
+    describe('dollar-delimited math anchors (legacy read_note output)', () => {
+        const DEL_STYLE = 'background-color:rgba(210,40,40,0.28);text-decoration:line-through;border-radius:2px;padding:0 1px';
+        const ADD_STYLE = 'background-color:rgba(16,150,72,0.28);border-radius:2px;padding:0 1px';
+        const MATH_NOTE = '<div data-schema-version="9">'
+            + '<p>Energy <span class="math">$E = mc^2$</span> and a $5 fee.</p>'
+            + '<pre class="math">$$a + b$$</pre></div>';
+
+        /** LaTeX each math element would contribute to its ProseMirror atom. */
+        function mathElementTexts(html: string): string[] {
+            return [...html.matchAll(/<(span|pre)\b[^>]*class="math"[^>]*>([\s\S]*?)<\/\1>/g)]
+                .map(match => match[2].replace(/<[^>]+>/g, ''));
+        }
+
+        /** The diff markup the preview injects. */
+        async function previewHtml(edit: any): Promise<string> {
+            vi.useFakeTimers();
+            const h = makeHarness(MATH_NOTE);
+            const shown = await showDiffPreview(1, 'NOTE0001', [edit]);
+            expect(shown, JSON.stringify(vi.mocked(logger).mock.calls)).toBe(true);
+            return String(h.applyIncrementalUpdate.mock.calls[0][0].html);
+        }
+
+        it('targets the whole math element for a legacy dollar anchor', async () => {
+            const html = await previewHtml({
+                operation: 'str_replace', oldString: '$E = mc^2$', newString: '$E = mc^{2}$',
+            });
+            // Old and new each occupy their own wrapper: no nested math element
+            // and no single node holding both formulas.
+            expect(html).toContain(`<span class="math"><span style="${DEL_STYLE}">$E = mc^2$</span></span>`);
+            expect(html).toContain(`<span class="math"><span style="${ADD_STYLE}">$E = mc^{2}$</span></span>`);
+            expect(html).not.toContain('<span class="math"><span class="math">');
+            // Each wrapper carries exactly one version of the formula. A split
+            // boundary would leave one node holding both ("$E = mc^2{2}$"),
+            // since the math nodes are atoms parsed from their textContent.
+            expect(mathElementTexts(html)).toEqual(['$E = mc^2$', '$E = mc^{2}$', '$$a + b$$']);
+        });
+
+        it('removes the whole math element when a formula becomes prose', async () => {
+            const html = await previewHtml({
+                operation: 'str_replace', oldString: '$E = mc^2$', newString: 'mass-energy equivalence',
+            });
+            expect(html).toContain(`<span class="math"><span style="${DEL_STYLE}">$E = mc^2$</span></span>`);
+            expect(html).toContain(`<span style="${ADD_STYLE}">mass-energy equivalence</span>`);
+            // The replacement is prose, so it must not land inside a wrapper.
+            expect(html).not.toContain('<span class="math"><span style="background-color:rgba(16,150,72');
+        });
+
+        it('keeps display math intact when it becomes prose', async () => {
+            const html = await previewHtml({
+                operation: 'str_replace', oldString: '$$a + b$$', newString: 'the sum',
+            });
+            expect(html).toContain(`<pre class="math"><span style="${DEL_STYLE}">$$a + b$$</span></pre>`);
+            expect(html).toContain(`<span style="${ADD_STYLE}">the sum</span>`);
+        });
+
+        it('renders an anchor that mixes prose and inline math', async () => {
+            const html = await previewHtml({
+                operation: 'str_replace',
+                oldString: '<p>Energy $E = mc^2$ and a $5 fee.</p>',
+                newString: '<p>Replaced.</p>',
+            });
+            expect(html).toContain('Replaced');
+            expect(html).toContain(`<span class="math"><span style="${DEL_STYLE}">$E = mc^2$</span></span>`);
+            expect(html).not.toContain('<span class="math"><span class="math">');
+        });
+
+        it('shows only the injection for insert_after on a math anchor', async () => {
+            // Validation merges old into new for insert_after, so the anchor is
+            // the diff's common prefix and only the injected text is added.
+            const html = await previewHtml({
+                operation: 'insert_after',
+                oldString: '$E = mc^2$',
+                newString: '$E = mc^2$ (Einstein)',
+            });
+            expect(html).toContain('<span class="math">$E = mc^2$</span>');
+            expect(html).toContain(`<span style="${ADD_STYLE}"> (Einstein)</span>`);
+            expect(mathElementTexts(html)).toEqual(['$E = mc^2$', '$$a + b$$']);
+        });
+
+        it('does not pair an anchor dollar with an injected one for insert_after', async () => {
+            const html = await previewHtml({
+                operation: 'insert_after',
+                oldString: 'Energy $E = mc^2$ and a $5 fee.',
+                newString: 'Energy $E = mc^2$ and a $5 fee. In CAD: 7$.',
+            });
+            expect(html).toContain(`<span style="${ADD_STYLE}"> In CAD: 7$.</span>`);
+            expect(mathElementTexts(html)).toEqual(['$E = mc^2$', '$$a + b$$']);
+        });
+
+        it('leaves a literal prose dollar anchor unwrapped', async () => {
+            const html = await previewHtml({
+                operation: 'str_replace', oldString: 'a $5 fee', newString: 'a $6 fee',
+            });
+            expect(html).toContain(`<span style="${DEL_STYLE}">5</span>`);
+            expect(html).toContain(`<span style="${ADD_STYLE}">6</span>`);
+            // The prose dollars stay literal — no new math element appears.
+            expect(html.match(/class="math"/g)?.length).toBe(2);
+        });
+    });
+
+    it('previews a preloaded external-file filename and link', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const previousAsterMargin = Zotero.AsterMargin;
+        const previousFile = Zotero.File;
+        try {
+            (Zotero as any).AsterMargin = { ...(Zotero as any).AsterMargin, db: { getExternalFileByKey: vi.fn(async () => ({
+                filename: 'Report.pdf', storedPath: '/stored/Report.pdf',
+            })) } };
+            (Zotero as any).File = { pathToFileURI: vi.fn(() => 'file:///stored/Report.pdf') };
+            vi.mocked(IOUtils.exists).mockResolvedValue(true);
+            const shown = await showDiffPreview(1, 'NOTE0001', [{
+                operation: 'append', oldString: '', newString: '<p><citation id="ext-MRDTFYHP" loc="page6"/></p>',
+            }]);
+            expect(shown, JSON.stringify(vi.mocked(logger).mock.calls)).toBe(true);
+            const html = h.applyIncrementalUpdate.mock.calls[0][0].html;
+            expect(html).toContain('href="file:///stored/Report.pdf"');
+            expect(html).toContain('Report.pdf');
+            expect(html).not.toContain('Attached file ext-');
+        } finally {
+            (Zotero as any).AsterMargin = previousAsterMargin;
+            (Zotero as any).File = previousFile;
+        }
+    });
+
+    it('re-renders instead of dispatching approval when the note drifted after render', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        expect(h.diffRenderCount()).toBe(1);
+
+        // Drift the STORED note while the preview is up (the previewed editor
+        // itself is frozen — this models sync or another window), then click
+        // the banner's Apply.
+        h.setNoteHtml('<div data-schema-version="9"><p>Intro. Alpha paragraph body text.</p></div>');
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+
+        await vi.advanceTimersByTimeAsync(250);   // poll tick → guard trips, dismiss starts
+        expect(onBanner).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1600);  // dismiss settles (fallback timer) → re-show kicks off
+        await vi.advanceTimersByTimeAsync(300);   // re-show async steps + scroll timer
+
+        // Approval was never dispatched; a fresh preview rendered against the
+        // drifted content instead.
+        expect(onBanner).not.toHaveBeenCalled();
+        expect(h.diffRenderCount()).toBe(2);
+    });
+
+    it('dispatches approval normally when the note is unchanged', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);
+
+        expect(onBanner).toHaveBeenCalledWith('approveAll');
+        expect(h.diffRenderCount()).toBe(1);
+    });
+
+    it('does not report drift for unsaved live-editor content (stored baseline)', async () => {
+        vi.useFakeTimers();
+        // The editor holds unsaved content that differs from the stored note;
+        // the preview renders from the live snapshot, but the drift baseline
+        // must be the STORED note or every Apply would bounce.
+        const h = makeHarness(NOTE, {
+            liveHtml: '<div data-schema-version="9"><p>Alpha paragraph body text. Unsaved tail.</p></div>',
+        });
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);
+
+        expect(onBanner).toHaveBeenCalledWith('approveAll');
+        expect(h.diffRenderCount()).toBe(1);
+    });
+
+    it('cancels the deferred re-render when the preview is dismissed during the bounce', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.setNoteHtml('<div data-schema-version="9"><p>Intro. Alpha paragraph body text.</p></div>');
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);   // guard trips, dismissal in flight
+
+        // The deferred re-render is visible as a pending show, so
+        // approval-resolution paths can find and cancel it...
+        expect(isDiffPreviewPendingFor(1, 'NOTE0001')).toBe(true);
+        expect(isDiffPreviewPending()).toBe(true);
+        // ...which is exactly what an approval being applied/rejected
+        // elsewhere does via its isDiffPreviewPendingFor -> dismiss gate.
+        void dismissDiffPreview();
+
+        await vi.advanceTimersByTimeAsync(1600);
+        await vi.advanceTimersByTimeAsync(300);
+
+        // No resurrected preview, no dispatched approval, no pending show.
+        expect(h.diffRenderCount()).toBe(1);
+        expect(onBanner).not.toHaveBeenCalled();
+        expect(isDiffPreviewPendingFor(1, 'NOTE0001')).toBe(false);
+        expect(isDiffPreviewPending()).toBe(false);
+    });
+
+    it('detects drift that lands during the async preview setup (baseline captured with the snapshot)', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        // The stored note changes DURING showDiffPreview's awaited page-label
+        // work — after the render snapshot was taken. The baseline must
+        // reflect the snapshot-time content so the first Apply reads as
+        // drift; hashing at activePreview creation would silently adopt the
+        // newer content under a stale preview.
+        vi.mocked(preloadNotePageLabels).mockImplementationOnce(async () => {
+            h.setNoteHtml('<div data-schema-version="9"><p>Intro. Alpha paragraph body text.</p></div>');
+            return {};
+        });
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);   // guard must trip
+        expect(onBanner).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1600);  // dismiss settles -> re-render
+        await vi.advanceTimersByTimeAsync(300);
+
+        expect(onBanner).not.toHaveBeenCalled();
+        expect(h.diffRenderCount()).toBe(2);
+    });
+
+    it("treats another editor's unsaved changes during the preview as drift", async () => {
+        vi.useFakeTimers();
+        // Second editor starts in sync with the stored note, then edits it
+        // (unsaved) while the preview is up. Execute would flush that
+        // snapshot to the DB before matching, so it must count as drift.
+        const h = makeHarness(NOTE, { otherEditorHtml: NOTE });
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.setOtherEditorHtml('<div data-schema-version="9"><p>Intro. Alpha paragraph body text.</p></div>');
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);
+        expect(onBanner).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1600);
+        await vi.advanceTimersByTimeAsync(300);
+        expect(onBanner).not.toHaveBeenCalled();
+        expect(h.diffRenderCount()).toBe(2);
+    });
+
+    it("does not bounce on another editor's STABLE unsaved snapshot", async () => {
+        vi.useFakeTimers();
+        // The other editor's divergent-but-unchanged snapshot is part of the
+        // baseline (symmetric reads), so Apply must dispatch — no bounce loop
+        // while the other editor simply has not autosaved yet.
+        const divergent = '<div data-schema-version="9"><p>Alpha paragraph body text. Other tail.</p></div>';
+        const h = makeHarness(NOTE, { otherEditorHtml: divergent });
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);
+
+        expect(onBanner).toHaveBeenCalledWith('approveAll');
+        expect(h.diffRenderCount()).toBe(1);
+    });
+
+    it('serializes a dismissal call behind the in-flight teardown of a bounce', async () => {
+        vi.useFakeTimers();
+        const h = makeHarness(NOTE);
+        const onBanner = vi.fn();
+        setOnBannerAction(onBanner);
+
+        expect(await showDiffPreview(1, 'NOTE0001', EDITS)).toBe(true);
+        h.setNoteHtml('<div data-schema-version="9"><p>Intro. Alpha paragraph body text.</p></div>');
+        h.wrapped.__astermarginPreviewAction = 'approveAll';
+        await vi.advanceTimersByTimeAsync(250);   // guard trips; teardown restore in flight
+
+        // An execute handler canceling the pending bounce awaits
+        // dismissDiffPreview() before mutating the note. Even though no
+        // preview is active in this window, the promise must NOT resolve
+        // until the outstanding editor restore has settled — otherwise the
+        // restore could later overwrite the freshly written editor state.
+        let settled = false;
+        void dismissDiffPreview().then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1600);  // restore fallback settles
+        expect(settled).toBe(true);
+    });
+});

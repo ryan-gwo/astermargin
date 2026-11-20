@@ -1,0 +1,138 @@
+import { loadBuildEnvironment } from './build-env.mjs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { defineConfig } from "zotero-plugin-scaffold";
+import pkg from "./package.json";
+
+const { mode, definitions } = loadBuildEnvironment();
+
+// Zotero UI locales (mirrors chrome/locale/* in the Zotero source tree)
+const ZOTERO_LOCALES = [
+  "af-ZA", "ar", "bg-BG", "br", "ca-AD", "cs-CZ", "da-DK", "de", "el-GR",
+  "en-GB", "en-US", "es-ES", "et-EE", "eu-ES", "fa", "fi-FI", "fr-FR",
+  "gl-ES", "he-IL", "hr-HR", "hu-HU", "id-ID", "is-IS", "it-IT", "ja-JP",
+  "km", "ko-KR", "lt-LT", "mn-MN", "nb-NO", "nl-NL", "nn-NO", "pl-PL",
+  "pt-BR", "pt-PT", "ro-RO", "ru-RU", "sk-SK", "sl-SI", "sr-RS", "sv-SE",
+  "ta", "th-TH", "tr-TR", "uk-UA", "vi-VN", "zh-CN", "zh-TW",
+];
+
+export default defineConfig({
+  // `source` drives the serve watcher AND asset-destination stripping in
+  // copyAssets. "packages" is safe there only while `build.assets` globs stay
+  // under addon/ — revisit if assets ever come from elsewhere.
+  source: ["src", "addon", "packages"],
+  // source: {
+  //   paths: ["src", "addon"],
+  //   ignored: ["src/react/**"]
+  // },
+  // source: [
+  //   "src/**/*",          // All files in src
+  //   "!src/react/**",     // Exclude react directory
+  //   "!src/react/**/*",   // Exclude all files in react directory
+  //   "addon/**/*"         // All files in addon
+  // ],
+  dist: ".scaffold/build",
+  name: pkg.config.addonName,
+  xpiName: "astermargin",
+  id: pkg.config.addonID,
+  namespace: pkg.config.addonRef,
+  updateURL: `https://github.com/{{owner}}/{{repo}}/releases/download/release/${
+    pkg.version.includes("-") ? "update-beta.json" : "update.json"
+  }`,
+  xpiDownloadLink:
+    "https://github.com/{{owner}}/{{repo}}/releases/download/v{{version}}/{{xpiName}}.xpi",
+
+  build: {
+    makeManifest: { enable: false },
+    assets: ["addon/**/*", "!addon/**/.DS_Store"],
+    define: {
+      ...pkg.config,
+      author: pkg.author,
+      description: pkg.description,
+      buildVersion: pkg.version,
+      buildTime: "{{buildTime}}",
+    },
+    prefs: {
+      prefix: pkg.config.prefsPrefix,
+    },
+    esbuildOptions: [
+      {
+        entryPoints: ["src/index.ts"],
+        define: {
+          ...definitions,
+          __env__: JSON.stringify(mode),
+          "process.env.NODE_ENV": JSON.stringify(mode),
+          "process.env.BUILD_ENV": JSON.stringify(process.env.BUILD_ENV ?? ""),
+        },
+        bundle: true,
+        target: "firefox115",
+        outfile: `.scaffold/build/addon/content/scripts/${pkg.config.addonRef}.js`,
+      },
+      {
+        // Bundled MuPDF worker — see src/astermargin-extract/worker/index.ts.
+        // Output is reachable from the main thread at
+        // `chrome://astermargin/content/scripts/mupdf-worker.js`. The WASM factory
+        // at `chrome://astermargin/content/lib/mupdf-wasm.mjs` is loaded at
+        // runtime via dynamic import; `external: ["chrome://*"]` keeps any
+        // chrome-URL imports from being resolved at bundle time.
+        entryPoints: ["src/astermargin-extract/worker/index.ts"],
+        define: {
+          "process.env.NODE_ENV": JSON.stringify(mode),
+          "process.env.BUILD_ENV": JSON.stringify(process.env.BUILD_ENV ?? ""),
+        },
+        bundle: true,
+        format: "esm",
+        target: "firefox115",
+        external: ["chrome://*"],
+        outfile: `.scaffold/build/addon/content/scripts/mupdf-worker.js`,
+      },
+      {
+        // Export runtime: the parser and writers of @astermargin/agent-export with
+        // remark, KaTeX, docx and JSZip. Loaded on first export into its own
+        // script scope (src/services/export/exportRuntime.ts), so the main
+        // bundle does not carry it. `neutral` keeps esbuild off the packages'
+        // `browser` builds, which assume a DOM the plugin realm does not have.
+        entryPoints: ["packages/agent-export/src/runtime.ts"],
+        define: {
+          "process.env.NODE_ENV": JSON.stringify(mode),
+        },
+        // JSZip's Node stream support. It requires the module inside a
+        // try/catch and only uses it when that succeeds, so left unresolved
+        // the require fails and JSZip writes without Node streams.
+        external: ["readable-stream"],
+        bundle: true,
+        format: "iife",
+        globalName: "AsterMarginExportRuntime",
+        platform: "neutral",
+        mainFields: ["module", "main"],
+        target: "firefox115",
+        minify: mode === "production",
+        outfile: `.scaffold/build/addon/content/scripts/astermargin-export.js`,
+      },
+    ],
+    hooks: {
+      "build:fluent": async (ctx) => {
+        const enUsDir = join(ctx.dist, "addon/locale/en-US");
+        if (!existsSync(enUsDir)) return;
+        const files = readdirSync(enUsDir).filter((f) => f.endsWith(".ftl"));
+        if (files.length === 0) return;
+        for (const locale of ZOTERO_LOCALES) {
+          if (locale === "en-US") continue;
+          const target = join(ctx.dist, "addon/locale", locale);
+          mkdirSync(target, { recursive: true });
+          for (const f of files) {
+            if (!existsSync(join(target, f))) copyFileSync(join(enUsDir, f), join(target, f));
+          }
+        }
+      },
+    },
+  },
+
+  server: {
+    // Allow multiple Zotero instances (one per git worktree) to run side-by-side.
+    startArgs: ["-no-remote"],
+  },
+
+  // If you need to see a more detailed log, uncomment the following line:
+  // logLevel: "trace",
+});

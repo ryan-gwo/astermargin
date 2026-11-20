@@ -1,0 +1,463 @@
+import { preloadStandaloneAttachmentLinks } from '../../src/utils/zoteroLinkCitation';
+import type { Citation, PartLocation } from '@astermargin/agent-core/types/citations';
+import type { RenderContextData } from './citationRenderers';
+import { store } from '../store';
+import { citationMapAtom } from '@astermargin/agent-core/citations/atoms';
+import { externalReferenceItemMappingAtom, externalReferenceMappingAtom } from '@astermargin/agent-core/citations/externalReferences';
+import { CITATION_TAG_PATTERN } from './citationPreprocessing';
+import {
+    baseCitationKey,
+    citationIndexCandidateIdsForLocator,
+    getPageLocator,
+    getRequestedRef,
+    getResolvedRef,
+    normalizeCitationTag,
+    parseRawCitationAttributes,
+    requestedCitationKey,
+    type CitationRef,
+    type ExternalFileCitationRef,
+    type Locator,
+} from '@astermargin/agent-core/citations/citationGrammar';
+import {
+    getCitationPreloadFilePath,
+    preloadPageLabelsForCitations,
+    preloadPageLabelsForContent,
+} from './pageLabels';
+import type { PageLabelNamespace } from '../../src/services/documentExtraction/pageLabels';
+import { resolvePrintedPageLabels } from '@astermargin/agent-core/extract/pageLabels/printedPageLabels';
+import type { CitationIndexEntry, StructuredExtractResult } from '@astermargin/agent-core/extract/schema';
+import { getCitationIndex } from '../../src/astermargin-extract/schema/citationIndex';
+import {
+    locatorSchemaVersion,
+    structuredPdfResultForSchema,
+} from '../../src/services/documentExtraction/structuredPdfResult';
+import { UNRESOLVED_LIBRARY_ID, resolveLibraryRef } from '../../src/utils/libraryIdentity';
+import { ensureLibraryItemsLoaded } from '../../src/utils/zoteroDataLoading';
+import type { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import { isPdfDocument } from '../../src/utils/attachmentFiles';
+import type { ExternalFileRecord } from '../../src/services/database';
+
+function citationLocationsFromEntries(entries: CitationIndexEntry[]): PartLocation[] {
+    const byPage = new Map<number, PartLocation>();
+    for (const entry of entries) {
+        if (!Number.isInteger(entry.pageIndex) || entry.pageIndex < 0) continue;
+        const key = entry.pageIndex;
+        const existing = byPage.get(key);
+        if (existing) continue;
+        byPage.set(key, {
+            part_id: entry.id,
+            page_idx: entry.pageIndex,
+        });
+    }
+    return [...byPage.values()];
+}
+
+/** Printed labels per document, resolved once however many tags cite it. */
+const printedLabelsByResult = new WeakMap<StructuredExtractResult, Record<number, string>>();
+
+function printedLabelsOf(result: StructuredExtractResult): Record<number, string> {
+    let labels = printedLabelsByResult.get(result);
+    if (!labels) {
+        labels = resolvePrintedPageLabels({
+            pageCount: result.document.pageCount,
+            derived: result.document.derivedPageLabels,
+            embedded: result.document.pageLabels,
+        });
+        printedLabelsByResult.set(result, labels);
+    }
+    return labels;
+}
+
+/**
+ * Labels of the pages the entries sit on. Locator labels come from the index
+ * (`buildCitationIndex`); printed labels from the document's derived page
+ * numbers.
+ */
+function pageLabelsFromEntries(
+    entries: CitationIndexEntry[],
+    result: StructuredExtractResult,
+    namespace: PageLabelNamespace,
+): Record<number, string> | undefined {
+    const printed = namespace === 'printed' ? printedLabelsOf(result) : null;
+    const labels: Record<number, string> = {};
+    for (const entry of entries) {
+        if (!Number.isInteger(entry.pageIndex)) continue;
+        const label = printed ? printed[entry.pageIndex] : entry.pageLabel;
+        if (label) labels[entry.pageIndex] = label;
+    }
+    return Object.keys(labels).length > 0 ? labels : undefined;
+}
+
+function resolveEntriesFromStructuredResult(
+    result: StructuredExtractResult,
+    locator: Locator,
+): CitationIndexEntry[] {
+    const index = getCitationIndex(result.document);
+    const entries: CitationIndexEntry[] = [];
+    const seen = new Set<string>();
+    for (const id of citationIndexCandidateIdsForLocator(locator)) {
+        const entry = index[id];
+        if (!entry || seen.has(entry.id)) continue;
+        seen.add(entry.id);
+        entries.push(entry);
+    }
+    return entries;
+}
+
+/**
+ * Builds local citation metadata for non-page locators using the structured
+ * extraction cache. Tool-call note content is not always covered by backend
+ * citation metadata, so note export needs this local page bridge. A locator
+ * whose id scheme names a producible non-current PDF schema version resolves
+ * against an uncached extraction of that version.
+ */
+export async function buildLocalCitationDataMapForContent(
+    content: string,
+    pageLabels: PageLabelNamespace = 'locator',
+): Promise<Record<string, Citation>> {
+    const cache = Zotero.AsterMargin?.documentCache;
+    if (!cache) return {};
+
+    const localMap: Record<string, Citation> = {};
+    const seen = new Set<string>();
+    const structuredResultsByFile = new Map<string, Promise<StructuredExtractResult | null>>();
+    const regex = new RegExp(CITATION_TAG_PATTERN.source, CITATION_TAG_PATTERN.flags);
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(content)) !== null) {
+        const rawAttrs = parseRawCitationAttributes(match[1] || '');
+        const normalized = normalizeCitationTag(rawAttrs);
+        if (!normalized.ok || normalized.ref.kind !== 'zotero' || !normalized.ref.loc) continue;
+        if (normalized.ref.loc.kind === 'page') continue;
+
+        const citationKey = requestedCitationKey(normalized.ref);
+        if (seen.has(citationKey)) continue;
+        seen.add(citationKey);
+        // A portable ref whose library isn't available on this device can't be
+        // looked up (and would throw); local metadata is only an export
+        // enhancement, so skip it and fall back to normal citation rendering.
+        if (normalized.ref.library_id === UNRESOLVED_LIBRARY_ID) continue;
+
+        try {
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(
+                normalized.ref.library_id,
+                normalized.ref.zotero_key,
+            );
+            if (!item || typeof item === 'boolean') continue;
+
+            const preloadPath = await getCitationPreloadFilePath(item);
+            if (!preloadPath) continue;
+
+            const schemaVersion = locatorSchemaVersion(
+                normalized.ref.loc,
+                isPdfDocument(preloadPath.item),
+            );
+            const cacheKey = `${preloadPath.item.libraryID}:${preloadPath.item.key}:${preloadPath.filePath}:${schemaVersion}`;
+            let resultPromise = structuredResultsByFile.get(cacheKey);
+            if (!resultPromise) {
+                resultPromise = structuredPdfResultForSchema({
+                    source: { kind: 'zotero', item: preloadPath.item },
+                    filePath: preloadPath.filePath,
+                    schemaVersion,
+                });
+                structuredResultsByFile.set(cacheKey, resultPromise);
+            }
+            const result = await resultPromise;
+            if (!result) continue;
+
+            const entries = resolveEntriesFromStructuredResult(result, normalized.ref.loc);
+            const locations = citationLocationsFromEntries(entries);
+            if (locations.length === 0) continue;
+
+            const rawTag = match[0];
+            const entryPageLabels = pageLabelsFromEntries(entries, result, pageLabels);
+            localMap[`local:${citationKey}`] = {
+                citation_id: `local:${citationKey}`,
+                run_id: 'local',
+                locations,
+                pages: [...new Set(locations
+                    .map((location) => location.page_idx)
+                    .filter((pageIdx): pageIdx is number => pageIdx !== undefined)
+                    .map((pageIdx) => pageIdx + 1)
+                )],
+                raw_tag: rawTag,
+                requested_ref: normalized.ref,
+                resolved_ref: normalized.ref,
+                citation_type: 'item',
+                ...(entryPageLabels ? { page_labels: entryPageLabels } : {}),
+            };
+        } catch {
+            // Local metadata is an export enhancement; unresolved locators fall
+            // back to the normal citation rendering path.
+        }
+    }
+
+    return localMap;
+}
+
+/**
+ * The most pages one locator is expanded to. A citation naming a longer span is
+ * malformed rather than ambitious, so it keeps only its endpoints: the
+ * reference still reports what it covers without allocating the span.
+ */
+const MAX_CITED_PAGES = 100;
+
+/**
+ * Expand a page locator's value into the 1-based pages it cites.
+ *
+ * A locator carries the range or list the model wrote (`page6-8`, `page6,8`),
+ * while `Citation.pages` is the flat list the renderer collapses back into a
+ * display range. Reading only the locator's first number would silently narrow
+ * the citation to its opening page.
+ */
+function citedPagesFromLocator(value: string | undefined): number[] {
+    if (!value) return [];
+
+    const pages = new Set<number>();
+    // En/em dashes reach here from a model that wrote the range typographically.
+    for (const part of value.replace(/[\u2013\u2014]/g, '-').split(',')) {
+        const [startText, endText] = part.split('-');
+        const start = Number.parseInt(startText ?? '', 10);
+        if (!Number.isSafeInteger(start) || start <= 0) continue;
+
+        const end = endText === undefined ? start : Number.parseInt(endText, 10);
+        if (!Number.isSafeInteger(end) || end <= 0) {
+            pages.add(start);
+            continue;
+        }
+
+        const [low, high] = start <= end ? [start, end] : [end, start];
+        if (high - low >= MAX_CITED_PAGES) {
+            pages.add(low);
+            pages.add(high);
+            continue;
+        }
+        for (let page = low; page <= high; page++) pages.add(page);
+    }
+
+    return [...pages].sort((a, b) => a - b);
+}
+
+/**
+ * Resolve the external-file citations in the content against the local
+ * `external_files` registry.
+ *
+ * Returns the absolute path of each cited file that exists on this computer
+ * (so the export can offer a clickable file link) and a synthetic citation per
+ * cited identity carrying the file's name, content kind and cited pages.
+ *
+ * That synthetic metadata is what makes the exported reference readable.
+ * Backend citation metadata is resolved from a run's message text only, so a
+ * file cited inside note content has none — and unlike a library citation
+ * there is no Zotero item the export could format from instead, so the
+ * reference would render with an empty label. Real backend metadata, when it
+ * exists, still wins: `prepareCitationRenderContext` merges it over this map.
+ */
+export async function resolveExternalFileCitations(content: string): Promise<{
+    localPaths: Record<string, string>;
+    citationDataMap: Record<string, Citation>;
+}> {
+    const localPaths: Record<string, string> = {};
+    const citationDataMap: Record<string, Citation> = {};
+
+    const db = Zotero.AsterMargin?.db;
+    if (!db) return { localPaths, citationDataMap };
+
+    // One entry per cited identity (ext key + locator), in citation order.
+    const citedRefs = new Map<string, { ref: ExternalFileCitationRef; rawTag: string }>();
+    const regex = new RegExp(CITATION_TAG_PATTERN.source, CITATION_TAG_PATTERN.flags);
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(content)) !== null) {
+        const normalized = normalizeCitationTag(parseRawCitationAttributes(match[1] || ''));
+        if (!normalized.ok || normalized.ref.kind !== 'external_file') continue;
+
+        const citationKey = requestedCitationKey(normalized.ref);
+        if (citedRefs.has(citationKey)) continue;
+        citedRefs.set(citationKey, { ref: normalized.ref, rawTag: match[0] });
+    }
+
+    if (citedRefs.size === 0) return { localPaths, citationDataMap };
+
+    // Each distinct file is read once, however often it is cited.
+    const extKeys = new Set([...citedRefs.values()].map(({ ref }) => ref.ext_key));
+    const recordsByExtKey = new Map<string, ExternalFileRecord>();
+    await Promise.all([...extKeys].map(async (extKey) => {
+        try {
+            const record = await db.getExternalFileByKey(extKey);
+            if (!record) return;
+            recordsByExtKey.set(extKey, record);
+            if (await IOUtils.exists(record.storedPath).catch(() => false)) {
+                localPaths[extKey] = record.storedPath;
+            }
+        } catch {
+            // Both the link and the filename are export enhancements; a file
+            // this device knows nothing about falls back to the plain-text
+            // citation rendering.
+        }
+    }));
+
+    for (const [citationKey, { ref, rawTag }] of citedRefs) {
+        const record = recordsByExtKey.get(ref.ext_key);
+        if (!record) continue;
+
+        const citedPages = citedPagesFromLocator(getPageLocator(ref));
+        citationDataMap[`local:${citationKey}`] = {
+            citation_id: `local:${citationKey}`,
+            run_id: 'local',
+            citation_type: 'external_file',
+            // External files are attachments living outside Zotero; the client
+            // branches on content_kind for the per-type icon and for how a
+            // cited page reads (an EPUB "page" is a section ordinal).
+            item_type: 'attachment',
+            content_kind: record.contentKind,
+            display_name: record.filename,
+            requested_ref: ref,
+            resolved_ref: ref,
+            raw_tag: rawTag,
+            ...(citedPages.length > 0 ? { pages: citedPages } : {}),
+        };
+    }
+
+    return { localPaths, citationDataMap };
+}
+
+/**
+ * Load the Zotero libraries of every item cited in the content.
+ *
+ * Static citation renderers (note export, copied Markdown) resolve and format
+ * items synchronously, which fails for items in a library Zotero has not
+ * loaded yet. Awaiting this first makes those synchronous reads succeed. A
+ * citation's library comes from its resolved metadata ref when present, else
+ * from the tag itself; external references count via their mapped Zotero item.
+ * Not gated on library exclusion: this only enables rendering persisted history.
+ */
+export async function loadCitedLibraries(
+    content: string,
+    citations: Iterable<Citation> = [],
+    externalMapping: Record<string, ZoteroItemReference | null> = {},
+): Promise<void> {
+    const libraryIds = new Set<number>();
+    for (const { ref: tagRef, metadata } of citationTagsWithMetadata(content, citations)) {
+        for (const ref of [tagRef, metadata ? getResolvedRef(metadata) : null]) {
+            if (ref?.kind === 'zotero') {
+                const libraryId = resolveLibraryRef(ref);
+                if (libraryId) libraryIds.add(libraryId);
+            } else if (ref?.kind === 'external') {
+                const mapped = externalMapping[ref.external_id];
+                const libraryId = mapped ? resolveLibraryRef(mapped) : null;
+                if (libraryId) libraryIds.add(libraryId);
+            }
+        }
+    }
+
+    await ensureLibraryItemsLoaded(libraryIds);
+}
+
+/**
+ * Each citation tag in `content` with the metadata the chat looks it up by:
+ * the tag's requested key, then its base key.
+ */
+function citationTagsWithMetadata(
+    content: string,
+    citations: Iterable<Citation>,
+): Array<{ ref: CitationRef; metadata: Citation | undefined }> {
+    const citationByKey = new Map<string, Citation>();
+    for (const citation of citations) {
+        const requested = getRequestedRef(citation);
+        if (!requested) continue;
+        citationByKey.set(requestedCitationKey(requested), citation);
+        if (!citationByKey.has(baseCitationKey(requested))) {
+            citationByKey.set(baseCitationKey(requested), citation);
+        }
+    }
+
+    const tags: Array<{ ref: CitationRef; metadata: Citation | undefined }> = [];
+    const regex = new RegExp(CITATION_TAG_PATTERN.source, CITATION_TAG_PATTERN.flags);
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(content)) !== null) {
+        const normalized = normalizeCitationTag(parseRawCitationAttributes(match[1] || ''));
+        if (!normalized.ok) continue;
+        tags.push({
+            ref: normalized.ref,
+            metadata: citationByKey.get(requestedCitationKey(normalized.ref))
+                ?? citationByKey.get(baseCitationKey(normalized.ref)),
+        });
+    }
+    return tags;
+}
+
+/**
+ * Build the full static-render context for Zotero note export.
+ *
+ * `pageLabels` picks the label namespace: `locator` (the default) for Zotero
+ * notes, whose citations Zotero navigates by label; `printed` for file exports,
+ * which show readers the page numbers printed on the pages.
+ */
+export async function prepareCitationRenderContext(
+    content: string,
+    contextData?: RenderContextData,
+    pageLabels: PageLabelNamespace = 'locator',
+): Promise<RenderContextData | undefined> {
+    const citations = Object.values((contextData ? contextData.citationDataMap : store.get(citationMapAtom)) ?? {});
+    // First, so the preloads below and the synchronous render that follows
+    // can look up every cited item.
+    await loadCitedLibraries(
+        content,
+        citations,
+        (contextData ? contextData.externalMapping : store.get(externalReferenceItemMappingAtom)) ?? {},
+    );
+    // Metadata can resolve a tag to another attachment than the one it names;
+    // the render cites that one, so its labels are preloaded as well.
+    const citedMetadata = [...new Set(
+        citationTagsWithMetadata(content, citations)
+            .map(({ metadata }) => metadata)
+            .filter((metadata): metadata is Citation => !!metadata),
+    )];
+    // The citation preload runs after the content preload: a cache miss
+    // analyzes the PDF once, and the second preload reads the record it wrote.
+    const pageLabelsPromise = preloadPageLabelsForContent(content, pageLabels)
+        .then(async (contentPageLabels) => ({
+            ...(await preloadPageLabelsForCitations(citedMetadata, pageLabels)),
+            ...contentPageLabels,
+        }));
+    const [pageLabelsByAttachmentId, structuredCitationDataMap, externalFiles] = await Promise.all([
+        pageLabelsPromise,
+        buildLocalCitationDataMapForContent(content, pageLabels),
+        resolveExternalFileCitations(content),
+        preloadStandaloneAttachmentLinks(content),
+    ]);
+
+    const localCitationDataMap = {
+        ...structuredCitationDataMap,
+        ...externalFiles.citationDataMap,
+    };
+    const externalFileLocalPaths = externalFiles.localPaths;
+
+    const hasPageLabels = Object.keys(pageLabelsByAttachmentId).length > 0;
+    const hasLocalCitations = Object.keys(localCitationDataMap).length > 0;
+    const hasExternalFilePaths = Object.keys(externalFileLocalPaths).length > 0;
+    if (!contextData && !hasPageLabels && !hasLocalCitations && !hasExternalFilePaths) return undefined;
+
+    const baseContext: RenderContextData = contextData ?? {
+        citationDataMap: store.get(citationMapAtom),
+        externalMapping: store.get(externalReferenceItemMappingAtom),
+        externalReferencesMap: store.get(externalReferenceMappingAtom),
+    };
+
+    return {
+        ...baseContext,
+        citationDataMap: {
+            ...localCitationDataMap,
+            ...(baseContext.citationDataMap ?? {}),
+        },
+        pageLabelsByAttachmentId: {
+            ...(baseContext.pageLabelsByAttachmentId ?? {}),
+            ...pageLabelsByAttachmentId,
+        },
+        externalFileLocalPaths: {
+            ...(baseContext.externalFileLocalPaths ?? {}),
+            ...externalFileLocalPaths,
+        },
+    };
+}

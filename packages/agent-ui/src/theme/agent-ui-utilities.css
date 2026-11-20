@@ -1,0 +1,413 @@
+/*
+ * @astermargin/agent-ui — utility layer.
+ *
+ * A hand-rolled, Tailwind-shaped vocabulary shared by every AsterMargin client, so
+ * the same markup describes the same thing everywhere. The scale is its own and
+ * deliberately not Tailwind's (`gap-2` is a 0.5rem column gap but a 0.35rem row
+ * gap, `py-15` is 0.375rem, `mt-010` is 0.1rem, `p-0` is 0.1rem). Do not
+ * "correct" a value against Tailwind, and do not convert units: these values
+ * are load-bearing in shipped layouts.
+ *
+ * Every selector is scoped under `.astermargin-root`, the one root class each client
+ * puts on its React mount points. In astermargin-zotero that is every element with a
+ * `astermargin-pane-*` id (`src/ui/ui.ts`, `astermarginWindow.xhtml`,
+ * `astermarginPreferences.xhtml`); `[id^="astermargin-pane-"] .foo` and `.astermargin-root
+ * .foo` both weigh (0,2,0), so the move was specificity-neutral. Nothing here
+ * may style a client's own root or chrome — a rule that needs the root element
+ * itself belongs in the client's sheet.
+ *
+ * This sheet is loaded BEFORE each client's own sheet, so a client rule of
+ * equal specificity wins. That is the intended direction (the shared layer is
+ * the default, the client overrides it), but it is the opposite of what a
+ * single interleaved file encodes. When a utility class and a client component
+ * class land on the same element and set the same property, the client now
+ * wins. A handful of Zotero rules relied on the old order and were therefore
+ * left in `astermargin.css`; see the notes there. Before adding a class here, check
+ * that no client component rule of equal specificity sets the same property on
+ * an element that also carries the new class.
+ *
+ * Tokens: this sheet uses platform custom properties (`--fill-*`, `--accent-*`,
+ * `--material-*`, `--color-scrollbar*`, the flat `--tag-*` hues) that it does
+ * not define. They come from the host application's theme — see
+ * `agent-ui-tokens.css` for the contract.
+ */
+
+/* A few classes declared apart from their own section in the sheet this layer
+   came out of. Order within this file is that sheet's order, and it is
+   load-bearing: `.bg-tertiary`, `.bg-senary` and `.opacity-90` are each declared
+   twice, and the later declaration is the one that applies. */
+
+.astermargin-root .bg-quarternary {
+    background-color: var(--fill-quarternary);
+}
+
+.astermargin-root .bg-senary {
+    background-color: var(--fill-senary);
+}
+
+.astermargin-root .bg-tertiary {
+    background-color: var(--fill-tertiary);
+}
+
+.astermargin-root .bg-transparent {
+    background-color: transparent;
+}
+
+.astermargin-root .opacity-90 {
+    opacity: 0.9;
+}
+
+.astermargin-root .inset-0 {
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+}
+
+/* Layout. The `display` utilities (`display-flex`, `hidden`, `inline-flex`,
+   `inline-block`, `block`, `single-line`) and `flex-1` / `h-full` are absent on
+   purpose: in astermargin-zotero they are bundled with rules that style the pane root
+   itself, and they sit in cascade ties that the split would invert. They stay in
+   that client's sheet until those ties are gone. */
+.astermargin-root .flex-none { flex: none; }
+.astermargin-root .flex-row { flex-direction: row; }
+.astermargin-root .flex-col { flex-direction: column; }
+.astermargin-root .flex-wrap { flex-wrap: wrap; }
+.astermargin-root .flex-shrink-0 { flex-shrink: 0 }
+.astermargin-root .items-center { align-items: center; }
+.astermargin-root .items-start { align-items: flex-start; }
+.astermargin-root .items-end { align-items: flex-end; }
+.astermargin-root .justify-center { justify-content: center; }
+.astermargin-root .justify-between { justify-content: space-between; }
+.astermargin-root .justify-end { justify-content: flex-end; }
+.astermargin-root .h-screen { height: 100vh; }
+.astermargin-root .w-full { width: 100%; }
+.astermargin-root .w-90 { width: 90%; }
+.astermargin-root .w-screen { width: 100vw; }
+.astermargin-root .max-w-full { max-width: 100%; }
+.astermargin-root .max-h-full { max-height: 100%; }
+.astermargin-root .max-height-200 { max-height: 200px; }
+.astermargin-root .fit-content { width: fit-content; }
+.astermargin-root .object-contain { object-fit: contain; }
+.astermargin-root .min-w-0 { min-width: 0; }
+.astermargin-root .min-h-0 { min-height: 0; }
+.astermargin-root .relative { position: relative; }
+.astermargin-root .fixed { position: fixed; }
+.astermargin-root .truncate { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.astermargin-root .text-left { text-align: left; }
+.astermargin-root .text-center { text-align: center; }
+.astermargin-root .text-right { text-align: right; }
+.astermargin-root .align-self-start { align-self: flex-start; }
+
+.astermargin-root .absolute { position: absolute; }
+.astermargin-root .left-1\/2 { left: 50%; }
+.astermargin-root .transform { transform: none; }
+.astermargin-root .-translate-x-1\/2 { transform: translateX(-50%); }
+.astermargin-root .z-10 { z-index: 10; }
+.astermargin-root .z-1000 { z-index: 1000; }
+/* Floating overlays (tooltips) must clear Zotero's focused items-tree row,
+   which gets z-index: 10000 while the tree has focus (blue selection). */
+.astermargin-root .z-100000 { z-index: 100000; }
+.astermargin-root .whitespace-nowrap { white-space: nowrap; }
+.astermargin-root .whitespace-normal { white-space: normal; }
+
+
+/* Spacing */
+.astermargin-root .gap-05 { column-gap: 0.125rem; row-gap: 0.125rem; }
+.astermargin-root .gap-1 { column-gap: 0.375rem; row-gap: 0.25rem; }
+.astermargin-root .gap-15 { column-gap: 0.425rem; row-gap: 0.30rem; }
+.astermargin-root .gap-2 { column-gap: 0.5rem; row-gap: 0.35rem; }
+.astermargin-root .gap-25 { column-gap: 0.625rem; row-gap: 0.45rem; }
+.astermargin-root .gap-3 { column-gap: 0.75rem; row-gap: 0.5rem; }
+.astermargin-root .gap-4 { column-gap: 1rem; row-gap: 0.75rem; }
+.astermargin-root .gap-5 { column-gap: 1.25rem; row-gap: 1.2rem; }
+.astermargin-root .gap-col-1 { column-gap: 0.25rem; }
+.astermargin-root .gap-col-2 { column-gap: 0.35rem; }
+.astermargin-root .gap-col-3 { column-gap: 0.5rem; }
+.astermargin-root .gap-row-1 { row-gap: 0.25rem; }
+.astermargin-root .gap-row-2 { row-gap: 0.35rem; }
+.astermargin-root .gap-row-3 { row-gap: 0.5rem; }
+.astermargin-root .p-0 { padding: 0.1rem; }
+.astermargin-root .p-1 { padding: 0.25rem; }
+.astermargin-root .p-15 { padding: 0.375rem; }
+.astermargin-root .p-2 { padding: 0.5rem; }
+.astermargin-root .p-25 { padding: 0.625rem; }
+.astermargin-root .p-3 { padding: 0.75rem; }
+.astermargin-root .p-4 { padding: 1rem; }
+.astermargin-root .p-5 { padding: 1.25rem; }
+.astermargin-root .px-1 { padding-left: 0.25rem; padding-right: 0.25rem; }
+.astermargin-root .px-15 { padding-left: 0.375rem; padding-right: 0.375rem; }
+.astermargin-root .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
+.astermargin-root .px-4 { padding-left: 1rem; padding-right: 1rem; }
+.astermargin-root .px-5 { padding-left: 1.25rem; padding-right: 1.25rem; }
+.astermargin-root .px-6 { padding-left: 1.5rem; padding-right: 1.5rem; }
+.astermargin-root .py-05 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
+.astermargin-root .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+.astermargin-root .py-15 { padding-top: 0.375rem; padding-bottom: 0.375rem; }
+.astermargin-root .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+.astermargin-root .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
+.astermargin-root .pb-1 { padding-bottom: 0.25rem; }
+.astermargin-root .pb-2 { padding-bottom: 0.5rem; }
+.astermargin-root .pb-25 { padding-bottom: 0.625rem; }
+.astermargin-root .pb-3 { padding-bottom: 0.75rem; }
+.astermargin-root .pb-4 { padding-bottom: 1rem; }
+.astermargin-root .pb-5 { padding-bottom: 1.25rem; }
+.astermargin-root .pt-0 { padding-top: 0rem; }
+.astermargin-root .pt-1 { padding-top: 0.25rem; }
+.astermargin-root .pt-2 { padding-top: 0.5rem; }
+.astermargin-root .pt-3 { padding-top: 0.75rem; }
+.astermargin-root .pt-4 { padding-top: 1rem; }
+.astermargin-root .m-0 { margin: 0rem; }
+.astermargin-root .m-1 { margin: 0.25rem; }
+.astermargin-root .m-2 { margin: 0.5rem; }
+.astermargin-root .m-3 { margin: 0.75rem; }
+.astermargin-root .mx-1 { margin-left: 0.25rem; margin-right: 0.25rem; }
+.astermargin-root .mx-2 { margin-left: 0.5rem; margin-right: 0.5rem; }
+.astermargin-root .mx-3 { margin-left: 0.75rem; margin-right: 0.75rem; }
+.astermargin-root .mx-auto { margin-left: auto; margin-right: auto; }
+.astermargin-root .mb-075 { margin-bottom: 0.075rem; }
+.astermargin-root .mb-1 { margin-bottom: 0.15rem; }
+.astermargin-root .mb-15 { margin-bottom: 0.35rem; }
+.astermargin-root .mb-2 { margin-bottom: 0.5rem; }
+.astermargin-root .mb-3 { margin-bottom: 0.75rem; }
+.astermargin-root .mb-4 { margin-bottom: 1rem; }
+.astermargin-root .mb-6 { margin-bottom: 1.5rem; }
+.astermargin-root .mb-8 { margin-bottom: 2rem; }
+.astermargin-root .mr-01 { margin-right: 0.1rem; }
+.astermargin-root .mr-015 { margin-right: 0.15rem; }
+.astermargin-root .mr-1 { margin-right: 0.25rem; }
+.astermargin-root .mr-2 { margin-right: 0.5rem; }
+.astermargin-root .mr-3 { margin-right: 0.75rem; }
+.astermargin-root .mr-4 { margin-right: 1rem; }
+.astermargin-root .mr-5 { margin-right: 1.25rem; }
+.astermargin-root .ml-025 { margin-left: 0.0625rem; }
+.astermargin-root .ml-05 { margin-left: 0.125rem; }
+.astermargin-root .ml-1 { margin-left: 0.25rem; }
+.astermargin-root .ml-15 { margin-left: 0.375rem; }
+.astermargin-root .ml-2 { margin-left: 0.5rem; }
+.astermargin-root .ml-3 { margin-left: 0.75rem; }
+.astermargin-root .ml-4 { margin-left: 1rem; }
+.astermargin-root .ml-5 { margin-left: 1.25rem; }
+.astermargin-root .mt-010 { margin-top: 0.1rem; }
+.astermargin-root .mt-015 { margin-top: 0.15rem; }
+.astermargin-root .mt-020 { margin-top: 0.20rem; }
+.astermargin-root .mt-1 { margin-top: 0.25rem; }
+.astermargin-root .mt-15 { margin-top: 0.375rem; }
+.astermargin-root .mt-2 { margin-top: 0.5rem; }
+.astermargin-root .mt-3 { margin-top: 0.75rem; }
+.astermargin-root .mt-4 { margin-top: 1rem; }
+.astermargin-root .mt-5 { margin-top: 1.25rem; }
+.astermargin-root .mt-6 { margin-top: 1.5rem; }
+.astermargin-root .mt-7 { margin-top: 1.75rem; }
+.astermargin-root .mt-8 { margin-top: 2rem; }
+.astermargin-root .my-1 { margin-top: 0.25rem; margin-bottom: 0.25rem; }
+.astermargin-root .my-2 { margin-top: 0.5rem; margin-bottom: 0.5rem; }
+.astermargin-root .my-3 { margin-top: 0.75rem; margin-bottom: 0.75rem; }
+.astermargin-root .h-2 { height: 0.5rem; }
+.astermargin-root .-mt-010 { margin-top: -0.1rem; }
+.astermargin-root .-mb-015 { margin-bottom: -0.15rem; }
+.astermargin-root .-mb-1 { margin-bottom: -0.25rem; }
+.astermargin-root .-mt-1 { margin-top: -0.25rem; }
+.astermargin-root .-mt-2 { margin-top: -0.5rem; }
+.astermargin-root .-mt-3 { margin-top: -0.75rem; }
+
+.astermargin-root .-ml-015 { margin-left: -0.15rem; }
+.astermargin-root .-ml-020 { margin-left: -0.20rem; }
+.astermargin-root .-ml-05 { margin-left: -0.125rem; }
+.astermargin-root .-ml-1 { margin-left: -0.25rem; }
+.astermargin-root .-ml-15 { margin-left: -0.375rem; }
+.astermargin-root .-ml-2 { margin-left: -0.5rem; }
+.astermargin-root .-ml-3 { margin-left: -0.75rem; }
+.astermargin-root .-mr-005 { margin-right: -0.05rem; }
+.astermargin-root .-mr-0035 { margin-right: -0.035rem; }
+.astermargin-root .-mr-010 { margin-right: -0.10rem; }
+.astermargin-root .-mr-015 { margin-right: -0.15rem; }
+.astermargin-root .-mr-020 { margin-right: -0.20rem; }
+.astermargin-root .-mr-1 { margin-right: -0.25rem; }
+.astermargin-root .-mr-2 { margin-right: -0.5rem; }
+.astermargin-root .-mr-3 { margin-right: -0.75rem; }
+.astermargin-root .-mx-4 { margin-right: -0.75rem; margin-left: -0.75rem; }
+
+.astermargin-root .inset-x-0 { left: 0; right: 0; }
+.astermargin-root .translate-y-full { transform: translateY(100%); }
+.astermargin-root .-translate-y-full { transform: translateY(-100%); }
+.astermargin-root .top-4 { top: 1rem; }
+
+
+/* Typography */
+.astermargin-root .uppercase { text-transform: uppercase; }
+.astermargin-root .text-xs { font-size: 0.75rem; }
+.astermargin-root .text-sm { font-size: 0.875rem; }
+.astermargin-root .text-lg { font-size: 1.125rem; }
+.astermargin-root .text-xl { font-size: 1.25rem; }
+.astermargin-root .text-2xl { font-size: 1.5rem; }
+.astermargin-root .text-underline { text-decoration: underline; }
+.astermargin-root .font-medium { font-weight: 500; }
+.astermargin-root .font-semibold { font-weight: 600; }
+.astermargin-root .font-italic { font-style: italic; }
+.astermargin-root .font-bold { font-weight: 700; }
+.astermargin-root .font-color-primary { color: var(--fill-primary); }
+.astermargin-root .font-color-secondary { color: var(--fill-secondary); }
+.astermargin-root .font-color-tertiary { color: var(--fill-tertiary); }
+.astermargin-root .font-color-quarternary { color: var(--fill-quarternary); }
+.astermargin-root .font-color-quinary { color: var(--fill-quinary); }
+.astermargin-root .font-color-senary { color: var(--fill-senary); }
+.astermargin-root .font-color-red { color: var(--tag-red); opacity: 0.8; }
+.astermargin-root .font-color-green { color: var(--tag-green); opacity: 0.8; }
+.astermargin-root .font-color-accent-green { color: var(--accent-green); opacity: 0.8; }
+.astermargin-root .font-color-orange { color: var(--tag-orange); }
+.astermargin-root .font-color-blue { color: var(--tag-blue); opacity: 0.8; }
+.astermargin-root .font-color-accent-blue { color: var(--accent-blue); }
+.astermargin-root .stroke-width-2 path { stroke-width: 2; }
+.astermargin-root .font-color-yellow { color: var(--tag-yellow); opacity: 0.8; }
+.astermargin-root .font-color-purple { color: var(--tag-purple); opacity: 0.8; }
+.astermargin-root .font-color-error { color: var(--tag-red); opacity: 0.8; }
+
+.astermargin-root .user-select-none { user-select: none; }
+.astermargin-root .user-select-text { user-select: text; }
+
+.astermargin-root .line-through { text-decoration: line-through; }
+
+/* Transitions */
+.astermargin-root .transition { transition: all 0.2s ease-in-out; }
+.astermargin-root .transition-colors { transition: background-color 0.2s ease-in-out, color 0.2s ease-in-out; }
+.astermargin-root .transition-opacity { transition: opacity 0.2s ease-in-out; }
+.astermargin-root .duration-300 { transition-duration: 0.3s; }
+.astermargin-root .duration-400 { transition-duration: 0.4s; }
+.astermargin-root .duration-500 { transition-duration: 0.5s; }
+.astermargin-root .duration-700 { transition-duration: 0.7s; }
+.astermargin-root .duration-1000 { transition-duration: 1s; }
+.astermargin-root .ease-in-out { transition-timing-function: ease-in-out; }
+.astermargin-root .ease-in { transition-timing-function: ease-in; }
+.astermargin-root .ease-out { transition-timing-function: ease-out; }
+
+/* States */
+.astermargin-root .opacity-0 { opacity: 0; }
+.astermargin-root .opacity-50 { opacity: 0.5; }
+.astermargin-root .opacity-60 { opacity: 0.6; }
+.astermargin-root .opacity-70 { opacity: 0.7; }
+.astermargin-root .opacity-80 { opacity: 0.8; }
+.astermargin-root .opacity-85 { opacity: 0.85; }
+.astermargin-root .opacity-90 { opacity: 0.9; }
+.astermargin-root .opacity-100 { opacity: 1; }
+.astermargin-root .cursor-pointer { cursor: pointer; }
+.astermargin-root .cursor-default { cursor: default; }
+.astermargin-root .cursor-not-allowed { cursor: not-allowed; }
+/* Scaling */
+
+.astermargin-root .scale-60 { transform: scale(0.6); }
+.astermargin-root .scale-70 { transform: scale(0.7); }
+.astermargin-root .scale-75 { transform: scale(0.75); }
+.astermargin-root .scale-80 { transform: scale(0.8); }
+.astermargin-root .scale-85 { transform: scale(0.85); }
+.astermargin-root .scale-90 { transform: scale(0.9); }
+.astermargin-root .scale-95 { transform: scale(0.95); }
+.astermargin-root .scale-100 { transform: scale(1); }
+.astermargin-root .scale-105 { transform: scale(1.05); }
+.astermargin-root .scale-11 { transform: scale(1.1); }
+.astermargin-root .scale-115 { transform: scale(1.15); }
+.astermargin-root .scale-12 { transform: scale(1.2); }
+.astermargin-root .scale-125 { transform: scale(1.25); }
+.astermargin-root .scale-13 { transform: scale(1.3); }
+.astermargin-root .scale-14 { transform: scale(1.4); }
+.astermargin-root .scale-15 { transform: scale(1.5); }
+.astermargin-root .scale-16 { transform: scale(1.6); }
+.astermargin-root .scale-17 { transform: scale(1.7); }
+
+/* Overflow */
+.astermargin-root .overflow-scroll { overflow: scroll; }
+.astermargin-root .overflow-auto { overflow: auto; }
+.astermargin-root .overflow-y-auto { overflow-y: auto; }
+.astermargin-root .overflow-x-auto { overflow-x: auto; }
+.astermargin-root .overflow-hidden { overflow: hidden; }
+.astermargin-root .overflow-x-hidden { overflow-x: hidden; }
+.astermargin-root .overflow-y-hidden { overflow-y: hidden; }
+.astermargin-root .text-ellipsis { text-overflow: ellipsis; }
+
+/* Opacity */
+.astermargin-root .opacity-0 { opacity: 0; }
+.astermargin-root .opacity-25 { opacity: 0.25; }
+.astermargin-root .opacity-50 { opacity: 0.5; }
+.astermargin-root .opacity-75 { opacity: 0.75; }
+.astermargin-root .opacity-90 { opacity: 0.9; }
+
+/* Background colors */
+.astermargin-root .bg-sidepane { background-color: var(--material-sidepane); }
+.astermargin-root .bg-primary { background-color: var(--fill-primary); }
+.astermargin-root .bg-secondary { background-color: var(--fill-secondary); }
+.astermargin-root .bg-tertiary { background-color: var(--fill-tertiary); }
+.astermargin-root .bg-quinary { background-color: var(--fill-quinary); }
+.astermargin-root .bg-senary { background-color: var(--fill-senary); }
+/* Opaque surface for anything that floats above the pane: menus, tooltips,
+   popovers, modal scrims. */
+.astermargin-root .bg-overlay { background-color: var(--astermargin-surface-overlay); }
+/* Opaque surface for a card sitting on the pane, level with the composer. */
+.astermargin-root .bg-raised { background-color: var(--astermargin-surface-raised); }
+/* Translucent fill for inline badges and pills, which sit inside cards. */
+.astermargin-root .bg-chip { background-color: var(--astermargin-fill-chip); }
+
+/* Rounded corners. The general-purpose scale, plus `.rounded-card` for the
+   inline cards that sit at the composer's width and share its corner. */
+.astermargin-root .rounded-sm { border-radius: var(--astermargin-radius-sm); }
+.astermargin-root .rounded-md { border-radius: var(--astermargin-radius-md); }
+.astermargin-root .rounded-lg { border-radius: var(--astermargin-radius-lg); }
+.astermargin-root .rounded-xl { border-radius: var(--astermargin-radius-xl); }
+.astermargin-root .rounded-card { border-radius: var(--astermargin-radius-card); }
+/* A card's header and footer rows carry their own fill, which would square off
+   the corner the card just rounded. Clip them to the card's inner radius — the
+   card's own radius less its 1px border. */
+.astermargin-root .rounded-card > .bg-senary:first-child {
+    border-top-left-radius: calc(var(--astermargin-radius-card) - 1px);
+    border-top-right-radius: calc(var(--astermargin-radius-card) - 1px);
+}
+.astermargin-root .rounded-card > .bg-senary:last-child {
+    border-bottom-left-radius: calc(var(--astermargin-radius-card) - 1px);
+    border-bottom-right-radius: calc(var(--astermargin-radius-card) - 1px);
+}
+
+/* Borders */
+.astermargin-root .border-left-quinary { border-left: 1px solid var(--fill-quinary); }
+.astermargin-root .border-left-quarternary { border-left: 1px solid var(--fill-quarternary); }
+.astermargin-root .border-right-quinary { border-right: 1px solid var(--fill-quinary); }
+.astermargin-root .border-top-quinary { border-top: 1px solid var(--fill-quinary); }
+.astermargin-root .border-bottom-quinary { border-bottom: 1px solid var(--fill-quinary); }
+.astermargin-root .border-bottom-quarternary { border-bottom: 1px solid var(--fill-quarternary); }
+.astermargin-root .border-quinary { border: 1px solid var(--fill-quinary); }
+.astermargin-root .border-quarternary { border: 1px solid var(--material-mix-quarternary); }
+/* `.border-popup` outlines overlays — menus, tooltips, dialogs — which sit on
+   their own surface and need the stronger edge. `.border-card` outlines inline
+   cards, which carry the same border weight as the composer. */
+.astermargin-root .border-popup { border: 1px solid var(--astermargin-border-strong); }
+.astermargin-root .border-card { border: 1px solid var(--astermargin-border-default); }
+.astermargin-root .border-top-popup { border-top: 1px solid var(--fill-quarternary); }
+.astermargin-root .border-transparent { border: 1px solid transparent; }
+.astermargin-root .border-error { border: 1px solid var(--tag-red-tertiary); }
+
+/* Shadows */
+.astermargin-root .shadow-sm { box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.1); }
+.astermargin-root .shadow-md { box-shadow: 0 0.375rem 0.75rem rgba(0, 0, 0, 0.15); }
+.astermargin-root .shadow-sm-top { box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.1), 0 -0.075rem 0.25rem rgba(0, 0, 0, 0.075); }
+.astermargin-root .shadow-md-top { box-shadow: 0 0.375rem 0.75rem rgba(0, 0, 0, 0.125), 0 -0.075rem 0.75rem rgba(0, 0, 0, 0.075); }
+.astermargin-root .shadow-lg { box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15); }
+.astermargin-root .shadow-xl { box-shadow: 0 0.75rem 1.5rem rgba(0, 0, 0, 0.15); }
+
+/* Scrollbar */
+.astermargin-root .scrollbar {
+    scrollbar-color: var(--color-scrollbar) var(--color-scrollbar-background);
+}
+
+.astermargin-root .outline-none {
+    outline: none;
+}
+
+.astermargin-root .ring-0 {
+    outline: 0 solid transparent;
+}
+
+.astermargin-root .shadow-none {
+    box-shadow: none;
+}
+
+.astermargin-root .appearance-none {
+    appearance: none;
+}

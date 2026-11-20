@@ -1,0 +1,74 @@
+import React from 'react';
+import { CancelIcon } from '../../icons/icons';
+import IconButton from '@astermargin/agent-ui/primitives/IconButton';
+
+interface PopupMessageHeaderProps {
+    icon: React.ReactNode;
+    rightIcon?: React.ReactElement;
+    title?: string;
+    handleDismiss: () => void;
+    fontColor?: string;
+    /** Overrides default title typography (text-base font-medium). Use for prominent headers e.g. in-panel version updates. */
+    titleClassName?: string;
+    count?: number;
+    buttonIcon?: React.ComponentType<React.SVGProps<SVGSVGElement>>;
+    buttonOnClick?: () => void;
+    cancelable?: boolean;
+}
+
+const PopupMessageHeader: React.FC<PopupMessageHeaderProps> = ({
+    icon,
+    rightIcon,
+    title,
+    count,
+    buttonIcon,
+    buttonOnClick,
+    fontColor = 'font-color-secondary',
+    titleClassName,
+    handleDismiss,
+    cancelable = true,
+}) => {
+
+    return (
+        <div className="display-flex flex-row items-start w-full gap-3">
+            {icon &&
+                <div className="flex-shrink-0">
+                    {icon}
+                </div>
+            }
+            <div className={`flex-1 ${titleClassName ?? 'text-base font-medium'} ${fontColor}`}>
+                {`${title} ${count ? `(${count})` : ''}`}
+            </div>
+            <div className="display-flex flex-row gap-2 items-start flex-shrink-0">
+                {rightIcon && (
+                    <div className="flex-shrink-0">
+                        {rightIcon}
+                    </div>
+                )}
+                {buttonIcon && buttonOnClick && (
+                    <IconButton
+                        variant="ghost"
+                        icon={buttonIcon}
+                        onClick={() => {
+                            if(buttonOnClick) {
+                                buttonOnClick();
+                                handleDismiss();
+                            }
+                        }}
+                        iconClassName="font-color-secondary scale-11"
+                    />
+                )}
+                {cancelable && (
+                    <IconButton
+                        icon={CancelIcon}
+                        variant="ghost-secondary"
+                        onClick={handleDismiss}
+                        // iconClassName={`${fontColor}`}
+                    />
+                )}
+            </div>
+        </div>
+    )
+};
+
+export default PopupMessageHeader;

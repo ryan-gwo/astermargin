@@ -1,0 +1,1334 @@
+import { resolveCollection } from '../../src/services/collections/collectionIdentity';
+import {
+    getPageLocator,
+    normalizeCitationTag,
+    parseRawCitationAttributes,
+} from '@astermargin/agent-core/citations/citationGrammar';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import type { EditNoteOperation } from '@astermargin/agent-core/types/agentActions/editNote';
+import { isValidAnnotationType, SourceAttachment } from '@astermargin/agent-core/types/attachments/apiTypes';
+import { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import { agentItemFilter, agentItemFilterAsync, isAgentSupportedItem } from '../../src/utils/agentItemSupport';
+import { getItemDisplayName, MAX_NOTE_TITLE_LENGTH } from '../../src/utils/itemDisplayName';
+import {
+    modelObjectIdFromReference,
+    resolveItemReference,
+    resolveLibraryRef,
+    resolveObjectId,
+    UNRESOLVED_LIBRARY_ID,
+} from '../../src/utils/libraryIdentity';
+import { getAsterMarginFooterAppendPoint } from '../../src/utils/noteEditFooter';
+import { isAttachmentOnServer } from '../../src/utils/webAPI';
+import { getSelectedCollection } from '../../src/utils/zoteroSelection';
+import { safeFileExists } from '../../src/utils/zoteroUtils';
+import { runUserIdAtom } from '../atoms/auth';
+import { searchableLibraryIdsAtom } from '../atoms/profile';
+import { computeDiff, stripHtmlTags } from '../components/agentRuns/EditNotePreview';
+import { ensureCitedLibrariesLoaded } from '../../src/utils/noteCitationExpand';
+import { notifyReferenceUnavailable } from '../host/zotero/sourceActions';
+import { openNote, viewAttachment } from '../runtime/navigation';
+import { getContextWindow, tryGetWindowRuntime } from '../runtime/windowRuntime';
+import { store } from '../store';
+import { getNoteContentPreviewText } from './noteText';
+import { selectItemById } from './selectItem';
+export { wasItemAddedBeforeLastSync } from '../../src/utils/itemSyncStatus';
+
+// Constants
+export const MAX_NOTE_CONTENT_LENGTH = 150;
+
+export { MAX_NOTE_TITLE_LENGTH };
+
+/**
+ * Short display label for an item.
+ *
+ * Thin alias for the shared formatter in `src/utils/itemDisplayName.ts`; that
+ * module is React-free so the data provider can serve the same label to clients
+ * without a local Zotero.
+ */
+export function getDisplayNameFromItem(item: Zotero.Item, count: number | null = null, noteTitleLength: number = MAX_NOTE_TITLE_LENGTH): string {
+    return getItemDisplayName(item, count, noteTitleLength);
+}
+
+export function getReferenceFromItem(item: Zotero.Item): string {
+    let formatted_citation: string;
+    if (item.isNote()) {
+        formatted_citation = getNoteContentPreviewText(
+            item.getNote(),
+            item.getNoteTitle(),
+            MAX_NOTE_CONTENT_LENGTH
+        );
+    } else {
+        formatted_citation = Zotero.AsterMargin?.citationService?.formatBibliography(item) ?? '';
+    }
+    return formatted_citation.replace(/\n/g, '<br />');
+}
+
+
+/**
+* Source method: Get the Zotero item from a Source
+*/
+export function getZoteroItem(source: SourceAttachment | ZoteroItemReference): Zotero.Item | null {
+    try {
+        if (!source.zotero_key) return null;
+        const libId = resolveLibraryRef(source);
+        if (!libId) return null;
+        const itemKeyValue = source.zotero_key;
+        const item = Zotero.Items.getByLibraryAndKey(libId, itemKeyValue);
+        return item || null;
+    } catch (error) {
+        console.error("Error retrieving Zotero item:", error);
+        return null;
+    }
+}
+
+/**
+ * Check if an item was added before the last sync
+ * @param item The item to check
+ * @param syncWithZotero Whether to use Zotero sync
+ * @param userID The user ID
+ * @returns True if the item was added before the last sync
+ */
+
+
+/**
+* Source method: Check if a source is valid
+*/
+export async function isValidZoteroItem(item: Zotero.Item): Promise<{valid: boolean, error?: string}> {
+
+    // User ID. Local mode has no account, so the run user id stands in for it.
+    const userID = store.get(runUserIdAtom);
+    if (!userID) return {valid: false, error: "User ID not found. Make sure you are logged in."};
+
+    // Item library
+    const library = Zotero.Libraries.get(item.libraryID);
+    if (!library) {
+        return {valid: false, error: "Library not found"};
+    }
+
+    // Is library searchable?
+    const libraryIds = store.get(searchableLibraryIdsAtom);
+    if (!libraryIds.includes(item.libraryID)) {
+        const library_name = library ? library.name : undefined;
+        return {
+            valid: false,
+            error: library_name
+                ? `The library "${library_name}" is excluded from AsterMargin. You can update this setting in AsterMargin Preferences.`
+                : "This library is excluded from AsterMargin. You can update this setting in AsterMargin Preferences."};
+    }
+
+    // ------- Regular items -------
+    if (item.isRegularItem()) {
+        if (item.isInTrash()) return {valid: false, error: "Item is in trash"};
+
+        // (a) Pass the supported-item filter
+        if (!(await agentItemFilterAsync(item))) {
+            return {valid: false, error: "File not available to use in AsterMargin"};
+        }
+
+        return {valid: true};
+    }
+
+    // ------- Attachments -------
+    else if (item.isAttachment()) {
+
+        // (a) Check if attachment is supported
+        if (!isAgentSupportedItem(item)) {
+            return {valid: false, error: "AsterMargin only supports PDF, EPUB, and plain-text attachments"};
+        }
+
+        // (b) Check if attachment is in trash
+        if (item.isInTrash()) return {valid: false, error: "Item is in trash"};
+
+        
+        // (c) Check if file exists locally or on server
+        if (!(await safeFileExists(item)) && !isAttachmentOnServer(item)) {
+            return {valid: false, error: "File unavailable locally and on server"};
+        }
+
+        // (d) Use the comprehensive supported-item filter
+        if (!(await agentItemFilterAsync(item))) {
+            return {valid: false, error: "Attachment not available to use in AsterMargin"};
+        }
+        
+        // Confirm upload status
+        // const userId = store.get(userIdAtom) || '';
+        // const attachment = await Zotero.AsterMargin.db.getAttachmentByZoteroKey(userId, item.libraryID, item.key);
+        // if (!attachment) return {valid: false, error: "Attachment not found"};
+        // if (attachment.upload_status !== 'completed') return {valid: false, error: "Attachment not uploaded"};
+
+        return {valid: true};
+    }
+
+    // ------- Annotations -------
+    else if (item.isAnnotation()) {
+        // (a) Check if the annotation type is valid
+        if (!isValidAnnotationType(item.annotationType)) return {valid: false, error: "Invalid annotation type"};
+
+        // (b) Check if annotation is empty
+        if (item.annotationType === 'underline' && !item.annotationText && !item.annotationComment) return {valid: false, error: "Annotation is empty"};
+        if (item.annotationType === 'highlight' && !item.annotationText && !item.annotationComment) return {valid: false, error: "Annotation is empty"};
+        // if (item.annotationType === 'note' && !item.annotationText && !item.annotationComment) return {valid: false, error: "Annotation is empty"};
+
+        // (c) Check if the parent exists and is an attachment
+        const parent = item.parentItem;
+        if (!parent || !parent.isAttachment()) return {valid: false, error: "Parent item is not an attachment"};
+
+        // (d) Check if the parent is available to AsterMargin
+        if (!agentItemFilter(parent)) return {valid: false, error: "Parent item is not available to use in AsterMargin"};
+
+        // (e) Check if the parent file exists
+        const hasFile = await safeFileExists(parent);
+        if (!hasFile) return {valid: false, error: "Parent file does not exist"};
+
+        return {valid: true};
+    }
+
+    // ------- Notes -------
+    else if (item.isNote()) {
+        if (item.isInTrash()) return {valid: false, error: "Note is in trash"};
+        return {valid: true};
+    }
+
+    return {valid: false, error: "Invalid item type"};
+}
+
+/**
+ * Reveal source item in Zotero, optionally in a specific collection
+ * @param source - The source item to reveal
+ * @param collectionKey - Optional collection key to navigate to before revealing
+ */
+export function revealSource(source: ZoteroItemReference | SourceAttachment, collectionKey?: string) {
+    const runtime = tryGetWindowRuntime();
+    if (!runtime || runtime.hostWindow.closed) return;
+    if (!source.zotero_key) return;
+    const libraryID = resolveLibraryRef(source);
+    if (!libraryID) {
+        logger(`revealSource: library unavailable (${source.library_ref || source.library_id}, ${source.zotero_key})`);
+        notifyReferenceUnavailable('item', 'library_unavailable');
+        return;
+    }
+    const itemID = Zotero.Items.getIDFromLibraryAndKey(libraryID, source.zotero_key);
+    if (!itemID) {
+        logger(`revealSource: item not found (${libraryID}, ${source.zotero_key})`);
+        notifyReferenceUnavailable('item');
+        return;
+    }
+    let collectionId: number | undefined;
+    if (collectionKey) {
+        try {
+            collectionId = resolveCollection(collectionKey, { libraryID, access: 'local' }).collection.id;
+        } catch {
+            // The item remains navigable when its historical collection is gone.
+        }
+    }
+    // A standalone with no context lets navigation open and await a main window.
+    void selectItemById(itemID, true, collectionId, runtime.contextWindow).catch(error => {
+        logger(`revealSource: unable to reveal item ${itemID}: ${error}`, 2);
+    });
+}
+
+/**
+ * Resolve the key of the currently selected collection when the given item
+ * (or its top-level parent, for child notes) is a member of that collection.
+ *
+ * Pass the result to `revealSource` so the item is revealed within the
+ * current collection instead of switching to the library root. Returns
+ * undefined when there is no selected collection or the item does not belong
+ * to it — callers then fall back to the default library-root behavior.
+ */
+export async function getCurrentCollectionKeyForItem(
+    libraryId: number,
+    zoteroKey: string,
+): Promise<string | undefined> {
+    if (libraryId === UNRESOLVED_LIBRARY_ID) return undefined;
+    try {
+        const selectedCollection = getSelectedCollection(getContextWindow()?.ZoteroPane);
+        if (!selectedCollection || selectedCollection.libraryID !== libraryId) return undefined;
+
+        const item = await Zotero.Items.getByLibraryAndKeyAsync(libraryId, zoteroKey);
+        if (!item) return undefined;
+
+        // Collection membership lives on the top-level item; a child note
+        // inherits its placement from its parent. Load the parent async via
+        // its ID — the synchronous `parentItem` getter throws when the parent
+        // is not yet in Zotero's object cache.
+        let topLevelItem = item;
+        if (item.isNote() && item.parentItemID) {
+            const parent = await Zotero.Items.getAsync(item.parentItemID);
+            if (parent) topLevelItem = parent;
+        }
+        await topLevelItem.loadDataType('collections');
+        return topLevelItem.getCollections().includes(selectedCollection.id)
+            ? selectedCollection.key
+            : undefined;
+    } catch (error) {
+        logger(`getCurrentCollectionKeyForItem: ${error}`, 1);
+        return undefined;
+    }
+}
+
+export async function openSource(source: SourceAttachment | ZoteroItemReference) {
+    const resolved = await resolveItemReference(source);
+    if (resolved.status !== 'found') {
+        logger(`openSource: item not found (${source.library_ref || source.library_id}, ${source.zotero_key})`);
+        notifyReferenceUnavailable('item', resolved.status === 'library_unavailable' ? 'library_unavailable' : 'missing');
+        return;
+    }
+    const item = resolved.item;
+    
+    // Regular items
+    if (item.isRegularItem()) {
+        const bestAttachment = await item.getBestAttachment();
+        if (bestAttachment) {
+            viewAttachment(bestAttachment.id);
+        }
+    }
+
+    // Attachments
+    if (item.isAttachment()) {
+        viewAttachment(item.id);
+    }
+
+    // Notes
+    if (item.isNote()) {
+        await openNoteById(item.id);
+    }
+}
+
+/**
+ * Open a note in the Zotero editor (tab or window based on user preference).
+ * Uses Zotero.Notes.open() which respects the `extensions.zotero.openNoteInNewWindow` setting.
+ */
+export async function openNoteById(itemId: number, win?: Window): Promise<void> {
+    try {
+        await openNote(itemId, win);
+    } catch (error) {
+        logger(`openNoteById: ${error}`, 2);
+    }
+}
+
+/**
+ * Clear (collapse) the selection in an open note editor.
+ * Called after an edit is applied or undone so the selection doesn't shift
+ * to unrelated text when ProseMirror remaps through document changes.
+ */
+export function clearNoteEditorSelection(libraryId: number, zoteroKey: string): void {
+    const itemId = Zotero.Items.getIDFromLibraryAndKey(libraryId, zoteroKey);
+    if (!itemId) return;
+
+    // Wait for the Notifier to propagate the content change, then collapse
+    // the selection to a cursor so it doesn't highlight unrelated text.
+    setTimeout(() => {
+        try {
+            const view = getNoteEditorView(itemId);
+            if (!view?.dom) return;
+
+            const SelectionBase = Object.getPrototypeOf(
+                Object.getPrototypeOf(view.state.selection)
+            ).constructor;
+            const TextSelectionClass = SelectionBase.atStart(view.state.doc).constructor;
+            // Collapse to cursor at the selection's start (mapped to the edit point)
+            const cursorPos = Math.min(view.state.selection.from, view.state.doc.content.size);
+            const selection = TextSelectionClass.create(view.state.doc, cursorPos);
+            view.dispatch(view.state.tr.setSelection(selection));
+        } catch {
+            // Best-effort — a stale selection is cosmetic, not critical
+        }
+    }, 150);
+}
+
+/**
+ * Open a note by library ID and zotero key.
+ */
+export async function openNoteByKey(libraryId: number, zoteroKey: string): Promise<void> {
+    const itemId = Zotero.Items.getIDFromLibraryAndKey(libraryId, zoteroKey);
+    if (itemId) {
+        await openNoteById(itemId);
+    }
+}
+
+/**
+ * Open a note and search for the edited text, scrolling to the match.
+ * Uses the ProseMirror search plugin to highlight and scroll to the relevant
+ * section of the note.
+ *
+ * @param libraryId - Library ID of the note item
+ * @param zoteroKey - Zotero key of the note item
+ * @param oldString - The original string being replaced (simplified HTML)
+ * @param newString - The replacement string (simplified HTML)
+ * @param isApplied - Whether the edit has already been applied
+ */
+export async function openNoteAndSearchEdit(
+    libraryId: number,
+    zoteroKey: string,
+    oldString: string,
+    newString: string,
+    isApplied: boolean,
+    undoBeforeContext?: string,
+    undoAfterContext?: string,
+    targetBeforeContext?: string,
+    targetAfterContext?: string,
+    operation?: EditNoteOperation,
+): Promise<void> {
+    logger(`openNoteAndSearchEdit: called with libraryId=${libraryId}, zoteroKey=${zoteroKey}, isApplied=${isApplied}`, 1);
+    logger(`openNoteAndSearchEdit: oldString (${oldString.length} chars): "${oldString.substring(0, 200)}"`, 1);
+    logger(`openNoteAndSearchEdit: newString (${newString.length} chars): "${newString.substring(0, 200)}"`, 1);
+
+    const itemId = Zotero.Items.getIDFromLibraryAndKey(libraryId, zoteroKey);
+    if (!itemId) {
+        logger(`openNoteAndSearchEdit: item not found for ${libraryId}-${zoteroKey}, aborting`, 1);
+        return;
+    }
+    logger(`openNoteAndSearchEdit: resolved itemId=${itemId}`, 1);
+
+    // Check if the note is already open in an editor before opening.
+    // If not, we'll need to wait longer for the tab to fully initialize.
+    const wasAlreadyOpen = (Zotero as any).Notes?._editorInstances?.some(
+        (e: any) => e.itemID === itemId
+    ) ?? false;
+    logger(`openNoteAndSearchEdit: note wasAlreadyOpen=${wasAlreadyOpen}`, 1);
+
+    // Open the note (or focus if already open)
+    await openNoteById(itemId);
+    logger(`openNoteAndSearchEdit: note opened/focused`, 1);
+
+    // When opening a note in a new tab, the tab switch triggers async UI
+    // events (useZoteroTabSelection, useZoteroContext) that can reinitialize
+    // the editor after our search runs. Wait for the tab switch to settle.
+    if (!wasAlreadyOpen) {
+        logger(`openNoteAndSearchEdit: waiting 500ms for new tab to settle`, 1);
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    // Search text is derived from citation labels resolved with synchronous
+    // item lookups; load the cited libraries first so those lookups succeed.
+    await ensureCitedLibrariesLoaded(
+        [oldString, newString, targetBeforeContext, targetAfterContext, undoBeforeContext, undoAfterContext],
+        [],
+        { includeExcluded: true },
+    );
+
+    // Determine what to search for and what to select based on edit status.
+    let searchText: string | null = null;
+    let selectText: string | undefined;
+    let endSearchText: string | undefined;
+    let selectOffsetInSearch: number | undefined;
+    let contextualSearches: Array<{ searchText: string; selectText: string; selectOffsetInSearch: number }> = [];
+
+    // For applied edits, highlight the added text; for pending/undone edits,
+    // highlight the text that will be replaced (the deleted portion).
+    const diffTarget = isApplied ? 'addition' : 'deletion';
+    const fallbackHtml = isApplied ? newString : oldString;
+
+    const result = operation === 'append' && !isApplied
+        ? null
+        : extractHighlightedDiffText(oldString, newString, diffTarget);
+    if (result) {
+        searchText = result.searchText;
+        selectText = result.selectText;
+        endSearchText = result.endSearchText;
+        selectOffsetInSearch = result.selectOffsetInSearch;
+        logger(`openNoteAndSearchEdit: extractHighlightedDiffText(${diffTarget}): searchText="${searchText.substring(0, 80)}", selectText="${selectText.substring(0, 80)}", selectOffsetInSearch=${selectOffsetInSearch}${endSearchText ? `, endSearchText="${endSearchText.substring(0, 80)}"` : ''}`, 1);
+    } else {
+        // Fall back when there's no char-level diff highlight.
+        if (operation === 'append' && !isApplied) {
+            searchText = await extractAppendAnchorSearchText(itemId);
+            logger(`openNoteAndSearchEdit: using append anchor search "${searchText?.substring(0, 80)}"`, 1);
+        } else if (diffTarget === 'deletion') {
+            // For pending pure insertions, search for the END of the old text
+            // so we scroll to the insertion point.
+            searchText = extractSearchTermEnd(fallbackHtml) || extractSearchTerm(fallbackHtml);
+        } else {
+            // For applied pure deletions (nothing highlighted on the addition
+            // side), find context around the edit point in the new text so we
+            // scroll to where the deletion happened, not the paragraph start.
+            if (!newString && undoBeforeContext && undoAfterContext) {
+                // For full deletions with undo context, search for the seam
+                // (before + after context concatenated) in the note's plain text.
+                const seamText = stripHtmlTags(undoBeforeContext + undoAfterContext);
+                // Use the last ~60 chars before + first ~40 chars after as search text
+                const beforePart = seamText.substring(Math.max(0, seamText.length / 2 - 60), Math.floor(seamText.length / 2));
+                const afterPart = seamText.substring(Math.floor(seamText.length / 2), Math.floor(seamText.length / 2) + 40);
+                const seamSearch = (beforePart + afterPart).trim();
+                searchText = seamSearch.length >= 10 ? seamSearch : null;
+                logger(`openNoteAndSearchEdit: using undo context seam for applied deletion: "${searchText?.substring(0, 80)}"`, 1);
+            }
+            if (!searchText) {
+                searchText = extractEditPointContext(oldString, newString) || extractSearchTerm(fallbackHtml);
+            }
+        }
+        logger(`openNoteAndSearchEdit: fell back to fallback search: ${searchText ? `"${searchText}"` : 'null'}`, 1);
+    }
+
+    // When validation persisted explicit target context for an ambiguous raw
+    // match (e.g. duplicate citations with different refs), derive a text-level
+    // anchor for the editor search. The editor matcher operates on flattened
+    // plain text, so we convert the raw-note context to nearby text here
+    // instead of passing raw HTML into selectAndScrollInNoteEditor.
+    if (!endSearchText && !(operation === 'append' && !isApplied)) {
+        contextualSearches = extractTargetContextSearches(
+            targetBeforeContext,
+            isApplied ? newString : oldString,
+            targetAfterContext,
+            selectText,
+        );
+        const contextualSearch = contextualSearches[0];
+        if (contextualSearch) {
+            searchText = contextualSearch.searchText;
+            selectText = contextualSearch.selectText;
+            selectOffsetInSearch = contextualSearch.selectOffsetInSearch;
+            logger(`openNoteAndSearchEdit: using target-context search "${searchText.substring(0, 80)}"`, 1);
+        }
+    }
+
+    if (!searchText) {
+        logger(`openNoteAndSearchEdit: no search text resolved, aborting search`, 1);
+        return;
+    }
+    logger(`openNoteAndSearchEdit: final searchText="${searchText}", selectText=${selectText ? `"${selectText}"` : 'undefined'}, endSearchText=${endSearchText ? `"${endSearchText}"` : 'undefined'}`, 1);
+
+    // Wait for the editor instance to be available and initialized,
+    // then select the text and scroll to it.
+    let found = await selectAndScrollInNoteEditor(itemId, searchText, selectText, endSearchText, selectOffsetInSearch);
+
+    // If the first target-context search variant failed, try alternate
+    // rendered variants before falling back to generic search terms.
+    if (!found && contextualSearches.length > 1) {
+        for (const candidate of contextualSearches.slice(1)) {
+            logger(`openNoteAndSearchEdit: retrying alternate target-context search "${candidate.searchText.substring(0, 80)}"`, 1);
+            found = await selectAndScrollInNoteEditor(
+                itemId,
+                candidate.searchText,
+                candidate.selectText,
+                undefined,
+                candidate.selectOffsetInSearch,
+            );
+            if (found) break;
+        }
+    }
+
+    // Retry without placeholder tokens ([citation], [image]) that won't
+    // match the editor DOM — citations render as formatted text and images
+    // have no text node. This handles cases where stripHtmlTags couldn't
+    // recover the citation label (e.g. item not in local library).
+    if (!found && /\[(citation|image)\]/.test(searchText)) {
+        const stripPlaceholders = (s: string) => s.replace(/\s*\[(citation|image)\]\s*/g, ' ').trim();
+        const cleanSearch = stripPlaceholders(searchText);
+        const cleanSelect = selectText ? stripPlaceholders(selectText) : undefined;
+        const cleanEnd = endSearchText ? stripPlaceholders(endSearchText) : undefined;
+        if (cleanSearch.length >= 10) {
+            logger(`openNoteAndSearchEdit: retrying without placeholder tokens: "${cleanSearch.substring(0, 80)}"`, 1);
+            found = await selectAndScrollInNoteEditor(itemId, cleanSearch, cleanSelect, cleanEnd);
+        }
+    }
+
+    // Fallback: only applied edits should try the opposite text. For pending,
+    // rejected, and undone actions the note is expected to contain oldString,
+    // so jumping to newString can select the wrong citation entirely.
+    if (!found && isApplied) {
+        const fallbackText = extractSearchTerm(oldString);
+        if (fallbackText) {
+            logger(`openNoteAndSearchEdit: primary search failed, trying fallback: "${fallbackText}"`, 1);
+            await selectAndScrollInNoteEditor(itemId, fallbackText);
+        }
+    }
+}
+
+/**
+ * Extract search and selection text from the diff between old and new HTML.
+ *
+ * @param targetType - Which diff line type to extract from:
+ *   `'addition'` for applied edits (find the new text in the note),
+ *   `'deletion'` for pending/undone edits (find the old text in the note).
+ *
+ * Returns:
+ *  - `searchText`: the first target-type line (used for locating the edit and
+ *    for disambiguation when `selectText` is not unique).
+ *  - `selectText`: the highlighted (char-level diff) portion of the first
+ *    target-type line — the narrowest text we want to select.
+ *  - `endSearchText` (optional): the last target-type line text, returned only
+ *    for multi-line edits so the selection can span the full edit range.
+ *
+ * Returns null when no target-type line with a highlight is found or the
+ * result is too short to be a useful search term.
+ */
+function extractHighlightedDiffText(
+    oldHtml: string,
+    newHtml: string,
+    targetType: 'addition' | 'deletion',
+): { searchText: string; selectText: string; selectOffsetInSearch?: number; endSearchText?: string } | null {
+    const strippedOld = stripHtmlTags(oldHtml);
+    const strippedNew = stripHtmlTags(newHtml);
+    logger(`extractHighlightedDiffText(${targetType}): strippedOld (${strippedOld.length} chars): "${strippedOld.substring(0, 150)}"`, 1);
+    logger(`extractHighlightedDiffText(${targetType}): strippedNew (${strippedNew.length} chars): "${strippedNew.substring(0, 150)}"`, 1);
+
+    if (!strippedOld && !strippedNew) return null;
+
+    const diffLines = computeDiff(strippedOld, strippedNew);
+    logger(`extractHighlightedDiffText(${targetType}): ${diffLines.length} diff lines computed`, 1);
+
+    // Collect all lines of the target type (with or without segments)
+    const targetLines = diffLines.filter(l => l.type === targetType);
+    if (targetLines.length === 0) {
+        logger(`extractHighlightedDiffText(${targetType}): no ${targetType} lines found`, 1);
+        return null;
+    }
+
+    // Find the first target line with a highlighted segment
+    const firstHighlightedLine = targetLines.find(
+        l => l.segments?.some(s => s.highlighted && s.text.trim()),
+    );
+    if (!firstHighlightedLine) {
+        logger(`extractHighlightedDiffText(${targetType}): no highlighted ${targetType} line found`, 1);
+        return null;
+    }
+
+    const fullLineText = firstHighlightedLine.text.trim();
+    if (fullLineText.length < 10) {
+        logger(`extractHighlightedDiffText(${targetType}): first highlighted line too short (${fullLineText.length} chars)`, 1);
+        return null;
+    }
+
+    // Extract only the highlighted (char-level diff) portion.
+    // truncateSegments only truncates non-highlighted segments, so the
+    // highlighted text from segments is accurate.
+    let selectText = firstHighlightedLine.segments!
+        .filter(s => s.highlighted)
+        .map(s => s.text)
+        .join('')
+        .trim();
+    selectText = stripEllipsis(selectText);
+    if (!selectText) {
+        logger(`extractHighlightedDiffText(${targetType}): highlighted segments empty after stripping`, 1);
+        return null;
+    }
+
+    // Find the correct position of selectText in fullLineText.
+    // selectText may appear multiple times (e.g., "the" in
+    // "Why did the German police officer arrest the battery?").
+    // Use adjacent segment text as context to disambiguate.
+    const segs = firstHighlightedLine.segments!;
+    let selectOffset = fullLineText.indexOf(selectText);
+    let prefixContext = '';
+    for (const seg of segs) {
+        if (seg.highlighted) break;
+        prefixContext = seg.text; // keep last non-highlighted segment before highlight
+    }
+    prefixContext = prefixContext.replace(/^…+/, ''); // strip truncation ellipsis
+    if (prefixContext.length > 0) {
+        const ctxLen = Math.min(15, prefixContext.length);
+        const ctx = prefixContext.slice(-ctxLen);
+        const combined = ctx + selectText;
+        const combinedIdx = fullLineText.indexOf(combined);
+        if (combinedIdx !== -1) {
+            selectOffset = combinedIdx + ctx.length;
+        }
+    }
+
+    // A tiny highlight (e.g. the single differing digit of "200" → "250") is
+    // a poor search/selection target on its own. Expand it to the word that
+    // contains the change so downstream matching can still locate the edit —
+    // including when the surrounding sentence has drifted and only the
+    // changed word survives in the note.
+    if (selectText.length < 2) {
+        if (selectOffset === -1) {
+            logger(`extractHighlightedDiffText(${targetType}): selectText too short and not locatable in line`, 1);
+            return null;
+        }
+        let wordStart = selectOffset;
+        while (wordStart > 0 && !/\s/.test(fullLineText[wordStart - 1]) && selectOffset - wordStart < 30) wordStart--;
+        let wordEnd = selectOffset + selectText.length;
+        while (wordEnd < fullLineText.length && !/\s/.test(fullLineText[wordEnd]) && wordEnd - wordStart < 60) wordEnd++;
+        selectText = fullLineText.slice(wordStart, wordEnd);
+        selectOffset = wordStart;
+        logger(`extractHighlightedDiffText(${targetType}): expanded short highlight to word "${selectText}"`, 1);
+    }
+
+    // Build searchText from the full line, truncated to a window centered
+    // around the highlighted portion so it always contains selectText.
+    let searchText = fullLineText;
+    let searchTextStart = 0; // track where the window starts within fullLineText
+    const windowSize = Math.max(200, selectText.length + 40);
+    if (searchText.length > windowSize) {
+        if (selectOffset !== -1) {
+            const margin = Math.floor((windowSize - selectText.length) / 2);
+            searchTextStart = Math.max(0, selectOffset - margin);
+            searchText = searchText.substring(searchTextStart, searchTextStart + windowSize);
+        } else {
+            searchText = searchText.substring(0, windowSize);
+        }
+    }
+    searchText = stripEllipsis(searchText);
+
+    // Compute offset of selectText within searchText for downstream
+    // disambiguation (avoids indexOf which may find the wrong occurrence).
+    const selectOffsetInSearch = selectOffset !== -1
+        ? selectOffset - searchTextStart
+        : undefined;
+
+    // For multi-line edits, include the last target line so the selection
+    // can span the entire edited range (not just the first line).
+    let endSearchText: string | undefined;
+    if (targetLines.length > 1) {
+        const lastLine = targetLines[targetLines.length - 1];
+        let endText = lastLine.text.trim();
+        if (endText.length > 100) endText = endText.slice(-100);
+        endText = stripEllipsis(endText);
+        if (endText && endText.length >= 5) {
+            endSearchText = endText;
+        }
+    }
+
+    logger(`extractHighlightedDiffText(${targetType}): searchText="${searchText.substring(0, 80)}", selectText="${selectText.substring(0, 80)}", selectOffsetInSearch=${selectOffsetInSearch}${endSearchText ? `, endSearchText="${endSearchText.substring(0, 80)}"` : ''}`, 1);
+    return { searchText, selectText, selectOffsetInSearch, endSearchText };
+}
+
+/**
+ * Extract a search-friendly plain-text term from simplified HTML.
+ * Strips HTML tags (handling citations, annotations, images) and takes
+ * the first meaningful line, truncated to a reasonable length for search.
+ */
+function extractSearchTerm(html: string): string | null {
+    logger(`extractSearchTerm: input html (${html.length} chars): "${html.substring(0, 200)}"`, 1);
+
+    const plainText = stripHtmlTags(html);
+    logger(`extractSearchTerm: after stripHtmlTags (${plainText.length} chars): "${plainText.substring(0, 200)}"`, 1);
+
+    if (!plainText) {
+        logger(`extractSearchTerm: plainText is empty after stripping`, 1);
+        return null;
+    }
+
+    // Take the first non-empty line as the search term.
+    // This avoids multi-line search issues with ProseMirror.
+    const lines = plainText.split('\n').filter(l => l.trim());
+    logger(`extractSearchTerm: ${lines.length} non-empty lines found`, 1);
+    if (lines.length === 0) return null;
+
+    let term = lines[0].trim();
+    logger(`extractSearchTerm: first line (${term.length} chars): "${term.substring(0, 200)}"`, 1);
+
+    // Truncate to a reasonable length — long terms may not match well
+    // due to whitespace normalization differences between simplified HTML
+    // and ProseMirror's text representation.
+    if (term.length > 100) {
+        term = term.substring(0, 100);
+        logger(`extractSearchTerm: truncated to 100 chars`, 1);
+    }
+
+    term = stripEllipsis(term);
+    return term;
+}
+
+/**
+ * Like extractSearchTerm but takes the LAST line and its trailing portion.
+ * Used for pending pure insertions so we scroll to the insertion point
+ * (end of existing text) rather than the beginning of the paragraph.
+ */
+function extractSearchTermEnd(html: string): string | null {
+    const plainText = stripHtmlTags(html);
+    if (!plainText) return null;
+
+    const lines = plainText.split('\n').filter(l => l.trim());
+    if (lines.length === 0) return null;
+
+    let term = lines[lines.length - 1].trim();
+    if (term.length > 100) {
+        term = term.slice(-100);
+    }
+    term = stripEllipsis(term);
+    return term || null;
+}
+
+/**
+ * Derive a plain-text search anchor near the note append point.
+ */
+async function extractAppendAnchorSearchText(itemId: number): Promise<string | null> {
+    const item = await Zotero.Items.getAsync(itemId);
+    if (!item) return null;
+    await item.loadDataType('note');
+
+    const html = item.getNote();
+    const appendPoint = getAsterMarginFooterAppendPoint(html);
+    const bodyHtml = html.slice(0, appendPoint);
+    const spacedHtml = bodyHtml.replace(/<\/(p|div|li|h[1-6])>\s*</gi, '</$1> <');
+    const plainText = stripHtmlTags(spacedHtml).replace(/\s+/g, ' ').trim();
+    if (!plainText) return null;
+
+    const anchor = plainText.length > 80 ? plainText.slice(-80) : plainText;
+    return anchor.length >= 10 ? anchor : null;
+}
+
+/**
+ * Find the context around the edit point in the new text by comparing
+ * old and new HTML. Used for applied pure deletions where nothing was
+ * added — ensures we scroll to where the deletion happened rather than
+ * the beginning of the paragraph.
+ */
+function extractEditPointContext(oldHtml: string, newHtml: string): string | null {
+    const oldText = stripHtmlTags(oldHtml);
+    const newText = stripHtmlTags(newHtml);
+    if (!oldText || !newText) return null;
+
+    // Find where old and new text first diverge
+    let prefixLen = 0;
+    const minLen = Math.min(oldText.length, newText.length);
+    while (prefixLen < minLen && oldText[prefixLen] === newText[prefixLen]) {
+        prefixLen++;
+    }
+
+    // If texts are identical, nothing to search for
+    if (prefixLen === oldText.length && prefixLen === newText.length) return null;
+
+    // Extract context around the edit point from the new text,
+    // biased toward text before the edit (recognizable to the user).
+    const contextBefore = 60;
+    const contextAfter = 40;
+    const start = Math.max(0, prefixLen - contextBefore);
+    const end = Math.min(newText.length, prefixLen + contextAfter);
+
+    let term = newText.substring(start, end).trim();
+    term = stripEllipsis(term);
+    if (!term || term.length < 10) return null;
+    if (term.length > 100) term = term.substring(0, 100);
+
+    logger(`extractEditPointContext: editPoint=${prefixLen}, context="${term.substring(0, 80)}"`, 1);
+    return term;
+}
+
+function normalizeSearchFragment(html: string | undefined): string {
+    if (!html) return '';
+    return stripEllipsis(stripHtmlTags(html).replace(/\s+/g, ' ').trim());
+}
+
+function formatCitationTextForSearch(citationItems: any[]): string | null {
+    if (citationItems.length === 0) return null;
+    try {
+        const citation = { citationItems, properties: {} };
+        const formatted = Zotero.EditorInstanceUtilities.formatCitation(citation);
+        return formatted?.replace(/<[^>]+>/g, '').trim() || null;
+    } catch {
+        return null;
+    }
+}
+
+function lookupCitationItemForSearch(itemId: string, locator?: string): any | null {
+    const ref = resolveObjectId(itemId);
+    if (!ref || ref.library_id === UNRESOLVED_LIBRARY_ID) return null;
+    try {
+        const item = Zotero.Items.getByLibraryAndKey(ref.library_id, ref.zotero_key);
+        if (!item || typeof item === 'boolean') return null;
+        const citeItem = item.isAttachment?.() && item.parentItemID
+            ? Zotero.Items.get(item.parentItemID)
+            : item;
+        if (!citeItem || typeof citeItem === 'boolean') return null;
+        return {
+            uris: [Zotero.URI.getItemURI(citeItem)],
+            itemData: Zotero.Utilities.Item.itemToCSLJSON(citeItem),
+            ...(locator ? { locator, label: 'page' } : {}),
+        };
+    } catch {
+        // Item not loaded (unopened library) or not formattable: no label.
+        return null;
+    }
+}
+
+function parseCompoundCitationItemForSearch(entry: string): { itemId: string; page?: string } {
+    const trimmed = entry.trim();
+    const pageMarker = ':page=';
+    const pageIdx = trimmed.indexOf(pageMarker);
+    if (pageIdx === -1) return { itemId: trimmed };
+    return {
+        itemId: trimmed.substring(0, pageIdx).trim(),
+        page: trimmed.substring(pageIdx + pageMarker.length).trim() || undefined,
+    };
+}
+
+function recoverCitationLabelForSearch(tag: string): string | null {
+    const openTag = tag.match(/^<citation\b([^>]*)\/>/i);
+    const attrs = parseRawCitationAttributes(openTag?.[1] || '');
+    const normalized = normalizeCitationTag(attrs);
+    if (normalized.ok && normalized.ref.kind === 'zotero') {
+        const ci = lookupCitationItemForSearch(modelObjectIdFromReference(normalized.ref));
+        return ci ? formatCitationTextForSearch([ci]) : null;
+    }
+    if (attrs.items) {
+        const citationItems = attrs.items.split(',')
+            .map((entry) => {
+                const { itemId, page } = parseCompoundCitationItemForSearch(entry);
+                return lookupCitationItemForSearch(itemId, page);
+            })
+            .filter(Boolean);
+        return formatCitationTextForSearch(citationItems);
+    }
+    return null;
+}
+
+function appendCitationPageWithStyle(tag: string, label: string, style: 'short' | 'word'): string {
+    const attrMatch = tag.match(/^<citation\b([^>]*)\/>/i);
+    const attrs = parseRawCitationAttributes(attrMatch?.[1] || '');
+    const normalized = normalizeCitationTag(attrs);
+    let page = normalized.ok ? getPageLocator(normalized.ref) : (attrs.page || null);
+    if (!page) return label;
+    page = page.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+    const suffix = style === 'word' ? `, page ${page}` : `, p. ${page}`;
+    const locatorWithParen = /^(.*?)(,\s*(?:p{1,2}\.|page)\s+[^)]*)(\))$/i;
+    if (locatorWithParen.test(label)) {
+        return label.replace(locatorWithParen, `$1${suffix}$3`);
+    }
+    const locatorPlain = /^(.*?)(,\s*(?:p{1,2}\.|page)\s+.*)$/i;
+    if (locatorPlain.test(label)) {
+        return label.replace(locatorPlain, `$1${suffix}`);
+    }
+    if (label.endsWith(')')) {
+        return label.slice(0, -1) + suffix + ')';
+    }
+    return label + suffix;
+}
+
+function normalizeTargetSearchVariant(html: string, style: 'short' | 'word'): string {
+    const expandedCitations = html
+        .replace(
+            /<citation\b(?:[^>"']|"[^"]*"|'[^']*')*\blabel="([^"]*)"(?:[^>"']|"[^"]*"|'[^']*')*\/>/gi,
+            (match, label) => appendCitationPageWithStyle(match, label || '[citation]', style)
+        )
+        .replace(/<citation\b(?:[^>"']|"[^"]*"|'[^']*')*\/>/gi, (match) => {
+            const label = recoverCitationLabelForSearch(match) || '[citation]';
+            return appendCitationPageWithStyle(match, label, style);
+        });
+    return stripEllipsis(stripHtmlTags(expandedCitations).replace(/\s+/g, ' ').trim());
+}
+
+function extractTargetContextSearches(
+    beforeHtml: string | undefined,
+    targetHtml: string,
+    afterHtml: string | undefined,
+    preferredSelectText?: string,
+): Array<{ searchText: string; selectText: string; selectOffsetInSearch: number }> {
+    const beforeText = normalizeSearchFragment(beforeHtml);
+    const afterText = normalizeSearchFragment(afterHtml);
+    if (!beforeText && !afterText) return [];
+
+    const targetTextVariants = Array.from(new Set([
+        normalizeSearchFragment(targetHtml),
+        normalizeTargetSearchVariant(targetHtml, 'word'),
+        normalizeTargetSearchVariant(targetHtml, 'short'),
+    ].filter((text) => text && text.length >= 2)));
+    if (targetTextVariants.length === 0) return [];
+
+    const preferred = normalizeSearchFragment(preferredSelectText);
+    const beforeTail = beforeText ? beforeText.slice(-80) : '';
+    const afterHead = afterText ? afterText.slice(0, 80) : '';
+    const searches: Array<{ searchText: string; selectText: string; selectOffsetInSearch: number }> = [];
+
+    for (const targetText of targetTextVariants) {
+        const selectText = preferred && targetText.includes(preferred)
+            ? preferred
+            : targetText;
+        if (!selectText || selectText.length < 2) continue;
+
+        const parts = [beforeTail, targetText, afterHead].filter(Boolean);
+        if (parts.length === 0) continue;
+
+        const searchText = parts.join(' ').trim();
+        if (!searchText || searchText.length < 10) continue;
+
+        const selectOffsetInTarget = targetText.indexOf(selectText);
+        const selectOffsetInSearch = (beforeTail ? beforeTail.length + 1 : 0)
+            + (selectOffsetInTarget >= 0 ? selectOffsetInTarget : 0);
+
+        searches.push({
+            searchText,
+            selectText,
+            selectOffsetInSearch,
+        });
+    }
+
+    return searches;
+}
+
+/**
+ * Find text in the note editor, select it, and scroll to it using
+ * ProseMirror's TextSelection and scrollIntoView — no search bar shown.
+ *
+ * @param searchText - Text to locate in the editor DOM (first addition line).
+ * @param selectText - Optional narrower text to actually select. When
+ *   provided, the function first checks if it's unique in the note. If
+ *   unique it selects just that text; otherwise it locates `searchText`
+ *   (the wider context) and selects the `selectText` portion within it.
+ * @param endSearchText - Optional text of the last addition line. When
+ *   provided (multi-line edits), the selection spans from the start of
+ *   `selectText` within `searchText` to the end of `endSearchText`.
+ */
+/** @internal Exported for testing only. */
+export async function selectAndScrollInNoteEditor(
+    itemId: number,
+    searchText: string,
+    selectText?: string,
+    endSearchText?: string,
+    selectOffsetInSearch?: number,
+): Promise<boolean> {
+    const maxWaitMs = 3000;
+    const pollIntervalMs = 100;
+    const startTime = Date.now();
+
+    logger(`selectAndScrollInNoteEditor: polling for editor view (itemId=${itemId})`, 1);
+
+    while (Date.now() - startTime < maxWaitMs) {
+        const view = getNoteEditorView(itemId);
+        if (view?.dom) {
+            logger(`selectAndScrollInNoteEditor: view found after ${Date.now() - startTime}ms`, 1);
+
+            const { textNodes, fullText } = buildEditorTextMap(view.dom);
+
+            // Determine which character range to select
+            let rangeStart: number;
+            let rangeEnd: number;
+
+            if (endSearchText) {
+                // Multi-line edit: select from start of selectText (within
+                // searchText) to end of endSearchText.
+                const ctxIdx = fullText.indexOf(searchText);
+                if (ctxIdx === -1) {
+                    logger(`selectAndScrollInNoteEditor: searchText not found in DOM`, 1);
+                    return false;
+                }
+
+                // Start from the selectText (changed portion) within the
+                // first addition line, not from the shared prefix.
+                if (selectText) {
+                    const withinIdx = selectOffsetInSearch ?? searchText.indexOf(selectText);
+                    rangeStart = withinIdx !== -1 ? ctxIdx + withinIdx : ctxIdx;
+                } else {
+                    rangeStart = ctxIdx;
+                }
+
+                // Find endSearchText after the start position
+                const endIdx = fullText.indexOf(endSearchText, rangeStart);
+                if (endIdx !== -1) {
+                    rangeEnd = endIdx + endSearchText.length;
+                } else {
+                    // Fallback: select to end of searchText
+                    logger(`selectAndScrollInNoteEditor: endSearchText not found, falling back to searchText range`, 1);
+                    rangeEnd = ctxIdx + searchText.length;
+                }
+                logger(`selectAndScrollInNoteEditor: multi-line range ${rangeStart}-${rangeEnd}`, 1);
+            } else if (selectText && selectText !== searchText) {
+                // Single-line edit: check if selectText is unique in the note
+                const firstIdx = fullText.indexOf(selectText);
+                const secondIdx = firstIdx !== -1
+                    ? fullText.indexOf(selectText, firstIdx + 1)
+                    : -1;
+
+                if (firstIdx !== -1 && secondIdx === -1) {
+                    // selectText is unique → select it directly
+                    logger(`selectAndScrollInNoteEditor: selectText is unique, selecting directly`, 1);
+                    rangeStart = firstIdx;
+                    rangeEnd = firstIdx + selectText.length;
+                } else {
+                    // selectText appears multiple times (or not at all) —
+                    // use searchText for disambiguation
+                    logger(`selectAndScrollInNoteEditor: selectText not unique (first=${firstIdx}, second=${secondIdx}), using searchText context`, 1);
+                    const ctxIdx = fullText.indexOf(searchText);
+                    if (ctxIdx !== -1) {
+                        // Use the pre-computed offset when available (avoids
+                        // indexOf picking the wrong occurrence of selectText
+                        // within searchText, e.g. "the" appearing twice).
+                        const withinIdx = selectOffsetInSearch ?? searchText.indexOf(selectText);
+                        if (withinIdx !== -1) {
+                            rangeStart = ctxIdx + withinIdx;
+                            rangeEnd = rangeStart + selectText.length;
+                        } else {
+                            rangeStart = ctxIdx;
+                            rangeEnd = ctxIdx + searchText.length;
+                        }
+                    } else if (firstIdx !== -1) {
+                        rangeStart = firstIdx;
+                        rangeEnd = firstIdx + selectText.length;
+                    } else {
+                        logger(`selectAndScrollInNoteEditor: neither searchText nor selectText found in DOM`, 1);
+                        return false;
+                    }
+                }
+            } else {
+                // No separate selectText — find and select searchText
+                const idx = fullText.indexOf(searchText);
+                if (idx === -1) {
+                    logger(`selectAndScrollInNoteEditor: text not found in DOM: "${searchText}"`, 1);
+                    return false;
+                }
+                rangeStart = idx;
+                rangeEnd = idx + searchText.length;
+            }
+
+            // Map character range to DOM nodes
+            const match = resolveRangeInTextMap(textNodes, rangeStart, rangeEnd);
+            if (!match) {
+                logger(`selectAndScrollInNoteEditor: failed to map char range to DOM nodes`, 1);
+                return false;
+            }
+
+            const fromPos = view.posAtDOM(match.startNode, match.startOffset);
+            let toPos = view.posAtDOM(match.endNode, match.endOffset);
+
+            // posAtDOM maps positions inside an inline atom's DOM (e.g.
+            // citations, images) to the atom's start position, so the
+            // selection ends just before the atom. Detect this and extend
+            // toPos to include the full atom.
+            try {
+                const $to = view.state.doc.resolve(toPos);
+                if ($to.nodeAfter?.isAtom && $to.nodeAfter.isInline) {
+                    const atomDom = view.nodeDOM(toPos);
+                    if (atomDom && (atomDom === match.endNode || atomDom.contains(match.endNode))) {
+                        toPos += $to.nodeAfter.nodeSize;
+                    }
+                }
+            } catch { /* best effort */ }
+
+            logger(`selectAndScrollInNoteEditor: mapped to positions ${fromPos}-${toPos}`, 1);
+
+            // Create a TextSelection for the target range.
+            // IMPORTANT: We must reliably get the TextSelection class, not just
+            // use `view.state.selection.constructor`. If the current selection is
+            // a NodeSelection (e.g., after clicking a citation/image/math block),
+            // its `.create()` method has a different signature and silently
+            // produces the wrong selection type.
+            //
+            // We can't use Selection.fromJSON here because Firefox's Xray
+            // wrappers prevent the content-compartment function from reading
+            // properties on objects created in the chrome compartment. Instead,
+            // we use Selection.atStart() which always returns a TextSelection —
+            // then grab its constructor. All arguments stay within the content
+            // compartment, avoiding cross-compartment issues.
+            let selection: any;
+            try {
+                const SelectionBase = Object.getPrototypeOf(
+                    Object.getPrototypeOf(view.state.selection)
+                ).constructor;
+                const TextSelectionClass = SelectionBase.atStart(view.state.doc).constructor;
+                selection = TextSelectionClass.create(view.state.doc, fromPos, toPos);
+            } catch (selErr: any) {
+                logger(`selectAndScrollInNoteEditor: TextSelection lookup failed (${selErr?.message}), using constructor fallback`, 1);
+                const Ctor = view.state.selection.constructor;
+                selection = Ctor.create(view.state.doc, fromPos, toPos);
+            }
+            const tr = view.state.tr.setSelection(selection).scrollIntoView();
+            view.dispatch(tr);
+
+            // Verify the selection was actually applied
+            const actualSel = view.state.selection;
+            logger(`selectAndScrollInNoteEditor: selection after dispatch: from=${actualSel.from}, to=${actualSel.to} (expected ${fromPos}-${toPos})`, 1);
+
+            // Scroll the selection start into the center of the editor's
+            // scrollable container. We set scrollTop directly because
+            // element.scrollIntoView() doesn't work reliably inside
+            // Zotero's note-editor iframe.
+            try {
+                const scrollContainer = findScrollContainer(view.dom);
+                if (scrollContainer) {
+                    const coords = view.coordsAtPos(fromPos);
+                    const containerRect = scrollContainer.getBoundingClientRect();
+                    const targetScrollTop = scrollContainer.scrollTop
+                        + (coords.top - containerRect.top)
+                        - scrollContainer.clientHeight / 2;
+                    scrollContainer.scrollTop = Math.max(0, targetScrollTop);
+                }
+            } catch (err: any) {
+                logger(`selectAndScrollInNoteEditor: scroll failed (${err?.message})`, 1);
+            }
+
+            // Defer focus so it runs after the current click event finishes
+            // processing (the sidebar click steals focus back otherwise).
+            // Focus the iframe element in the parent window first, then the
+            // ProseMirror view inside it. We retry a few times because React
+            // re-renders and event bubbling can steal focus back after our
+            // first attempt.
+            const iframeDoc = view.dom.ownerDocument;
+            const iframeEl = iframeDoc?.defaultView?.frameElement;
+            const focusEditor = () => {
+                try {
+                    if (iframeEl && typeof (iframeEl as HTMLElement).focus === 'function') {
+                        (iframeEl as HTMLElement).focus();
+                    }
+                    view.focus();
+                } catch {
+                    // Best-effort — selection is still set even without focus
+                }
+            };
+            setTimeout(focusEditor, 50);
+            setTimeout(focusEditor, 200);
+
+            logger(`selectAndScrollInNoteEditor: selection set and scrolled into view`, 1);
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+
+    logger(`selectAndScrollInNoteEditor: timed out after ${maxWaitMs}ms`, 1);
+    return false;
+}
+
+/**
+ * Walk all text nodes in the editor DOM and build a flat text string with
+ * a mapping from character offsets back to DOM nodes.
+ */
+/** @internal Exported for testing only. */
+export function buildEditorTextMap(editorDOM: HTMLElement): {
+    textNodes: { node: Node; start: number }[];
+    fullText: string;
+} {
+    const walker = editorDOM.ownerDocument.createTreeWalker(editorDOM, 4 /* SHOW_TEXT */);
+    const textNodes: { node: Node; start: number }[] = [];
+    let fullText = '';
+
+    // Block-level tag names — when the tree walker crosses from one block
+    // ancestor into another, we insert a space so that text from adjacent
+    // paragraphs/headings doesn't run together. This matches how
+    // extractTargetContextSearches joins context fragments with spaces.
+    const blockTags = new Set([
+        'P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+        'LI', 'TR', 'BLOCKQUOTE', 'PRE', 'TABLE', 'UL', 'OL',
+        'SECTION', 'ARTICLE', 'HEADER', 'FOOTER',
+    ]);
+
+    function getBlockAncestor(node: Node): Node {
+        let current = node.parentNode;
+        while (current && current !== editorDOM) {
+            if ((current as Element).tagName && blockTags.has((current as Element).tagName)) {
+                return current;
+            }
+            current = current.parentNode;
+        }
+        return editorDOM;
+    }
+
+    let prevBlock: Node | null = null;
+
+    while (walker.nextNode()) {
+        const currentBlock = getBlockAncestor(walker.currentNode);
+        if (prevBlock !== null && currentBlock !== prevBlock && fullText.length > 0) {
+            fullText += ' ';
+        }
+        prevBlock = currentBlock;
+        textNodes.push({ node: walker.currentNode, start: fullText.length });
+        fullText += walker.currentNode.textContent || '';
+    }
+
+    return { textNodes, fullText };
+}
+
+/**
+ * Given a character range [startIdx, endIdx) in the flat text built by
+ * `buildEditorTextMap`, resolve it to the corresponding DOM nodes and
+ * offsets. Handles ranges that span multiple text nodes (e.g. across
+ * inline elements like bold, italic, links, citations).
+ */
+/** @internal Exported for testing only. */
+export function resolveRangeInTextMap(
+    textNodes: { node: Node; start: number }[],
+    startIdx: number,
+    endIdx: number,
+): { startNode: Node; startOffset: number; endNode: Node; endOffset: number } | null {
+    let startNode: Node | null = null;
+    let startOffset = 0;
+    let endNode: Node | null = null;
+    let endOffset = 0;
+
+    for (const tn of textNodes) {
+        const nodeEnd = tn.start + (tn.node.textContent?.length || 0);
+        if (!startNode && startIdx < nodeEnd) {
+            startNode = tn.node;
+            // Clamp to 0: if startIdx falls on a virtual block separator
+            // (inserted by buildEditorTextMap between blocks), it may be
+            // before this text node's start position.
+            startOffset = Math.max(0, startIdx - tn.start);
+        }
+        if (endIdx <= nodeEnd) {
+            endNode = tn.node;
+            endOffset = Math.max(0, endIdx - tn.start);
+            break;
+        }
+    }
+
+    if (!startNode || !endNode) return null;
+    return { startNode, startOffset, endNode, endOffset };
+}
+
+/**
+ * Walk up the DOM from `el` to find the nearest scrollable ancestor
+ * (overflow-y: auto or scroll with content taller than the viewport).
+ */
+/** @internal Exported for testing only. */
+export function findScrollContainer(el: HTMLElement): HTMLElement | null {
+    const win = el.ownerDocument.defaultView;
+    if (!win) return null;
+    let current = el.parentElement;
+    while (current) {
+        const style = win.getComputedStyle(current);
+        if (style && (style.overflowY === 'auto' || style.overflowY === 'scroll')
+            && current.scrollHeight > current.clientHeight) {
+            return current;
+        }
+        current = current.parentElement;
+    }
+    return null;
+}
+
+/**
+ * Strip leading/trailing ellipsis characters (`…`) that diff truncation
+ * helpers (truncateSegments, truncateContext) may have inserted. These
+ * won't match actual note text.
+ */
+/** @internal Exported for testing only. */
+export function stripEllipsis(term: string): string {
+    let result = term;
+    if (result.startsWith('…')) result = result.substring(1);
+    if (result.endsWith('…')) result = result.slice(0, -1);
+    return result.trim();
+}
+
+/**
+ * Get the ProseMirror EditorView from an open note editor instance.
+ * Returns null if the editor isn't available or hasn't finished initializing.
+ *
+ * A note can have multiple editor instances open simultaneously (e.g., one in
+ * a tab and one in a window). Since `openNoteById` opens notes in a tab by
+ * default, we prefer tab instances over other viewModes. Picking the wrong
+ * instance would set the selection on a non-visible editor — the operation
+ * would log success but nothing would appear on screen.
+ */
+/** @internal Exported for testing only. */
+export function getNoteEditorView(itemId: number, win = getContextWindow()): any | null {
+    try {
+        const instances: any[] = (Zotero as any).Notes?._editorInstances;
+        if (!instances) return null;
+
+        const matching = instances.filter((e: any) => {
+            if (e.itemID !== itemId || win.closed) return false;
+            const owner = e._iframeWindow?.top ?? e._iframe?.ownerDocument?.defaultView;
+            if (owner?.closed) return false;
+            // Legacy note windows are opened with their initiating main window as opener.
+            return owner === win || (e.viewMode === 'window' && owner?.opener === win) || (e.tabID && win.Zotero_Tabs?._tabs?.some((tab: any) => tab.id === e.tabID));
+        });
+        if (matching.length === 0) return null;
+
+        // Prefer tab instance (openNoteById opens in a tab), then any other
+        const inst = matching.find((e: any) => e.viewMode === 'tab')
+            || matching[0];
+
+        logger(`getNoteEditorView: found instance viewMode=${inst.viewMode}, total matching=${matching.length}`, 1);
+
+        if (!inst?._iframeWindow) return null;
+
+        const wrappedJS = inst._iframeWindow.wrappedJSObject;
+        if (!wrappedJS) return null;
+
+        const innerEditor = wrappedJS._currentEditorInstance;
+        if (!innerEditor?._editorCore?.view) return null;
+
+        return innerEditor._editorCore.view;
+    } catch (err: any) {
+        logger(`getNoteEditorView: exception: ${err?.message || err}`, 1);
+        return null;
+    }
+}

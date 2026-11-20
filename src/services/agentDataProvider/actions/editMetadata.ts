@@ -1,0 +1,726 @@
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    WSAgentActionExecuteResponse,
+    WSAgentActionValidateResponse
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import type {
+    AppliedMetadataEdit,
+    EditMetadataProposedData,
+    EditMetadataResultData,
+    FailedMetadataEdit,
+    MetadataEdit,
+} from '@astermargin/agent-core/types/agentActions/base';
+import { libraryRefForLibraryID, modelObjectIdFromReference, resolveItemReference, resolveLibraryRef } from '../../../utils/libraryIdentity';
+import { SETTABLE_PRIMARY_FIELDS, canSetField, getCreatorTypeInfo, resolveFieldForItemType, sanitizeCreators } from '../../../utils/zoteroUtils';
+import type { ActionExecuteRequest, ActionValidateRequest } from '../operationContext';
+import { TimeoutContext, TimeoutError, checkAborted } from '../timeout';
+import { checkLibraryExcluded, excludedLibraryMessage, getDeferredToolPreference } from '../utils';
+import { actionError, assertLibraryNotExcluded, assertLibraryRefNotExcluded, toExecuteResponse } from './actionExecution';
+
+
+/**
+ * Fields that AsterMargin should NOT modify, even though they may be technically settable.
+ * These are system fields, metadata, or fields that require special handling.
+ * 
+ * Note: This list only includes fields that CAN be set but SHOULD NOT be.
+ * Fields that can't be set at all (like 'firstCreator', 'id', etc.) are 
+ * already handled by canSetField().
+ */
+const AI_RESTRICTED_FIELDS = [
+    // System metadata - technically settable but should be immutable
+    'dateAdded',        // Creation timestamp - immutable record
+    'dateModified',     // Managed automatically by Zotero
+    
+    // Sync/versioning - critical for data integrity
+    'version',          // Used for sync conflict resolution
+    'synced',           // Sync status flag
+    
+    // Group library metadata - user/permission related
+    'createdByUserID',
+    'lastModifiedByUserID',
+    
+    // Structural changes - too risky for AI
+    'itemTypeID',       // Changing item type can lose data
+] as const;
+
+const ATTACHMENT_EDITABLE_FIELDS = ['title', 'url'] as const;
+
+// ============================================================================
+// Field Validation Types and Functions
+// ============================================================================
+
+/** Result of validating a single field edit */
+export interface FieldValidationResult {
+    allowed: boolean;
+    error?: string;
+    error_code?: 'field_restricted' | 'field_unknown' | 'field_invalid_for_type';
+}
+
+/** Error information for a failed field validation */
+export interface FieldValidationError {
+    field: string;
+    error: string;
+    error_code: 'field_restricted' | 'field_unknown' | 'field_invalid_for_type';
+}
+
+/** Result of validating all field edits */
+export interface AllEditsValidationResult {
+    valid: boolean;
+    errors: FieldValidationError[];
+}
+
+// ============================================================================
+// Creator Validation Types
+// ============================================================================
+
+/** A creator in Zotero's JSON API format */
+interface CreatorJSON {
+    firstName?: string;
+    lastName?: string;
+    name?: string;
+    creatorType: string;
+}
+
+/** Error information for a failed creator validation */
+interface CreatorValidationError {
+    index: number;
+    error: string;
+    error_code: 'invalid_structure' | 'invalid_creator_type';
+}
+
+/** Result of validating all creator entries */
+interface CreatorValidationResult {
+    valid: boolean;
+    errors: CreatorValidationError[];
+}
+
+/**
+ * Validates whether a field can be edited, with detailed error information.
+ * This combines policy checks (AI restrictions) with technical checks (Zotero schema).
+ * 
+ * @param item - The Zotero item being edited
+ * @param field - The field name to validate
+ * @returns Validation result with allowed status and error details if not allowed
+ */
+export function validateFieldEdit(item: Zotero.Item, field: string): FieldValidationResult {
+    // Attachments are intentionally scoped to a small safe subset.
+    if (
+        item.isAttachment() &&
+        !(ATTACHMENT_EDITABLE_FIELDS as readonly string[]).includes(field)
+    ) {
+        return {
+            allowed: false,
+            error: `Field '${field}' is not editable for attachments. Only these fields are allowed: ${ATTACHMENT_EDITABLE_FIELDS.join(', ')}`,
+            error_code: 'field_restricted',
+        };
+    }
+
+    // 1. Check if field is restricted by AI safety policy
+    if ((AI_RESTRICTED_FIELDS as readonly string[]).includes(field)) {
+        return {
+            allowed: false,
+            error: `Field '${field}' is a system field that should not be modified by AI`,
+            error_code: 'field_restricted'
+        };
+    }
+    
+    // 2. Check if field exists in Zotero's schema
+    const fieldID = Zotero.ItemFields.getID(field);
+    if (!fieldID && !(SETTABLE_PRIMARY_FIELDS as readonly string[]).includes(field)) {
+        return {
+            allowed: false,
+            error: `Field '${field}' does not exist in Zotero's schema`,
+            error_code: 'field_unknown'
+        };
+    }
+    
+    // 3. Check if field is technically editable for this item type.
+    //    If the exact field is not valid, attempt a base-field remap: the agent
+    //    may have supplied a display label belonging to the wrong item type
+    //    (e.g. 'bookTitle' on a journalArticle, which shares the base field
+    //    'publicationTitle'). Genuine mismatches (no shared base field for this
+    //    type) still fall through to the error below.
+    if (!canSetField(item, field)) {
+        const resolved = resolveFieldForItemType(item.itemTypeID, field);
+        if (resolved && resolved !== field && canSetField(item, resolved)) {
+            return { allowed: true };
+        }
+
+        const itemType = Zotero.ItemTypes.getName(item.itemTypeID);
+        const itemTypeID = item.itemTypeID;
+        const typeFields = Zotero.ItemFields.getItemTypeFields(itemTypeID);
+        const typeFieldNames = typeFields.map((fid: number) => Zotero.ItemFields.getName(fid));
+
+        return {
+            allowed: false,
+            error: `Field '${field}' is not valid for item type '${itemType}'. Valid fields: ${typeFieldNames.join(', ')}`,
+            error_code: 'field_invalid_for_type'
+        };
+    }
+    
+    return { allowed: true };
+}
+
+/**
+ * Validates all field edits and returns detailed error information for each failure.
+ * This reports ALL invalid fields at once instead of failing on the first one.
+ * 
+ * @param item - The Zotero item being edited
+ * @param edits - Array of field edits to validate
+ * @returns Validation result with all errors
+ */
+export function validateAllEdits(item: Zotero.Item, edits: MetadataEdit[]): AllEditsValidationResult {
+    const errors: FieldValidationError[] = [];
+    
+    for (const edit of edits) {
+        const result = validateFieldEdit(item, edit.field);
+        if (!result.allowed) {
+            errors.push({
+                field: edit.field,
+                error: result.error!,
+                error_code: result.error_code!
+            });
+        }
+    }
+    
+    return {
+        valid: errors.length === 0,
+        errors
+    };
+}
+
+/**
+ * Validates an array of creators for structural correctness and type compatibility.
+ * Reports ALL errors at once (batch pattern matching validateAllEdits).
+ *
+ * Checks per creator:
+ * 1. Must have either `name` (org) or `lastName` (person), not both, not neither
+ * 2. Must have `creatorType` string
+ * 3. `creatorType` must be a known Zotero creator type
+ * 4. `creatorType` must be valid for the item's type
+ *
+ * @param item - The Zotero item whose type determines valid creator types
+ * @param creators - Array of creators in JSON API format
+ * @returns Validation result with all errors
+ */
+export function validateCreators(item: Zotero.Item, creators: CreatorJSON[]): CreatorValidationResult {
+    const errors: CreatorValidationError[] = [];
+    const itemTypeID = item.itemTypeID;
+
+    for (let i = 0; i < creators.length; i++) {
+        const creator = creators[i];
+
+        // Check structure: must have either name (org) or lastName (person), not both
+        const hasName = typeof creator.name === 'string' && creator.name.length > 0;
+        const hasLastName = typeof creator.lastName === 'string' && creator.lastName.length > 0;
+
+        if (hasName && hasLastName) {
+            errors.push({
+                index: i,
+                error: `Creator at index ${i} has both 'name' and 'lastName'. Use 'name' for organizations or 'firstName'/'lastName' for persons.`,
+                error_code: 'invalid_structure',
+            });
+            continue;
+        }
+
+        if (!hasName && !hasLastName) {
+            errors.push({
+                index: i,
+                error: `Creator at index ${i} must have either 'name' (organization) or 'lastName' (person).`,
+                error_code: 'invalid_structure',
+            });
+            continue;
+        }
+
+        // Check creatorType is provided
+        if (!creator.creatorType || typeof creator.creatorType !== 'string') {
+            errors.push({
+                index: i,
+                error: `Creator at index ${i} must have a 'creatorType' string.`,
+                error_code: 'invalid_structure',
+            });
+            continue;
+        }
+
+        // Check creatorType is known in Zotero's schema
+        const creatorTypeID = Zotero.CreatorTypes.getID(creator.creatorType);
+        if (!creatorTypeID) {
+            errors.push({
+                index: i,
+                error: `Creator at index ${i} has unknown creator type '${creator.creatorType}'.`,
+                error_code: 'invalid_creator_type',
+            });
+            continue;
+        }
+
+        // Check creatorType is valid for the item's type
+        if (!Zotero.CreatorTypes.isValidForItemType(creatorTypeID, itemTypeID)) {
+            const info = getCreatorTypeInfo(itemTypeID);
+            const itemType = Zotero.ItemTypes.getName(itemTypeID);
+            // Name the primary creator type explicitly. It is the type that
+            // fills the `author` role for this item type, so it is the
+            // intended target in the common case of a generic 'author'.
+            const primaryHint = info?.primary
+                ? ` Use '${info.primary}' for the item's main creator.`
+                : '';
+            errors.push({
+                index: i,
+                error: `Creator type '${creator.creatorType}' is not valid for item type '${itemType}'. Valid creator types: ${(info?.valid ?? []).join(', ')}.${primaryHint}`,
+                error_code: 'invalid_creator_type',
+            });
+        }
+    }
+
+    return {
+        valid: errors.length === 0,
+        errors,
+    };
+}
+
+
+/**
+ * Checks if AsterMargin should be allowed to edit this field.
+ * More restrictive than canSetField() - focuses on safety and best practices.
+ *
+ * @deprecated Use validateFieldEdit() for detailed error information
+ */
+export function isFieldEditAllowed(item: Zotero.Item, field: string): boolean {
+    return validateFieldEdit(item, field).allowed;
+}
+
+// ============================================================================
+// In-memory rollback helpers
+// ============================================================================
+
+/**
+ * Restore in-memory field values on an item after a failed save or timeout.
+ * Prevents dirty in-memory state from leaking into future saves.
+ */
+function restoreFieldSnapshots(
+    item: any,
+    snapshots: Array<{ field: string; originalValue: any }>,
+): void {
+    for (const snap of snapshots) {
+        try {
+            item.setField(snap.field, snap.originalValue ?? '');
+        } catch (_) {
+            // Best-effort restoration — field may not be settable
+        }
+    }
+}
+
+/**
+ * Restore in-memory creators on an item after a failed save or timeout.
+ * Uses the internal format snapshot from item.getCreators().
+ */
+function restoreCreatorSnapshots(item: any, originalCreators: any[] | null): void {
+    if (originalCreators === null) return;
+    try {
+        item.setCreators(originalCreators);
+    } catch (_) {
+        // Best-effort restoration — setCreators may fail if item is in bad state
+    }
+}
+
+
+// ============================================================================
+// Edit Metadata Action Validation and Execution
+// ============================================================================
+
+/**
+ * Validate an edit_metadata action.
+ * Checks if the item exists, validates all fields (batch), and returns current field values.
+ */
+async function validateEditMetadataAction(
+    request: ActionValidateRequest
+): Promise<WSAgentActionValidateResponse> {
+    const { library_id, library_ref, zotero_key, edits, creators } = request.action_data as {
+        library_id: number;
+        library_ref?: string;
+        zotero_key: string;
+        edits: MetadataEdit[];
+        creators?: CreatorJSON[] | null;
+    };
+
+    // Enforce the exclusion boundary before resolving/loading the item.
+    // library_ref is authoritative when the numeric library_id is stale.
+    const targetLibraryId = resolveLibraryRef({ library_id, library_ref });
+    const excluded = targetLibraryId === null ? null : checkLibraryExcluded(targetLibraryId);
+    if (excluded) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: excluded.message,
+            error_code: 'library_not_searchable',
+            preference: 'always_ask',
+        };
+    }
+
+    const resolved = await resolveItemReference({ library_id, library_ref, zotero_key });
+    if (resolved.status === 'library_unavailable') {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Library not available for item: ${library_ref || library_id}-${zotero_key}`,
+            error_code: 'library_unavailable',
+            preference: 'always_ask',
+        };
+    }
+    if (resolved.status === 'not_found') {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Item not found: ${modelObjectIdFromReference({ library_id, library_ref, zotero_key })}`,
+            error_code: 'item_not_found',
+            preference: 'always_ask',
+        };
+    }
+    const item = resolved.item;
+    const resolvedLibraryId = item.libraryID;
+
+    // Validate library exists
+    const library = Zotero.Libraries.get(resolvedLibraryId);
+    if (!library) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Library not found: ${resolvedLibraryId}`,
+            error_code: 'library_not_found',
+            preference: 'always_ask',
+        };
+    }
+
+    // Validate library is searchable
+    const searchableLibraryIds = (Zotero.AsterMargin.libraryScopeInitialized ? (Zotero.AsterMargin.searchableLibraryIds ?? []) : []);
+    if (!searchableLibraryIds.includes(resolvedLibraryId)) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: excludedLibraryMessage(resolvedLibraryId),
+            error_code: 'library_not_searchable',
+            preference: 'always_ask',
+        };
+    }
+
+    // Validate item type
+    if (item.isNote()) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Editing Notes is not supported with this tool. Use the edit_note instead to change the content of a note or the title, which is the first line of the note.`,
+            error_code: 'note_items_not_supported',
+            preference: 'always_ask',
+        };
+    }
+
+    if (item.isAnnotation()) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Editing Annotations is not supported`,
+            error_code: 'annotation_items_not_supported',
+            preference: 'always_ask',
+        };
+    }
+
+    if (item.isAttachment()) {
+        // Attachments support a limited set of fields (title, url).
+        // Reject creator edits — attachments have no valid creator types.
+        if (creators != null && creators.length > 0) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: 'Attachments do not support creators. Only the following fields can be edited on attachments: title, url.',
+                error_code: 'creators_not_supported_for_attachments',
+                preference: 'always_ask',
+            };
+        }
+        // Attachment field allowlist is enforced by validateFieldEdit()/validateAllEdits() below.
+    } else if (!item.isRegularItem()) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Editing items other than regular items is not supported`,
+            error_code: 'item_type_not_supported',
+            preference: 'always_ask',
+        };
+    }
+
+    // Check if library is editable (check early to avoid unnecessary field validation)
+    if (!library || !library.editable) {
+        const libraryName = library && typeof library !== 'boolean' ? library.name : String(library_id);
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Library '${libraryName}' is read-only and cannot be edited`,
+            error_code: 'library_not_editable',
+            preference: 'always_ask',
+        };
+    }
+
+    // Check that at least one change is specified
+    const hasEdits = edits && edits.length > 0;
+    const hasCreators = creators != null && creators.length > 0;
+
+    // Reject empty creators array — the agent cannot clear all creators
+    if (Array.isArray(creators) && creators.length === 0) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: 'Empty creators array is not allowed. Provide at least one creator or omit the creators field.',
+            error_code: 'empty_creators',
+            preference: 'always_ask',
+        };
+    }
+
+    if (!hasEdits && !hasCreators) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: 'No changes specified: at least one field edit or creators must be provided',
+            error_code: 'no_changes',
+            preference: 'always_ask',
+        };
+    }
+
+    // Validate ALL fields using batch validation (reports all errors at once)
+    if (hasEdits) {
+        const validation = validateAllEdits(item, edits);
+        if (!validation.valid) {
+            const errorSummary = validation.errors
+                .map(e => `${e.field}: ${e.error}`)
+                .join('; ');
+
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: errorSummary,
+                error_code: 'field_validation_failed',
+                errors: validation.errors,
+                preference: 'always_ask',
+            };
+        }
+    }
+
+    // Validate creators if provided
+    if (hasCreators) {
+        const creatorValidation = validateCreators(item, creators!);
+        if (!creatorValidation.valid) {
+            const errorSummary = creatorValidation.errors
+                .map(e => `[${e.index}]: ${e.error}`)
+                .join('; ');
+
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: errorSummary,
+                error_code: 'creator_validation_failed',
+                preference: 'always_ask',
+            };
+        }
+    }
+
+    // Get current values for all edited fields. Keyed by the field name the
+    // agent supplied so the backend can match results to its request, but read
+    // via the type-resolved field so wrong-type labels return the real value.
+    const currentValue: Record<string, any> = {};
+    for (const edit of edits) {
+        try {
+            const resolvedField = resolveFieldForItemType(item.itemTypeID, edit.field) ?? edit.field;
+            // includeBaseMapped=true so base fields resolve to type-specific fields
+            const value = item.getField(resolvedField, false, true);
+            currentValue[edit.field] = value ? String(value) : null;
+        } catch {
+            currentValue[edit.field] = null;
+        }
+    }
+
+    // Include current creators for before/after tracking (not applicable for attachments)
+    if (item.isRegularItem()) {
+        currentValue.current_creators = item.getCreatorsJSON();
+    }
+
+    // Get user preference from settings
+    const preference = getDeferredToolPreference('edit_metadata', undefined, request.operation);
+
+    return {
+        type: 'agent_action_validate_response',
+        request_id: request.request_id,
+        valid: true,
+        current_value: currentValue,
+        preference,
+    };
+}
+
+
+export interface EditMetadataApplyHooks {
+    /** Called with the item right before any field is set; throws to refuse the edit. */
+    assertUnchanged?: (item: Zotero.Item) => void;
+    /** Filled with per-phase durations (`resolve_ms`, `save_ms`) for the execute response. */
+    timing?: Record<string, number>;
+}
+
+/**
+ * Apply an edit_metadata action's field and creator edits to its item and
+ * return its `result_data`, with each field's value before the edit recorded
+ * for undo.
+ *
+ * A field Zotero refuses is listed in `failed_edits` and the others are still
+ * saved, so the result records what to undo. Only when nothing could be saved
+ * does the apply fail (`edit_failed`). A failed save restores the item's
+ * in-memory state, so the refused edits cannot ride along with a later,
+ * unrelated save.
+ */
+export async function applyEditMetadata(
+    data: EditMetadataProposedData,
+    ctx: TimeoutContext,
+    hooks: EditMetadataApplyHooks = {},
+): Promise<EditMetadataResultData> {
+    const { library_id, library_ref, zotero_key, edits, creators } = data;
+    const timing = hooks.timing ?? {};
+
+    // TOCTOU guard: never edit an item in a library the user excluded from AsterMargin,
+    // even if validation passed earlier or the action waited for approval.
+    // Resolve and gate the library before resolving/loading the item.
+    assertLibraryRefNotExcluded({ library_id, library_ref });
+
+    // Per-phase timing: the save is where slow executes spend their time
+    // (Zotero awaits every notifier observer inside the transaction), and
+    // separating it from item resolution is what makes that visible.
+    ctx.reportPhase?.('resolving');
+    const resolveStartedAt = Date.now();
+    const resolved = await resolveItemReference({ library_id, library_ref, zotero_key });
+    timing.resolve_ms = Date.now() - resolveStartedAt;
+    if (resolved.status !== 'found') {
+        throw resolved.status === 'library_unavailable'
+            ? actionError('library_unavailable', `Library not available for item: ${library_ref || library_id}-${zotero_key}`)
+            : actionError('item_not_found', `Item not found: ${modelObjectIdFromReference({ library_id, library_ref, zotero_key })}`);
+    }
+    const item = resolved.item;
+    const resolvedLibraryId = item.libraryID;
+    assertLibraryNotExcluded(resolvedLibraryId);
+    hooks.assertUnchanged?.(item);
+
+    const appliedEdits: AppliedMetadataEdit[] = [];
+    const failedEdits: FailedMetadataEdit[] = [];
+    // Snapshot original field values for in-memory rollback on failure
+    const fieldSnapshots: Array<{ field: string; originalValue: any }> = [];
+    // Snapshot original creators for in-memory rollback on failure
+    let creatorSnapshot: any[] | null = null;
+    let oldCreatorsJSON: CreatorJSON[] | null = null;
+    let creatorsApplied = false;
+
+    try {
+        // Apply each field edit (in-memory only, not persisted until saveTx)
+        for (const edit of edits) {
+            try {
+                // Resolve to the field valid for this item type. The agent may
+                // supply a display label belonging to the wrong type (e.g.
+                // 'bookTitle' on a journalArticle); resolveFieldForItemType
+                // remaps it via the shared base field ('publicationTitle').
+                // setField() rejects wrong-type labels, so the resolved name
+                // must be used for getField/setField and the rollback snapshot.
+                const resolvedField = resolveFieldForItemType(item.itemTypeID, edit.field) ?? edit.field;
+                // includeBaseMapped=true so base fields (e.g. 'publicationTitle')
+                // resolve to the type-specific field (e.g. 'bookTitle' on bookSection)
+                const oldValue = item.getField(resolvedField, false, true) ?? null;
+                fieldSnapshots.push({ field: resolvedField, originalValue: oldValue });
+                item.setField(resolvedField, edit.new_value);
+                appliedEdits.push({
+                    // Report the field the agent supplied so the backend can
+                    // match applied edits to its request.
+                    field: edit.field,
+                    applied_value: edit.new_value,
+                    old_value: oldValue,
+                });
+            } catch (error) {
+                failedEdits.push({
+                    field: edit.field,
+                    error: String(error),
+                });
+            }
+        }
+
+        // Apply creators (in-memory only, not persisted until saveTx)
+        if (creators && creators.length > 0) {
+            try {
+                creatorSnapshot = item.getCreators();
+                oldCreatorsJSON = item.getCreatorsJSON() as CreatorJSON[];
+                // Type assertion: creatorType has been validated by the validate handler
+                item.setCreators(sanitizeCreators(creators) as any[]);
+                creatorsApplied = true;
+            } catch (error) {
+                failedEdits.push({
+                    field: 'creators',
+                    error: String(error),
+                });
+            }
+        }
+
+        // Save the item if any changes were applied
+        if (appliedEdits.length > 0 || creatorsApplied) {
+            // Checkpoint: abort before persisting if timeout has fired
+            checkAborted(ctx, 'edit_metadata:before_save');
+            ctx.reportPhase?.('saving');
+            const saveStartedAt = Date.now();
+            try {
+                await item.saveTx();
+                timing.save_ms = Date.now() - saveStartedAt;
+                logger(`applyEditMetadata: Saved ${appliedEdits.length} edits${creatorsApplied ? ' + creators' : ''} to ${resolvedLibraryId}-${zotero_key} (${timing.save_ms}ms)`, 1);
+            } catch (error) {
+                timing.save_ms = Date.now() - saveStartedAt;
+                if (error instanceof TimeoutError) throw error;
+                throw actionError('save_failed', `Failed to save item: ${error}`);
+            }
+        }
+    } catch (error) {
+        // Restore in-memory state on any failure (including TimeoutError)
+        restoreFieldSnapshots(item, fieldSnapshots);
+        restoreCreatorSnapshots(item, creatorSnapshot);
+        throw error;
+    }
+
+    if (failedEdits.length > 0 && appliedEdits.length === 0 && !creatorsApplied) {
+        throw actionError(
+            'edit_failed',
+            `No edits could be applied: ${failedEdits.map(e => `${e.field} (${e.error})`).join(', ')}`,
+        );
+    }
+
+    return {
+        library_id: resolvedLibraryId,
+        zotero_key,
+        library_ref: libraryRefForLibraryID(resolvedLibraryId) ?? undefined,
+        applied_edits: appliedEdits,
+        rejected_edits: [],
+        failed_edits: failedEdits,
+        old_creators: creatorsApplied ? oldCreatorsJSON : null,
+        new_creators: creatorsApplied ? item.getCreatorsJSON() as CreatorJSON[] : null,
+    };
+}
+
+/** Execute an edit_metadata action for the backend during a run. */
+async function executeEditMetadataAction(
+    request: ActionExecuteRequest,
+    ctx: TimeoutContext,
+): Promise<WSAgentActionExecuteResponse> {
+    const timing: Record<string, number> = {};
+    return toExecuteResponse(request.request_id, 'executeEditMetadataAction',
+        () => applyEditMetadata(request.action_data as EditMetadataProposedData, ctx, { timing }), () => timing);
+}
+
+export { executeEditMetadataAction, validateEditMetadataAction };

@@ -1,0 +1,612 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Test-controlled mock state — reset in beforeEach.
+const mockState = {
+    renderImpl: null as ((args: any) => Promise<any>) | null,
+    metadataImpl: null as ((signal?: AbortSignal) => Promise<any>) | null,
+    renderCalls: [] as any[],
+    cannedPageCount: 3,
+    cannedPageLabels: { 0: 'i', 1: '1', 2: '2' } as Record<number, string>,
+};
+
+vi.mock('../../../src/astermargin-extract', () => {
+    // Honors the per-request worker like the real one: every op runs through it.
+    class MockPDFExtractor {
+        constructor(private readonly worker?: { run<T>(op: (client: unknown) => Promise<T>): Promise<T> }) {}
+
+        private through<T>(op: () => Promise<T>): Promise<T> {
+            return this.worker ? this.worker.run(() => op()) : op();
+        }
+
+        async getPageCount(): Promise<number> {
+            return mockState.cannedPageCount;
+        }
+
+        async getMetadata(
+            _pdfData: Uint8Array | ArrayBuffer,
+            signal?: AbortSignal,
+        ): Promise<{ pageCount: number; pageLabels: Record<number, string> }> {
+            return this.through(async () => {
+                if (mockState.metadataImpl) {
+                    return mockState.metadataImpl(signal);
+                }
+                return {
+                    pageCount: mockState.cannedPageCount,
+                    pageLabels: mockState.cannedPageLabels,
+                };
+            });
+        }
+
+        async renderPages(
+            _pdfData: Uint8Array | ArrayBuffer,
+            args: any,
+        ): Promise<{ pageCount: number; pageLabels: Record<number, string>; pages: any[] }> {
+            return this.through(() => this.render(args));
+        }
+
+        private async render(args: any): Promise<{ pageCount: number; pageLabels: Record<number, string>; pages: any[] }> {
+            mockState.renderCalls.push(args);
+            if (mockState.renderImpl) {
+                return mockState.renderImpl(args);
+            }
+            const indices: number[] | undefined = args?.pageIndices;
+            const resolved = indices ?? Array.from({ length: mockState.cannedPageCount }, (_, i) => i);
+            return {
+                pageCount: mockState.cannedPageCount,
+                pageLabels: mockState.cannedPageLabels,
+                pages: resolved.map((pageIndex) => ({
+                    pageIndex,
+                    data: new Uint8Array([1, 2, 3]),
+                    format: 'png' as const,
+                    width: 100,
+                    height: 200,
+                    scale: 1,
+                    dpi: 72,
+                })),
+            };
+        }
+    }
+
+    class MockExtractionError extends Error {
+        code: string;
+        pageCount?: number;
+
+        constructor(code: string, message: string, _details?: unknown, _pageLabels?: Record<number, string>, pageCount?: number) {
+            super(message);
+            this.code = code;
+            this.pageCount = pageCount;
+        }
+    }
+
+    class MockWorkerAbortError extends Error {}
+
+    return {
+        AsterMarginExtractor: MockPDFExtractor,
+        ExtractionError: MockExtractionError,
+        WorkerAbortError: MockWorkerAbortError,
+        // Mirrors the real name-based fallback in isWorkerDeadlineError so
+        // tests can simulate a busy-lease reap with a plain tagged Error.
+        isWorkerDeadlineError: (error: unknown) =>
+            (error as { name?: unknown } | null | undefined)?.name === 'WorkerDeadlineError',
+        getMuPDFWorkerClient: (slot: string = 'hot') => ({ slot }),
+        getExistingMuPDFWorkerClient: (slot: string = 'hot') => ({
+            slot,
+            getStats: () => ({
+                hasWorker: true,
+                spawnCount: 1,
+                retryCount: 0,
+                consecutiveStartFailures: 0,
+                leaseReapCount: 0,
+                lastLeaseReapOp: null,
+                lastLeaseReapAgeMs: null,
+            }),
+            inFlight: 1,
+            oldestInFlightStartedAt: Date.now(),
+        }),
+        ExtractionErrorCode: {
+            ENCRYPTED: 'encrypted',
+            INVALID_PDF: 'invalid_pdf',
+            PAGE_OUT_OF_RANGE: 'page_out_of_range',
+        },
+    };
+});
+
+// Mock heavy transitive deps so we can `importActual` utils.ts and use the
+// real `preflightCachedPdfMeta` (the handler delegates to it — pure logic,
+// exercising it is preferable to stubbing).
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: { auth: { getSession: vi.fn() } },
+}));
+vi.mock('../../../react/store', () => ({
+    store: { get: vi.fn(), set: vi.fn() },
+}));
+vi.mock('../../../react/atoms/profile', () => ({
+    searchableLibraryIdsAtom: { toString: () => 'searchableLibraryIdsAtom' },
+}));
+
+vi.mock('../../../src/services/agentDataProvider/utils', async () => {
+    const actual = await vi.importActual<typeof import('../../../src/services/agentDataProvider/utils')>(
+        '../../../src/services/agentDataProvider/utils',
+    );
+    return {
+        ...actual,
+        resolveToPdfAttachment: vi.fn(),
+        validateZoteroItemReference: vi.fn(() => null),
+        backfillMetadataForError: vi.fn(),
+        loadPdfData: vi.fn(async () => new Uint8Array([1, 2, 3])),
+        checkRemotePdfSize: vi.fn(() => null),
+        isRemoteAccessAvailable: vi.fn(() => false),
+    };
+});
+
+import { handleZoteroAttachmentPageImagesRequest } from '../../../src/services/agentDataProvider/handleZoteroAttachmentPageImagesRequest';
+import { loadPdfData, resolveToPdfAttachment } from '../../../src/services/agentDataProvider/utils';
+
+describe('handleZoteroAttachmentPageImagesRequest page labels', () => {
+    const mockIOUtils = (globalThis as any).IOUtils as {
+        read: ReturnType<typeof vi.fn>;
+        stat: ReturnType<typeof vi.fn>;
+    };
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockState.renderImpl = null;
+        mockState.metadataImpl = null;
+        mockState.renderCalls = [];
+        mockState.cannedPageCount = 3;
+        mockState.cannedPageLabels = { 0: 'i', 1: '1', 2: '2' };
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    function setupRequestScenario(opts: {
+        cachedPageCount: number | null;
+        cachedPageLabels?: Record<number, string> | null;
+        cachedDerivedPageLabels?: Record<string, string> | null;
+    }) {
+        return setupRequestScenarioWithFullCache({
+            cachedPageCount: opts.cachedPageCount,
+            cachedPageLabels: opts.cachedPageLabels,
+            cachedDerivedPageLabels: opts.cachedDerivedPageLabels,
+            // Default to a complete, non-OCR record for tests that just need
+            // a plausible cache hit and don't exercise OCR-state branches.
+            needs_ocr: false,
+            has_text_layer: true,
+        });
+    }
+
+    function setupRequestScenarioWithFullCache(opts: {
+        cachedPageCount: number | null;
+        cachedPageLabels?: Record<number, string> | null;
+        cachedDerivedPageLabels?: Record<string, string> | null;
+        needs_ocr?: boolean | null | undefined;
+        has_text_layer?: boolean | null | undefined;
+    }) {
+        const cache = {
+            getMetadata: vi.fn().mockResolvedValue(
+                opts.cachedPageCount == null && opts.needs_ocr === undefined
+                    ? null
+                    : {
+                          pageCount: opts.cachedPageCount,
+                          pageLabels: opts.cachedPageLabels ?? null,
+                          derivedPageLabels: opts.cachedDerivedPageLabels,
+                          errorCode: opts.needs_ocr ? 'no_text_layer' : null,
+                      },
+            ),
+            putMetadata: vi.fn().mockResolvedValue(undefined),
+            putErrorMetadata: vi.fn().mockResolvedValue(undefined),
+        };
+
+        const resolvedPdfItem = {
+            id: 42,
+            key: 'ABCD1234',
+            libraryID: 1,
+            attachmentContentType: 'application/pdf',
+            getFilePathAsync: vi.fn().mockResolvedValue('/storage/ABCD1234/test.pdf'),
+        };
+        const requestItem = {
+            loadAllData: vi.fn().mockResolvedValue(undefined),
+        };
+
+        (globalThis as any).Zotero.Items = {
+            getByLibraryAndKeyAsync: vi.fn().mockResolvedValue(requestItem),
+        };
+        (globalThis as any).Zotero.Attachments = {
+            getTotalFileSize: vi.fn().mockResolvedValue(1024),
+        };
+        (globalThis as any).Zotero.AsterMargin = {
+            data: { env: 'test' },
+            documentCache: cache,
+        };
+
+        vi.mocked(resolveToPdfAttachment).mockResolvedValue({
+            resolved: true,
+            item: resolvedPdfItem,
+            key: '1-ABCD1234',
+        } as any);
+
+        mockIOUtils.read?.mockResolvedValue(new Uint8Array([1, 2, 3]));
+        mockIOUtils.stat?.mockResolvedValue({ lastModified: 1700000000000, size: 123456 });
+
+        return { cache };
+    }
+
+    it.each([
+        ['stat', () => { (globalThis as any).Zotero.Attachments.getTotalFileSize = vi.fn().mockRejectedValue(
+            Object.assign(new Error('Could not stat'), { name: 'NotAllowedError' })); }],
+        ['read', () => { vi.mocked(loadPdfData).mockRejectedValueOnce(
+            Object.assign(new Error('Could not open'), { name: 'NotAllowedError' })); }],
+    ])('maps a local file the OS refuses to %s to file_permission_denied', async (_label, deny) => {
+        setupRequestScenario({ cachedPageCount: null });
+        deny();
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-denied',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+        });
+
+        expect(response.error_code).toBe('file_permission_denied');
+        expect(response.error).toContain('does not have permission to read the PDF file for 1-ABCD1234');
+    });
+
+    it('does not report a NotAllowedError from rendering as a refused file', async () => {
+        setupRequestScenario({ cachedPageCount: 3 });
+        mockState.renderImpl = async () => {
+            throw Object.assign(new Error('Operation not allowed'), { name: 'NotAllowedError' });
+        };
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-render-not-allowed',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+        });
+
+        expect(mockState.renderCalls).toHaveLength(1);
+        expect(response.error_code).toBeDefined();
+        expect(response.error_code).not.toBe('file_permission_denied');
+    });
+
+    it('reports printed page labels from cache metadata, not the labels the PDF declares', async () => {
+        setupRequestScenario({
+            cachedPageCount: 3,
+            cachedPageLabels: { 0: '1', 1: '2', 2: '3' },
+            cachedDerivedPageLabels: { '0': '1201', '1': '1202', '2': '1203' },
+        });
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-1',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+        });
+
+        expect(response.pages).toEqual([
+            expect.objectContaining({ page_number: 1, page_label: '1201' }),
+        ]);
+    });
+
+    it('recovers printed labels from the cached payload for metadata written without them', async () => {
+        setupRequestScenario({ cachedPageCount: 3, cachedPageLabels: { 0: '1', 1: '2', 2: '3' } });
+        const cache = (globalThis as any).Zotero.AsterMargin.documentCache;
+        cache.getMetadata.mockResolvedValue({
+            libraryId: 1, zoteroKey: 'ABCD1234', contentKind: 'pdf',
+            pageCount: 3, pageLabels: { 0: '1', 1: '2', 2: '3' }, errorCode: null,
+        });
+        cache.getSerializedResult = vi.fn().mockResolvedValue({
+            metadata: { derivedPageLabels: { '0': '1201', '1': '1202', '2': '1203' } },
+        });
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-1',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: ['1202'],
+            skip_local_limits: true,
+            prefer_page_labels: true,
+        });
+
+        expect(cache.getSerializedResult).toHaveBeenCalledWith(
+            { libraryId: 1, zoteroKey: 'ABCD1234' }, 'structured', '/storage/ABCD1234/test.pdf',
+        );
+        expect(response.pages).toEqual([
+            expect.objectContaining({ page_number: 2, page_label: '1202' }),
+        ]);
+    });
+
+    it('omits page_label when printed labels are not known, even if the PDF declares labels', async () => {
+        // Cached page_count present, no derived labels: the rendered PDF's
+        // own label ('i') is not a printed label.
+        setupRequestScenario({ cachedPageCount: 3, cachedPageLabels: null });
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-1',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+        });
+
+        expect(response.pages).toHaveLength(1);
+        expect(response.pages[0].page_number).toBe(1);
+        expect(response.pages[0].page_label).toBeUndefined();
+        // Exactly one render call (no separate getPageCount or label hydration).
+        expect(mockState.renderCalls).toHaveLength(1);
+    });
+
+    it('resolves a requested label against printed labels before declared ones', async () => {
+        setupRequestScenario({
+            cachedPageCount: 3,
+            cachedPageLabels: { 0: '1', 1: '2', 2: '3' },
+            cachedDerivedPageLabels: { '0': '2', '1': '3', '2': '4' },
+        });
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-1',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: ['2'],
+            skip_local_limits: true,
+            prefer_page_labels: true,
+        });
+
+        // Printed "2" is physical page 1; the declared "2" would be page 2.
+        expect(response.pages).toEqual([
+            expect.objectContaining({ page_number: 1, page_label: '2' }),
+        ]);
+    });
+
+    it('attaches worker diagnostics when uncached page-label metadata times out', async () => {
+        vi.useFakeTimers();
+        setupRequestScenario({ cachedPageCount: null, cachedPageLabels: null });
+        mockState.metadataImpl = (signal) => new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+
+        const pending = handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-label-timeout',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+            prefer_page_labels: true,
+            timeout_seconds: 0.01,
+        });
+
+        await vi.advanceTimersByTimeAsync(10);
+
+        await expect(pending).resolves.toMatchObject({
+            error_code: 'timeout',
+            worker_diagnostics: {
+                slot: 'hot',
+                lease_reaped: false,
+                has_worker: true,
+                in_flight: 1,
+            },
+        });
+    });
+
+    it('attaches lease_reaped worker diagnostics when the eager label load hits a busy-lease deadline', async () => {
+        // A WorkerDeadlineError from the eager label-metadata load must
+        // propagate to the handler's timeout classification (rather than
+        // being swallowed into a null-labels fallback) so the lease reap is
+        // visible in worker_diagnostics.
+        setupRequestScenario({ cachedPageCount: null, cachedPageLabels: null });
+        const deadlineError = Object.assign(new Error('worker busy-age lease exceeded'), {
+            name: 'WorkerDeadlineError',
+        });
+        mockState.metadataImpl = async () => {
+            throw deadlineError;
+        };
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-label-deadline',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+            prefer_page_labels: true,
+        });
+
+        expect(response).toMatchObject({
+            error_code: 'timeout',
+            worker_diagnostics: {
+                slot: 'hot',
+                lease_reaped: true,
+                has_worker: true,
+                in_flight: 1,
+            },
+        });
+        // The render call never happens — the eager load's rethrow short-circuits it.
+        expect(mockState.renderCalls).toHaveLength(0);
+    });
+
+    it('routes its worker ops through the interactive router and releases the route', async () => {
+        setupRequestScenario({ cachedPageCount: 3, cachedPageLabels: { 0: '1', 1: '2', 2: '3' } });
+        const release = vi.fn();
+        const acquire = vi.fn(async () => ({ slot: 'background', release }));
+        (globalThis as any).Zotero.AsterMargin.backgroundExtractor = { interactiveOverflow: { acquire } };
+
+        const response = await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-routed',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+        });
+
+        expect(response.pages).toHaveLength(1);
+        expect(acquire).toHaveBeenCalledTimes(1);
+        expect(acquire).toHaveBeenCalledWith(expect.objectContaining({ affinityKey: '1/ABCD1234' }));
+        expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it('snapshots the background worker when a routed request times out', async () => {
+        vi.useFakeTimers();
+        setupRequestScenario({ cachedPageCount: null, cachedPageLabels: null });
+        const release = vi.fn();
+        (globalThis as any).Zotero.AsterMargin.backgroundExtractor = {
+            interactiveOverflow: { acquire: vi.fn(async () => ({ slot: 'background', release })) },
+        };
+        mockState.metadataImpl = (signal) => new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+
+        const pending = handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-routed-timeout',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+            prefer_page_labels: true,
+            timeout_seconds: 0.01,
+        });
+        await vi.advanceTimersByTimeAsync(10);
+
+        await expect(pending).resolves.toMatchObject({
+            error_code: 'timeout',
+            worker_diagnostics: { slot: 'background' },
+        });
+        expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it('attaches no worker snapshot when the request timed out waiting for a free worker', async () => {
+        vi.useFakeTimers();
+        setupRequestScenario({ cachedPageCount: 3, cachedPageLabels: { 0: '1', 1: '2', 2: '3' } });
+        // Both workers busy: the wait ends only with the request's deadline.
+        const acquire = vi.fn(({ signal }: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(
+                Object.assign(new Error('aborted'), { name: 'WorkerAbortError' }),
+            ), { once: true });
+        }));
+        (globalThis as any).Zotero.AsterMargin.backgroundExtractor = { interactiveOverflow: { acquire } };
+
+        const pending = handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-queue-timeout',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+            timeout_seconds: 0.01,
+        });
+        await vi.advanceTimersByTimeAsync(10);
+
+        const response = await pending;
+        expect(response.error_code).toBe('timeout');
+        expect(response).not.toHaveProperty('worker_diagnostics');
+        expect(mockState.renderCalls).toHaveLength(0);
+    });
+
+    it('does NOT write metadata after a successful render even when a prior writer confirmed text-layer status', async () => {
+        // The image-render path never writes metadata. Rendering proves the
+        // PDF opens but never inspects the text layer, so metadata is owned
+        // exclusively by writers that run an authoritative text-layer check
+        // (file status, text extraction) — even when a prior record exists.
+        const { cache } = setupRequestScenarioWithFullCache({
+            cachedPageCount: 3,
+            cachedPageLabels: null,
+            needs_ocr: false,
+            has_text_layer: true,
+        });
+
+        await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-meta',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1, 2],
+            skip_local_limits: true,
+        });
+
+        expect(cache.putMetadata).not.toHaveBeenCalled();
+        expect(cache.putErrorMetadata).not.toHaveBeenCalled();
+    });
+
+    it('does NOT seed cache from image render when no prior writer (regression)', async () => {
+        // First-time render with no cachedMeta. Writing `needs_ocr: null`
+        // would let `fileStatusFromCache` treat a scanned PDF as "available"
+        // and skip the later OCR analysis. Skip the write entirely.
+        const { cache } = setupRequestScenarioWithFullCache({
+            cachedPageCount: null,
+            cachedPageLabels: null,
+            needs_ocr: undefined,
+            has_text_layer: undefined,
+        });
+
+        await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-no-seed',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+        });
+
+        expect(cache.putMetadata).not.toHaveBeenCalled();
+        expect(cache.putErrorMetadata).not.toHaveBeenCalled();
+    });
+
+    it('does NOT overwrite cache from image render when needs_ocr is unknown (null)', async () => {
+        // cachedMeta exists but with needs_ocr: null (unknown). Same risk:
+        // re-writing would still leave needs_ocr null. Skip.
+        const { cache } = setupRequestScenarioWithFullCache({
+            cachedPageCount: 3,
+            cachedPageLabels: null,
+            needs_ocr: null,
+            has_text_layer: null,
+        });
+
+        await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-no-overwrite',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+        });
+
+        expect(cache.putMetadata).not.toHaveBeenCalled();
+        expect(cache.putErrorMetadata).not.toHaveBeenCalled();
+    });
+
+    it('passes pageIndices: undefined for all-pages requests', async () => {
+        setupRequestScenario({ cachedPageCount: 3, cachedPageLabels: { 0: 'i' } });
+
+        await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-all',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            // pages omitted → all-pages request
+            skip_local_limits: true,
+        });
+
+        expect(mockState.renderCalls).toHaveLength(1);
+        expect(mockState.renderCalls[0].pageIndices).toBeUndefined();
+    });
+
+    it('does NOT overwrite cache from image render when prior cachedMeta says needs_ocr: true (regression)', async () => {
+        // A PDF previously cached with needs_ocr: true must keep that flag
+        // after an image render — otherwise later text requests lose the
+        // fast-fail and `fileStatusFromCache` flips to "available". Stronger
+        // guarantee: skip the write entirely (prior writer is authoritative).
+        const { cache } = setupRequestScenarioWithFullCache({
+            cachedPageCount: 3,
+            cachedPageLabels: null,
+            needs_ocr: true,
+            has_text_layer: false,
+        });
+
+        await handleZoteroAttachmentPageImagesRequest({
+            event: 'zotero_attachment_page_images_request',
+            request_id: 'req-ocr-preserve',
+            attachment: { library_id: 1, zotero_key: 'ABCD1234' },
+            pages: [1],
+            skip_local_limits: true,
+        });
+
+        expect(cache.putMetadata).not.toHaveBeenCalled();
+        expect(cache.putErrorMetadata).not.toHaveBeenCalled();
+    });
+});

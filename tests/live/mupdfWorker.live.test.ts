@@ -1,0 +1,454 @@
+/**
+ * MuPDF worker smoke suite.
+ *
+ * Exercises the production worker path against real PDFs in a live Zotero
+ * process. Pre-PR #4 this file was a parity suite (main-thread vs worker);
+ * after PR #4 the main-thread path is gone, so the suite collapses to a
+ * single-path regression net. The unit tests in
+ * `tests/unit/services/mupdfWorkerClient.test.ts` cover client-wrapper
+ * correctness; this file's load-bearing value is the `NO_TEXT_LAYER`
+ * payload round-trip against `NO_TEXT_PDF`.
+ *
+ * Prerequisites (per tests/README.md):
+ *   - Dev build of AsterMargin loaded in a running Zotero (NODE_ENV=development).
+ *   - User authenticated so the test endpoints are registered.
+ *   - Fixture attachments seeded (SMALL_PDF, NORMAL_PDF, ENCRYPTED_PDF,
+ *     NO_TEXT_PDF). Set ZOTERO_INVALID_PDF_REF to exercise the corrupt
+ *     attachment path.
+ *
+ * Run with: `npm run test:live -- mupdfWorker`
+ */
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { SCHEMA_VERSION } from '@astermargin/agent-core/extract/schema';
+
+import {
+    isZoteroAvailable,
+    skipIfNoZotero,
+} from '../helpers/zoteroAvailability';
+import {
+    pdfPageCount,
+    pdfPageCountFromBytes,
+    pdfPageLabels,
+    pdfRenderPages,
+    pdfRenderPagesWithMeta,
+    pdfExtractRawDetailed,
+    pdfExtract,
+    pdfHasTextLayer,
+    pdfAnalyzeOcr,
+    pdfSearchScored,
+    pdfSentenceBBoxes,
+    workerCacheClear,
+    workerMarkStale,
+    workerStats,
+} from '../helpers/cacheInspector';
+import {
+    SMALL_PDF,
+    NORMAL_PDF,
+    ENCRYPTED_PDF,
+    INVALID_PDF_FIXTURE,
+    NO_TEXT_PDF,
+} from '../helpers/fixtures';
+
+let available = false;
+beforeAll(async () => {
+    available = await isZoteroAvailable();
+});
+
+const SMALL_PDF_PAGE_COUNT = 2;
+describe('MuPDF worker smoke — PR #1 ops', () => {
+    beforeEach((ctx) => {
+        skipIfNoZotero(ctx, available);
+    });
+
+    it('returns the expected page count for a healthy PDF', async () => {
+        const res = await pdfPageCount(SMALL_PDF);
+        expect(res.ok).toBe(true);
+        expect(res.count).toBe(SMALL_PDF_PAGE_COUNT);
+    });
+
+    it('returns ENCRYPTED for an encrypted PDF', async () => {
+        const res = await pdfPageCount(ENCRYPTED_PDF);
+        expect(res.ok).toBe(false);
+        expect(res.error?.code).toBe('ENCRYPTED');
+    });
+
+    it('returns INVALID_PDF for raw garbage bytes', async () => {
+        const garbage = new TextEncoder().encode('not a pdf');
+        const res = await pdfPageCountFromBytes(garbage);
+        expect(res.ok).toBe(false);
+        expect(res.error?.code).toBe('INVALID_PDF');
+    });
+
+    it('returns INVALID_PDF for an explicitly configured corrupt attachment', async (ctx) => {
+        // The repository fallback key currently identifies a parseable empty
+        // PDF, not a page-count-level corrupt file. Require an explicit live
+        // fixture so the prerequisite is independent of the result under test.
+        if (!process.env.ZOTERO_INVALID_PDF_REF?.trim()) ctx.skip();
+
+        const res = await pdfPageCount(INVALID_PDF_FIXTURE);
+        expect(res.ok).toBe(false);
+        expect(res.error?.code).toBe('INVALID_PDF');
+    });
+
+});
+
+// ---------------------------------------------------------------------------
+// PR #2 — worker primitives
+//
+// These endpoints call worker primitives directly (no AsterMarginExtractor /
+// SearchScorer). They prove the WS-driven worker path runs end-to-end
+// against real PDFs.
+// ---------------------------------------------------------------------------
+
+describe('MuPDF worker smoke — PR #2 ops', () => {
+    beforeEach((ctx) => {
+        skipIfNoZotero(ctx, available);
+    });
+
+    it('getMetadata returns pageCount + pageLabels', async () => {
+        const res = await pdfPageLabels(SMALL_PDF);
+        expect(res.ok).toBe(true);
+        expect(res.pageCount).toBe(SMALL_PDF_PAGE_COUNT);
+        expect(res.pageLabels).toBeDefined();
+    });
+
+    it('renderPagesToImages produces a non-empty image', async () => {
+        const res = await pdfRenderPages(SMALL_PDF, { page_indices: [0] });
+        expect(res.ok).toBe(true);
+        const page = res.pages![0];
+        expect(page.pageIndex).toBe(0);
+        expect(page.width).toBeGreaterThan(0);
+        expect(page.height).toBeGreaterThan(0);
+        expect(page.data_byte_length).toBeGreaterThan(0);
+    });
+
+    it('renderPages returns { pageCount, pageLabels, pages } in one round-trip', async () => {
+        const res = await pdfRenderPagesWithMeta(SMALL_PDF, { page_indices: [0] });
+        expect(res.ok).toBe(true);
+        expect(res.pageCount).toBe(SMALL_PDF_PAGE_COUNT);
+        expect(res.pageLabels).toBeDefined();
+        expect(res.pages?.length).toBe(1);
+        const page = res.pages![0];
+        expect(page.pageIndex).toBe(0);
+        expect(page.data_byte_length).toBeGreaterThan(0);
+    });
+
+    it('renderPages enumerates all pages when no pageIndices/pageRange given', async () => {
+        const res = await pdfRenderPagesWithMeta(SMALL_PDF);
+        expect(res.ok).toBe(true);
+        expect(res.pageCount).toBe(SMALL_PDF_PAGE_COUNT);
+        expect(res.pages?.length).toBe(SMALL_PDF_PAGE_COUNT);
+    });
+
+    it('renderPages resolves an open-ended pageRange against pageCount', async () => {
+        // startIndex=0, no endIndex → worker uses pageCount-1.
+        const res = await pdfRenderPagesWithMeta(SMALL_PDF, {
+            page_range: { startIndex: 0, maxPages: 10 },
+        });
+        expect(res.ok).toBe(true);
+        expect(res.pageCount).toBe(SMALL_PDF_PAGE_COUNT);
+        expect(res.pages?.length).toBe(SMALL_PDF_PAGE_COUNT);
+    });
+
+    it('renderPages throws PAGE_OUT_OF_RANGE for all-invalid explicit indices and carries pageCount in the payload', async () => {
+        const res = await pdfRenderPagesWithMeta(SMALL_PDF, { page_indices: [99999] });
+        expect(res.ok).toBe(false);
+        expect(res.error?.code).toBe('PAGE_OUT_OF_RANGE');
+        expect(res.error?.pageCount).toBe(SMALL_PDF_PAGE_COUNT);
+    });
+
+    it('extractRawPageDetailed returns blocks for the requested page', async () => {
+        const res = await pdfExtractRawDetailed(SMALL_PDF, { page_index: 0 });
+        expect(res.ok).toBe(true);
+        const page = res.result!;
+        expect(page.pageIndex).toBe(0);
+        expect(page.width).toBeGreaterThan(0);
+        expect(page.height).toBeGreaterThan(0);
+        expect(Array.isArray(page.blocks)).toBe(true);
+    });
+
+    it('extractRawPageDetailed throws PAGE_OUT_OF_RANGE for an invalid index', async () => {
+        const res = await pdfExtractRawDetailed(SMALL_PDF, { page_index: 99999 });
+        expect(res.ok).toBe(false);
+        expect(res.error?.code).toBe('PAGE_OUT_OF_RANGE');
+    });
+
+});
+
+describe('MuPDF worker smoke — orchestration ops', () => {
+    beforeEach((ctx) => {
+        skipIfNoZotero(ctx, available);
+    });
+
+    describe('extract', () => {
+        it('returns page-level extraction for a healthy PDF', async () => {
+            const res = await pdfExtract(SMALL_PDF, {});
+            expect(res.ok).toBe(true);
+
+            const result = res.result;
+            expect(result.mode).toBe('markdown');
+            expect(result.schemaVersion).toBe(SCHEMA_VERSION);
+            expect(result.document.pageCount).toBe(SMALL_PDF_PAGE_COUNT);
+            expect(result.document.pages).toHaveLength(SMALL_PDF_PAGE_COUNT);
+            for (const page of result.document.pages) {
+                expect(typeof page.index).toBe('number');
+                expect(page.width).toBeGreaterThan(0);
+                expect(page.height).toBeGreaterThan(0);
+                expect(typeof page.markdown).toBe('string');
+            }
+        });
+
+        it('returns NO_TEXT_LAYER with full payload', async () => {
+            const res = await pdfExtract(NO_TEXT_PDF);
+            expect(res.ok).toBe(false);
+            expect(res.error?.code).toBe('NO_TEXT_LAYER');
+            // Payload-passing through rehydrateError — the load-bearing
+            // case for the structured-error contract.
+            expect(res.error?.payload?.ocrAnalysis).toBeDefined();
+            const ocr = res.error!.payload!.ocrAnalysis as any;
+            expect(ocr.needsOCR).toBe(true);
+            expect(typeof res.error!.payload!.pageCount).toBe('number');
+            expect(res.error!.payload!.pageLabels).toBeDefined();
+        });
+    });
+
+    describe('hasTextLayer', () => {
+        it('returns true for a healthy PDF', async () => {
+            const res = await pdfHasTextLayer(SMALL_PDF);
+            expect(res.ok).toBe(true);
+            expect(res.hasTextLayer).toBe(true);
+        });
+
+        it('returns false for a no-text-layer PDF', async () => {
+            const res = await pdfHasTextLayer(NO_TEXT_PDF);
+            expect(res.ok).toBe(true);
+            expect(res.hasTextLayer).toBe(false);
+        });
+    });
+
+    describe('analyzeOCRNeeds', () => {
+        it('returns needsOCR=false for a healthy PDF', async () => {
+            const res = await pdfAnalyzeOcr(SMALL_PDF);
+            expect(res.ok).toBe(true);
+
+            const result = res.result;
+            expect(result.needsOCR).toBe(false);
+            expect(typeof result.issueRatio).toBe('number');
+            expect(result.issueBreakdown).toBeDefined();
+            expect(typeof result.sampledPages).toBe('number');
+            expect(typeof result.totalPages).toBe('number');
+        });
+
+        it('returns needsOCR=true for a no-text-layer PDF', async () => {
+            const res = await pdfAnalyzeOcr(NO_TEXT_PDF);
+            expect(res.ok).toBe(true);
+            expect(res.result.needsOCR).toBe(true);
+        });
+    });
+
+    describe('search (scored)', () => {
+        it('returns scored matches for a common term', async () => {
+            const res = await pdfSearchScored(SMALL_PDF, { query: 'the' });
+            expect(res.ok).toBe(true);
+
+            const result = res.result;
+            expect(typeof result.totalMatches).toBe('number');
+            for (const page of result.pages) {
+                expect(typeof page.pageIndex).toBe('number');
+                expect(page.matchCount).toBeGreaterThan(0);
+                expect(typeof page.score).toBe('number');
+            }
+        });
+
+        it('returns no-match early-return for an absent term', async () => {
+            const res = await pdfSearchScored(SMALL_PDF, {
+                query: 'zzzz_nonexistent_xyzzy',
+            });
+            expect(res.ok).toBe(true);
+            expect(res.result.totalMatches).toBe(0);
+            expect(res.result.pages).toEqual([]);
+        });
+    });
+
+    describe('structured extract (sentence-level)', () => {
+        it('returns sentences with bboxes for a healthy PDF page', async () => {
+            const res = await pdfSentenceBBoxes(SMALL_PDF, { page_index: 0 });
+            expect(res.ok).toBe(true);
+
+            const result = res.result;
+            expect(Array.isArray(result.items)).toBe(true);
+            expect(Array.isArray(result.sentences)).toBe(true);
+            // `degradation` is optional — omitted when no items degraded.
+            if (result.degradation !== undefined) {
+                expect(typeof result.degradation.count).toBe('number');
+                expect(Array.isArray(result.degradation.notes)).toBe(true);
+            }
+            for (const sentence of result.sentences) {
+                expect(typeof sentence.text).toBe('string');
+                expect(Array.isArray(sentence.bboxes)).toBe(true);
+            }
+        });
+
+        it('returns PAGE_OUT_OF_RANGE for an invalid index', async () => {
+            const res = await pdfSentenceBBoxes(SMALL_PDF, { page_index: 99999 });
+            expect(res.ok).toBe(false);
+            expect(res.error?.code).toBe('PAGE_OUT_OF_RANGE');
+        });
+
+        it.each([
+            ['missing', {}],
+            ['non-numeric', { page_index: 'not-a-page' }],
+            ['fractional', { page_index: 0.5 }],
+            ['negative', { page_index: -1 }],
+        ])('rejects a %s page index as malformed', async (_label, body) => {
+            const res = await pdfSentenceBBoxes(SMALL_PDF, body as any);
+            expect(res.ok).toBe(false);
+            expect(res.error).toMatchObject({
+                name: 'Error',
+                message: 'page_index (non-negative integer) is required',
+            });
+            expect(res.error?.code).toBeUndefined();
+        });
+    });
+
+});
+
+// ---------------------------------------------------------------------------
+// Doc cache — short-lived in-worker document cache.
+//
+// Tests verify the cache eliminates re-parses for back-to-back ops on the
+// same `pdfData` and that introspection RPCs (`worker-stats`,
+// `worker-cache-clear`) are non-spawning / non-mutating with respect to
+// dispatchCounts.
+// ---------------------------------------------------------------------------
+
+describe('MuPDF worker — doc cache', () => {
+    beforeEach((ctx) => {
+        skipIfNoZotero(ctx, available);
+    });
+
+    it('two back-to-back ops on the same fixture produce 1 miss + 1 hit', async () => {
+        // Reset both client-side dispatch counters and the worker-side
+        // cache counters so the assertion can use exact values.
+        await workerStats({ reset: true });
+        await workerCacheClear({ resetCounters: true });
+
+        const first = await pdfPageCount(SMALL_PDF);
+        expect(first.ok).toBe(true);
+
+        const second = await pdfPageCount(SMALL_PDF);
+        expect(second.ok).toBe(true);
+        expect(second.count).toBe(first.count);
+
+        const stats = await workerStats();
+        expect(stats.cacheStats).not.toBeNull();
+        expect(stats.cacheStats!.misses).toBe(1);
+        expect(stats.cacheStats!.hits).toBe(1);
+        expect(stats.cacheStats!.entries).toBe(1);
+        expect(stats.cacheStats!.cryptoUsable).toBe(true);
+    });
+
+    it('different fixtures produce two separate entries (no false hits)', async () => {
+        await workerStats({ reset: true });
+        await workerCacheClear({ resetCounters: true });
+
+        await pdfPageCount(SMALL_PDF);
+        await pdfPageCount(NORMAL_PDF);
+
+        const stats = await workerStats();
+        expect(stats.cacheStats!.misses).toBe(2);
+        expect(stats.cacheStats!.hits).toBe(0);
+        expect(stats.cacheStats!.entries).toBeGreaterThanOrEqual(1);
+        expect(stats.cacheStats!.entries).toBeLessThanOrEqual(2);
+    });
+
+    it('cache is cleared after worker-mark-stale (per-worker scope)', async () => {
+        await workerStats({ reset: true });
+        await workerCacheClear({ resetCounters: true });
+
+        await pdfPageCount(SMALL_PDF);
+        const before = await workerStats();
+        // `cacheStats` is null when no worker is alive, which would otherwise
+        // surface as an opaque TypeError on the next line. The op above just
+        // ran, so a missing worker means something disposed the hot slot
+        // underneath us — name that rather than letting it read as a cache bug.
+        expect(
+            before.stats.hasWorker,
+            'hot worker was gone right after a successful op, so cacheStats is null',
+        ).toBe(true);
+        expect(before.cacheStats!.entries).toBeGreaterThanOrEqual(1);
+
+        await workerMarkStale({ reason: 'doc-cache test' });
+
+        // After mark-stale and a fresh op the cache must be empty before the
+        // miss, then hold one entry. Hits/misses also reset to 0/1 because
+        // the new worker has its own counters.
+        await pdfPageCount(SMALL_PDF);
+        const after = await workerStats();
+        expect(after.cacheStats!.misses).toBe(1);
+        expect(after.cacheStats!.hits).toBe(0);
+        expect(after.cacheStats!.entries).toBe(1);
+    });
+
+    it('worker-stats does NOT spawn a worker, dispose first to prove it', async () => {
+        // Force the worker to die so `getCacheStats()` cannot reach it.
+        await workerMarkStale({ reason: 'pre-spawn-test' });
+
+        const stats = await workerStats({ reset: true });
+        // hasWorker stays false: the introspection call did not respawn.
+        // (markStale clears `this.worker`; only a real op respawns it.)
+        expect(stats.stats.hasWorker).toBe(false);
+        expect(stats.cacheStats).toBeNull();
+        expect(Object.keys(stats.stats.dispatchCounts).length).toBe(0);
+    });
+
+    it('introspection ops do not pollute dispatchCounts', async () => {
+        await workerStats({ reset: true });
+        await workerCacheClear({ resetCounters: true });
+
+        // One real op.
+        await pdfPageCount(SMALL_PDF);
+
+        // Multiple introspection RPCs around the real op.
+        await workerStats();
+        await workerStats();
+        await workerCacheClear({ resetCounters: false });
+
+        const final = await workerStats();
+        // The real op is the only one that should have been counted.
+        expect(final.stats.dispatchCounts.getPageCount).toBe(1);
+        expect(final.stats.dispatchCounts).not.toHaveProperty('__cacheStats');
+        expect(final.stats.dispatchCounts).not.toHaveProperty('__cacheClear');
+    });
+
+    it('multi-call pattern on the same attachment hits cache on every reuse', async () => {
+        // The pages handler typically issues getMetadata + getPageCount
+        // + (extract). Here we simulate the multi-call pattern with two
+        // cheap ops: page count and metadata. Both share the same
+        // pdfData, so the second one should be a cache hit.
+        await workerStats({ reset: true });
+        await workerCacheClear({ resetCounters: true });
+
+        await pdfPageCount(SMALL_PDF);
+        await pdfPageLabels(SMALL_PDF);
+
+        const stats = await workerStats();
+        expect(stats.cacheStats!.misses).toBe(1);
+        expect(stats.cacheStats!.hits).toBe(1);
+        expect(stats.cacheStats!.entries).toBe(1);
+    });
+
+    it('discard-on-error prevents an out-of-range op from warming the cache', async () => {
+        await workerStats({ reset: true });
+        await workerCacheClear({ resetCounters: true });
+
+        const res = await pdfExtractRawDetailed(SMALL_PDF, { page_index: 9999 });
+        expect(res.ok).toBe(false);
+        expect(res.error?.code).toBe('PAGE_OUT_OF_RANGE');
+
+        const stats = await workerStats();
+        expect(stats.cacheStats).not.toBeNull();
+        expect(stats.cacheStats!.entries).toBe(0);
+        expect(stats.cacheStats!.discards).toBe(1);
+    });
+});

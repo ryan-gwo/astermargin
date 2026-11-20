@@ -1,0 +1,204 @@
+import React from 'react'
+import { useAtomValue, useSetAtom } from 'jotai';
+import { stagedReaderActionContextAtom, currentReaderAttachmentAtom, effectiveReaderTextSelectionAtom, currentMessageFiltersAtom, removeItemFromMessageAtom, currentMessageItemsAtom, currentMessageCollectionsAtom, currentMessageViewsAtom, currentMessageExternalFilesAtom, removeExternalFileFromMessageAtom, clearMessageContextAtom, messageItemDataRevisionAtom } from '../../atoms/messageComposition';
+import { currentNoteItemAtom } from '../../atoms/zoteroContext';
+import { removePopupMessagesByTypeAtom } from '../../atoms/ui';
+import { TextSelectionButton } from '../input/TextSelectionButton';
+// import { ZoteroIcon, ZOTERO_ICONS } from './icons/ZoteroIcon';
+import { LibraryButton } from '../library/LibraryButton';
+import { CollectionButton } from '../library/CollectionButton';
+import { TagButton } from '../library/TagButton';
+import { MessageItemButton } from '../input/MessageItemButton';
+import { TableMessageItemButton } from '../input/TableMessageItemButton';
+import { isTableAttachment } from '../../../src/services/artifacts/tableItemIdentity';
+import { MessageCollectionButton } from '../input/MessageCollectionButton';
+import { MessageViewButton } from '../input/MessageViewButton';
+import { messageAttachmentKey } from '@astermargin/agent-core/types/attachments/apiTypes';
+import { ExternalFileButton } from '../input/ExternalFileButton';
+import { collectionReferenceKey } from '@astermargin/agent-core/types/zotero';
+import { ChipWithListPopup } from '@astermargin/agent-ui/chat/ChipPopup';
+import { buildItemsSummaryListPopup } from '../input/MessageItemChipPopup';
+
+const MAX_ATTACHMENTS = 4;
+
+/**
+ * The chips for whatever is attached to the message being composed.
+ *
+ * Renders nothing when there is nothing attached — the "+" that used to
+ * anchor this row moved into the composer's control row, so an empty row has
+ * no reason to occupy a line.
+ */
+const MessageAttachmentDisplay = () => {
+    const staged = useAtomValue(stagedReaderActionContextAtom);
+    const readerAttachment = useAtomValue(currentReaderAttachmentAtom);
+    const noteItem = useAtomValue(currentNoteItemAtom);
+    const currentReaderAttachment = staged ? null : readerAttachment;
+    const currentNoteItem = staged ? null : noteItem;
+    const readerTextSelection = useAtomValue(effectiveReaderTextSelectionAtom);
+    const currentMessageFilters = useAtomValue(currentMessageFiltersAtom);
+    const { libraryIds: currentLibraryIds, collectionIds: currentCollectionIds, tagSelections: currentTagSelections } = currentMessageFilters;
+    const currentMessageItems = useAtomValue(currentMessageItemsAtom);
+    // Bumped when attached items finish loading the data their labels read.
+    const itemDataRevision = useAtomValue(messageItemDataRevisionAtom);
+    const currentMessageCollections = useAtomValue(currentMessageCollectionsAtom);
+    const currentMessageViews = useAtomValue(currentMessageViewsAtom);
+    const currentMessageExternalFiles = useAtomValue(currentMessageExternalFilesAtom);
+    const removeExternalFileFromMessage = useSetAtom(removeExternalFileFromMessageAtom);
+    const removeItemFromMessage = useSetAtom(removeItemFromMessageAtom);
+    const clearMessageContext = useSetAtom(clearMessageContextAtom);
+    const removePopupMessagesByType = useSetAtom(removePopupMessagesByTypeAtom);
+
+    const selectedLibraries = currentLibraryIds
+        .map(id => Zotero.Libraries.get(id))
+        .filter(lib => lib) as Zotero.Library[];
+
+    const selectedCollections = currentCollectionIds
+        .map(id => {
+            try {
+                return Zotero.Collections.get(id);
+            } catch {
+                return null;
+            }
+        })
+        .filter((collection): collection is Zotero.Collection => Boolean(collection));
+
+    const filteredMessageItems = React.useMemo(
+        () => currentMessageItems.filter(
+            (item) => (!currentReaderAttachment || item.key !== currentReaderAttachment.key)
+                && (!currentNoteItem || item.key !== currentNoteItem.key),
+        ),
+        [currentMessageItems, currentNoteItem, currentReaderAttachment],
+    );
+    const displayedMessageItems = React.useMemo(
+        () => filteredMessageItems.slice(0, MAX_ATTACHMENTS),
+        [filteredMessageItems],
+    );
+    const overflowMessageItems = React.useMemo(
+        () => filteredMessageItems.slice(MAX_ATTACHMENTS),
+        [filteredMessageItems],
+    );
+    const overflowCount = overflowMessageItems.length;
+    const overflowPopup = React.useMemo(
+        () => overflowCount > 0
+            ? buildItemsSummaryListPopup(overflowMessageItems)
+            : null,
+        [overflowCount, overflowMessageItems, itemDataRevision],
+    );
+
+    // Count of editable (removable) context items currently attached. Excludes
+    // the non-removable reader attachment and note tab item.
+    const removableContextCount =
+        filteredMessageItems.length +
+        selectedLibraries.length +
+        selectedCollections.length +
+        currentTagSelections.length +
+        currentMessageCollections.length +
+        currentMessageViews.length +
+        currentMessageExternalFiles.length +
+        (readerTextSelection ? 1 : 0);
+
+    // The removable count plus the two chips that cannot be removed, so a new
+    // attachment kind only has to be added to the count above.
+    const hasAttachments =
+        removableContextCount > 0 ||
+        Boolean(currentReaderAttachment) ||
+        Boolean(currentNoteItem);
+
+    // Offer "Remove all" only when there is more than one removable item
+    const handleRemoveAll = removableContextCount > 1
+        ? () => {
+            clearMessageContext();
+            removePopupMessagesByType(['items_summary']);
+        }
+        : undefined;
+
+    if (!hasAttachments) return null;
+
+    return (
+        <div className="composer-attachments">
+            {/* Selected Libraries */}
+            {selectedLibraries.map(library => (
+                <LibraryButton key={library.libraryID} library={library} onRemoveAll={handleRemoveAll} />
+            ))}
+
+            {/* Selected Collections */}
+            {selectedCollections.map(collection => (
+                <CollectionButton key={collection.id} collection={collection} onRemoveAll={handleRemoveAll} />
+            ))}
+
+            {/* Selected Tags */}
+            {currentTagSelections.map(tag => (
+                <TagButton key={tag.id} tag={tag} onRemoveAll={handleRemoveAll} />
+            ))}
+
+            {/* Current message collections */}
+            {currentMessageCollections.map(col => (
+                <MessageCollectionButton key={collectionReferenceKey(col)} collection={col} onRemoveAll={handleRemoveAll} />
+            ))}
+
+            {/* Current message saved searches and built-in views */}
+            {currentMessageViews.map(view => (
+                <MessageViewButton key={messageAttachmentKey(view)} view={view} onRemoveAll={handleRemoveAll} />
+            ))}
+
+            {/* Current reader attachment */}
+            {currentReaderAttachment && (
+                isTableAttachment(currentReaderAttachment)
+                    ? <TableMessageItemButton item={currentReaderAttachment} />
+                    : <MessageItemButton item={currentReaderAttachment} canEdit={false} tabContextType="reader" />
+            )}
+
+            {/* Current note tab item */}
+            {currentNoteItem && (
+                <MessageItemButton item={currentNoteItem} canEdit={false} tabContextType="note" />
+            )}
+
+            {/* Current message items */}
+            {displayedMessageItems.map((item) => (
+                isTableAttachment(item) ? <TableMessageItemButton key={`${item.libraryID}-${item.key}`} item={item}
+                    onRemove={() => removeItemFromMessage(item)} onRemoveAll={handleRemoveAll} /> : <MessageItemButton
+                    key={item.key}
+                    item={item}
+                    onRemove={(item) => {
+                        removeItemFromMessage(item);
+                    }}
+                    onRemoveAll={handleRemoveAll}
+                />
+            ))}
+
+            {overflowPopup && (
+                <ChipWithListPopup content={overflowPopup}>
+                    <button
+                        type="button"
+                        className="variant-outline source-button"
+                        style={{ height: '22px' }}
+                        title={`${overflowCount} more attachment${overflowCount === 1 ? '' : 's'}`}
+                    >
+                        +{overflowCount}
+                    </button>
+                </ChipWithListPopup>
+            )}
+
+            {/* External files */}
+            {currentMessageExternalFiles.map((file) => (
+                <ExternalFileButton
+                    key={file.extKey}
+                    extKey={file.extKey}
+                    filename={file.filename}
+                    contentKind={file.contentKind}
+                    storedPath={file.storedPath}
+                    onRemove={removeExternalFileFromMessage}
+                    onRemoveAll={handleRemoveAll}
+                />
+            ))}
+
+            {/* Current text selection */}
+            {readerTextSelection && (
+                <TextSelectionButton selection={readerTextSelection} onRemoveAll={handleRemoveAll} />
+            )}
+            
+        </div>
+    )
+}
+
+export default MessageAttachmentDisplay;

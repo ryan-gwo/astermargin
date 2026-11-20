@@ -1,0 +1,1991 @@
+/**
+ * Shared extraction core for whole-document PDF extraction.
+ *
+ * Factored out of `handleZoteroDocumentRequest` so it can be reused by the
+ * background extractor (timeout-retry path) without duplicating the
+ * cache-lookup / resolve / preflight / extract pipeline.
+ *
+ * Routing: `workerName` selects which MuPDF worker the call uses
+ * (`"hot"` is the default; `"background"` is reserved for the queue
+ * processor). Interactive requests on the hot slot may instead run on the
+ * idle background worker when hot is busy (`PdfRequestWorker`, interactive
+ * overflow). Interactive rules — the request-timeout clamp, the shared
+ * extraction budget, single-flight scope and the cache write after
+ * responding — follow `interactive`, whichever worker runs the request.
+ * The shared core calls the routed `MuPDFWorkerClient` directly for every
+ * MuPDF op — never via `AsterMarginExtractor`, which always uses the default
+ * `"hot"` slot internally.
+ */
+
+import type {
+    AsterMarginExtractResult,
+    SerializedAsterMarginExtractResult,
+} from '../astermargin-extract/schema';
+import type { PageGeometry } from '@astermargin/agent-core/extract/types';
+import { derivedPageLabelsForCache } from '../astermargin-extract/pipeline/output';
+import {
+    ExtractionError,
+    ExtractionErrorCode,
+    StaleWorkerError,
+    WorkerAbortError,
+    WorkerSpawnError,
+    isWorkerDeadlineError,
+    type MuPDFWorkerClient,
+    type PDFWorkerSlotName,
+    type WorkerCallTiming,
+    type WorkerState,
+} from '../astermargin-extract';
+import {
+    DEFAULT_PAGES_TIMEOUT_SECONDS,
+    ExternalAbortError,
+    MAX_INTERACTIVE_PDF_TIMEOUT_SECONDS,
+    MAX_PDF_TIMEOUT_SECONDS,
+    TimeoutError,
+    type TimeoutControllerContext,
+    awaitWithRequestAbort,
+    createTimeoutController,
+} from './agentDataProvider/timeout';
+import type { ZoteroDocumentErrorCode } from '@astermargin/agent-core/protocol/agentProtocol';
+import type { DocumentCacheExtractionMode } from './database';
+import type {
+    DocumentCacheItemRef,
+    DocumentCacheSourceIdentity,
+    SerializedDocumentCacheResult,
+} from './documentCache';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { effectiveMaxFileSizeMB, effectiveMaxPageCount, effectiveMaxSnapshotFileSizeMB } from '@astermargin/agent-core/transport/attachmentLimits';
+import {
+    fileAccessDeniedMessage,
+    isFileAccessDeniedError,
+    isLocalFileReadDenied,
+    loadAttachmentData,
+    resolveAttachmentFileSource,
+    resolveToReadableAttachment,
+    validateZoteroItemReference,
+    preflightCachedPdfMeta,
+    type AttachmentFileSource,
+} from './documentExtraction';
+import { readableToExtractKind, type ExtractContentKind } from '@astermargin/agent-core/extract/document/shared/contentKinds';
+import {
+    isCurrentExtractionSchemaVersion,
+    unsupportedSchemaVersionMessage,
+} from './documentExtraction/shared/extractionSchemaVersions';
+import { recordReadingOutcome } from './documentExtraction/readingOutcome';
+import { PdfRequestWorker } from './documentExtraction/pdfRequestWorker';
+import type { OverflowSkipReason } from './backgroundQueue/interactiveOverflow';
+import {
+    EpubStructureError,
+    extractEpubDocumentFromFile,
+    preflightEpubFile,
+    type EpubDocument,
+} from './documentExtraction/epub';
+import {
+    extractSnapshotDocumentFromFile,
+    preflightSnapshotFile,
+    resolveSnapshotSectionMeta,
+    type SnapshotDocument,
+} from './documentExtraction/snapshot';
+
+/**
+ * Extra margin granted to a shared interactive extraction beyond the request's
+ * own deadline before the document cache aborts it (and the worker client
+ * terminates the worker), freeing the worker for the next read.
+ * The request timeout plus this grace must stay below
+ * DEFAULT_BUSY_LEASE_MS_HOT so the cache abort reclaims the slot before the
+ * worker client's busy lease reaps the operation. Interactive request timeouts
+ * are clamped to MAX_INTERACTIVE_PDF_TIMEOUT_SECONDS to enforce this. The
+ * same budget bounds an interactive request that overflowed to the
+ * background worker, well inside that worker's longer lease.
+ */
+export const HOT_SHARED_EXTRACTION_GRACE_MS = 2000;
+
+export interface ResolvedAttachment {
+    libraryId: number;
+    zoteroKey: string;
+}
+
+/**
+ * Source identity for an already-resolved extraction target.
+ *
+ * `zotero` keeps the existing behavior exactly (item-based file resolution,
+ * remote download fallback). `external` is a user-attached external file: the
+ * managed copy at `filePath` is the only source (no remote fallback) and
+ * `itemRef` supplies the synthetic cache identity
+ * ({ id: 0, libraryID: EXTERNAL_LIBRARY_ID, key: extKey }).
+ */
+export type ExtractionSource =
+    | { kind: 'zotero'; item: Zotero.Item }
+    | { kind: 'external'; filePath: string; itemRef: DocumentCacheItemRef };
+
+/**
+ * Inline local-file source check for external files (no Zotero item).
+ * `maxMB` is the already-resolved ceiling, so snapshot callers can pass their
+ * tighter one.
+ */
+async function resolveExternalFileSource(
+    filePath: string,
+    maxMB: number,
+): Promise<
+    | { kind: 'ok'; filePath: string }
+    | { kind: 'error'; code: 'file_missing' | 'file_too_large'; sizeMB?: number; maxMB?: number }
+> {
+    let stat: { size?: number | null };
+    try {
+        stat = await IOUtils.stat(filePath);
+    } catch {
+        return { kind: 'error', code: 'file_missing' };
+    }
+    const sizeMB = (stat.size ?? 0) / 1024 / 1024;
+    if (sizeMB > maxMB) {
+        return { kind: 'error', code: 'file_too_large', sizeMB, maxMB };
+    }
+    return { kind: 'ok', filePath };
+}
+
+/**
+ * Match an `ExtractionError` even when it was constructed in the other bundle.
+ * The shared MuPDF worker client is a cross-bundle singleton and rehydrates
+ * errors using its own bundle's `ExtractionError` class, so a document request
+ * served from the other bundle would fail a plain `instanceof` check and
+ * misroute a document verdict (e.g. heap exhaustion) into a generic bucket.
+ * Falls back to the structural `name`/`code` shape the worker always sets.
+ */
+function asExtractionError(error: unknown): ExtractionError | null {
+    if (error instanceof ExtractionError) return error;
+    if (
+        error
+        && typeof error === 'object'
+        && (error as { name?: unknown }).name === 'ExtractionError'
+        && typeof (error as { code?: unknown }).code === 'string'
+    ) {
+        return error as ExtractionError;
+    }
+    return null;
+}
+
+/**
+ * True only for worker *lifecycle* failures (the engine could not start /
+ * respawn), bundle-agnostic via an `instanceof` + `name` fallback. Deliberately
+ * excludes heap exhaustion (an `ExtractionError`, a document verdict) so those
+ * keep their `pdf_too_complex` classification instead of being reported as a
+ * transient worker outage.
+ */
+function isWorkerLifecycleError(error: unknown): boolean {
+    if (error instanceof StaleWorkerError || error instanceof WorkerSpawnError) {
+        return true;
+    }
+    const name = (error as { name?: unknown } | null | undefined)?.name;
+    return name === 'StaleWorkerError' || name === 'WorkerSpawnError' || name === 'WorkerQueueFullError';
+}
+
+export interface ExtractAndCacheArgs {
+    libraryId: number;
+    zoteroKey: string;
+    mode: DocumentCacheExtractionMode;
+    /**
+     * Reject threshold for total document page count. `null` falls back to
+     * AsterMargin's hard page-count cap. Counted in *document* pages, not requested
+     * pages.
+     */
+    maxPages: number | null;
+    /** Extraction deadline in seconds. */
+    timeoutSeconds: number;
+    /** Default `"hot"`. Background processor sets `"background"`. */
+    workerName?: PDFWorkerSlotName;
+    /**
+     * Interactive request (someone is waiting for it). Defaults to true unless
+     * `workerName` is `"background"`. Interactive requests are clamped to the
+     * interactive timeout, share single-flight extractions with each other on
+     * either worker, and write to the document cache after responding. On the
+     * hot slot they may overflow to an idle background worker.
+     */
+    interactive?: boolean;
+    /**
+     * Caller-supplied abort signal. When it fires, the in-flight
+     * extraction returns `{ kind: 'external_abort' }` so the caller can
+     * release the work without counting it as a failure.
+     */
+    externalAbortSignal?: AbortSignal;
+    /**
+     * Invoked once on remote-download failure (before the error is rethrown
+     * internally)
+     */
+    onRemoteDownloadFailure?: (error: unknown) => void;
+    /** Carry explicit cache preparation through fresh no-text-layer detection. */
+    prepareCache?: boolean;
+    /**
+     * PDF schema version to produce; absent means the current version. A
+     * producible non-current version is extracted without the document cache
+     * (no reads, no writes, no reading outcome), structured mode only.
+     */
+    schemaVersion?: string | null;
+}
+
+export interface ExtractAndCacheResolvedPdfArgs
+    extends Omit<ExtractAndCacheArgs, 'libraryId' | 'zoteroKey'> {
+    source: ExtractionSource;
+    resolvedKey: string;
+    contentType: string;
+    /** Reuse the caller's timeout when item resolution and PDF extraction share one deadline. */
+    timeoutContext?: TimeoutControllerContext;
+    /** Return pre-serialized PDF JSON bytes instead of a parsed result object. */
+    serializedResult?: boolean;
+}
+
+export interface ExtractAndCacheEpubArgs {
+    source: ExtractionSource;
+    resolvedKey: string;
+    contentType: string;
+    /**
+     * Reject threshold for total document page count. `null` falls back to
+     * AsterMargin's hard page-count cap. EPUB pages are the extractor's per-item
+     * `pageNumber` coordinate (physical print pages when the book carries
+     * markers, otherwise synthetic ~character-interval pages).
+     */
+    maxPages: number | null;
+    externalAbortSignal?: AbortSignal;
+    onFileNotSyncedLocally?: () => void;
+    /** Pre-resolved remote source: extract from a temporary local copy while
+     * keying cache freshness to the synthetic remote identity. */
+    resolvedFile?: {
+        cacheFilePath: string;
+        extractionFilePath: string;
+        sourceSizeBytes: number;
+    };
+}
+
+export interface ExtractAndCacheSnapshotArgs {
+    source: ExtractionSource;
+    resolvedKey: string;
+    contentType: string;
+    /**
+     * Reject threshold for total document page count. `null` falls back to
+     * AsterMargin's hard page-count cap. Snapshot pages are the extractor's per-item
+     * synthetic `pageNumber` coordinate (~character-interval pages).
+     */
+    maxPages: number | null;
+    externalAbortSignal?: AbortSignal;
+    onFileNotSyncedLocally?: () => void;
+    resolvedFile?: {
+        cacheFilePath: string;
+        extractionFilePath: string;
+        sourceSizeBytes: number;
+    };
+}
+
+export type ExtractAndCacheSnapshotResult =
+    | {
+          kind: 'ok';
+          cached: boolean;
+          document: SnapshotDocument;
+          resolvedAttachment: ResolvedAttachment;
+          contentType: string;
+      }
+    | {
+          kind: 'response_error';
+          code: ZoteroDocumentErrorCode;
+          message: string;
+          /** Document page count when known (e.g. the count that tripped `too_many_pages`). */
+          pageCount?: number | null;
+          /**
+           * See the EPUB result's `permanent`. The snapshot extractor does not
+           * classify structural failures yet; the field is declared so the two
+           * DOM results stay one shape for the shared executor branch.
+           */
+          permanent?: boolean;
+          resolvedAttachment: ResolvedAttachment;
+          contentKind?: ExtractContentKind;
+      };
+
+export function buildExtractedDocumentCacheMetadata(extracted: AsterMarginExtractResult): {
+    pageCount: number;
+    pageLabels: Record<string, string>;
+    derivedPageLabels?: Record<string, string> | null;
+    pages: (PageGeometry | null)[];
+} {
+    const doc = extracted.document;
+    const extractedPageLabels = doc.pageLabels ?? Object.fromEntries(
+        doc.pages
+            .filter((page) => page.label)
+            .map((page) => [String(page.index), page.label as string]),
+    );
+    const pages: (PageGeometry | null)[] = new Array(doc.pageCount).fill(null);
+    for (const page of doc.pages) {
+        // Annotation cache geometry uses unrotated PDF user-space dimensions.
+        // Structured-page width/height describe the extraction bbox frame.
+        pages[page.index] = {
+            viewBox: page.viewBox,
+            width: page.viewBox[2] - page.viewBox[0],
+            height: page.viewBox[3] - page.viewBox[1],
+            rotation: page.rotation,
+        };
+    }
+    const derivedPageLabels = derivedPageLabelsForCache(extracted);
+    return {
+        pageCount: doc.pageCount,
+        pageLabels: extractedPageLabels,
+        ...(derivedPageLabels !== undefined ? { derivedPageLabels } : {}),
+        pages,
+    };
+}
+
+function serializedWorkerResultToCacheResult(
+    extracted: SerializedAsterMarginExtractResult,
+): SerializedDocumentCacheResult {
+    return {
+        schemaVersion: extracted.schemaVersion,
+        mode: extracted.mode,
+        document: { pageCount: extracted.pageCount },
+        byteLength: extracted.byteLength,
+        jsonBytes: extracted.jsonBytes,
+        metadata: {
+            pageCount: extracted.cacheMetadata.pageCount,
+            pageLabels: extracted.cacheMetadata.pageLabels,
+            derivedPageLabels: extracted.cacheMetadata.derivedPageLabels,
+            pages: extracted.cacheMetadata.pages,
+        },
+    };
+}
+
+/**
+ * Where a PDF document request spent its time in the plugin, ms (whole
+ * milliseconds). Stages that did not run are absent.
+ */
+export interface PdfDocumentTimings {
+    /**
+     * How the result was obtained: `cache` (the document cache had it),
+     * `extracted` (this request ran the extraction), or `shared` (another
+     * request's extraction of the same document, or a cache entry written
+     * meanwhile).
+     */
+    source: 'cache' | 'extracted' | 'shared';
+    /** Resolving the attachment's file (local path, size, remote availability). */
+    resolveMs?: number;
+    /** Document-cache lookups before extracting. */
+    cacheLookupMs?: number;
+    /** Reading (or downloading) the PDF bytes. */
+    fileReadMs?: number;
+    /** Page-count worker op on a cache miss without stored metadata (round trip). */
+    pageCountMs?: number;
+    /** Extraction worker op, round trip as seen by the plugin. */
+    extractMs?: number;
+    /**
+     * Waiting for other work, summed over this request's worker ops (page count
+     * and extraction; see `WorkerCallTiming`): in the client's work queue, for
+     * the worker to start, and in the worker behind a running op. The first
+     * (`clientQueueMs`) also includes waiting for a free worker before the
+     * request's first op (interactive routing).
+     */
+    clientQueueMs?: number;
+    workerStartMs?: number;
+    workerQueueMs?: number;
+    /** The worker running the extraction. */
+    workerOpMs?: number;
+    /** The worker when this request used it (see `WorkerCallTiming.workerState`). */
+    workerState?: WorkerState;
+    /**
+     * The worker slot this request's ops ran on: `background` when an
+     * interactive request overflowed from a busy hot worker.
+     */
+    workerSlot?: PDFWorkerSlotName;
+    /** Why a request that found the hot worker busy still queued on it. */
+    overflowSkip?: OverflowSkipReason;
+    /** The worker's WASM heap after this request's last worker op, MB. */
+    workerHeapMb?: number;
+    /** The largest WASM heap any worker of the slot has reported so far, MB. */
+    workerPeakHeapMb?: number;
+    /**
+     * Writing this request's extraction to the document cache. On the hot
+     * slot the write runs after the result is returned, so this is set only
+     * once it finishes (and is not part of the request's own time).
+     */
+    cacheWriteMs?: number;
+}
+
+export type ExtractAndCacheResult =
+    | {
+          kind: 'ok';
+          cached: boolean;
+          result: AsterMarginExtractResult;
+          serializedResult?: undefined;
+          totalPages: number;
+          resolvedAttachment: ResolvedAttachment;
+          contentType: string;
+          /** Set by the PDF path. */
+          timings?: PdfDocumentTimings;
+      }
+    | {
+          kind: 'ok';
+          cached: boolean;
+          result?: undefined;
+          serializedResult: SerializedDocumentCacheResult;
+          totalPages: number;
+          resolvedAttachment: ResolvedAttachment;
+          contentType: string;
+          /** Set by the PDF path. */
+          timings?: PdfDocumentTimings;
+      }
+    | {
+          kind: 'cached_error';
+          code: 'encrypted' | 'invalid_pdf' | 'no_text_layer';
+          message: string;
+          pageCount: number | null;
+          resolvedAttachment: ResolvedAttachment | null;
+          contentKind?: ExtractContentKind;
+      }
+    | {
+          kind: 'response_error';
+          code: ZoteroDocumentErrorCode;
+          message: string;
+          /**
+           * See the EPUB result's `permanent`. Local-only: the wire `code` is
+           * unchanged, so nothing the backend or the model sees is affected.
+           */
+          permanent?: boolean;
+          pageCount: number | null;
+          resolvedAttachment: ResolvedAttachment | null;
+          contentKind?: ExtractContentKind;
+      }
+    | {
+          kind: 'timeout';
+          phase: string;
+          timeoutSeconds: number;
+          pageCount: number | null;
+          resolvedAttachment: ResolvedAttachment | null;
+          /** True when the worker busy-lease watchdog reaped the operation. */
+          leaseReaped?: boolean;
+          /**
+           * True when this request's own extraction dispatched to the PDF
+           * worker before timing out. Stays false for timeouts during cache
+           * pre-work (reads, decompression) and for requests joined to another
+           * request's in-flight shared extraction, so the worker snapshot on
+           * the response never describes unrelated activity.
+           */
+          workerDispatched?: boolean;
+          /** The worker slot this request dispatched to, when it did. */
+          workerSlot?: PDFWorkerSlotName;
+      }
+    | {
+          kind: 'external_abort';
+          phase: string;
+          pageCount: number | null;
+          resolvedAttachment: ResolvedAttachment | null;
+          /** True when this request dispatched to the PDF worker before the external abort. */
+          workerDispatched?: boolean;
+          /** The worker slot this request dispatched to, when it did. */
+          workerSlot?: PDFWorkerSlotName;
+      };
+
+export type ExtractAndCacheEpubResult =
+    | {
+          kind: 'ok';
+          cached: boolean;
+          document: EpubDocument;
+          resolvedAttachment: ResolvedAttachment;
+          contentType: string;
+      }
+    | {
+          kind: 'response_error';
+          code: ZoteroDocumentErrorCode;
+          message: string;
+          /** Document page count when known (e.g. the count that tripped `too_many_pages`). */
+          pageCount?: number | null;
+          /**
+           * The failure can never succeed on a retry (e.g. the file is not a
+           * usable EPUB). Local-only: the wire `code` is unchanged, so the
+           * backend and the model see exactly what they saw before. Consumed by
+           * the background queue, which would otherwise retry and dead-letter
+           * every structurally broken book.
+           */
+          permanent?: boolean;
+          resolvedAttachment: ResolvedAttachment;
+          contentKind?: ExtractContentKind;
+      };
+
+/** See `ExtractAndCacheArgs.interactive`. */
+function isInteractive(args: Pick<ExtractAndCacheArgs, 'interactive' | 'workerName'>): boolean {
+    return args.interactive ?? (args.workerName ?? 'hot') !== 'background';
+}
+
+function isAbortError(error: unknown): boolean {
+    return error instanceof Error && /abort/i.test(error.message);
+}
+
+async function extractAndCacheDocumentOwned(
+    args: ExtractAndCacheArgs,
+): Promise<ExtractAndCacheResult> {
+    const requestKey = `${args.libraryId}-${args.zoteroKey}`;
+
+    const formatError = validateZoteroItemReference({
+        library_id: args.libraryId,
+        zotero_key: args.zoteroKey,
+    });
+    if (formatError) {
+        return {
+            kind: 'response_error',
+            code: 'invalid_format',
+            message: `Invalid attachment reference '${requestKey}': ${formatError}`,
+            pageCount: null,
+            resolvedAttachment: null,
+        };
+    }
+
+    const timeout = createTimeoutController(
+        args.timeoutSeconds,
+        DEFAULT_PAGES_TIMEOUT_SECONDS,
+        args.externalAbortSignal,
+        isInteractive(args) ? MAX_INTERACTIVE_PDF_TIMEOUT_SECONDS : undefined,
+    );
+    const { signal, timeoutSeconds, throwIfTimedOut, dispose } = timeout;
+
+    try {
+        const zoteroItem = await awaitWithRequestAbort(
+            Zotero.Items.getByLibraryAndKeyAsync(args.libraryId, args.zoteroKey),
+            signal,
+            throwIfTimedOut,
+            'zotero_item_lookup',
+        );
+        if (!zoteroItem) {
+            return {
+                kind: 'response_error',
+                code: 'not_found',
+                message: `Attachment does not exist in user's library: ${requestKey}`,
+                pageCount: null,
+                resolvedAttachment: null,
+            };
+        }
+
+        await awaitWithRequestAbort(
+            zoteroItem.loadAllData(),
+            signal,
+            throwIfTimedOut,
+            'zotero_item_load',
+        );
+
+        const resolveResult = await awaitWithRequestAbort(
+            resolveToReadableAttachment(zoteroItem, requestKey),
+            signal,
+            throwIfTimedOut,
+            'readable_attachment_resolution',
+        );
+        if (!resolveResult.resolved) {
+            const code = resolveResult.error_code === 'not_readable'
+                ? 'unsupported_type'
+                : resolveResult.error_code;
+            return {
+                kind: 'response_error',
+                code,
+                message: resolveResult.error,
+                pageCount: null,
+                resolvedAttachment: null,
+            };
+        }
+
+        const { item: resolvedItem, contentKind } = resolveResult;
+        const resolvedAttachment = {
+            libraryId: resolvedItem.libraryID,
+            zoteroKey: resolvedItem.key,
+        };
+
+        if (contentKind !== 'pdf') {
+            const extractKind = readableToExtractKind(contentKind);
+            return {
+                kind: 'response_error',
+                code: 'unsupported_type',
+                message: `Attachment ${resolveResult.key} is a ${contentKind} document, but document extraction currently supports PDF only.`,
+                pageCount: null,
+                resolvedAttachment,
+                ...(extractKind ? { contentKind: extractKind } : {}),
+            };
+        }
+
+        // Stay in the owning invocation so resolution and extraction share one deadline.
+        return await extractAndCacheResolvedPdfDocumentOwned({
+            ...args,
+            source: { kind: 'zotero', item: resolvedItem },
+            resolvedKey: resolveResult.key,
+            contentType: resolveResult.contentType,
+            timeoutContext: timeout,
+        });
+    } catch (error) {
+        if (error instanceof ExternalAbortError) {
+            return {
+                kind: 'external_abort',
+                phase: error.phase,
+                pageCount: null,
+                resolvedAttachment: null,
+            };
+        }
+        if (error instanceof TimeoutError || signal.aborted) {
+            return {
+                kind: 'timeout',
+                phase: error instanceof TimeoutError ? error.phase : 'unknown',
+                timeoutSeconds,
+                pageCount: null,
+                resolvedAttachment: null,
+            };
+        }
+        throw error;
+    } finally {
+        dispose();
+    }
+}
+
+/**
+ * Run the EPUB extraction pipeline for an already-resolved EPUB attachment.
+ * Expected outcomes are returned as a tagged union for caller-side mapping.
+ */
+async function extractAndCacheEpubDocumentOwned(
+    args: ExtractAndCacheEpubArgs,
+): Promise<ExtractAndCacheEpubResult> {
+    const attemptedAt = Date.now();
+    const result = await extractAndCacheEpubDocumentImpl(args);
+    if (args.source.kind === 'zotero' && !args.externalAbortSignal?.aborted
+        && !(result.kind === 'response_error' && result.code === 'too_many_pages'
+            && args.maxPages != null && args.maxPages < effectiveMaxPageCount())) {
+        await recordReadingOutcome(args.source.item, 'epub', result, attemptedAt);
+    }
+    return result;
+}
+
+async function extractAndCacheEpubDocumentImpl(
+    args: ExtractAndCacheEpubArgs,
+): Promise<ExtractAndCacheEpubResult> {
+    const cacheItemRef: DocumentCacheItemRef = args.source.kind === 'zotero'
+        ? args.source.item
+        : args.source.itemRef;
+    const resolvedAttachment = {
+        libraryId: cacheItemRef.libraryID,
+        zoteroKey: cacheItemRef.key,
+    };
+    const requestKey = args.resolvedKey;
+
+    let filePath: string;
+    let extractionFilePath: string;
+    let sourceSizeBytes = 0;
+    if (args.resolvedFile) {
+        filePath = args.resolvedFile.cacheFilePath;
+        extractionFilePath = args.resolvedFile.extractionFilePath;
+        sourceSizeBytes = args.resolvedFile.sourceSizeBytes;
+    } else if (args.source.kind === 'zotero') {
+        const preflight = await preflightEpubFile(args.source.item, {
+            onFileNotSyncedLocally: args.onFileNotSyncedLocally,
+        });
+        if (preflight.kind === 'response_error') {
+            return {
+                kind: 'response_error',
+                code: preflight.code,
+                message: preflight.message,
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+        filePath = preflight.filePath;
+        extractionFilePath = filePath;
+    } else {
+        // External files skip the Zotero preflight (kind already validated at
+        // attach time; the managed copy is local-only).
+        const externalSource = await resolveExternalFileSource(args.source.filePath, effectiveMaxFileSizeMB());
+        if (externalSource.kind === 'error') {
+            return {
+                kind: 'response_error',
+                code: externalSource.code,
+                message: externalSource.code === 'file_missing'
+                    ? `The EPUB file for ${requestKey} is not available on this device.`
+                    : `The EPUB file for ${requestKey} is ${(externalSource.sizeMB ?? 0).toFixed(1)} MB, which exceeds the ${externalSource.maxMB} MB limit.`,
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+        filePath = externalSource.filePath;
+        extractionFilePath = filePath;
+    }
+
+    const maxFileSizeMB = effectiveMaxFileSizeMB();
+    const maxSourceSizeBytes = maxFileSizeMB * 1024 * 1024;
+    const maxPages = effectiveMaxPageCount(args.maxPages);
+
+    const okOrNoText = (
+        document: EpubDocument,
+        cached: boolean,
+    ): ExtractAndCacheEpubResult => {
+        if (document.diagnostics.extractedTextChars === 0) {
+            return {
+                kind: 'response_error',
+                code: 'no_text_layer',
+                message: `The EPUB file for ${requestKey} contains no extractable text.`,
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+        // Match the PDF path and the backend's document_fetch_max_pages: reject
+        // oversized documents before serializing the (potentially large) payload.
+        // EPUB page counts are the extractor's per-item page coordinate.
+        if (document.pageCount != null && document.pageCount > maxPages) {
+            return {
+                kind: 'response_error',
+                code: 'too_many_pages',
+                message: `The EPUB file for ${requestKey} has ${document.pageCount} pages, which exceeds the ${maxPages}-page limit.`,
+                pageCount: document.pageCount,
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+        return {
+            kind: 'ok',
+            cached,
+            document,
+            resolvedAttachment,
+            contentType: args.contentType,
+        };
+    };
+
+    try {
+        const cache = Zotero.AsterMargin?.documentCache;
+        if (!cache) {
+            logger(`extractAndCacheEpubDocument: document cache not available for ${requestKey}`, 1);
+            return okOrNoText(
+                await extractEpubDocumentFromFile(extractionFilePath, { abortSignal: args.externalAbortSignal }),
+                false,
+            );
+        }
+
+        const ref = {
+            libraryId: cacheItemRef.libraryID,
+            zoteroKey: cacheItemRef.key,
+        };
+        const cached = await cache.getEpubResult(ref, filePath, { maxSourceSizeBytes }).catch(() => null);
+        if (cached) {
+            return okOrNoText(cached, true);
+        }
+
+        let created = false;
+        const document = await cache.getOrCreateResult<EpubDocument>({
+            item: cacheItemRef,
+            filePath,
+            contentKind: 'epub',
+            mode: 'structured',
+            sourceSizeBytes,
+            contentType: args.contentType,
+            maxSourceSizeBytes,
+            abortSignal: args.externalAbortSignal,
+            readCached: (cacheRef) => cache.getEpubResult(cacheRef, filePath, { maxSourceSizeBytes }),
+            create: async (signal) => {
+                created = true;
+                return extractEpubDocumentFromFile(extractionFilePath, { abortSignal: signal });
+            },
+            metadata: (doc) => ({
+                contentKind: 'epub',
+                // PDF-only fields stay null for EPUB.
+                pageCount: null,
+                pageLabels: null,
+                pages: null,
+                epubPageCount: doc.pageCount ?? null,
+                epubSections: doc.sections.map((section) => ({
+                    index: section.index,
+                    rawHref: section.rawHref,
+                    label: section.label,
+                    itemCount: section.items.length,
+                    // Item-less sections do not have an extraction page. Page
+                    // numbers are non-decreasing in reading order, so the first
+                    // and last items bound the section's page span.
+                    firstPageNumber: section.items[0]?.pageNumber,
+                    lastPageNumber: section.items[section.items.length - 1]?.pageNumber,
+                })),
+                epubExtractedTextChars: doc.diagnostics.extractedTextChars,
+            }),
+        });
+
+        if (!document) {
+            return {
+                kind: 'response_error',
+                code: 'file_too_large',
+                message: `The EPUB file for ${requestKey} exceeds the ${maxFileSizeMB}MB limit.`,
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+
+        return okOrNoText(document, !created);
+    } catch (error) {
+        if (args.externalAbortSignal?.aborted && isAbortError(error)) {
+            return {
+                kind: 'response_error',
+                code: 'timeout',
+                message: `EPUB extraction interrupted for ${requestKey}`,
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+        // The EPUB zip reader reports a denied open as a generic failure.
+        if (isFileAccessDeniedError(error) || await isLocalFileReadDenied(extractionFilePath)) {
+            return {
+                kind: 'response_error',
+                code: 'file_permission_denied',
+                message: fileAccessDeniedMessage('EPUB', requestKey),
+                resolvedAttachment,
+                contentKind: 'epub',
+            };
+        }
+        return {
+            kind: 'response_error',
+            code: 'extraction_failed',
+            message: `Failed to extract EPUB content for ${requestKey}: ${error instanceof Error ? error.message : String(error)}`,
+            // A broken container/OPF is not a transient glitch; retrying it just
+            // burns attempts and dead-letters the job.
+            permanent: error instanceof EpubStructureError,
+            resolvedAttachment,
+            contentKind: 'epub',
+        };
+    }
+}
+
+/**
+ * Run the snapshot extraction pipeline for an already-resolved HTML snapshot
+ * attachment. Expected outcomes are returned as a tagged union for caller-side
+ * mapping, matching the EPUB extraction result shape.
+ */
+async function extractAndCacheSnapshotDocumentOwned(
+    args: ExtractAndCacheSnapshotArgs,
+): Promise<ExtractAndCacheSnapshotResult> {
+    const attemptedAt = Date.now();
+    const result = await extractAndCacheSnapshotDocumentImpl(args);
+    if (args.source.kind === 'zotero' && !args.externalAbortSignal?.aborted
+        && !(result.kind === 'response_error' && result.code === 'too_many_pages'
+            && args.maxPages != null && args.maxPages < effectiveMaxPageCount())) {
+        await recordReadingOutcome(args.source.item, 'snapshot', result, attemptedAt);
+    }
+    return result;
+}
+
+async function extractAndCacheSnapshotDocumentImpl(
+    args: ExtractAndCacheSnapshotArgs,
+): Promise<ExtractAndCacheSnapshotResult> {
+    const cacheItemRef: DocumentCacheItemRef = args.source.kind === 'zotero'
+        ? args.source.item
+        : args.source.itemRef;
+    const resolvedAttachment = {
+        libraryId: cacheItemRef.libraryID,
+        zoteroKey: cacheItemRef.key,
+    };
+    const requestKey = args.resolvedKey;
+
+    let filePath: string;
+    let extractionFilePath: string;
+    let sourceSizeBytes = 0;
+    if (args.resolvedFile) {
+        filePath = args.resolvedFile.cacheFilePath;
+        extractionFilePath = args.resolvedFile.extractionFilePath;
+        sourceSizeBytes = args.resolvedFile.sourceSizeBytes;
+    } else if (args.source.kind === 'zotero') {
+        const preflight = await preflightSnapshotFile(args.source.item, {
+            onFileNotSyncedLocally: args.onFileNotSyncedLocally,
+        });
+        if (preflight.kind === 'response_error') {
+            return {
+                kind: 'response_error',
+                code: preflight.code,
+                message: preflight.message,
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+        filePath = preflight.filePath;
+        extractionFilePath = filePath;
+    } else {
+        // Match the tighter Zotero snapshot preflight limit for external files.
+        const externalSource = await resolveExternalFileSource(
+            args.source.filePath,
+            effectiveMaxSnapshotFileSizeMB(),
+        );
+        if (externalSource.kind === 'error') {
+            return {
+                kind: 'response_error',
+                code: externalSource.code,
+                message: externalSource.code === 'file_missing'
+                    ? `The snapshot file for ${requestKey} is not available on this device.`
+                    : `The snapshot file for ${requestKey} is ${(externalSource.sizeMB ?? 0).toFixed(1)} MB, which exceeds the ${externalSource.maxMB} MB limit.`,
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+        filePath = externalSource.filePath;
+        extractionFilePath = filePath;
+    }
+
+    // Section metadata (URL / title) for the single snapshot section. Only Zotero
+    // items carry it; external files fall back to the filename in the extractor.
+    const sectionMeta = args.source.kind === 'zotero'
+        ? await resolveSnapshotSectionMeta(args.source.item)
+        : {};
+
+    // Keep cache and fallback errors aligned with snapshot preflight.
+    const maxFileSizeMB = effectiveMaxSnapshotFileSizeMB();
+    const maxSourceSizeBytes = maxFileSizeMB * 1024 * 1024;
+    const maxPages = effectiveMaxPageCount(args.maxPages);
+
+    const okOrNoText = (
+        document: SnapshotDocument,
+        cached: boolean,
+    ): ExtractAndCacheSnapshotResult => {
+        if (document.diagnostics.extractedTextChars === 0) {
+            return {
+                kind: 'response_error',
+                code: 'no_text_layer',
+                message: `The snapshot file for ${requestKey} contains no extractable text: the saved page is empty, likely a placeholder (such as a browser PDF viewer or a loading page) rather than the article.`,
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+        // Reject oversized extracted content before serializing the payload.
+        if (document.pageCount != null && document.pageCount > maxPages) {
+            return {
+                kind: 'response_error',
+                code: 'too_many_pages',
+                message: `The snapshot for ${requestKey} is too long for AsterMargin to process — its extracted content exceeds the supported size.`,
+                pageCount: document.pageCount,
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+        return {
+            kind: 'ok',
+            cached,
+            document,
+            resolvedAttachment,
+            contentType: args.contentType,
+        };
+    };
+
+    try {
+        const cache = Zotero.AsterMargin?.documentCache;
+        if (!cache) {
+            logger(`extractAndCacheSnapshotDocument: document cache not available for ${requestKey}`, 1);
+            return okOrNoText(
+                await extractSnapshotDocumentFromFile(extractionFilePath, {
+                    ...sectionMeta,
+                    abortSignal: args.externalAbortSignal,
+                }),
+                false,
+            );
+        }
+
+        const ref = {
+            libraryId: cacheItemRef.libraryID,
+            zoteroKey: cacheItemRef.key,
+        };
+        const cached = await cache.getSnapshotResult(ref, filePath, { maxSourceSizeBytes }).catch(() => null);
+        if (cached) {
+            return okOrNoText(cached, true);
+        }
+
+        let created = false;
+        const document = await cache.getOrCreateResult<SnapshotDocument>({
+            item: cacheItemRef,
+            filePath,
+            contentKind: 'snapshot',
+            mode: 'structured',
+            sourceSizeBytes,
+            contentType: args.contentType,
+            maxSourceSizeBytes,
+            abortSignal: args.externalAbortSignal,
+            readCached: (cacheRef) => cache.getSnapshotResult(cacheRef, filePath, { maxSourceSizeBytes }),
+            create: async (signal) => {
+                created = true;
+                return extractSnapshotDocumentFromFile(extractionFilePath, { ...sectionMeta, abortSignal: signal });
+            },
+            metadata: (doc) => ({
+                contentKind: 'snapshot',
+                // PDF-only fields stay null for snapshots.
+                pageCount: null,
+                pageLabels: null,
+                pages: null,
+                snapshotPageCount: doc.pageCount ?? null,
+                snapshotTitle: doc.sections[0]?.label,
+                snapshotSections: doc.sections.map((section) => ({
+                    index: section.index,
+                    title: section.label,
+                    itemCount: section.items.length,
+                })),
+                snapshotExtractedTextChars: doc.diagnostics.extractedTextChars,
+            }),
+        });
+
+        if (!document) {
+            return {
+                kind: 'response_error',
+                code: 'file_too_large',
+                message: `The snapshot file for ${requestKey} exceeds the ${maxFileSizeMB}MB limit.`,
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+
+        return okOrNoText(document, !created);
+    } catch (error) {
+        if (args.externalAbortSignal?.aborted && isAbortError(error)) {
+            return {
+                kind: 'response_error',
+                code: 'timeout',
+                message: `Snapshot extraction interrupted for ${requestKey}`,
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+        if (isFileAccessDeniedError(error)) {
+            return {
+                kind: 'response_error',
+                code: 'file_permission_denied',
+                message: fileAccessDeniedMessage('snapshot', requestKey),
+                resolvedAttachment,
+                contentKind: 'snapshot',
+            };
+        }
+        return {
+            kind: 'response_error',
+            code: 'extraction_failed',
+            message: `Failed to extract snapshot content for ${requestKey}: ${error instanceof Error ? error.message : String(error)}`,
+            resolvedAttachment,
+            contentKind: 'snapshot',
+        };
+    }
+}
+
+/**
+ * Run the PDF extraction pipeline for an already-resolved PDF attachment.
+ * Expected outcomes are returned as a tagged union for caller-side mapping.
+ */
+async function extractAndCacheResolvedPdfDocumentOwned(
+    args: ExtractAndCacheResolvedPdfArgs,
+): Promise<ExtractAndCacheResult> {
+    const attemptedAt = Date.now();
+    const result = await extractAndCacheResolvedPdfDocumentImpl(args);
+    if (args.source.kind === 'zotero' && !args.externalAbortSignal?.aborted
+        && uncachedPdfSchemaVersion(args.schemaVersion) === null
+        && !(result.kind === 'response_error' && result.code === 'too_many_pages'
+            && args.maxPages != null && args.maxPages < effectiveMaxPageCount())) {
+        await recordReadingOutcome(args.source.item, 'pdf', result, attemptedAt);
+    }
+    return result;
+}
+
+/**
+ * The requested PDF schema version when it is not the current one, i.e. when
+ * the extraction must bypass the document cache; `null` for the current one.
+ */
+function uncachedPdfSchemaVersion(schemaVersion: string | null | undefined): string | null {
+    return isCurrentExtractionSchemaVersion('pdf', schemaVersion) ? null : schemaVersion ?? null;
+}
+
+async function extractAndCacheResolvedPdfDocumentImpl(
+    args: ExtractAndCacheResolvedPdfArgs,
+): Promise<ExtractAndCacheResult> {
+    const {
+        mode,
+        externalAbortSignal,
+    } = args;
+    const workerName: PDFWorkerSlotName = args.workerName ?? 'hot';
+    const interactive = isInteractive(args);
+    // Interactive requests share single-flight extractions on either worker,
+    // so a hot request and an overflow request for one document run once.
+    const lockScope: PDFWorkerSlotName = interactive ? 'hot' : workerName;
+    const requestKey = args.resolvedKey;
+    const uncachedSchemaVersion = uncachedPdfSchemaVersion(args.schemaVersion);
+    const unsupportedVersion = unsupportedSchemaVersionMessage('pdf', args.schemaVersion, mode);
+    if (unsupportedVersion) {
+        const cacheRef = args.source.kind === 'zotero' ? args.source.item : args.source.itemRef;
+        return {
+            kind: 'response_error',
+            code: 'unsupported_schema_version',
+            message: unsupportedVersion,
+            pageCount: null,
+            resolvedAttachment: { libraryId: cacheRef.libraryID, zoteroKey: cacheRef.key },
+            contentKind: 'pdf',
+        };
+    }
+
+    const maxFileSizeMB = effectiveMaxFileSizeMB();
+    const maxPages = effectiveMaxPageCount(args.maxPages);
+
+    const ownsTimeout = !args.timeoutContext;
+    const timeout = args.timeoutContext ?? createTimeoutController(
+        args.timeoutSeconds,
+        DEFAULT_PAGES_TIMEOUT_SECONDS,
+        externalAbortSignal,
+        interactive ? MAX_INTERACTIVE_PDF_TIMEOUT_SECONDS : undefined,
+    );
+    const { signal, timeoutSeconds, throwIfTimedOut, dispose } = timeout;
+
+    // Chooses the worker at the first op (waiting, within this request's
+    // deadline, while both workers are busy) and keeps it for every later op. An
+    // overflow op on the background worker is bounded by this request's
+    // interactive deadline (`signal` / `sharedTimeoutMs`), not that worker's
+    // longer lease; aborting it terminates the background worker, and the
+    // next use starts a fresh one.
+    const sourceRef = args.source.kind === 'zotero' ? args.source.item : args.source.itemRef;
+    const worker = new PdfRequestWorker({
+        interactive,
+        workerName,
+        signal,
+        affinityKey: `${sourceRef.libraryID}/${sourceRef.key}`,
+    });
+    const startedAt = Date.now();
+    const timings: PdfDocumentTimings = { source: 'extracted' };
+    const pageCountTiming: WorkerCallTiming = {};
+    const extractTiming: WorkerCallTiming = {};
+    /** Whether this request ran the extraction itself (`timings.source`). */
+    let extractedHere = false;
+    const elapsed = (from: number) => Date.now() - from;
+    const readFile = async (load: () => ReturnType<typeof loadAttachmentData>) => {
+        const t = Date.now();
+        try {
+            return await load();
+        } finally {
+            timings.fileReadMs = (timings.fileReadMs ?? 0) + elapsed(t);
+        }
+    };
+    /** The request's worker state: `starting` if any of its ops waited for the worker to start. */
+    const workerState = (): PdfDocumentTimings['workerState'] =>
+        pageCountTiming.workerState === 'starting' || extractTiming.workerState === 'starting'
+            ? 'starting'
+            : extractTiming.workerState ?? pageCountTiming.workerState;
+    const runExtraction = async <T>(run: () => Promise<T>): Promise<T> => {
+        const t = Date.now();
+        try {
+            return await run();
+        } finally {
+            extractedHere = true;
+            timings.extractMs = Date.now() - t;
+        }
+    };
+    // Interactive requests respond before their result is written to the
+    // document cache; requests that join meanwhile share the in-memory result.
+    const cacheWrite = {
+        writeAfterResolve: interactive,
+        onCacheWrite: (ms: number) => {
+            timings.cacheWriteMs = ms;
+        },
+    };
+
+    // Budget for the shared (single-flight) extraction on the document cache.
+    // Interactive reads run on the hot worker (or an overflow background
+    // worker held exclusively for them): once every waiter has detached
+    // (request timed out), letting the shared extraction keep running up to
+    // MAX_PDF_TIMEOUT_SECONDS would head-of-line-block every subsequent
+    // interactive read. Cap it near this request's own deadline instead — the
+    // request's timeout path enqueues a background re-extraction, so the
+    // result is still produced and cached on the background slot. Background
+    // jobs keep the full ceiling.
+    const sharedTimeoutMs = interactive
+        ? Math.round(timeoutSeconds * 1000) + HOT_SHARED_EXTRACTION_GRACE_MS
+        : MAX_PDF_TIMEOUT_SECONDS * 1000;
+
+    const zoteroItem = args.source.kind === 'zotero' ? args.source.item : null;
+    const cacheItemRef: DocumentCacheItemRef = zoteroItem ?? (args.source as Extract<ExtractionSource, { kind: 'external' }>).itemRef;
+    let resolvedCacheRef: DocumentCacheItemRef | null = null;
+    let resolvedAttachment: ResolvedAttachment | null = null;
+    let resolvedFilePath: string | null = null;
+    let totalPages: number | null = null;
+    let loadedPdfData: Uint8Array | null = null;
+    let workerDispatched = false;
+    // Dispatched *and* given a worker: a request that timed out waiting for a
+    // free worker never touched one, so its timeout carries no worker snapshot.
+    const reachedWorker = () => workerDispatched && worker.slot !== undefined;
+
+    const aborted = (): ExtractAndCacheResult | null => {
+        if (externalAbortSignal?.aborted) {
+            return {
+                kind: 'external_abort',
+                phase: 'external_pre_abort',
+                pageCount: totalPages,
+                resolvedAttachment,
+                workerDispatched: reachedWorker(),
+                workerSlot: worker.slot,
+            };
+        }
+        return null;
+    };
+
+    try {
+        resolvedCacheRef = cacheItemRef;
+        resolvedAttachment = {
+            libraryId: cacheItemRef.libraryID,
+            zoteroKey: cacheItemRef.key,
+        };
+        const resolvedKeyStr = args.resolvedKey;
+
+        let attachmentSource: AttachmentFileSource;
+        if (args.source.kind === 'external') {
+            // External files: the managed copy is the only source — no remote
+            // fallback, plain stat-based existence/size check.
+            const externalSource = await resolveExternalFileSource(args.source.filePath, maxFileSizeMB);
+            throwIfTimedOut('file_missing_response');
+            if (externalSource.kind === 'error') {
+                if (externalSource.code === 'file_too_large') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_too_large',
+                        message: `The PDF file for ${resolvedKeyStr} has a file size of ${(externalSource.sizeMB ?? 0).toFixed(1)}MB, which exceeds the ${externalSource.maxMB}MB limit.`,
+                        pageCount: null,
+                        resolvedAttachment,
+                    };
+                }
+                return {
+                    kind: 'response_error',
+                    code: 'file_missing',
+                    message: `The PDF file for ${resolvedKeyStr} is not available on this device.`,
+                    pageCount: null,
+                    resolvedAttachment,
+                };
+            }
+            attachmentSource = { kind: 'local', filePath: externalSource.filePath, isRemoteOnly: false };
+        } else {
+            const source = await resolveAttachmentFileSource({
+                item: args.source.item,
+                localSizeStrategy: 'zotero-total',
+                signal,
+                throwIfTimedOut,
+            });
+            if (source.kind === 'error') {
+                throwIfTimedOut('file_missing_response');
+                if (source.code === 'file_too_large') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_too_large',
+                        message: `The PDF file for ${resolvedKeyStr} has a file size of ${(source.sizeMB ?? 0).toFixed(1)}MB, which exceeds the ${source.maxMB}MB limit.`,
+                        pageCount: null,
+                        resolvedAttachment,
+                    };
+                }
+                if (source.code === 'file_permission_denied') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_permission_denied',
+                        message: fileAccessDeniedMessage('PDF', resolvedKeyStr),
+                        pageCount: null,
+                        resolvedAttachment,
+                    };
+                }
+                return {
+                    kind: 'response_error',
+                    code: 'file_missing',
+                    message: source.remoteAvailable
+                        ? `The PDF file for ${resolvedKeyStr} is not available locally and remote file access is disabled in settings.`
+                        : `The PDF file for ${resolvedKeyStr} is not available locally.`,
+                    pageCount: null,
+                    resolvedAttachment,
+                };
+            }
+            attachmentSource = source.source;
+        }
+        const effectiveFilePath = attachmentSource.filePath;
+        const isRemoteOnly = attachmentSource.isRemoteOnly;
+        resolvedFilePath = effectiveFilePath;
+        timings.resolveMs = elapsed(startedAt);
+        const cacheLookupStartedAt = Date.now();
+
+        // A non-current schema version never touches the cache; the cache
+        // object only lends it single-flight for concurrent requests.
+        const documentCache = Zotero.AsterMargin?.documentCache;
+        if (!documentCache) {
+            logger(`extractAndCacheDocument: document cache not available for ${requestKey}`, 1);
+        }
+        const cache = uncachedSchemaVersion === null ? documentCache : undefined;
+        const docRef = {
+            libraryId: cacheItemRef.libraryID,
+            zoteroKey: cacheItemRef.key,
+        };
+        const initialSourceIdentity: DocumentCacheSourceIdentity | null = cache && !isRemoteOnly
+            ? await cache.getSourceIdentitySnapshot(effectiveFilePath).catch((error: unknown) => {
+                logger(`extractAndCacheDocument: source identity snapshot failed for ${requestKey}: ${error}`, 1);
+                return null;
+            })
+            : null;
+        const cachedMeta = cache ? await cache.getMetadata(docRef, effectiveFilePath).catch(() => null) : null;
+        throwIfTimedOut('metadata_cache_lookup');
+
+        const preflight = preflightCachedPdfMeta(cachedMeta, {
+            checkOcr: true,
+            applyPageCountCap: true,
+            maxPageCount: maxPages,
+        });
+        if (preflight) {
+            switch (preflight.code) {
+                case 'encrypted':
+                    return {
+                        kind: 'cached_error',
+                        code: 'encrypted',
+                        message: `The PDF file for ${resolvedKeyStr} is password-protected`,
+                        pageCount: preflight.pageCount ?? null,
+                        resolvedAttachment,
+                    };
+                case 'invalid_pdf':
+                    return {
+                        kind: 'cached_error',
+                        code: 'invalid_pdf',
+                        message: `The PDF file for ${resolvedKeyStr} is invalid or corrupted`,
+                        pageCount: preflight.pageCount ?? null,
+                        resolvedAttachment,
+                    };
+                case 'no_text_layer':
+                    return {
+                        kind: 'cached_error',
+                        code: 'no_text_layer',
+                        message: `The PDF file for ${resolvedKeyStr} is not prepared (no text layer). Cloud preparation may be turned off or temporarily unavailable; reading does not start OCR`,
+                        pageCount: preflight.pageCount,
+                        resolvedAttachment,
+                    };
+                case 'too_many_pages':
+                    return {
+                        kind: 'response_error',
+                        code: 'too_many_pages',
+                        message: `The PDF file for ${resolvedKeyStr} has ${preflight.pageCount} pages, which exceeds the ${preflight.maxPageCount}-page limit.`,
+                        pageCount: preflight.pageCount,
+                        resolvedAttachment,
+                    };
+            }
+        }
+
+        const maxSourceSizeBytes = maxFileSizeMB * 1024 * 1024;
+        const cachedResult = cache
+            ? await (
+                args.serializedResult
+                    ? cache.getSerializedResult(
+                        { libraryId: cacheItemRef.libraryID, zoteroKey: cacheItemRef.key },
+                        mode,
+                        effectiveFilePath,
+                        { maxSourceSizeBytes },
+                    )
+                    : cache.getResult(
+                        { libraryId: cacheItemRef.libraryID, zoteroKey: cacheItemRef.key },
+                        mode,
+                        effectiveFilePath,
+                        { maxSourceSizeBytes },
+                    )
+            ).catch(() => null)
+            : null;
+        throwIfTimedOut('payload_cache_lookup');
+        // An extraction that finished moments ago and is still being written
+        // to the cache: take its result instead of reading the file again.
+        const unwrittenResult = !cachedResult && cache && initialSourceIdentity
+            ? cache.getUnwrittenResult<SerializedDocumentCacheResult | AsterMarginExtractResult>({
+                item: cacheItemRef,
+                mode,
+                source: initialSourceIdentity,
+                serialized: args.serializedResult === true,
+                lockScope,
+            })
+            : null;
+        const availableResult = cachedResult ?? unwrittenResult;
+        timings.cacheLookupMs = elapsed(cacheLookupStartedAt);
+        if (availableResult) {
+            timings.source = cachedResult ? 'cache' : 'shared';
+            if (availableResult.document.pageCount > maxPages) {
+                return {
+                    kind: 'response_error',
+                    code: 'too_many_pages',
+                    message: `The PDF file for ${resolvedKeyStr} has ${availableResult.document.pageCount} pages, which exceeds the ${maxPages}-page limit.`,
+                    pageCount: availableResult.document.pageCount,
+                    resolvedAttachment,
+                };
+            }
+            return {
+                kind: 'ok',
+                cached: cachedResult !== null,
+                ...(args.serializedResult
+                    ? { serializedResult: availableResult as SerializedDocumentCacheResult }
+                    : { result: availableResult as AsterMarginExtractResult }),
+                totalPages: availableResult.document.pageCount,
+                resolvedAttachment,
+                contentType: zoteroItem?.attachmentContentType || cachedMeta?.contentType || args.contentType || 'application/pdf',
+                timings,
+            };
+        }
+
+        let pdfData: Uint8Array | null = null;
+
+        if (cachedMeta?.pageCount != null) {
+            totalPages = cachedMeta.pageCount;
+        }
+
+        if (totalPages == null) {
+            const loaded = await readFile(() => loadAttachmentData({
+                item: zoteroItem,
+                source: attachmentSource,
+                onRemoteDownloadFailure: args.onRemoteDownloadFailure,
+                signal,
+                throwIfTimedOut,
+            }));
+            if (loaded.kind === 'error') {
+                if (aborted()) return aborted()!;
+                if (loaded.code === 'file_too_large') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_too_large',
+                        message: `The PDF file for ${resolvedKeyStr} has a file size of ${(loaded.sizeMB ?? 0).toFixed(1)}MB, which exceeds the ${loaded.maxMB}MB limit.`,
+                        pageCount: null,
+                        resolvedAttachment,
+                    };
+                }
+                if (loaded.code === 'file_permission_denied') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_permission_denied',
+                        message: fileAccessDeniedMessage('PDF', resolvedKeyStr),
+                        pageCount: null,
+                        resolvedAttachment,
+                    };
+                }
+                if (loaded.code === 'read_failed') {
+                    return {
+                        kind: 'response_error',
+                        code: 'extraction_failed',
+                        message: `Failed to read PDF file for ${resolvedKeyStr}: ${loaded.error instanceof Error ? loaded.error.message : String(loaded.error)}`,
+                        pageCount: null,
+                        resolvedAttachment,
+                    };
+                }
+                logger(`extractAndCacheDocument: Remote download failed: ${loaded.error}`, 1);
+                return {
+                    kind: 'response_error',
+                    code: 'download_failed',
+                    message: `Failed to download PDF for ${resolvedKeyStr} from remote storage: ${loaded.error instanceof Error ? loaded.error.message : String(loaded.error)}`,
+                    permanent: loaded.permanent === true,
+                    pageCount: null,
+                    resolvedAttachment,
+                };
+            }
+            pdfData = loaded.data;
+            throwIfTimedOut('pdf_data_load_for_page_count');
+            loadedPdfData = pdfData;
+            workerDispatched = true;
+            const pageCountStartedAt = Date.now();
+            const pageCountData = pdfData;
+            totalPages = await worker.run((client) => client.getPageCount(pageCountData, signal, pageCountTiming));
+            timings.pageCountMs = elapsed(pageCountStartedAt);
+            throwIfTimedOut('page_count_extraction');
+        }
+
+        if (totalPages > maxPages) {
+            return {
+                kind: 'response_error',
+                code: 'too_many_pages',
+                message: `The PDF file for ${resolvedKeyStr} has ${totalPages} pages, which exceeds the ${maxPages}-page limit.`,
+                pageCount: totalPages,
+                resolvedAttachment,
+            };
+        }
+
+        if (totalPages === 0) {
+            return {
+                kind: 'response_error',
+                code: 'empty_document',
+                message: `The PDF file for ${resolvedKeyStr} has no readable pages (it may be empty or corrupted)`,
+                pageCount: 0,
+                resolvedAttachment,
+            };
+        }
+
+        if (!pdfData) {
+            const loaded = await readFile(() => loadAttachmentData({
+                item: zoteroItem,
+                source: attachmentSource,
+                onRemoteDownloadFailure: args.onRemoteDownloadFailure,
+                signal,
+                throwIfTimedOut,
+            }));
+            if (loaded.kind === 'error') {
+                if (aborted()) return aborted()!;
+                if (loaded.code === 'file_too_large') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_too_large',
+                        message: `The PDF file for ${resolvedKeyStr} has a file size of ${(loaded.sizeMB ?? 0).toFixed(1)}MB, which exceeds the ${loaded.maxMB}MB limit.`,
+                        pageCount: totalPages,
+                        resolvedAttachment,
+                    };
+                }
+                if (loaded.code === 'file_permission_denied') {
+                    return {
+                        kind: 'response_error',
+                        code: 'file_permission_denied',
+                        message: fileAccessDeniedMessage('PDF', resolvedKeyStr),
+                        pageCount: totalPages,
+                        resolvedAttachment,
+                    };
+                }
+                if (loaded.code === 'read_failed') {
+                    return {
+                        kind: 'response_error',
+                        code: 'extraction_failed',
+                        message: `Failed to read PDF file for ${resolvedKeyStr}: ${loaded.error instanceof Error ? loaded.error.message : String(loaded.error)}`,
+                        pageCount: totalPages,
+                        resolvedAttachment,
+                    };
+                }
+                logger(`extractAndCacheDocument: Remote download failed: ${loaded.error}`, 1);
+                return {
+                    kind: 'response_error',
+                    code: 'download_failed',
+                    message: `Failed to download PDF for ${resolvedKeyStr} from remote storage: ${loaded.error instanceof Error ? loaded.error.message : String(loaded.error)}`,
+                    permanent: loaded.permanent === true,
+                    pageCount: totalPages,
+                    resolvedAttachment,
+                };
+            }
+            pdfData = loaded.data;
+            throwIfTimedOut('pdf_data_load');
+            loadedPdfData = pdfData;
+        }
+
+        logger(
+            `extractAndCacheDocument: full-document extract for ${requestKey} mode=${mode} worker=${workerName}${interactive ? ' interactive' : ''}`,
+            3,
+        );
+        const pdfBytes = pdfData;
+        if (!pdfBytes) {
+            throw new Error('PDF data was not loaded before extraction');
+        }
+        const extractArgs = {
+            mode,
+            settings: { checkTextLayer: true as const },
+            schemaVersion: uncachedSchemaVersion ?? undefined,
+        };
+        const createSharedResult = async (extractSignal: AbortSignal) => {
+            // Set only when this request's own extraction actually dispatches to the worker.
+            // A timeout during cache pre-work (metadata/payload reads, decompression) or while
+            // joined to another request's in-flight shared extraction must not attribute worker
+            // state to this request; if a shared extraction wedges, the leader request's timeout
+            // response carries the worker snapshot for that episode.
+            workerDispatched = true;
+            // The shared extraction outlives its leader while other requests
+            // wait for it, so its wait for a worker follows the shared signal.
+            return args.serializedResult
+                ? runExtraction(() => worker.run(
+                    (client) => client.extractSerialized(pdfBytes, extractArgs, extractSignal, extractTiming),
+                    { signal: extractSignal },
+                ))
+                : runExtraction(() => worker.run(
+                    (client) => client.extract(pdfBytes, extractArgs, extractSignal, extractTiming),
+                    { signal: extractSignal },
+                ));
+        };
+
+        const createUnsharedResult = async () => {
+            workerDispatched = true;
+            const extracted = args.serializedResult
+                ? serializedWorkerResultToCacheResult(
+                    await runExtraction(() => worker.run((client) => client.extractSerialized(pdfBytes, extractArgs, signal, extractTiming))),
+                )
+                : await runExtraction(() => worker.run((client) => client.extract(pdfBytes, extractArgs, signal, extractTiming)));
+            throwIfTimedOut('pdf_extract');
+            return extracted;
+        };
+
+        // Joining another request's extraction: nothing left to run here, so
+        // this request's worker is free for others (including that extraction).
+        const onJoin = () => worker.releaseWorker();
+
+        const createUncachedSharedResult = (extractSignal: AbortSignal) =>
+            createSharedResult(extractSignal).then((extracted) => args.serializedResult
+                ? serializedWorkerResultToCacheResult(extracted as SerializedAsterMarginExtractResult)
+                : extracted as AsterMarginExtractResult);
+
+        const resultPromise = cache
+            ? args.serializedResult
+                ? cache.getOrCreateSerializedResult({
+                    item: cacheItemRef,
+                    filePath: effectiveFilePath,
+                    mode,
+                    sourceSizeBytes: isRemoteOnly ? pdfBytes.byteLength : 0,
+                    contentType: zoteroItem?.attachmentContentType || args.contentType || 'application/pdf',
+                    maxSourceSizeBytes,
+                    lockScope,
+                    sharedTimeoutMs,
+                    abortSignal: signal,
+                    expectedSourceIdentity: isRemoteOnly ? null : initialSourceIdentity,
+                    create: createSharedResult as (extractSignal: AbortSignal) => ReturnType<MuPDFWorkerClient['extractSerialized']>,
+                    onJoin,
+                    ...cacheWrite,
+                })
+                : cache.getOrCreateResult({
+                item: cacheItemRef,
+                filePath: effectiveFilePath,
+                mode,
+                sourceSizeBytes: isRemoteOnly ? pdfBytes.byteLength : 0,
+                contentType: zoteroItem?.attachmentContentType || args.contentType || 'application/pdf',
+                maxSourceSizeBytes,
+                lockScope,
+                sharedTimeoutMs,
+                abortSignal: signal,
+                expectedSourceIdentity: isRemoteOnly ? null : initialSourceIdentity,
+                create: createSharedResult as (extractSignal: AbortSignal) => Promise<AsterMarginExtractResult>,
+                metadata: buildExtractedDocumentCacheMetadata,
+                onJoin,
+                ...cacheWrite,
+            })
+            : uncachedSchemaVersion !== null && documentCache
+                ? documentCache.getOrCreateUncachedResult<SerializedDocumentCacheResult | AsterMarginExtractResult>({
+                    key: [
+                        cacheItemRef.libraryID,
+                        cacheItemRef.key,
+                        effectiveFilePath,
+                        mode,
+                        `schema:${uncachedSchemaVersion}`,
+                        args.serializedResult ? 'serialized' : 'object',
+                        `scope:${lockScope}`,
+                    ].join('/'),
+                    sharedTimeoutMs,
+                    abortSignal: signal,
+                    create: createUncachedSharedResult,
+                    onJoin,
+                })
+                : createUnsharedResult();
+        const result = documentCache
+            ? await awaitWithRequestAbort(resultPromise, signal, throwIfTimedOut, 'pdf_extract')
+            : await resultPromise;
+        throwIfTimedOut('document_result_ready');
+        if (!extractedHere) timings.source = 'shared';
+        const waits = [pageCountTiming, extractTiming];
+        const sum = (part: 'clientQueueMs' | 'startMs' | 'queueMs') =>
+            waits.some((t) => t[part] !== undefined)
+                ? Math.round(waits.reduce((total, t) => total + (t[part] ?? 0), 0))
+                : undefined;
+        // Waiting for a worker before the first op is queue time too.
+        const opQueueMs = sum('clientQueueMs');
+        const clientQueueMs = opQueueMs === undefined && worker.routeWaitMs === 0
+            ? undefined
+            : Math.round((opQueueMs ?? 0) + worker.routeWaitMs);
+        const workerStartMs = sum('startMs');
+        const workerQueueMs = sum('queueMs');
+        if (clientQueueMs !== undefined) timings.clientQueueMs = clientQueueMs;
+        if (workerStartMs !== undefined) timings.workerStartMs = workerStartMs;
+        if (workerQueueMs !== undefined) timings.workerQueueMs = workerQueueMs;
+        if (extractTiming.opMs !== undefined) timings.workerOpMs = Math.round(extractTiming.opMs);
+        const heapTiming = extractTiming.heapBytes !== undefined ? extractTiming : pageCountTiming;
+        const toMb = (bytes: number) => Math.round(bytes / (1024 * 1024));
+        if (heapTiming.heapBytes !== undefined) timings.workerHeapMb = toMb(heapTiming.heapBytes);
+        if (heapTiming.peakHeapBytes !== undefined) timings.workerPeakHeapMb = toMb(heapTiming.peakHeapBytes);
+        const state = workerState();
+        if (state) timings.workerState = state;
+        if (worker.slot) timings.workerSlot = worker.slot;
+        if (worker.overflowSkip) timings.overflowSkip = worker.overflowSkip;
+
+        if (!result && uncachedSchemaVersion !== null) {
+            // The shared uncached extraction was aborted after it finished.
+            throw new WorkerAbortError();
+        }
+
+        if (!result) {
+            return {
+                kind: 'response_error',
+                code: 'file_too_large',
+                message: `The PDF file for ${resolvedKeyStr} exceeds the ${maxFileSizeMB}MB limit.`,
+                pageCount: totalPages,
+                resolvedAttachment,
+            };
+        }
+
+        if (result.mode !== mode) {
+            return {
+                kind: 'response_error',
+                code: 'mode_mismatch',
+                message: `Extractor returned ${result.mode} result for ${mode} request`,
+                pageCount: result.document.pageCount,
+                resolvedAttachment,
+            };
+        }
+
+        return {
+            kind: 'ok',
+            cached: false,
+            ...(args.serializedResult
+                ? { serializedResult: result as SerializedDocumentCacheResult }
+                : { result: result as AsterMarginExtractResult }),
+            totalPages: result.document.pageCount,
+            resolvedAttachment,
+            contentType: zoteroItem?.attachmentContentType || args.contentType || 'application/pdf',
+            timings,
+        };
+    } catch (error) {
+        if (error instanceof ExternalAbortError) {
+            return {
+                kind: 'external_abort',
+                phase: error.phase,
+                pageCount: totalPages,
+                resolvedAttachment,
+                workerDispatched: reachedWorker(),
+                workerSlot: worker.slot,
+            };
+        }
+
+        // A watchdog lease reap is a definitive failure of this operation and
+        // must not be masked as an external abort even when the external signal
+        // happens to be aborted at the same time; let it fall through to the
+        // timeout branch so leaseReaped is reported.
+        if (
+            externalAbortSignal?.aborted
+            && (error instanceof WorkerAbortError || signal.aborted)
+            && !isWorkerDeadlineError(error)
+        ) {
+            return {
+                kind: 'external_abort',
+                phase: 'external_abort',
+                pageCount: totalPages,
+                resolvedAttachment,
+                workerDispatched: reachedWorker(),
+                workerSlot: worker.slot,
+            };
+        }
+
+        if (
+            signal.aborted
+            || error instanceof WorkerAbortError
+            || error instanceof TimeoutError
+            || isWorkerDeadlineError(error)
+        ) {
+            logger(`extractAndCacheDocument[${worker.slot ?? workerName}]: Timed out after ${timeoutSeconds}s`, 1);
+            return {
+                kind: 'timeout',
+                phase: error instanceof TimeoutError ? error.phase : 'unknown',
+                timeoutSeconds,
+                pageCount: totalPages,
+                resolvedAttachment,
+                leaseReaped: isWorkerDeadlineError(error),
+                workerDispatched: reachedWorker(),
+                workerSlot: worker.slot,
+            };
+        }
+
+        logger(`extractAndCacheDocument[${worker.slot ?? workerName}]: Extraction failed: ${error}`, 1);
+        const errorKey = resolvedAttachment
+            ? `${resolvedAttachment.libraryId}-${resolvedAttachment.zoteroKey}`
+            : requestKey;
+
+        const extractionError = asExtractionError(error);
+        if (extractionError) {
+            // A retained OCR preparation of this source is unservable after an
+            // extraction update; background processing prepares it again.
+            const repreparing = extractionError.code === ExtractionErrorCode.NO_TEXT_LAYER
+                && resolvedCacheRef !== null && resolvedFilePath !== null
+                && await Zotero.AsterMargin?.documentCache?.getProtectedRepreparation(
+                    { libraryId: resolvedCacheRef.libraryID, zoteroKey: resolvedCacheRef.key },
+                    resolvedFilePath,
+                ) != null;
+            const noTextLayerMessage = repreparing
+                ? `The PDF file for ${errorKey} is a prepared scan that must be prepared again after an extraction update. Its text is unavailable until background preparation finishes`
+                : `The PDF file for ${errorKey} is not prepared (no text layer). Cloud preparation may be turned off or temporarily unavailable; reading does not start OCR`;
+            if (
+                resolvedCacheRef
+                && resolvedFilePath
+                && uncachedSchemaVersion === null
+                && (extractionError.code === ExtractionErrorCode.ENCRYPTED
+                    || extractionError.code === ExtractionErrorCode.INVALID_PDF
+                    || extractionError.code === ExtractionErrorCode.NO_TEXT_LAYER)
+            ) {
+                const pageLabels = extractionError.code === ExtractionErrorCode.NO_TEXT_LAYER
+                    ? extractionError.pageLabels ?? null
+                    : null;
+                await Zotero.AsterMargin?.documentCache?.putErrorMetadata({
+                    item: resolvedCacheRef,
+                    filePath: resolvedFilePath,
+                    sourceSizeBytes: loadedPdfData?.byteLength ?? 0,
+                    contentType: zoteroItem?.attachmentContentType || args.contentType || 'application/pdf',
+                    errorCode: extractionError.code === ExtractionErrorCode.ENCRYPTED
+                        ? 'encrypted'
+                        : extractionError.code === ExtractionErrorCode.INVALID_PDF
+                            ? 'invalid_pdf'
+                            : 'no_text_layer',
+                    pageCount: extractionError.pageCount ?? totalPages,
+                    pageLabels,
+                    pages: null,
+                });
+
+                const cachedCode = extractionError.code === ExtractionErrorCode.ENCRYPTED
+                    ? 'encrypted'
+                    : extractionError.code === ExtractionErrorCode.INVALID_PDF
+                        ? 'invalid_pdf'
+                        : 'no_text_layer';
+                return {
+                    kind: 'cached_error',
+                    code: cachedCode,
+                    message: cachedCode === 'encrypted'
+                        ? `The PDF file for ${errorKey} is password-protected`
+                        : cachedCode === 'invalid_pdf'
+                            ? `The PDF file for ${errorKey} is invalid or corrupted`
+                            : noTextLayerMessage,
+                    pageCount: extractionError.pageCount ?? totalPages,
+                    resolvedAttachment,
+                };
+            }
+
+            const totalPagesForError = extractionError.pageCount ?? totalPages;
+            switch (extractionError.code) {
+                case ExtractionErrorCode.ENCRYPTED:
+                    return {
+                        kind: 'response_error',
+                        code: 'encrypted',
+                        message: `The PDF file for ${errorKey} is password-protected`,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                case ExtractionErrorCode.NO_TEXT_LAYER:
+                    return {
+                        kind: 'response_error',
+                        code: 'no_text_layer',
+                        message: noTextLayerMessage,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                case ExtractionErrorCode.INVALID_PDF:
+                    return {
+                        kind: 'response_error',
+                        code: 'invalid_pdf',
+                        message: `The PDF file for ${errorKey} is invalid or corrupted`,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                case ExtractionErrorCode.EMPTY_DOCUMENT:
+                    return {
+                        kind: 'response_error',
+                        code: 'empty_document',
+                        message: `The PDF file for ${errorKey} has no readable pages (it may be empty or corrupted)`,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                case ExtractionErrorCode.PAGE_OUT_OF_RANGE:
+                    return {
+                        kind: 'response_error',
+                        code: 'page_out_of_range',
+                        message: extractionError.message,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                case ExtractionErrorCode.WASM_ERROR:
+                    return {
+                        kind: 'response_error',
+                        code: 'pdf_parser_crash',
+                        message: `The PDF file for ${errorKey} crashes the PDF parser and cannot be processed`,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                case ExtractionErrorCode.HEAP_EXHAUSTION:
+                    return {
+                        kind: 'response_error',
+                        code: 'pdf_too_complex',
+                        message: `The PDF file for ${errorKey} is too large or complex to process and exhausted the parser's memory`,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+                default:
+                    return {
+                        kind: 'response_error',
+                        code: 'extraction_failed',
+                        message: `Failed to extract PDF content for ${errorKey}: ${extractionError.message}`,
+                        pageCount: totalPagesForError,
+                        resolvedAttachment,
+                    };
+            }
+        }
+
+        // Worker lifecycle failure: the local PDF engine could not start (module
+        // load / configure handshake) or died mid-op and could not be respawned.
+        // Narrowed to lifecycle errors so a cross-bundle heap-exhaustion
+        // ExtractionError (handled above) is never misreported here.
+        if (isWorkerLifecycleError(error)) {
+            logger(
+                `extractAndCacheDocument[${worker.slot ?? workerName}]: local PDF engine unavailable for ${errorKey}: ${error}`,
+                1,
+            );
+            return {
+                kind: 'response_error',
+                code: 'worker_unavailable',
+                message:
+                    `AsterMargin's local PDF engine is temporarily unavailable on this computer, ` +
+                    `so ${errorKey} could not be processed. This is not a problem with the document. ` +
+                    `Retrying may succeed. Only retry once and if it keeps failing, ` +
+                    `the user may need to restart Zotero.`,
+                pageCount: totalPages,
+                resolvedAttachment,
+            };
+        }
+
+        // Unexpected/native JS error (not an ExtractionError)
+        const native = error instanceof Error ? error : undefined;
+        const rawMessage = native ? native.message : String(error);
+        const responseDetail = [
+            native ? `${native.name}: ${native.message}` : rawMessage,
+            `(mode=${mode}, worker=${worker.slot ?? workerName}, pages=${totalPages ?? 'unknown'})`,
+        ]
+            .filter(Boolean)
+            .join('\n');
+        const diagnosticDetail = [
+            responseDetail,
+            native?.stack
+                ? native.stack.split('\n').slice(0, 6).join('\n')
+                : undefined,
+        ]
+            .filter(Boolean)
+            .join('\n');
+        logger(
+            `extractAndCacheDocument[${worker.slot ?? workerName}]: Unexpected extraction failure for ${errorKey}\n${diagnosticDetail}`,
+            1,
+        );
+
+        // Classify a JS stack overflow so it is greppable/alertable instead of
+        // hiding in the generic `extraction_failed` bucket
+        const isStackOverflow =
+            /too much recursion|maximum call stack|call stack size exceeded/i.test(
+                rawMessage,
+            );
+
+        return {
+            kind: 'response_error',
+            code: isStackOverflow ? 'recursion_limit' : 'extraction_failed',
+            message: `Failed to extract PDF content for ${errorKey}: ${responseDetail}`,
+            pageCount: totalPages,
+            resolvedAttachment,
+        };
+    } finally {
+        worker.close();
+        if (ownsTimeout) {
+            dispose();
+        }
+    }
+}
+
+export async function extractAndCacheDocument(
+    args: ExtractAndCacheArgs,
+): Promise<ExtractAndCacheResult> {
+    const owner = Zotero.AsterMargin?.documents;
+    return owner ? owner.extractAndCacheDocument(args) : extractAndCacheDocumentOwned(args);
+}
+
+export async function extractAndCacheResolvedPdfDocument(
+    args: ExtractAndCacheResolvedPdfArgs,
+): Promise<ExtractAndCacheResult> {
+    const owner = Zotero.AsterMargin?.documents;
+    return owner ? owner.extractAndCacheResolvedPdfDocument(args) : extractAndCacheResolvedPdfDocumentOwned(args);
+}
+
+export async function extractAndCacheEpubDocument(
+    args: ExtractAndCacheEpubArgs,
+): Promise<ExtractAndCacheEpubResult> {
+    const owner = Zotero.AsterMargin?.documents;
+    return owner ? owner.extractAndCacheEpubDocument(args) : extractAndCacheEpubDocumentOwned(args);
+}
+
+export async function extractAndCacheSnapshotDocument(
+    args: ExtractAndCacheSnapshotArgs,
+): Promise<ExtractAndCacheSnapshotResult> {
+    const owner = Zotero.AsterMargin?.documents;
+    return owner ? owner.extractAndCacheSnapshotDocument(args) : extractAndCacheSnapshotDocumentOwned(args);
+}
+
+/** Plugin-realm implementations; callers use the public instance-routed functions. */
+export const documentImplementations = {
+    extractAndCacheDocument: extractAndCacheDocumentOwned,
+    extractAndCacheResolvedPdfDocument: extractAndCacheResolvedPdfDocumentOwned,
+    extractAndCacheEpubDocument: extractAndCacheEpubDocumentOwned,
+    extractAndCacheSnapshotDocument: extractAndCacheSnapshotDocumentOwned,
+};

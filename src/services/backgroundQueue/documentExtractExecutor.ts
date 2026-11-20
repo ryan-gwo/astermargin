@@ -1,0 +1,653 @@
+import {
+    extractAndCacheDocument,
+    extractAndCacheEpubDocument,
+    extractAndCacheSnapshotDocument,
+} from '../documentExtractionCore';
+import { liveAttachmentContentKind } from '../documentExtraction/attachmentResolution';
+import { isDocumentAccessRevokedError } from '../documentExtraction/accessRevoked';
+import {
+    loadAttachmentData,
+    resolveAttachmentFileSource,
+    type AttachmentFileSource,
+} from '../documentExtraction/attachmentSource';
+import { computeStructuredDocumentHash } from '../documentExtraction/structuredDocumentHash';
+import { expectedExtractionSchemaVersion } from '../documentExtraction/shared/extractionSchemaVersions';
+import type { DocumentExtractResult } from '@astermargin/agent-core/extract/document/shared/documentExtractResult';
+import type {
+    AttachmentProcessingStateRecord,
+    BackgroundJobRecord,
+} from '../database';
+import { observeAttachmentSource } from '../documentExtraction/sourceObservation';
+import { getFileSignature, getRemoteFileHash } from '../documentFileIdentity';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { UNRESOLVED_LIBRARY_ID } from '../../utils/libraryIdentity';
+import { safeIsInTrash } from '../../utils/zoteroItemUtils';
+import { isTableAttachment } from '../artifacts/tableItemIdentity';
+import { OCR_PRIORITY_BACKFILL } from '../ocr/constants';
+import { enqueueOcrJob } from '../ocr/enqueueOcr';
+import { shouldStopCachePreparation } from '../backgroundProcessing/cachePreparationBudget';
+import {
+    BACKGROUND_UPSERT_PRIORITY,
+} from '../backgroundProcessing/constants';
+import { isLibraryInScope, isLibraryScopeKnown } from '../libraryScope';
+import {
+    backgroundProcessingEnabled,
+    buildIndexJobPayload,
+    isBackgroundProcessingLibraryEnabled,
+} from '../backgroundProcessing/utils';
+import type {
+    JobExecutionContext,
+    JobExecutor,
+    JobOutcome,
+} from './jobExecutor';
+
+type ProcessableKind = AttachmentProcessingStateRecord['contentKind'];
+
+interface ExtractSuccess {
+    document: DocumentExtractResult | null;
+    ocrStatus: 'na' | 'needed';
+    reason: string;
+}
+
+/** Executes local document extraction jobs and advances the durable ledger. */
+export class DocumentExtractExecutor implements JobExecutor {
+    readonly jobType = 'document_extract' as const;
+
+    async execute(
+        record: BackgroundJobRecord,
+        ctx: JobExecutionContext,
+    ): Promise<JobOutcome> {
+        const attemptedAt = Date.now();
+        const preExecute = this.checkScope(record);
+        if (preExecute) return preExecute;
+        // The durable ledger describes the structured extraction pipeline.
+        // Markdown requests are hot-path cache work and must never stamp a
+        // structured schema version/hash into that ledger.
+        if (record.payloadKind !== 'structured') {
+            return ctx.runOnMuPDFWorker(() => this.executeLegacy(record, ctx));
+        }
+        // Lightweight adapters used by existing integrations expose primary
+        // item fields but not Zotero's lazy-data methods. Keep those callers on
+        // the established non-ledger path.
+        let compatibilityItem: Zotero.Item | null = null;
+        if (record.libraryId !== UNRESOLVED_LIBRARY_ID) {
+            try {
+                compatibilityItem = await Zotero.Items.getByLibraryAndKeyAsync(
+                    record.libraryId,
+                    record.zoteroKey,
+                ) || null;
+            } catch { /* resolveItem handles missing items below */ }
+        }
+        const postCompat = this.checkScope(record);
+        if (postCompat) return postCompat;
+        if (
+            compatibilityItem
+            && (
+                typeof compatibilityItem.loadAllData !== 'function'
+                || compatibilityItem.isRegularItem?.() === true
+            )
+        ) {
+            return ctx.runOnMuPDFWorker(() => this.executeLegacy(record, ctx));
+        }
+        const resolved = await this.resolveItem(record);
+        if ('outcome' in resolved) return resolved.outcome;
+        const { item, kind } = resolved;
+
+        const postResolve = this.checkScope(record);
+        if (postResolve) return postResolve;
+        // Background producers must re-check exclusions after claim. Priority
+        // <100 remains the on-demand path and was already validated upstream.
+        if (record.priority >= 100 && !isBackgroundProcessingLibraryEnabled(item.libraryID)) {
+            return { kind: 'complete', reason: 'library_excluded' };
+        }
+
+        if (await shouldStopCachePreparation(record)) {
+            return { kind: 'complete', reason: 'cache_budget_reached' };
+        }
+
+        const previous = await ctx.db.ensureAttachmentProcessingState({
+            libraryId: item.libraryID,
+            zoteroKey: item.key,
+            itemId: item.id,
+            contentKind: kind,
+        });
+        const source = await resolveAttachmentFileSource({
+            item,
+            localSizeStrategy: 'stat',
+        });
+        const observation = await observeAttachmentSource(item, kind, source);
+        const postObservation = this.checkScope(record);
+        if (postObservation) return postObservation;
+        const extractionSource = observation?.identity ?? null;
+        if (source.kind === 'error' && source.code === 'file_permission_denied') {
+            // Retried like a refused read: the same error reports a briefly locked file.
+            return { kind: 'retry', error: source.code, attemptedExtractionSource: extractionSource };
+        }
+        if (source.kind === 'error') {
+            await ctx.db.markAttachmentExtractFailure({
+                libraryId: item.libraryID,
+                zoteroKey: item.key,
+                status: 'skipped',
+                error: source.code,
+                attemptedAt,
+                extractionSource,
+            });
+            return { kind: 'complete', reason: source.code };
+        }
+        const beforeSignature = await getFileSignature(source.source.filePath);
+
+        let extracted: ExtractSuccess | JobOutcome;
+        try {
+            extracted = kind === 'pdf'
+                ? await ctx.runOnMuPDFWorker(async (): Promise<ExtractSuccess | JobOutcome> => {
+                    if (await shouldStopCachePreparation(record)) {
+                        return { kind: 'complete', reason: 'cache_budget_reached' };
+                    }
+                    return this.extractPdf(record, ctx, attemptedAt, extractionSource);
+                })
+                : await this.extractDom(record, item, kind, source.source, ctx, attemptedAt, extractionSource);
+        } catch (error) {
+            if (isDocumentAccessRevokedError(error)) {
+                return { kind: 'release', reason: 'external_abort' };
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+                kind: 'retry', error: `unexpected: ${message}`,
+                attemptedExtractionSource: extractionSource,
+            };
+        }
+        if ('kind' in extracted) {
+            return extracted.kind === 'retry'
+                ? { ...extracted, attemptedExtractionSource: extractionSource }
+                : extracted;
+        }
+
+        const afterSignature = await getFileSignature(source.source.filePath);
+        if (
+            beforeSignature.mtime_ms !== afterSignature.mtime_ms
+            || beforeSignature.size_bytes !== afterSignature.size_bytes
+        ) {
+            return {
+                kind: 'retry', error: 'source_changed_during_extraction',
+                attemptedExtractionSource: extractionSource,
+            };
+        }
+
+        let fileHash: string | null = null;
+        try {
+            fileHash = source.source.isRemoteOnly
+                ? await getRemoteFileHash(item)
+                : await item.attachmentHash || null;
+        } catch (error) {
+            logger(`DocumentExtractExecutor: attachmentHash failed: ${error}`, 2);
+        }
+        const documentHash = extracted.document
+            ? await computeStructuredDocumentHash(kind, extracted.document)
+            : null;
+        const schemaVersion = expectedExtractionSchemaVersion(kind);
+        if (!schemaVersion) {
+            await ctx.db.markAttachmentExtractFailure({
+                libraryId: item.libraryID,
+                zoteroKey: item.key,
+                status: 'skipped',
+                error: 'unsupported_schema_version',
+                attemptedAt,
+                extractionSource,
+            });
+            return { kind: 'complete', reason: 'unsupported_schema_version' };
+        }
+
+        // Detecting the original scan again must not discard its indexed OCR hash,
+        // whether cache preparation lost the prepared text or an extraction update
+        // made the retained preparation unservable. The document stays searchable
+        // under that hash; the OCR completion compares the restored content with
+        // it and replaces the membership only once the new identity is ready.
+        const restoringOcr = previous.ocrStatus === 'done' && extracted.ocrStatus === 'needed'
+            && previous.fileMtimeMs === afterSignature.mtime_ms
+            && previous.fileSizeBytes === afterSignature.size_bytes
+            && previous.fileHash === fileHash
+            && (record.payload?.prepare_cache === true
+                || await Zotero.AsterMargin?.documentCache?.getProtectedRepreparation(
+                    { libraryId: item.libraryID, zoteroKey: item.key },
+                    source.source.filePath,
+                ) != null);
+        const applied = restoringOcr ? await ctx.db.markAttachmentExtractedForOcrRestore({
+            libraryId: item.libraryID,
+            zoteroKey: item.key,
+            expectedExtractStatus: previous.extractStatus,
+            fileMtimeMs: afterSignature.mtime_ms,
+            fileSizeBytes: afterSignature.size_bytes,
+            fileHash,
+            extractSchemaVersion: schemaVersion,
+            extractionSource,
+        }) : await ctx.db.markAttachmentExtracted({
+            libraryId: item.libraryID,
+            zoteroKey: item.key,
+            expectedFileMtimeMs: previous.fileMtimeMs,
+            expectedFileSizeBytes: previous.fileSizeBytes,
+            previousDocumentHash: previous.structuredDocumentHash,
+            expectedExtractStatus: previous.extractStatus,
+            fileMtimeMs: afterSignature.mtime_ms,
+            fileSizeBytes: afterSignature.size_bytes,
+            fileHash,
+            structuredDocumentHash: documentHash,
+            extractSchemaVersion: schemaVersion,
+            extractionSource,
+            ocrStatus: extracted.ocrStatus,
+        });
+        if (!applied) {
+            return { kind: 'complete', reason: 'stale_completion_ignored' };
+        }
+
+        if (extracted.ocrStatus === 'needed') {
+            // Ticket the OCR continuation before this job retires. Fresh
+            // detection fires its own fire-and-forget enqueue inside the
+            // extraction, but a cached "no text layer" verdict does not, and a
+            // ticket that lands only after the queue looks empty loses an
+            // immediate-drain request. The enqueue dedupes against an existing
+            // ticket, so the double call is harmless.
+            try {
+                await enqueueOcrJob({
+                    item,
+                    libraryId: item.libraryID,
+                    zoteroKey: item.key,
+                    itemId: item.id,
+                    pageCount: null,
+                    priority: record.priority >= 100 ? OCR_PRIORITY_BACKFILL : undefined,
+                    prepareCache: record.payload?.prepare_cache === true,
+                    requestContext: record.payload?.request_context ?? 'backfill',
+                });
+            } catch (error) {
+                logger(`DocumentExtractExecutor: OCR enqueue failed for ${item.libraryID}-${item.key}: ${error}`, 2);
+            }
+        }
+
+        const hashChanged = previous.structuredDocumentHash !== documentHash;
+        if (!hashChanged && documentHash && extracted.ocrStatus === 'na') {
+            const accountId = Zotero.AsterMargin?.account?.getSnapshot().session?.user.id;
+            if (accountId) {
+                const woken = await ctx.db.finishFulltextCacheRecovery({
+                    libraryId: item.libraryID,
+                    zoteroKey: item.key,
+                    accountId,
+                    documentHash,
+                    extractionSource,
+                    now: Date.now(),
+                });
+                if (woken) Zotero.AsterMargin?.backgroundExtractor?.notify();
+            }
+        }
+        if (
+            hashChanged
+            && documentHash
+            && extracted.ocrStatus === 'na'
+            && Zotero.AsterMargin?.hasSearchIndexAccess === true
+            && backgroundProcessingEnabled()
+        ) {
+            await ctx.enqueue({
+                jobType: 'fulltext_upsert',
+                libraryId: item.libraryID,
+                itemId: item.id,
+                zoteroKey: item.key,
+                contentKind: kind,
+                payloadKind: 'structured',
+                priority: BACKGROUND_UPSERT_PRIORITY,
+                payload: buildIndexJobPayload(kind, {
+                    docHash: documentHash,
+                }),
+                now: Date.now(),
+            });
+        }
+        return { kind: 'complete', reason: extracted.reason };
+    }
+
+    describeFailure(): null {
+        return null;
+    }
+
+
+    /**
+     * Outcome to return when the job may no longer touch its library, or null
+     * when it may proceed.
+     *
+     * Unknown scope and exclusion are deliberately distinct: an unknown scope is
+     * a transient startup / logout state, so the row is released to run later,
+     * while a known exclusion retires it. Collapsing the two would silently drop
+     * queued work on an account switch.
+     */
+    private checkScope(record: BackgroundJobRecord): JobOutcome | null {
+        if (!isLibraryScopeKnown()) {
+            return { kind: 'release', reason: 'library_scope_unknown' };
+        }
+        if (record.libraryId === UNRESOLVED_LIBRARY_ID) return null;
+        if (isLibraryInScope(record.libraryId)) return null;
+        logger(
+            `DocumentExtractExecutor: ${record.libraryId}-${record.zoteroKey} skipped (library_excluded)`,
+            2,
+        );
+        return { kind: 'complete', reason: 'library_excluded' };
+    }
+
+    private async executeLegacy(
+        record: BackgroundJobRecord,
+        ctx: JobExecutionContext,
+    ): Promise<JobOutcome> {
+        let item: Zotero.Item | null = null;
+        // Re-check the searchable-library boundary here, not just at claim time:
+        // this lane serializes on the MuPDF worker, so a claimed job can wait
+        // behind other work before it reads anything.
+        const preLookup = this.checkScope(record);
+        if (preLookup) return preLookup;
+
+        if (record.libraryId === UNRESOLVED_LIBRARY_ID) {
+            logger(
+                `DocumentExtractExecutor: library not available on this device for ${record.libraryId}-${record.zoteroKey}`,
+                1,
+            );
+        } else {
+            try {
+                item = await Zotero.Items.getByLibraryAndKeyAsync(
+                    record.libraryId,
+                    record.zoteroKey,
+                ) || null;
+            } catch { /* missing is handled below */ }
+        }
+
+        // Re-assert the boundary immediately after the lookup await, before the
+        // item is touched at all: the scope mirror is published in the same turn
+        // as an exclusion, so it can change across that await.
+        const postLookup = this.checkScope(record);
+        if (postLookup) return postLookup;
+
+        if (item?.parentID) await Zotero.Items.getAsync(item.parentID);
+        const trashState = item ? safeIsInTrash(item) : null;
+        if (item && trashState === null) {
+            return { kind: 'retry', error: 'trash_state_unavailable' };
+        }
+        if (!item || trashState === true) {
+            return { kind: 'complete', reason: item ? 'in_trash' : 'item_missing' };
+        }
+        const liveKind = liveAttachmentContentKind(item);
+        const canResolvePdfFromParent = liveKind === null
+            && record.contentKind === 'pdf'
+            && item.isRegularItem?.() === true;
+        if (
+            (liveKind === null && !canResolvePdfFromParent)
+            || (liveKind !== null && liveKind !== record.contentKind)
+        ) {
+            return { kind: 'complete', reason: 'content_kind_stale' };
+        }
+        if (record.contentKind !== 'pdf') {
+            return { kind: 'complete', reason: 'unsupported_content_kind' };
+        }
+        const payload = record.payload;
+        if (!payload || payload.content_kind !== 'pdf') {
+            return { kind: 'complete', reason: 'missing_payload' };
+        }
+        let result: Awaited<ReturnType<typeof extractAndCacheDocument>>;
+        try {
+            result = await extractAndCacheDocument({
+                libraryId: record.libraryId,
+                zoteroKey: record.zoteroKey,
+                mode: record.payloadKind,
+                maxPages: payload.maxPages,
+                timeoutSeconds: payload.timeoutSeconds,
+                workerName: 'background',
+                externalAbortSignal: ctx.externalAbortSignal,
+            });
+        } catch (error) {
+            if (isDocumentAccessRevokedError(error)) {
+                return { kind: 'release', reason: 'external_abort' };
+            }
+            return {
+                kind: 'retry',
+                error: `unexpected: ${error instanceof Error ? error.message : String(error)}`,
+            };
+        }
+        switch (result.kind) {
+            case 'ok': return { kind: 'complete', reason: 'ok' };
+            case 'external_abort': return { kind: 'release', reason: 'external_abort' };
+            case 'cached_error': return { kind: 'complete', reason: `cached_error:${result.code}` };
+            case 'timeout': return { kind: 'retry', error: `timeout:${result.phase}`, reason: `timeout:${result.phase}` };
+            case 'response_error':
+                return result.permanent !== true && isTransientResponseError(result.code)
+                    ? { kind: 'retry', error: `${result.code}: ${result.message}`, reason: result.code }
+                    : { kind: 'complete', reason: `terminal:${result.code}` };
+        }
+    }
+
+    private async resolveItem(
+        record: BackgroundJobRecord,
+    ): Promise<
+        { item: Zotero.Item; kind: ProcessableKind }
+        | { outcome: JobOutcome }
+    > {
+        if (record.libraryId === UNRESOLVED_LIBRARY_ID) {
+            return { outcome: { kind: 'complete', reason: 'item_missing' } };
+        }
+        let item: Zotero.Item | null = null;
+        try {
+            item = await Zotero.Items.getByLibraryAndKeyAsync(
+                record.libraryId,
+                record.zoteroKey,
+            ) || null;
+        } catch (error) {
+            logger(`DocumentExtractExecutor: item lookup failed: ${error}`, 1);
+        }
+        if (item?.parentID) await Zotero.Items.getAsync(item.parentID);
+        const trashState = item ? safeIsInTrash(item) : null;
+        if (item && trashState === null) {
+            return { outcome: { kind: 'retry', error: 'trash_state_unavailable' } };
+        }
+        if (!item || trashState === true) {
+            return {
+                outcome: {
+                    kind: 'complete',
+                    reason: item ? 'in_trash' : 'item_missing',
+                },
+            };
+        }
+        await item.loadAllData();
+        const liveKind = liveAttachmentContentKind(item);
+        if (liveKind !== record.contentKind) {
+            return { outcome: { kind: 'complete', reason: 'content_kind_stale' } };
+        }
+        if (liveKind !== 'pdf' && liveKind !== 'epub' && liveKind !== 'snapshot') {
+            return { outcome: { kind: 'complete', reason: 'unsupported_content_kind' } };
+        }
+        // Jobs queued for a AsterMargin table before tables were excluded; the
+        // reconciler retires the table's processing state.
+        if (isTableAttachment(item)) {
+            return { outcome: { kind: 'complete', reason: 'astermargin_table' } };
+        }
+        return { item, kind: liveKind };
+    }
+
+    private async extractPdf(
+        record: BackgroundJobRecord,
+        ctx: JobExecutionContext,
+        attemptedAt: number,
+        extractionSource: string | null,
+    ): Promise<ExtractSuccess | JobOutcome> {
+        const payload = record.payload;
+        if (!payload || payload.content_kind !== 'pdf') {
+            return { kind: 'complete', reason: 'missing_payload' };
+        }
+        const result = await extractAndCacheDocument({
+            libraryId: record.libraryId,
+            zoteroKey: record.zoteroKey,
+            mode: record.payloadKind,
+            maxPages: payload.maxPages,
+            timeoutSeconds: payload.timeoutSeconds,
+            workerName: 'background',
+            externalAbortSignal: ctx.externalAbortSignal,
+            prepareCache: payload.prepare_cache === true,
+        });
+        switch (result.kind) {
+            case 'ok':
+                return {
+                    document: result.result as DocumentExtractResult,
+                    ocrStatus: 'na',
+                    reason: 'ok',
+                };
+            case 'cached_error':
+                if (result.code === 'no_text_layer') {
+                    return { document: null, ocrStatus: 'needed', reason: 'needs_ocr' };
+                }
+                await this.persistTerminalExtractError(record, ctx, result.code, 'skipped', attemptedAt, extractionSource);
+                return { kind: 'complete', reason: `cached_error:${result.code}` };
+            case 'external_abort':
+                return { kind: 'release', reason: 'external_abort' };
+            case 'timeout':
+                return { kind: 'retry', error: `timeout:${result.phase}` };
+            case 'response_error':
+                if (result.permanent !== true && isTransientResponseError(result.code)) {
+                    return { kind: 'retry', error: `${result.code}: ${result.message}` };
+                }
+                await this.persistTerminalExtractError(
+                    record,
+                    ctx,
+                    result.code,
+                    isSkippedResponse(result.code) ? 'skipped' : 'failed',
+                    attemptedAt,
+                    extractionSource,
+                );
+                return { kind: 'complete', reason: `terminal:${result.code}` };
+        }
+    }
+
+    private async extractDom(
+        record: BackgroundJobRecord,
+        item: Zotero.Item,
+        kind: Extract<ProcessableKind, 'epub' | 'snapshot'>,
+        source: AttachmentFileSource,
+        ctx: JobExecutionContext,
+        attemptedAt: number,
+        extractionSource: string | null,
+    ): Promise<ExtractSuccess | JobOutcome> {
+        let temporaryPath: string | null = null;
+        let resolvedFile: {
+            cacheFilePath: string;
+            extractionFilePath: string;
+            sourceSizeBytes: number;
+        } | undefined;
+        if (source.isRemoteOnly) {
+            const loaded = await loadAttachmentData({
+                item,
+                source,
+                signal: ctx.externalAbortSignal,
+            });
+            if (loaded.kind === 'error') {
+                const retryable = loaded.permanent !== true
+                    && (loaded.code === 'download_failed' || loaded.code === 'read_failed');
+                if (retryable) return { kind: 'retry', error: loaded.code };
+                await this.persistTerminalExtractError(
+                    record,
+                    ctx,
+                    loaded.code,
+                    isSkippedResponse(loaded.code) ? 'skipped' : 'failed',
+                    attemptedAt,
+                    extractionSource,
+                );
+                return { kind: 'complete', reason: loaded.code };
+            }
+            const extension = kind === 'epub' ? 'epub' : 'html';
+            temporaryPath = PathUtils.join(
+                PathUtils.tempDir,
+                `astermargin-background-${Date.now()}-${Math.random().toString(36).slice(2)}.${extension}`,
+            );
+            await IOUtils.write(temporaryPath, loaded.data);
+            resolvedFile = {
+                cacheFilePath: source.filePath,
+                extractionFilePath: temporaryPath,
+                sourceSizeBytes: loaded.data.byteLength,
+            };
+        }
+        const common = {
+            source: { kind: 'zotero' as const, item },
+            resolvedKey: `${item.libraryID}-${item.key}`,
+            contentType: item.attachmentContentType || (
+                kind === 'epub' ? 'application/epub+zip' : 'text/html'
+            ),
+            maxPages: null,
+            externalAbortSignal: ctx.externalAbortSignal,
+            resolvedFile,
+        };
+        let result;
+        try {
+            result = kind === 'epub'
+                ? await extractAndCacheEpubDocument(common)
+                : await extractAndCacheSnapshotDocument(common);
+        } finally {
+            if (temporaryPath) {
+                await IOUtils.remove(temporaryPath).catch(() => undefined);
+            }
+        }
+        if (result.kind === 'ok') {
+            return {
+                document: result.document,
+                ocrStatus: 'na',
+                reason: 'ok',
+            };
+        }
+        if (ctx.externalAbortSignal.aborted || result.code === 'timeout') {
+            return { kind: 'release', reason: 'external_abort' };
+        }
+        // `permanent` overrides the code-based guess: `extraction_failed` is the
+        // catch-all for both "the extractor hiccuped" and "this file is not a
+        // usable EPUB", and only the extractor can tell those apart.
+        if (result.permanent !== true && isTransientResponseError(result.code)) {
+            return { kind: 'retry', error: `${result.code}: ${result.message}` };
+        }
+        await this.persistTerminalExtractError(
+            record,
+            ctx,
+            result.permanent === true && kind === 'epub'
+                ? `permanent_epub:${result.code}`
+                : result.code,
+            isSkippedResponse(result.code) ? 'skipped' : 'failed',
+            attemptedAt,
+            extractionSource,
+        );
+        return { kind: 'complete', reason: `terminal:${result.code}` };
+    }
+
+    private async persistTerminalExtractError(
+        record: BackgroundJobRecord,
+        ctx: JobExecutionContext,
+        code: string,
+        status: 'failed' | 'skipped',
+        attemptedAt: number,
+        extractionSource: string | null,
+    ): Promise<void> {
+        await ctx.db.markAttachmentExtractFailure({
+            libraryId: record.libraryId,
+            zoteroKey: record.zoteroKey,
+            status,
+            error: code,
+            attemptedAt,
+            extractionSource,
+        });
+    }
+}
+
+/**
+ * Codes worth another attempt. Deliberately a coarse guess: `extraction_failed`
+ * covers both a transient extractor fault and a permanently unreadable file, so
+ * an extractor that knows the difference says so via `permanent` on the result
+ * and that answer wins over this table. A permission denial is retried because
+ * the same error also reports a file another program briefly holds locked.
+ */
+function isTransientResponseError(code: string): boolean {
+    return code === 'download_failed'
+        || code === 'extraction_failed'
+        || code === 'file_permission_denied'
+        || code === 'worker_unavailable';
+}
+
+function isSkippedResponse(code: string): boolean {
+    return code === 'file_missing'
+        || code === 'file_too_large'
+        || code === 'unsupported_type'
+        || code === 'too_many_pages';
+}

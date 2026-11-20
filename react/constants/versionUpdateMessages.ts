@@ -1,0 +1,689 @@
+import { PopupMessageFeature } from '../types/popupMessage';
+import { compareVersions } from '../../src/utils/compareVersions';
+import type { FeatureTipId } from './featureTips';
+
+/**
+ * A visual a release note can carry — what `react/constants/versionShowcases.ts`
+ * draws for the id. An id rather than the component: this list is read by the
+ * plugin bundle at startup, which has no React.
+ */
+export type VersionShowcaseId = 'quick-prompt' | 'research-table';
+
+/** A chord a release note can draw as keycaps; the label comes from `react/utils/quickPromptShortcut.ts`. */
+export type VersionShortcutId = 'quick-prompt' | 'astermargin-window';
+
+/**
+ * A second feature a release note mentions beneath its showcase: one compact
+ * row rather than a checklist, so the showcase stays the headline.
+ */
+export interface VersionAlsoNew {
+    title: string;
+    /** One line; supports the same placeholders as the other copy fields. */
+    description?: string;
+    /** Drawn as keycaps beside the title. */
+    shortcut?: VersionShortcutId;
+}
+
+/**
+ * Declarative actions keep release configuration safe for the plugin bundle.
+ * The card adapts the button to the account (signed out, out of credits, ...);
+ * see `react/utils/versionUpdateAction.ts`.
+ */
+export type VersionUpdateAction =
+    | { type: 'open-astermargin'; label: string }
+    | { type: 'quick-prompt'; label: string }
+    | { type: 'open-url'; label: string; url: string }
+    /** Open AsterMargin with an action's /command in the chat input, bound to the
+     *  current selection like the home launcher. `requiresPlusTools`: the
+     *  feature runs only with Plus Tools (AsterMargin model, or own model with Plus
+     *  Tools on), so the card says what is missing instead. */
+    | { type: 'stage-action'; label: string; actionId: string; requiresPlusTools?: boolean };
+
+/**
+ * Example prompt shown as a chat bubble in the feature tour
+ */
+export interface ExamplePrompt {
+    /** The full text of the example prompt */
+    text: string;
+    /** Part of the text to highlight with accent color (must be substring of text) */
+    highlight?: string;
+    /** Position of the bubble - alternating creates a chat-like feel */
+    position?: 'left' | 'right' | 'center';
+}
+
+/**
+ * A single step/slide in the feature tour
+ */
+export interface FeatureStep {
+    /** Title of this feature */
+    title: string;
+    /** Description text (supports HTML links) */
+    description?: string;
+    /** Example prompts shown as chat bubbles */
+    examplePrompts?: ExamplePrompt[];
+    /** A visual between the description and the prompts — the feature itself. */
+    showcase?: VersionShowcaseId;
+    /** URL to learn more about this feature */
+    learnMoreUrl?: string;
+}
+
+/**
+ * The copy fields (`text`, `subtitle`, descriptions) may use
+ * `{{quickPromptShortcut}}` and `{{astermarginWindowShortcut}}` for those chords on
+ * the user's machine; they are filled when the note is built
+ * (`react/utils/versionUpdatePopup.ts`).
+ */
+export interface VersionUpdateMessageConfig {
+    version: string;
+    /** Delay related tips from when this release notification is shown, in milliseconds. */
+    deferFeatureTips?: Partial<Record<FeatureTipId, number>>;
+    title: string;
+    /** Subtitle/intro text shown on the first screen */
+    subtitle?: string;
+    /** @deprecated Use steps instead for new versions */
+    text?: string;
+    /** @deprecated Use steps instead for new versions */
+    featureList?: PopupMessageFeature[];
+    /** Feature steps for the guided tour (new format) */
+    steps?: FeatureStep[];
+    /** A visual under the intro text — the feature itself, not a description of it. */
+    showcase?: VersionShowcaseId;
+    /** A second feature, shown as one row under the showcase on the floating card. */
+    alsoNew?: VersionAlsoNew;
+    learnMoreUrl?: string;
+    learnMoreLabel?: string;
+    footer?: string;
+    /** When true, display inside the sidebar panel instead of as a floating popup */
+    inPanel?: boolean;
+    /** Primary button on the floating release card; defaults to Open AsterMargin. */
+    primaryAction?: VersionUpdateAction;
+}
+
+const versionUpdateMessageList: VersionUpdateMessageConfig[] = [
+    {
+        version: "0.5.0",
+        title: "Group libraries and PDF annotations",
+        text: "Bug fixes and stability, support for group libraries and annotation tool.",
+        featureList: [
+            {
+                title: "Support for group libraries",
+                description: "You can sync Group Libraries with AsterMargin.",
+            },
+            {
+                title: "AsterMargin can now annotate your PDFs",
+                description: "AsterMargin can highlight and add notes to your PDFs.",
+            },
+            {
+                title: "Bug fixes and improved stability",
+                description: "Resolved a wide range of reliability issues.",
+            }
+        ],
+        learnMoreUrl: "https://www.beaverapp.ai/changelog/v0.5",
+        learnMoreLabel: "Learn more",
+    },
+    {
+        version: "0.6.0",
+        title: "Agent 2.0 and improved search",
+        text: "New agent, improved metadata search and increased page balance.",
+        featureList: [
+            {
+                title: "Agent 2.0",
+                description: "A new agent that is more powerful, efficient and paves the way for future improvements.",
+            },
+            {
+                title: "Improved metadata search",
+                description: "AsterMargin can now search your library by publication title and filter results by year.",
+            },
+            {
+                title: "Increased page balance to 125,000 pages",
+                description: "Beta users can now process up to 125k pages for free. Additional files will be processed when you submit a chat query.",
+            }
+        ],
+    },
+    {
+        version: "0.7.0",
+        title: "Filter by tags and collections",
+        text: "Support for tags and collections and other improvements.",
+        featureList: [
+            {
+                title: "Support for tags and collections",
+                description: "Using the @ menu, you can now filter by tags and collections to restrict AsterMargin searches.",
+            },
+            {
+                title: "Improved handeling of user attachments",
+            }
+        ],
+        learnMoreUrl: "mailto:contact@astermarginapp.ai?subject=AsterMargin Feedback",
+        learnMoreLabel: "Give Feedback",
+    },
+    {
+        version: "0.7.3",
+        title: "Consistent UI and annotation updates",
+        featureList: [
+            {
+                title: "Under the hood improvements to annotation tools",
+                description: "The annotation tool was rewritten. Please report any issues you encounter.",
+            },
+            {
+                title: "Consistent AsterMargin UI between library and reader",
+                description: "The AsterMargin UI is now consistent when switching between the Zotero library and file reader."
+            }
+        ]
+    },
+    {
+        version: "0.7.9",
+        title: "Appearance and consistency fixes",
+        text: "Fixed appearance issues: AsterMargin now looks and behaves consistently across all systems and configurations.",
+        featureList: []
+    },
+    {
+        version: "0.8.0",
+        title: "Search 250M works and generate notes",
+        text: "Search 250M+ scholarly works. Generate & save Zotero notes. And more...",
+        featureList: [
+            {
+                title: "Search 250 million scholarly works",
+                description: "A sub-agent searches by topic, author, or journal, and follows citation chains to surface new references and extend your Zotero library. <a href='https://www.beaverapp.ai/docs/web-search'>Learn more</a>",
+            },
+            {
+                title: "Generate notes in a dedicated panel",
+                description: "AsterMargin now writes notes in a separate panel that you can save as Zotero Notes or copy elsewhere. <a href='https://www.beaverapp.ai/docs/notes'>Learn more</a>",
+            },
+            {
+                title: "New documentation site",
+                description: "AsterMargin finally has <a href='https://www.beaverapp.ai/docs'>better documentation</a>.",
+            }
+        ],
+        // learnMoreUrl: "https://www.beaverapp.ai/changelog/v0.8",
+        // learnMoreLabel: "Learn more",
+    },
+    {
+        version: "0.9.0",
+        title: "New research agent and window mode",
+        text: "New research agent, flexible window mode, and more",
+        featureList: [
+            {
+                title: "New Research Agent",
+                description: "Upgraded to a more powerful agent. This is a major change so please reach out with any feedback or problems!",
+            },
+            {
+                title: "Flexible Window Mode",
+                description: "In addition to the Zotero sidebar, you can now open AsterMargin in its own separate window.",
+            },
+            {
+                title: "Better Message Controls",
+                description: "Edit and resubmit previous messages, resume interrupted conversations, and other handy improvements."
+            }
+        ]
+    },
+    {
+        version: "0.9.4",
+        title: "Keyboard shortcuts and bug fixes",
+        featureList: [
+            {
+                title: "Copy text with keyboard shortcut (cmd/ctrl+c)",
+            },
+            {
+                title: "Use keyboard shortcut to open AsterMargin in separate window (cmd/ctrl+shift+l)",
+            },
+            {
+                title: "Various bug fixes and improvements",
+            }
+        ],
+        footer: "Full changelog <a href='https://github.com/jlegewie/beaver-zotero/releases/tag/v0.9.4' target='_blank'>here</a>."
+    },
+    {
+        version: "0.10.0",
+        title: "Introducing AsterMargin Free",
+        text: "Version 0.10 introduces AsterMargin Free, ensuring the platform remains sustainable and available to everyone in the long term.",
+        featureList: [
+            {
+                title: "Introducing AsterMargin Free",
+                description: "This new tier supports core features without cloud costs. Going forward, all new users will start on this plan.",
+            },
+            {
+                title: "Impact on existing accounts",
+                description: "Active users remain on Pro (Beta). To manage server costs, only long-term inactive accounts are migrated to the Free plan.",
+            },
+        ]
+    },
+    {
+        version: "0.11.0",
+        title: "Library organization and metadata editing",
+        // subtitle: "Organize your library, edit metadata, and enjoy more efficient AI usage.",
+        steps: [
+            {
+                title: "Organize Your Library",
+                description: "AsterMargin can now create collections, add tags, and help you organize items in bulk. <a href='https://www.beaverapp.ai/docs/library-management'>Learn more →</a>",
+                examplePrompts: [
+                    {
+                        text: "I added several papers this week. Organize them into appropriate collections based on their topics.",
+                        highlight: "Organize them into appropriate collections",
+                        position: "left"
+                    },
+                    {
+                        text: "Find all unfiled papers and suggest which collections they belong in.",
+                        highlight: "unfiled papers",
+                        position: "right"
+                    },
+                    {
+                        text: "I'm starting a literature review on ____. Create a collection and add all relevant papers from my library.",
+                        highlight: "add all relevant papers",
+                        position: "left"
+                    }
+                ],
+            },
+            {
+                title: "Edit Item Metadata",
+                description: "Fix incomplete metadata, add custom content like summaries to the extra field, and update bibliographic fields through natural conversation. <a href='https://www.beaverapp.ai/docs/editing-metadata'>Learn more →</a>",
+                examplePrompts: [
+                    {
+                        text: "Review and fix metadata for all items I added today. Look up the correct information and fix any issues.",
+                        highlight: "Review and fix metadata",
+                        position: "left"
+                    },
+                    {
+                        text: "Add the citation count to the extra field for all items that don't have it.",
+                        highlight: "Add the citation count",
+                        position: "right"
+                    },
+                    {
+                        text: "Find all items with missing abstracts and create an abstract for them.",
+                        highlight: "items with missing abstracts",
+                        position: "left"
+                    }
+                ],
+            },
+            {
+                title: "Tip: Use Actions for Common Tasks",
+                description: "Save time by creating reusable prompts in AsterMargin settings for common library management tasks.\n\nRead about all changes in the <a href='https://github.com/jlegewie/beaver-zotero/releases/tag/v0.11.0'>change log</a>.",
+            }
+        ]
+    },
+    {
+        version: "0.11.2",
+        title: "Improved metadata editing",
+        featureList: [
+            {
+                title: "Improved Metadata Editing",
+                description: "Support for almost all metadata fields from creators to docket number, or podcast episode.",
+            },
+            {
+                title: "Performance improvements and bug fixes",
+                description: "Improved performance so that adding tags to 100+ items should be a breeze.",
+            },
+        ],
+    },
+    {
+        version: "0.12.0",
+        title: "A new brain and the extract tool",
+        steps: [
+            {
+                title: "A New Brain for AsterMargin",
+                description: "More capable default model"
+            },
+            {
+                title: "Extract tool",
+                description: "Extract key info from 12+ papers at once",
+            },
+            {
+                title: "Automate common tasks",
+                description: "Use the <a href='https://www.beaverapp.ai/docs/actions'>/ slash menu</a> for custom actions",
+            },
+            // {</div>
+            //     title: "Keyboard shortcut updated",
+            //     description: "Toggle AsterMargin with ⌘J (Ctrl+J on Windows/Linux). Open in a separate window with ⌘⇧J (Ctrl+Shift+J on Windows/Linux).",
+            // }
+        ],
+        footer: "Credits reset, give it a spin!"
+    },
+    {
+        version: "0.13",
+        title: "MCP server and shareable links",
+        steps: [
+            {
+                title: "AsterMargin MCP server",
+                description: "Connect with AsterMargin from other AI tools to access your library. <a href='https://www.beaverapp.ai/docs/mcp-server'>Learn more →</a>",
+            },
+            {
+                title: "Deep links to chats and messages",
+                description: "Copy shareable links to AsterMargin chats and messages. Paste them in notes, docs, or your browser to jump right back",
+            },
+            {
+                title: "Copy and save entire chats",
+                description: "Export a full conversation as a Zotero note or copy it to the clipboard from the new '...' menu.",
+            },
+        ],
+    },
+    {
+        version: "0.13.2",
+        title: "Version 0.13.2: Free Credits Update",
+        text: "In an effort to make AsterMargin more sustainable as a service, free credits are now a one-time allocation rather than a monthly renewal. You can always use your own API key for unlimited usage.",
+        inPanel: true,
+    },
+    {
+        version: "0.13.3",
+        title: "Version 0.13.3: Redesigned chat history",
+        inPanel: true,
+        featureList: [
+            {
+                title: "Redesigned chat history",
+                description: "Browse, search, rename, and delete past chats from the new chat history panel.",
+            },
+            {
+                title: "Model selector fix",
+                description: "Fixed an issue where the selected model could reset when opening and closing AsterMargin.",
+            },
+        ],
+    },
+    {
+        version: "0.14.0",
+        title: "Smart homepage and custom actions",
+        steps: [
+            {
+                title: "Smart homepage",
+                description: "Select an item, open a collection, or read a paper and AsterMargin suggests actions based on what you're doing in Zotero. ",
+            },
+            {
+                title: "Customize your workflow",
+                description: "Create your own actions in Preferences → Actions. <a href='https://www.beaverapp.ai/docs/actions'>Learn more</a>.",
+            },
+            {
+                title: "Pick up where you left off",
+                description: "Recent chats now appear on the homepage and give you quick access to past conversations.",
+            },
+        ],
+        // footer: `We've updated our <a href="https://www.beaverapp.ai/terms" target='_blank'>Terms of Service</a> and <a href="https://www.beaverapp.ai/privacy-policy" target='_blank'>Privacy Policy</a>, including subscription and billing terms, simplified credit mechanics, and clarified how we use operational log data for service improvement. Effective March 26, 2026.`
+    },
+    {
+        version: "0.15.0",
+        title: "Introducing AsterMargin Plus",
+        steps: [
+            {
+                title: "Introducing AsterMargin Plus",
+                description: "Subscribe for $10/month to get 100 credits and Plus Tools (Discover New Research, Batch Processing, AI-Ranking). Or grab a one-time credit pack.",
+            },
+            {
+                title: "Free with your own API key",
+                description: "AsterMargin remains free and unlimited with your own API key. Discover New Research is now a Plus Tool due to server costs.",
+            },
+        ],
+        footer: `Read full <a href="https://www.beaverapp.ai/changelog/v0.15" target='_blank'>announcement</a>`
+    },
+    {
+        version: "0.16.0",
+        title: "Version 0.16: Right-click Actions and longer documents",
+        featureList: [
+            {
+                title: "AsterMargin Actions from the right-click menu (Zotero 8+ only)",
+                description: "Start customizable AI workflows without opening the chat panel",
+            },
+            {
+                title: "Create notes in any collection",
+                description: "AsterMargin can now add notes directly where you need them",
+            },
+            {
+                title: "Support for much longer documents",
+                description: "Work with documents up to 800 pages with Plus Tools",
+            },
+        ],
+        inPanel: true,
+    },
+    {
+        version: "0.17.0",
+        title: "Your notes writing and reviewing assistant",
+        subtitle: "Turn AsterMargin into a full-featured writing and reviewing assistant for your research notes.",
+        steps: [
+            {
+                title: "Read, edit, and create notes with AsterMargin",
+                description: "AsterMargin can review your notes, check citation accuracy, edit for clarity, and more.",
+            },
+            {
+                title: "Full integration of notes into AsterMargin",
+                description: "Add them to conversations, search for notes, assign tags, or move them to collections.",
+            },
+            {
+                title: "Note Actions",
+                description: "A new action type for notes lets you trigger repeated AI workflows on your notes, just like you can for items and PDFs.",
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.17.0" target='_blank'>Full changelog</a>`
+    },
+    {
+        version: "0.18.0",
+        title: "AsterMargin can now see PDF pages",
+        // subtitle: "Visual PDF understanding and better library management.",
+        steps: [
+            {
+                title: "AsterMargin can now see PDF pages",
+                description: "Understands figures, tables, and scanned PDFs without a text layer.",
+            },
+            {
+                title: "Image-based extraction (Plus Tools)",
+                description: "The extract tool now works on scanned, OCR-only PDFs (25 pages max).",
+            },
+            {
+                title: "Collection and tag management",
+                description: "Rename, move, and delete collections and tags directly.",
+            },
+            {
+                title: "Remote files",
+                description: "Support for remotely-stored attachments (disabled in settings).",
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.18.0" target='_blank'>Full changelog</a>`
+    },
+    {
+        version: "0.19.0",
+        title: "Version 0.19: Performance and maintenance",
+        inPanel: true,
+        featureList: [
+            {
+                title: "Faster, more responsive UI",
+                description: "PDF processing runs in the background and scrolling is smoother in long threads.",
+            },
+            {
+                title: "User input in actions",
+                description: "Define user inputs in actions to ask for input each time the action runs. <a href='https://www.beaverapp.ai/docs/actions#user-input-variables'>Learn more</a>",
+            },
+            {
+                title: "Many more stability and performance improvements",
+                description: "Resolved a wide range of reliability issues.",
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.19.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.20.0",
+        title: "Sentence-level citations and PDF annotations",
+        inPanel: false,
+        featureList: [
+            {
+                title: "Sentence-level citations",
+                description: "Citations now pinpoint exact sentences. Hover to preview the source, or click to open the highlighted PDF."
+            },
+            {
+                title: "AI-powered PDF annotations",
+                description: 'Ask AsterMargin to "highlight key findings" or "everything relevant to my project" and it annotates the PDF for you. Color-coded and ready to review. <a href="https://www.beaverapp.ai/docs/annotations">Learn more</a>',
+                
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.20.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.21.0",
+        title: "EPUB support, external files and improved search",
+        steps: [
+            {
+                title: "More file types and external files",
+                description: "Support for EPUB, image, and text files, with sentence-level citations and annotations for EPUBs. Drag & drop external files onto AsterMargin to use them without adding them to Zotero.",
+            },
+            {
+                title: "Search inside your documents",
+                description: "AsterMargin can now search the full text of selected attachments and pinpoint exact sentences where keywords appear.",
+            },
+            {
+                title: "System notifications",
+                description: "Get notified when a response is ready or an approval is waiting (turn off in settings).",
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.21.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.21.1",
+        title: "Support for Snapshot Attachments",
+        text: "AsterMargin can now read, annotate, and cite snapshot attachments down to the sentence level. As of version 0.21, that means support for PDFs, EPUBs, snapshots, images, and plain text files.",
+        inPanel: true,
+    },
+    {
+        version: "0.22.0",
+        title: "Version 0.22: Redesigned Actions, Home Screen Launcher and more",
+        featureList: [
+            {
+                title: "Redesigned Actions",
+                description: "Actions are rebuilt to handle more complex, multi-step workflows. Import and export actions to share with others.",
+            },
+            {
+                title: "Home Screen Launcher",
+                description: "Launch your actions right from the home screen for quick access to the workflows you use most.",
+            },
+            {
+                title: "AsterMargin can ask you questions",
+                description: "When a request is ambiguous, AsterMargin now pauses to ask instead of guessing keeping longer tasks on track.",
+            },
+        ],
+        inPanel: true,
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.22.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.22.5",
+        title: "Version 0.22.5: Improved IME support",
+        text: "Fixed text entry issues with input method editors (IMEs), including candidate selection and insertion.",
+        footer: "Please report any remaining IME issues to <a href='mailto:support@astermarginapp.ai'>support@astermarginapp.ai</a>.",
+        inPanel: true,
+    },
+    {
+        version: "0.22.6",
+        title: "Version 0.22.6: Improved Zotero 10 support",
+        text: "Actions now support selecting multiple collections at once, and all remaining compatibility issues with Zotero 10 have been resolved.",
+
+        inPanel: true,
+    },
+    {
+        version: "0.23.0",
+        title: "Version 0.23: Agent redesign and annotation editing",
+        featureList: [
+            {
+                title: "Under-the-hood agent redesign",
+                description: "Redesigned agent that rolled out over the last weeks. More efficient under the hood, and a stronger foundation for what's next.",
+            },
+            {
+                title: "Edit annotations",
+                description: "AsterMargin can now update existing PDF annotations: change color, edit comment, change position and more.",
+            },
+        ],
+        inPanel: true,
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.23.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.23.2",
+        title: "Increased usage for AsterMargin Plus and Plus Max",
+        featureList: [
+            {
+                title: "Increased usage for AsterMargin Plus and Plus Max",
+                description: "We increased the number of credits you get with AsterMargin Plus and Plus Max by 20%.",
+            },
+            {
+                title: "IMPORTANT: Updated confirmation dialog for credit charges",
+                description: "Previously, AsterMargin asked for every extra credit. Now, you can set a threshold and AsterMargin will only ask when the total cost exceeds the threshold (default is 5 credits). Most responses still cost 1 credit.",
+            },
+        ],
+        inPanel: true,
+        footer: `<a href="https://www.beaverapp.ai/docs/credits">Learn more</a>. These changes do not impact BYOK users.`,
+    },
+    {
+        version: "0.24.0",
+        title: "Batch jobs: Sort, tag, extract, and annotate hundreds of papers",
+        steps: [
+            {
+                title: "Batch jobs",
+                description: "AsterMargin now supports batch jobs to efficiently sort, tag, edit, annotate, summarize or extract findings from hundreds or even a thousand items. <a href='https://www.beaverapp.ai/batch-jobs'>Learn more</a>",
+            },
+            {
+                title: "Review library changes",
+                description: "Easily review, approve, reject or undo library changes from the bottom of any AsterMargin response.",
+            },
+            {
+                title: "Pinned chats, search in chats and more",
+                description: "Pin chats, search an open chat for keywords, redesigned chat input, and more.",
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.24.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.25.0",
+        deferFeatureTips: { 'run-status-popup': 7 * 24 * 60 * 60 * 1000 },
+        title: "Ask AsterMargin without opening the sidebar",
+        text: "Press {{quickPromptShortcut}} to type a request wherever you are in Zotero. A small card shows progress, asks for approvals, and reports the result.",
+        showcase: 'quick-prompt',
+        alsoNew: {
+            title: "Redesigned AsterMargin window",
+            description: "A full chat window with your history at hand, and room for a second chat.",
+            shortcut: 'astermargin-window',
+        },
+        primaryAction: { type: 'quick-prompt', label: 'Try now' },
+        inPanel: false,
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.25.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.26.0",
+        title: "Export to Word, PDF, and LaTeX",
+        featureList: [
+            {
+                title: "Export to Word, PDF, LaTeX, and Markdown",
+                description: "Save a note, a response or a whole chat as a file. Word exports keep live Zotero citations.",
+            },
+            {
+                title: "Find and merge duplicates",
+                description: "Review each merge, choose what to keep, and undo it later.",
+            },
+            {
+                title: "Improved item import",
+                description: "Create items from DOIs, URLs, or files.",
+            },
+        ],
+        footer: `<a href="https://github.com/jlegewie/beaver-zotero/releases/tag/v0.26.0" target='_blank'>Full changelog</a>`,
+    },
+    {
+        version: "0.27.0",
+        title: "Extract data from every paper. Compare them side by side",
+        text: "Introducing research tables in Zotero. AsterMargin reads each paper, fills in every answer and links it to the page it came from. Export the table to Excel or CSV.",
+        showcase: 'research-table',
+        primaryAction: { type: 'stage-action', label: 'Try it', actionId: 'builtin-research-table', requiresPlusTools: true },
+        inPanel: false,
+        learnMoreUrl: "https://www.beaverapp.ai/docs/research-tables",
+        learnMoreLabel: "Learn more",
+    },
+];
+
+versionUpdateMessageList.sort((a, b) => compareVersions(a.version, b.version));
+
+const versionUpdateMessageMap = versionUpdateMessageList.reduce<Record<string, VersionUpdateMessageConfig>>((acc, config) => {
+    acc[config.version] = config;
+    return acc;
+}, {});
+
+export const getVersionUpdateMessageConfig = (version: string): VersionUpdateMessageConfig | undefined => {
+    return versionUpdateMessageMap[version];
+};
+
+export const getAllVersionUpdateMessageVersions = (): string[] => {
+    return versionUpdateMessageList.map((config) => config.version);
+};
+
+/**
+ * Check if a version config uses the new step-based tour format
+ */
+export const usesStepFormat = (config: VersionUpdateMessageConfig): boolean => {
+    return !!(config.steps && config.steps.length > 0);
+};

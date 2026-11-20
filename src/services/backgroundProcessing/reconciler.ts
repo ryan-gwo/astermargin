@@ -1,0 +1,1004 @@
+import type {
+    AttachmentProcessingStateRecord,
+    BackgroundJobInput,
+    ProcessingIndexStateRecord,
+} from '../database';
+import type { QueueDB } from '../backgroundQueue/jobExecutor';
+import { expectedExtractionSchemaVersion } from '../documentExtraction/shared/extractionSchemaVersions';
+import { getReadableContentKind } from '../documentExtraction/attachmentResolution';
+import { recordReadingOutcome } from '../documentExtraction/readingOutcome';
+import { loadAttachmentData, resolveAttachmentFileSource } from '../documentExtraction/attachmentSource';
+import {
+    isLegacyRemoteIdentity,
+    observeAttachmentSource,
+    relocatedLocalIdentity,
+} from '../documentExtraction/sourceObservation';
+import {
+    OCR_ENGINE_VERSION,
+    OCR_PRIORITY_BACKFILL,
+    OCR_PRIORITY_ON_DEMAND,
+    OCR_SERVICE_UNAVAILABLE,
+} from '../ocr/constants';
+import type { AttachmentRef } from './issues';
+import { enqueueOcrJob, maybeEnqueueOcrJob } from '../ocr/enqueueOcr';
+import { getSystemIdleTimeMs } from '../../utils/idleService';
+import { safeIsInTrash } from '../../utils/zoteroItemUtils';
+import { loadIsTableAttachment, tableAttachmentSql } from '../artifacts/tableItemIdentity';
+import { processableAttachmentSql } from '../../utils/attachmentFiles';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    ATTACHMENT_SCAN_BATCH_SIZE,
+    BACKGROUND_EXTRACT_PRIORITY,
+    BACKGROUND_UPSERT_PRIORITY,
+    EXPECTED_SEARCH_INDEX_VERSION,
+    FULL_DIFF_SAFETY_INTERVAL_MS,
+    PROCESSING_RECONCILE_INTERVAL_MS,
+} from './constants';
+import {
+    backgroundProcessingEnabled,
+    buildBackgroundExtractPayload,
+    buildIndexJobPayload,
+    isBackgroundProcessingLibraryEnabled,
+} from './utils';
+
+export interface AttachmentChange {
+    event: 'add' | 'modify' | 'delete';
+    id: number;
+    /** Capture sync origin before the notification batch outlives the sync. */
+    backfill?: boolean;
+    extra?: { libraryID?: number; key?: string };
+}
+
+type ProcessableKind = AttachmentProcessingStateRecord['contentKind'];
+
+interface LibraryCursor {
+    maxClientDateModified: string | null;
+    attachmentCount: number;
+}
+
+const IDLE_THRESHOLD_MS = 30_000;
+/** Attachments a library scan enumerates; `getReadableContentKind()` makes the final call. */
+const PROCESSABLE_ATTACHMENT_SQL = processableAttachmentSql('IA');
+
+/**
+ * Terminal reasons that say "the bytes were not reachable", not "these bytes
+ * are unusable". Every one of them can stop being true without the attachment
+ * itself changing: metadata syncs ahead of the upload backing it, a WebDAV
+ * share or its configuration comes back, a user downloads the file later or
+ * grants Zotero access to the folder holding it.
+ */
+const RECOVERABLE_AVAILABILITY_ERRORS = [
+    'file_missing',
+    'download_failed',
+    'read_failed',
+    'file_permission_denied',
+];
+
+/**
+ * True when a row's terminal state came from the file being unreachable.
+ *
+ * Matches on prefix because the same cause reaches the ledger in two shapes: a
+ * bare code when an executor retires the job itself, and `"<code>: <message>"`
+ * when the queue dead-letters it.
+ */
+function hasRecoverableAvailabilityFailure(
+    row: AttachmentProcessingStateRecord,
+): boolean {
+    const terminal = row.extractStatus === 'skipped'
+        || row.extractStatus === 'failed'
+        || row.ocrStatus === 'failed';
+    if (!terminal || !row.lastError) return false;
+    return RECOVERABLE_AVAILABILITY_ERRORS.some((code) =>
+        row.lastError === code || row.lastError!.startsWith(`${code}:`)
+        // The OCR lane wraps its own load failures before recording them.
+        || row.lastError!.includes(`: ${code}`));
+}
+
+
+/** Whole-library producer. Expensive work remains in the dispatcher lanes. */
+export class ReconcilerService {
+    private stopped = true;
+    private nextScanAt = 0;
+    private pendingAttachments = new Map<number, AttachmentChange>();
+    private running = false;
+    private activeForce = false;
+    private pendingWake = false;
+    private pendingForce = false;
+    private scheduledForce = false;
+    private admissionScopes = new Map<number, string>();
+    private ocrAdmissionReopened = false;
+    private generation = 0;
+    private timer: ReturnType<typeof setTimeout> | null = null;
+    private prefObservers: symbol[] = [];
+    private idleWaiters: Array<() => void> = [];
+    private forceWaiters: Array<() => void> = [];
+
+    start(): void {
+        if (!this.stopped) return;
+        this.stopped = false;
+        this.nextScanAt = 0;
+        this.generation += 1;
+        for (const pref of ['extensions.zotero.astermargin.backgroundProcessingEnabled']) {
+            try {
+                this.prefObservers.push(Zotero.Prefs.registerObserver(
+                    pref,
+                    () => this.notify(),
+                    true,
+                ));
+            } catch (error) {
+                logger(`ReconcilerService: failed to observe ${pref}: ${error}`, 2);
+            }
+        }
+        this.schedule(1_000);
+    }
+
+    stop(): void {
+        this.stopped = true;
+        this.pendingAttachments.clear();
+        this.generation += 1;
+        if (this.timer) clearTimeout(this.timer);
+        this.timer = null;
+        this.pendingForce = false;
+        this.scheduledForce = false;
+        for (const resolve of this.forceWaiters.splice(0)) resolve();
+        for (const observer of this.prefObservers) {
+            try { Zotero.Prefs.unregisterObserver(observer); } catch { /* best effort */ }
+        }
+        this.prefObservers = [];
+    }
+
+    /** Stop producing work and await the current pass before storage maintenance. */
+    async suspendForMaintenance(): Promise<() => void> {
+        const wasStarted = !this.stopped;
+        this.stop();
+        if (this.running) await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+        return () => {
+            if (wasStarted && !Zotero.__astermarginShuttingDown) this.start();
+        };
+    }
+
+    notify(): void {
+        if (this.stopped) return;
+        if (this.running) {
+            this.pendingWake = true;
+            return;
+        }
+        this.schedule(0);
+    }
+
+    /**
+     * The OCR API accepted work for an attachment parked while admission was
+     * closed. The next pass tickets every other parked attachment.
+     */
+    notifyOcrAdmissionReopened(): void {
+        if (this.stopped) return;
+        this.ocrAdmissionReopened = true;
+        this.notify();
+    }
+
+    /** Notifications are hints, never evidence that file content changed. */
+    notifyAttachments(events: AttachmentChange[]): void {
+        if (this.stopped) return;
+        for (const event of events) {
+            const pending = this.pendingAttachments.get(event.id);
+            // Watcher batches can overlap a running pass; retain import intent
+            // until the pending attachment is reconciled.
+            this.pendingAttachments.set(event.id, {
+                ...event,
+                event: event.event === 'modify' && pending?.event === 'add' ? 'add' : event.event,
+                backfill: pending?.backfill === true || event.backfill === true,
+            });
+        }
+        this.notify();
+    }
+
+    private async reconcileNotifiedAttachments(db: QueueDB, generation: number): Promise<void> {
+        const changes = new Map(this.pendingAttachments);
+        this.pendingAttachments.clear();
+        // Parent trash/restore changes eligibility without modifying its children.
+        // Include trashed children and let the attachment check read current state.
+        const parentIds: number[] = [];
+        for (const event of changes.values()) {
+            if (this.cancelled(generation)) return;
+            if (event.event === 'delete') continue;
+            const item = await Zotero.Items.getAsync(event.id);
+            if (item?.isRegularItem() && isBackgroundProcessingLibraryEnabled(item.libraryID)) {
+                parentIds.push(event.id);
+            }
+        }
+        for (let start = 0; start < parentIds.length; start += ATTACHMENT_SCAN_BATCH_SIZE) {
+            const batch = parentIds.slice(start, start + ATTACHMENT_SCAN_BATCH_SIZE);
+            await Zotero.DB.queryAsync(
+                `SELECT itemID FROM itemAttachments WHERE parentItemID IN (${batch.map(() => '?').join(',')})`,
+                batch,
+                { onRow: (row: any) => {
+                    const id = row.getResultByIndex(0);
+                    if (!changes.has(id)) changes.set(id, { id, event: 'modify', backfill: true });
+                } },
+            );
+        }
+        const events = [...changes.values()];
+        // One new supported attachment in a 500ms quiet notification batch is
+        // interactive. Multiple attachments (including individually emitted adds)
+        // are backfill. Parent items do not count as attachments.
+        const addedAttachments: number[] = [];
+        for (const event of events) {
+            if (event.event !== 'add') continue;
+            const item = await Zotero.Items.getAsync(event.id);
+            if (item && isBackgroundProcessingLibraryEnabled(item.libraryID)
+                && getReadableContentKind(item)) addedAttachments.push(event.id);
+        }
+        for (const event of events) {
+            if (this.cancelled(generation)) return;
+            try {
+                let ref = event.extra;
+                if (event.event !== 'delete') {
+                    const identities: Array<{ libraryID: number; key: string }> = [];
+                    await Zotero.DB.queryAsync('SELECT libraryID, key FROM items WHERE itemID = ? LIMIT 1', [event.id], {
+                        onRow: (row: any) => identities.push({ libraryID: row.getResultByIndex(0), key: row.getResultByIndex(1) }),
+                    });
+                    ref = identities[0];
+                }
+                if (!ref?.libraryID || !ref.key || !isBackgroundProcessingLibraryEnabled(ref.libraryID)) continue;
+                const item = event.event === 'delete' ? null : await Zotero.Items.getAsync(event.id);
+                if (item?.isRegularItem()) continue;
+                if (item && item.parentID) await Zotero.Items.getAsync(item.parentID);
+                if (!isBackgroundProcessingLibraryEnabled(ref.libraryID)) continue;
+                const kind = item && safeIsInTrash(item) === false ? getReadableContentKind(item) : null;
+                // Text has independent reading outcomes; only stale processing state needs cleanup.
+                if (kind === 'text' && !await db.getAttachmentProcessingState(ref.libraryID, ref.key)) continue;
+                // A AsterMargin table's snapshot is rewritten on every table write and is
+                // never processed; removal clears state recorded before that rule.
+                if (!item || (kind !== 'pdf' && kind !== 'epub' && kind !== 'snapshot')
+                    || (kind === 'snapshot' && await loadIsTableAttachment(item))) {
+                    await this.removeAttachments(db, ref.libraryID, [ref.key]);
+                    continue;
+                }
+                if (!backgroundProcessingEnabled()) continue;
+                const jobs: BackgroundJobInput[] = [];
+                const row = await db.getAttachmentProcessingState(ref.libraryID, ref.key);
+                await this.reconcileAttachment(db, item, kind, true, jobs, row ?? undefined, false,
+                    !event.backfill && addedAttachments.length === 1 && addedAttachments[0] === event.id ? 'interactive' : 'backfill');
+                if (!this.cancelled(generation) && isBackgroundProcessingLibraryEnabled(ref.libraryID)) {
+                    await db.enqueueBackgroundJobs(jobs);
+                }
+            } catch (error) {
+                logger(`ReconcilerService: attachment ${event.id} check failed: ${error}`, 2);
+            }
+        }
+    }
+
+    /** Retire processing state (queueing remote untag) and drop cached content. */
+    private async removeAttachments(db: QueueDB, libraryId: number, keys: string[]): Promise<void> {
+        await db.retireAttachmentProcessingStates(libraryId, keys);
+        for (const key of keys) await Zotero.AsterMargin?.documentCache?.invalidate(libraryId, key);
+    }
+
+    /** Forced full pass, awaited: used by the dev endpoint and live tests. */
+    async reconcileNow(): Promise<void> {
+        if (this.running) {
+            const completed = new Promise<void>((resolve) => {
+                this.forceWaiters.push(resolve);
+            });
+            await this.run(true);
+            await completed;
+        } else {
+            await this.run(true);
+        }
+        Zotero.AsterMargin?.backgroundExtractor?.notify();
+    }
+
+    /**
+     * User-initiated retry of attachments listed under "could not read".
+     *
+     * Each attachment's failed stage is put back, its dead-lettered jobs and
+     * per-hash failure records are dropped, and the next job is enqueued
+     * before the drain bypass is requested, so the work runs without waiting
+     * for Zotero to go idle:
+     *
+     * - A failed or skipped extraction (and an OCR stage that failed because
+     *   the file was unreachable) restarts from extraction. The attachment's
+     *   document-cache entry is invalidated first: the cache remembers
+     *   terminal verdicts such as `invalid_pdf`, and a retry that merely
+     *   re-read that verdict would skip the file again without touching it.
+     *   A still-missing file fails source resolution right here and reappears
+     *   in the issue list.
+     * - A failed OCR stage on a readable extraction goes straight back to
+     *   `needed` and is ticketed here, awaited, rather than through a fresh
+     *   extraction whose cached "no text layer" verdict would leave the OCR
+     *   continuation to the next periodic reconcile. That shortcut is only
+     *   taken while the cached detection metadata the OCR executor reads its
+     *   page count from is still present and current; a cleared cache or a
+     *   replaced file restarts from extraction so the metadata is rewritten.
+     * - A failed index upload re-enqueues only the upsert.
+     *
+     * Excluded libraries and attachments that no longer exist are skipped.
+     * Returns the number of attachments reset.
+     */
+    async retryAttachments(refs: AttachmentRef[]): Promise<number> {
+        const db = Zotero.AsterMargin?.db;
+        if (!db) return 0;
+        const finishDiscovery = await Zotero.AsterMargin?.background?.beginProcessingDiscovery();
+        try {
+            const jobs: BackgroundJobInput[] = [];
+            let retried = 0;
+            for (const ref of refs) {
+                if (!isBackgroundProcessingLibraryEnabled(ref.libraryId)) continue;
+                const item = await Zotero.Items.getByLibraryAndKeyAsync(ref.libraryId, ref.zoteroKey);
+                if (item && item.parentID) await Zotero.Items.getAsync(item.parentID);
+                if (!item || safeIsInTrash(item) !== false || !isBackgroundProcessingLibraryEnabled(ref.libraryId)) continue;
+                const kind = getReadableContentKind(item);
+                if (kind === 'text') {
+                    const attemptedAt = Date.now();
+                    const source = await resolveAttachmentFileSource({ item, localSizeStrategy: 'stat' });
+                    if (!isBackgroundProcessingLibraryEnabled(ref.libraryId)) continue;
+                    const outcome = source.kind === 'error' ? source : await loadAttachmentData({ item, source: source.source });
+                    await recordReadingOutcome(item, 'text', outcome.kind === 'error'
+                        ? { kind: 'response_error', code: outcome.code } : { kind: 'ok' }, attemptedAt);
+                    retried += 1;
+                    continue;
+                }
+                if (kind !== 'pdf' && kind !== 'epub' && kind !== 'snapshot') continue;
+                let row = await db.getAttachmentProcessingState(ref.libraryId, ref.zoteroKey);
+                const readingError = await db.getAttachmentReadingError(ref.libraryId, ref.zoteroKey);
+                if (!row && readingError) row = await db.ensureAttachmentProcessingState({
+                    libraryId: ref.libraryId, zoteroKey: ref.zoteroKey, itemId: item.id, contentKind: kind,
+                });
+                if (!row) continue;
+
+                const extractFailed = row.extractStatus === 'failed' || row.extractStatus === 'skipped';
+                const ocrFailed = row.ocrStatus === 'failed';
+                // The original scan observation can remain after OCR prepares the text.
+                // It must not turn a subsequent index retry into another extraction.
+                const unresolvedReadingError = Boolean(readingError)
+                    && !(readingError === 'ocr_required' && row.ocrStatus === 'done');
+                const restartExtraction = unresolvedReadingError || extractFailed
+                    || (ocrFailed && (
+                        hasRecoverableAvailabilityFailure(row)
+                        || !(await this.hasOcrDetectionMetadata(item))
+                    ));
+                if (ocrFailed && row.fileHash) {
+                    await db.clearDocumentProcessingFailure(row.fileHash, 'ocr', OCR_ENGINE_VERSION);
+                }
+                if (restartExtraction) {
+                    await Zotero.AsterMargin?.documentCache?.invalidate(ref.libraryId, ref.zoteroKey);
+                    await db.resetAttachmentExtraction(ref.libraryId, ref.zoteroKey, 'user_retry');
+                    if (ocrFailed) await db.resetAttachmentOcr(ref.libraryId, ref.zoteroKey, 'user_retry');
+                    row = {
+                        ...row,
+                        extractStatus: null,
+                        ocrStatus: ocrFailed ? null : row.ocrStatus,
+                        lastError: 'user_retry',
+                    };
+                } else if (ocrFailed) {
+                    await db.requeueAttachmentOcr(ref.libraryId, ref.zoteroKey, 'user_retry');
+                    await db.deleteBackgroundDeadLetters(ref.libraryId, ref.zoteroKey);
+                    await enqueueOcrJob({
+                        item,
+                        libraryId: ref.libraryId,
+                        zoteroKey: ref.zoteroKey,
+                        itemId: item.id,
+                        pageCount: null,
+                        priority: OCR_PRIORITY_ON_DEMAND,
+                        requestContext: 'interactive',
+                    });
+                    retried += 1;
+                    continue;
+                } else if (row.upsertStatus === 'failed') {
+                    await db.resetAttachmentUpsert(ref.libraryId, ref.zoteroKey, 'user_retry');
+                    if (row.structuredDocumentHash) {
+                        await db.clearDocumentProcessingFailure(row.structuredDocumentHash, 'fulltext_upsert');
+                    }
+                    row = { ...row, upsertStatus: null, lastError: 'user_retry' };
+                }
+                // A dead letter can outlive a non-terminal ledger row (the job died
+                // before an executor recorded a verdict); dropping it is what lets
+                // the fresh job be counted as progress rather than as the old failure.
+                await db.deleteBackgroundDeadLetters(ref.libraryId, ref.zoteroKey);
+                await this.reconcileAttachment(db, item, kind, false, jobs, row, false, 'interactive');
+                retried += 1;
+            }
+            // An explicit retry is scoped to these attachments and works with the
+            // library-wide background sweep off. Its OCR continuation inherits the priority.
+            for (const job of jobs) job.priority = OCR_PRIORITY_ON_DEMAND;
+            if (jobs.length > 0) await db.enqueueBackgroundJobs(jobs);
+            if (retried > 0) {
+                Zotero.AsterMargin?.backgroundExtractor?.requestImmediateDrain();
+                Zotero.AsterMargin?.backgroundExtractor?.notify();
+            }
+            return retried;
+        } finally {
+            await finishDiscovery?.();
+        }
+    }
+
+    /**
+     * True when the document cache still holds current "no text layer"
+     * metadata with a page count for this attachment. The OCR executor resolves
+     * its job from that row and retires with `no_page_count` without it, so an
+     * OCR retry may only skip re-extraction while it is present.
+     */
+    private async hasOcrDetectionMetadata(item: Zotero.Item): Promise<boolean> {
+        const cache = Zotero.AsterMargin?.documentCache;
+        if (!cache) return false;
+        const source = await resolveAttachmentFileSource({ item, localSizeStrategy: 'stat' });
+        if (source.kind === 'error') return false;
+        const meta = await cache
+            .getMetadata({ libraryId: item.libraryID, zoteroKey: item.key }, source.source.filePath)
+            .catch(() => null);
+        return (meta?.pageCount ?? 0) >= 1;
+    }
+
+    private schedule(delayMs: number, force = false): void {
+        if (this.stopped) return;
+        this.scheduledForce = this.scheduledForce || force;
+        if (this.timer) clearTimeout(this.timer);
+        this.timer = setTimeout(() => {
+            this.timer = null;
+            const scheduledForce = this.scheduledForce;
+            this.scheduledForce = false;
+            void this.run(scheduledForce);
+        }, delayMs);
+        (this.timer as any)?.unref?.();
+    }
+
+    private async run(force: boolean): Promise<void> {
+        if (this.stopped || this.running) {
+            if (this.running) {
+                this.pendingWake = true;
+                this.pendingForce = this.pendingForce || (force && !this.activeForce);
+            }
+            return;
+        }
+        this.running = true;
+        this.activeForce = force;
+        const generation = this.generation;
+        let finishDiscovery: (() => Promise<void>) | undefined;
+        try {
+            finishDiscovery = await Zotero.AsterMargin?.background?.beginProcessingDiscovery();
+            if (Zotero.AsterMargin?.libraryScopeInitialized !== true) {
+                return;
+            }
+            const db = Zotero.AsterMargin?.db;
+            if (!db) return;
+
+            const targeted = this.pendingAttachments.size > 0;
+            await this.reconcileNotifiedAttachments(db, generation);
+            if (this.cancelled(generation)) return;
+            if (this.ocrAdmissionReopened) {
+                this.ocrAdmissionReopened = false;
+                await this.resumeUnavailableOcr(db, this.listProcessingLibraryIds(), 'all', generation);
+                if (this.cancelled(generation)) return;
+            }
+            Zotero.AsterMargin?.backgroundExtractor?.notify();
+            // Reading activity needs an attachment check, not a whole-library enumeration.
+            // Keep the periodic deadline independent of those notifications.
+            if (targeted && !force && Date.now() < this.nextScanAt) return;
+            const libraries = this.listProcessingLibraryIds();
+            for (const id of this.admissionScopes.keys()) {
+                if (!libraries.includes(id)) this.admissionScopes.delete(id);
+            }
+            for (const libraryId of libraries) {
+                if (this.cancelled(generation)) return;
+                await this.reconcileLibrary(db, libraryId, force, generation);
+            }
+            await this.resumeUnavailableOcr(db, libraries, 'probe', generation);
+            this.nextScanAt = Date.now() + PROCESSING_RECONCILE_INTERVAL_MS;
+            Zotero.AsterMargin?.backgroundExtractor?.notify();
+        } catch (error) {
+            logger(`ReconcilerService: reconcile failed: ${error}`, 1);
+        } finally {
+            await finishDiscovery?.();
+            this.running = false;
+            for (const resolve of this.idleWaiters.splice(0)) resolve();
+            this.activeForce = false;
+            if (force) {
+                for (const resolve of this.forceWaiters.splice(0)) resolve();
+            }
+            if (!this.stopped) {
+                const wake = this.pendingWake;
+                const forceNext = this.pendingForce;
+                this.pendingWake = false;
+                this.pendingForce = false;
+                this.schedule(wake ? 0 : this.nextScanAt > Date.now()
+                    ? this.nextScanAt - Date.now() : PROCESSING_RECONCILE_INTERVAL_MS, forceNext);
+            }
+        }
+    }
+
+    private listProcessingLibraryIds(): number[] {
+        return Zotero.Libraries.getAll()
+            .filter((library) => (library.libraryType === 'user' || library.libraryType === 'group')
+                && isBackgroundProcessingLibraryEnabled(library.libraryID))
+            .map((library) => library.libraryID);
+    }
+
+    /**
+     * Ticket OCR again for attachments parked because the OCR API was not
+     * accepting work (`ocr_service_unavailable`). A refused request creates no
+     * backend job, so nothing else retries them while the account, entitlement
+     * and library cursor stay unchanged.
+     *
+     * `probe` runs once per periodic pass and tickets only the attachment that
+     * has waited longest, and nothing while any parked attachment already has a
+     * ticket, so a long outage costs one OCR request per pass. Missing and
+     * trashed attachments are passed over, and each probed attachment moves to
+     * the back of the queue, so one whose ticket ends before reaching the OCR
+     * API (no local file, no hash, …) cannot hold the head of the queue. When
+     * the request is accepted, the OCR executor calls
+     * {@link notifyOcrAdmissionReopened} and the next pass runs `all`, which
+     * tickets every remaining parked attachment.
+     */
+    private async resumeUnavailableOcr(
+        db: QueueDB,
+        libraryIds: number[],
+        mode: 'probe' | 'all',
+        generation: number,
+    ): Promise<void> {
+        if (!backgroundProcessingEnabled() || Zotero.AsterMargin?.hasOcrAccess !== true) return;
+        const parked = await db.getOcrUnavailableAttachments(libraryIds);
+        if (mode === 'probe' && parked.some((row) => row.ticketed)) return;
+        let ticketed = 0;
+        for (const { libraryId, zoteroKey } of parked.filter((row) => !row.ticketed)) {
+            if (mode === 'probe' && ticketed > 0) break;
+            if (this.cancelled(generation)) return;
+            if (!isBackgroundProcessingLibraryEnabled(libraryId)) continue;
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(libraryId, zoteroKey);
+            if (item && item.parentID) await Zotero.Items.getAsync(item.parentID);
+            if (!item || safeIsInTrash(item) !== false) continue;
+            if (mode === 'probe') await db.touchAttachmentOcrUnavailable(libraryId, zoteroKey);
+            try {
+                if (await enqueueOcrJob({
+                    item,
+                    libraryId,
+                    zoteroKey,
+                    itemId: item.id,
+                    pageCount: null,
+                    priority: OCR_PRIORITY_BACKFILL,
+                    requestContext: 'backfill',
+                })) ticketed += 1;
+            } catch (error) {
+                logger(`ReconcilerService: OCR retry enqueue failed for ${libraryId}-${zoteroKey}: ${error}`, 2);
+            }
+        }
+        if (ticketed > 0) {
+            logger(`ReconcilerService: ticketed ${ticketed} of ${parked.length} attachment(s) waiting for OCR admission (${mode})`, 3);
+            Zotero.AsterMargin?.backgroundExtractor?.notify();
+        }
+    }
+
+    private cancelled(generation: number): boolean {
+        return this.stopped
+            || generation !== this.generation
+            || Zotero.__astermarginShuttingDown === true;
+    }
+
+    private async reconcileLibrary(
+        db: QueueDB,
+        libraryId: number,
+        force: boolean,
+        generation: number,
+    ): Promise<void> {
+        await this.reconcileReadingState(db, libraryId, generation);
+        if (this.cancelled(generation) || !backgroundProcessingEnabled()) return;
+        const cursor = await this.readLibraryCursor(libraryId);
+        const previous = await db.getProcessingIndexState(libraryId);
+        const safetyDiffDue = !!previous
+            && Date.now() - previous.lastScanTimestamp >= FULL_DIFF_SAFETY_INTERVAL_MS;
+        const fullDiffDue = force || !previous || safetyDiffDue;
+        const admissionScope = JSON.stringify([
+            Zotero.AsterMargin?.account?.getGeneration(),
+            Zotero.AsterMargin?.hasOcrAccess,
+            Zotero.AsterMargin?.hasSearchIndexAccess,
+        ]);
+        const admissionChanged = this.admissionScopes.get(libraryId) !== admissionScope;
+        const cursorChanged = !previous
+            || previous.maxClientDateModified !== cursor.maxClientDateModified
+            || previous.attachmentCount !== cursor.attachmentCount
+            || previous.ledgerRowCount !== (await db.getAttachmentProcessingAggregates(libraryId)).total;
+        if (!cursorChanged && !fullDiffDue && !admissionChanged) return;
+
+        // Weekly file stats are deliberately idle-only. A forced diagnostic pass
+        // may run the safety diff immediately. Do not
+        // advance the weekly timestamp when an active user prevented the stat
+        // sweep, or external byte changes could be postponed indefinitely.
+        const idleForStats = force || getSystemIdleTimeMs() >= IDLE_THRESHOLD_MS;
+        if (!cursorChanged && safetyDiffDue && !idleForStats && !admissionChanged) return;
+        const statFiles = force || (safetyDiffDue && idleForStats);
+        const items = await this.listProcessableAttachments(libraryId);
+        const ledgerRows = await db.getAttachmentProcessingStatesByLibrary(libraryId);
+        const ledgerByKey = new Map(ledgerRows.map((row) => [row.zoteroKey, row]));
+        const liveKeys = new Set<string>();
+        for (let start = 0; start < items.length; start += ATTACHMENT_SCAN_BATCH_SIZE) {
+            const batch = items.slice(start, start + ATTACHMENT_SCAN_BATCH_SIZE);
+            const jobs: BackgroundJobInput[] = [];
+            for (const item of batch) {
+                if (this.cancelled(generation)) return;
+                const kind = getReadableContentKind(item);
+                if (kind !== 'pdf' && kind !== 'epub' && kind !== 'snapshot') continue;
+                liveKeys.add(item.key);
+                await this.reconcileAttachment(
+                    db,
+                    item,
+                    kind,
+                    statFiles,
+                    jobs,
+                    ledgerByKey.get(item.key),
+                );
+            }
+            await db.enqueueBackgroundJobs(jobs);
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+        await this.enqueueProtectedOcrRepreparation(db, libraryId, liveKeys, generation);
+
+        // Heal missed delete notifications while a full enumeration is already
+        // happening. Untag work is persisted with the local ledger rows' removal.
+        await this.removeAttachments(db, libraryId, ledgerRows
+            .filter((row) => !liveKeys.has(row.zoteroKey)).map((row) => row.zoteroKey));
+
+        if (!isBackgroundProcessingLibraryEnabled(libraryId)) return;
+        const ledgerRowCount = (await db.getAttachmentProcessingAggregates(libraryId)).total;
+        const state: ProcessingIndexStateRecord = {
+            libraryId,
+            maxClientDateModified: cursor.maxClientDateModified,
+            attachmentCount: cursor.attachmentCount,
+            ledgerRowCount,
+            lastScanTimestamp: !statFiles && previous
+                ? previous.lastScanTimestamp
+                : Date.now(),
+        };
+        await db.upsertProcessingIndexState(state);
+        this.admissionScopes.set(libraryId, admissionScope);
+    }
+
+    private async reconcileAttachment(
+        db: QueueDB,
+        item: Zotero.Item,
+        kind: ProcessableKind,
+        statFile: boolean,
+        jobs: BackgroundJobInput[],
+        existing?: AttachmentProcessingStateRecord,
+        deepCheck = statFile,
+        requestContext: 'interactive' | 'backfill' = 'backfill',
+    ): Promise<void> {
+        if (!isBackgroundProcessingLibraryEnabled(item.libraryID)) return;
+        let row = existing;
+        const kindChanged = !!row && row.contentKind !== kind;
+        if (!row || row.itemId !== item.id || row.contentKind !== kind) {
+            row = await db.ensureAttachmentProcessingState({
+                libraryId: item.libraryID,
+                zoteroKey: item.key,
+                itemId: item.id,
+                contentKind: kind,
+            });
+        }
+
+        // The reconciler owns these resets, so the row is patched in memory
+        // instead of being refetched after each UPDATE.
+        const expectedSchema = expectedExtractionSchemaVersion(kind);
+        if (expectedSchema && row.extractStatus === 'done'
+            && row.extractSchemaVersion !== expectedSchema) {
+            await db.resetAttachmentExtraction(item.libraryID, item.key, 'extract_schema_changed');
+            row = { ...row, extractStatus: null, lastError: 'extract_schema_changed' };
+        }
+        if (kind === 'pdf' && row.ocrStatus === 'done'
+            && row.ocrEngineVersion !== OCR_ENGINE_VERSION) {
+            await db.resetAttachmentOcr(item.libraryID, item.key, 'ocr_engine_changed');
+            row = { ...row, ocrStatus: null, lastError: 'ocr_engine_changed' };
+        }
+        // This offline check uses a minimum floor; online reconciliation and
+        // uploads use the server requirements, which may advertise a newer version.
+        const storedIndexVersion = Number(row.upsertIndexVersion ?? 0);
+        if (row.upsertStatus === 'done' && storedIndexVersion < EXPECTED_SEARCH_INDEX_VERSION) {
+            await db.resetAttachmentUpsert(item.libraryID, item.key, 'index_version_changed');
+            row = { ...row, upsertStatus: null, lastError: 'index_version_changed' };
+        }
+
+        if (statFile || kindChanged) {
+            const observation = await observeAttachmentSource(item, kind);
+            if (!isBackgroundProcessingLibraryEnabled(item.libraryID)) return;
+            if (observation && row.extractionSource != null && !kindChanged
+                && isLegacyRemoteIdentity(row.extractionSource, observation.identity)) {
+                const adopted = await db.replaceAttachmentExtractionSource({
+                    libraryId: item.libraryID, zoteroKey: item.key,
+                    expectedSource: row.extractionSource, source: observation.identity,
+                });
+                if (!adopted) return;
+                row = { ...row, extractionSource: observation.identity };
+            }
+            if (observation && row.extractionSource != null && !kindChanged
+                && observation.identity !== row.extractionSource) {
+                const relocation = await this.relocateUnchangedBytes(db, item, row, observation.identity, jobs);
+                if (relocation === 'stale') return;
+                if (relocation === 'relocated') {
+                    row = { ...row, extractionSource: observation.identity, fileMtimeMs: observation.signature!.mtime_ms };
+                }
+            }
+            const changed = observation && row.extractionSource != null && observation.identity !== row.extractionSource;
+            // Legacy successes can adopt a matching local signature without work.
+            // Unknown failures are rechecked only by a deep pass, never by reading activity.
+            const legacyChanged = observation?.signature && row.extractionSource == null
+                && row.fileMtimeMs != null && row.fileSizeBytes != null
+                && (observation.signature.mtime_ms !== row.fileMtimeMs || observation.signature.size_bytes !== row.fileSizeBytes);
+            const legacyMatches = observation?.signature && row.extractionSource == null
+                && row.extractStatus === 'done' && row.fileMtimeMs === observation.signature.mtime_ms
+                && row.fileSizeBytes === observation.signature.size_bytes;
+            if (legacyMatches && observation) {
+                const adopted = await db.adoptAttachmentExtractionSource({
+                    libraryId: item.libraryID, zoteroKey: item.key, source: observation.identity,
+                    contentKind: kind, fileMtimeMs: observation.signature!.mtime_ms,
+                    fileSizeBytes: observation.signature!.size_bytes,
+                });
+                if (!adopted) return;
+                row = { ...row, extractionSource: observation.identity };
+            }
+            const unknown = observation && row.extractionSource == null && row.extractStatus !== null;
+            const availabilityRetry = deepCheck && hasRecoverableAvailabilityFailure(row);
+            if (kindChanged || changed || legacyChanged || (deepCheck && unknown) || availabilityRetry) {
+                await Zotero.AsterMargin?.documentCache?.invalidate(item.libraryID, item.key);
+                await db.resetAttachmentExtraction(item.libraryID, item.key, 'source_recheck');
+                if (kindChanged || changed || legacyChanged) {
+                    await db.deleteBackgroundDeadLetters(item.libraryID, item.key);
+                }
+                if (availabilityRetry && row.ocrStatus === 'failed') {
+                    await db.resetAttachmentOcr(item.libraryID, item.key, 'availability_recheck');
+                    row = { ...row, ocrStatus: null };
+                }
+                row = { ...row, extractStatus: null, lastError: 'source_recheck' };
+            }
+        }
+
+        if (row.extractStatus === null) {
+            const attemptedAt = Date.now();
+            const source = await resolveAttachmentFileSource({
+                item,
+                localSizeStrategy: 'stat',
+            });
+            if (source.kind === 'error') {
+                const observation = await observeAttachmentSource(item, kind, source);
+                if (!isBackgroundProcessingLibraryEnabled(item.libraryID)) return;
+                await db.markAttachmentExtractFailure({
+                    libraryId: item.libraryID,
+                    zoteroKey: item.key,
+                    status: 'skipped',
+                    error: source.code,
+                    attemptedAt,
+                    extractionSource: observation?.identity ?? null,
+                });
+                return;
+            }
+            jobs.push({
+                jobType: 'document_extract',
+                libraryId: item.libraryID,
+                itemId: item.id,
+                zoteroKey: item.key,
+                contentKind: kind,
+                payloadKind: 'structured',
+                priority: requestContext === 'interactive' ? OCR_PRIORITY_ON_DEMAND : BACKGROUND_EXTRACT_PRIORITY,
+                payload: { ...buildBackgroundExtractPayload(kind), request_context: requestContext },
+                now: Date.now(),
+            });
+            return;
+        }
+        if (row.extractStatus !== 'done') return;
+
+        if (
+            kind === 'pdf'
+            && row.ocrStatus === 'needed'
+            && Zotero.AsterMargin?.hasOcrAccess === true
+        ) {
+            // Attachments parked by a closed admission gate are resumed by
+            // resumeUnavailableOcr; re-ticketing them on every library change
+            // would send one OCR request per parked scan during an outage.
+            if (requestContext === 'backfill' && row.lastError === OCR_SERVICE_UNAVAILABLE) return;
+            maybeEnqueueOcrJob({
+                item,
+                libraryId: item.libraryID,
+                zoteroKey: item.key,
+                itemId: item.id,
+                pageCount: null,
+                priority: requestContext === 'interactive' ? OCR_PRIORITY_ON_DEMAND : OCR_PRIORITY_BACKFILL,
+                requestContext,
+            });
+            return;
+        }
+
+        const ocrReady = kind !== 'pdf'
+            || row.ocrStatus === 'na'
+            || row.ocrStatus === 'done';
+        if (
+            Zotero.AsterMargin?.hasSearchIndexAccess === true
+            && ocrReady
+            && row.structuredDocumentHash
+            && row.upsertStatus === null
+        ) {
+            jobs.push({
+                jobType: 'fulltext_upsert',
+                libraryId: item.libraryID,
+                itemId: item.id,
+                zoteroKey: item.key,
+                contentKind: kind,
+                payloadKind: 'structured',
+                priority: BACKGROUND_UPSERT_PRIORITY,
+                payload: buildIndexJobPayload(kind, {
+                    docHash: row.structuredDocumentHash,
+                }),
+                now: Date.now(),
+            });
+        }
+    }
+
+    /**
+     * Keep a successful extraction when only the file's path or mtime changed:
+     * a rename, a move, or a rewritten mtime. The bytes are compared with the
+     * recorded hash; on a match the document cache and the ledger adopt the new
+     * location, so nothing is extracted, OCR'd or indexed again. `changed`
+     * leaves the attachment to the regular reset; `stale` means the row or the
+     * library scope moved on while the file was hashed.
+     *
+     * A cache entry already discarded before this check (a read after the move
+     * no longer matched it) is rebuilt by a cache-preparation job, which keeps
+     * the ledger and index state, including a retained OCR hash.
+     */
+    private async relocateUnchangedBytes(
+        db: QueueDB,
+        item: Zotero.Item,
+        row: AttachmentProcessingStateRecord,
+        observed: string,
+        jobs: BackgroundJobInput[],
+    ): Promise<'relocated' | 'changed' | 'stale'> {
+        if (row.extractStatus !== 'done' || !row.fileHash || row.extractionSource == null) return 'changed';
+        const relocation = relocatedLocalIdentity(row.extractionSource, observed);
+        if (!relocation) return 'changed';
+        let fileHash: string | null = null;
+        try {
+            fileHash = await item.attachmentHash || null;
+        } catch (error) {
+            logger(`ReconcilerService: attachmentHash failed for ${item.libraryID}-${item.key}: ${error}`, 2);
+        }
+        if (fileHash !== row.fileHash) return 'changed';
+        // Bytes replaced while they were hashed must not inherit the old verdict.
+        const after = await observeAttachmentSource(item, row.contentKind);
+        if (after?.identity !== observed) return 'changed';
+        if (!isBackgroundProcessingLibraryEnabled(item.libraryID)) return 'stale';
+        // The cache is relocated first: the verified bytes make it valid for the
+        // new location even if the ledger row changes before its own update.
+        const cached = await Zotero.AsterMargin?.documentCache?.relocateSource(
+            { libraryId: item.libraryID, zoteroKey: item.key }, relocation.from, relocation.to);
+        const relocated = await db.relocateAttachmentExtractionSource({
+            libraryId: item.libraryID,
+            zoteroKey: item.key,
+            expectedSource: row.extractionSource,
+            fileHash,
+            source: observed,
+            fileMtimeMs: relocation.to.mtimeMs,
+        });
+        if (!relocated) return 'stale';
+        const preparable = row.ocrStatus === 'na'
+            || (row.ocrStatus === 'done' && Zotero.AsterMargin?.hasOcrAccess === true);
+        if (cached === 'missing' && preparable) {
+            jobs.push({
+                jobType: 'document_extract',
+                libraryId: item.libraryID,
+                itemId: item.id,
+                zoteroKey: item.key,
+                contentKind: row.contentKind,
+                payloadKind: 'structured',
+                priority: BACKGROUND_EXTRACT_PRIORITY,
+                payload: { ...buildBackgroundExtractPayload(row.contentKind), prepare_cache: true },
+                now: Date.now(),
+            });
+        }
+        return 'relocated';
+    }
+
+    /**
+     * Ticket OCR for processed scans whose retained preparation a cache-format
+     * update made unservable. Their ledger still reads as prepared, so nothing
+     * else would prepare them again. The ticket reuses the backend's OCR
+     * artifact when it still has one. Extraction-schema changes reach the same
+     * ticket through the reset extraction in {@link reconcileAttachment}.
+     */
+    private async enqueueProtectedOcrRepreparation(
+        db: QueueDB,
+        libraryId: number,
+        liveKeys: Set<string>,
+        generation: number,
+    ): Promise<void> {
+        const cache = Zotero.AsterMargin?.documentCache;
+        if (!cache || Zotero.AsterMargin?.hasOcrAccess !== true) return;
+        for (const key of await cache.getProtectedRepreparationKeys(libraryId)) {
+            if (this.cancelled(generation) || !isBackgroundProcessingLibraryEnabled(libraryId)) return;
+            if (!liveKeys.has(key)) continue;
+            const row = await db.getAttachmentProcessingState(libraryId, key);
+            if (row?.contentKind !== 'pdf' || row.extractStatus !== 'done' || row.ocrStatus !== 'done') continue;
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(libraryId, key);
+            if (!item || !isBackgroundProcessingLibraryEnabled(libraryId)) continue;
+            await enqueueOcrJob({
+                item,
+                libraryId,
+                zoteroKey: key,
+                itemId: item.id,
+                pageCount: null,
+                priority: OCR_PRIORITY_BACKFILL,
+                requestContext: 'backfill',
+            }).catch((error) => {
+                logger(`ReconcilerService: OCR re-preparation enqueue failed for ${libraryId}-${key}: ${error}`, 2);
+            });
+        }
+    }
+
+    /**
+     * Heal missed deletions for on-demand reads, including attachments outside
+     * the index pipeline. AsterMargin tables count as gone, so state recorded for
+     * one before tables were excluded is dropped even while processing is paused.
+     */
+    private async reconcileReadingState(db: QueueDB, libraryId: number, generation: number): Promise<void> {
+        const readingKeys = await db.getAttachmentReadingKeysByLibrary(libraryId);
+        if (readingKeys.length === 0) return;
+        const liveKeys = new Set<string>();
+        await Zotero.DB.queryAsync(
+            `SELECT I.key FROM items I
+             JOIN itemAttachments IA USING (itemID)
+             WHERE I.libraryID = ?
+               AND I.itemID NOT IN (SELECT itemID FROM deletedItems)
+               AND NOT EXISTS (SELECT 1 FROM deletedItems D WHERE D.itemID = IA.parentItemID)
+               AND NOT ${tableAttachmentSql('IA')}`,
+            [libraryId],
+            { onRow: (row: any) => liveKeys.add(row.getResultByIndex(0)) },
+        );
+        for (const key of readingKeys) {
+            if (this.cancelled(generation) || !isBackgroundProcessingLibraryEnabled(libraryId)) return;
+            if (!liveKeys.has(key)) {
+                // Preserve remote cleanup while dropping either local observation.
+                await this.removeAttachments(db, libraryId, [key]);
+            }
+        }
+    }
+
+    private async readLibraryCursor(libraryId: number): Promise<LibraryCursor> {
+        const rows: LibraryCursor[] = [];
+        await Zotero.DB.queryAsync(
+            `SELECT
+                MAX(I.clientDateModified),
+                SUM(CASE WHEN IA.itemID IS NOT NULL
+                    AND IA.linkMode != ?
+                    AND ${PROCESSABLE_ATTACHMENT_SQL} THEN 1 ELSE 0 END)
+             FROM items I
+             LEFT JOIN itemAttachments IA USING (itemID)
+             WHERE I.libraryID = ?
+               AND I.itemID NOT IN (SELECT itemID FROM deletedItems)
+               AND NOT EXISTS (SELECT 1 FROM deletedItems D WHERE D.itemID = IA.parentItemID)`,
+            [Zotero.Attachments.LINK_MODE_LINKED_URL, libraryId],
+            {
+                onRow: (row: any) => rows.push({
+                    maxClientDateModified: row.getResultByIndex(0) ?? null,
+                    attachmentCount: Number(row.getResultByIndex(1)) || 0,
+                }),
+            },
+        );
+        return rows[0] ?? { maxClientDateModified: null, attachmentCount: 0 };
+    }
+
+    private async listProcessableAttachments(libraryId: number): Promise<Zotero.Item[]> {
+        const ids: number[] = [];
+        await Zotero.DB.queryAsync(
+            `SELECT I.itemID
+             FROM items I
+             JOIN itemAttachments IA USING (itemID)
+             WHERE I.libraryID = ?
+               AND I.itemID NOT IN (SELECT itemID FROM deletedItems)
+               AND NOT EXISTS (SELECT 1 FROM deletedItems D WHERE D.itemID = IA.parentItemID)
+               AND IA.linkMode != ?
+               AND ${PROCESSABLE_ATTACHMENT_SQL}
+             ORDER BY I.itemID`,
+            [libraryId, Zotero.Attachments.LINK_MODE_LINKED_URL],
+            { onRow: (row: any) => ids.push(row.getResultByIndex(0)) },
+        );
+        if (ids.length === 0) return [];
+        const items = (await Zotero.Items.getAsync(ids)).filter(
+            (item): item is Zotero.Item => !!item && safeIsInTrash(item) !== true,
+        );
+        return items;
+    }
+}

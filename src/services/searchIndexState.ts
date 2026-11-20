@@ -1,0 +1,116 @@
+import type { SearchIndexState, SearchIndexLibraryState } from '@astermargin/agent-core/protocol/agentProtocol';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { libraryRefForLibraryID } from '../utils/libraryIdentity';
+import { processableAttachmentSql, processableKindFromStoredFields } from '../utils/attachmentFiles';
+import { getIndexScopeRef, getZoteroUserIdentifier } from '../utils/zoteroInstanceIdentity';
+import { expectedExtractionSchemaVersion } from './documentExtraction/shared/extractionSchemaVersions';
+import { EXPECTED_SEARCH_INDEX_VERSION } from './backgroundProcessing/constants';
+
+export interface SearchPreparationRow {
+    libraryId: number;
+    key: string;
+    contentKind: 'pdf' | 'epub' | 'snapshot';
+    extractStatus: string | null;
+    extractSchemaVersion: string | null;
+    ocrStatus: string | null;
+    upsertStatus: string | null;
+    upsertIndexVersion: string | null;
+    remoteIdentity: string | null;
+    error: string | null;
+    readingSucceeded: boolean;
+}
+
+// Unknown and service failures remain pending, even after retry exhaustion.
+const UNAVAILABLE_CODES = new Set([
+    'file_missing', 'encrypted', 'invalid_pdf', 'file_too_large', 'too_many_pages',
+    'pdf_too_complex', 'empty_document', 'insufficient_text', 'ocr_page_cap', 'ocr_no_text',
+    'ocr_service_unavailable',
+]);
+
+export function classifySearchPreparation(
+    row: SearchPreparationRow,
+    identity: { accountId: string; localId: string; scopeRef: string },
+): 'indexed' | 'unavailable' | 'pending' {
+    let remote: { index_account_id?: string; index_scope_ref?: string; index_local_id?: string } | null = null;
+    try { remote = row.remoteIdentity ? JSON.parse(row.remoteIdentity) : null; } catch { /* Unknown ownership is pending. */ }
+    if (row.upsertStatus === 'done' && row.extractStatus === 'done'
+        && row.extractSchemaVersion === expectedExtractionSchemaVersion(row.contentKind)
+        && Number(row.upsertIndexVersion) >= EXPECTED_SEARCH_INDEX_VERSION
+        && remote?.index_account_id === identity.accountId
+        && remote?.index_scope_ref === identity.scopeRef
+        && remote?.index_local_id === identity.localId) return 'indexed';
+
+    // Reading outcomes intentionally survive retries. Only settled processing
+    // outcomes can remove an attachment from the denominator.
+    const settled = row.extractStatus === 'failed' || row.extractStatus === 'skipped'
+        || (row.extractStatus === 'done' && row.ocrStatus === 'failed');
+    const codes = row.error?.split(':').map(part => part.trim()) ?? [];
+    // Exact legacy terminal text is retained for already-persisted outcomes.
+    const nativeDocumentLimitation = (
+        (row.contentKind === 'epub' || row.contentKind === 'snapshot')
+        && row.error === 'no_text_layer'
+    ) || (
+        row.contentKind === 'epub'
+        && row.error?.startsWith('permanent_epub:') === true
+    );
+    const unavailable = nativeDocumentLimitation || codes.some(code => UNAVAILABLE_CODES.has(code))
+        || row.error === 'OCR produced no usable text layer';
+    const ocrAdmissionUnavailable = row.ocrStatus === 'needed'
+        && codes.includes('ocr_service_unavailable');
+    if (!row.readingSucceeded && unavailable && (settled || ocrAdmissionUnavailable)) return 'unavailable';
+    return 'pending';
+}
+
+/** Two local reads per dispatch; no file I/O, item loading, cache or remote requests. */
+export async function getSearchIndexState(): Promise<SearchIndexState | undefined> {
+    try {
+        const astermargin = Zotero.AsterMargin;
+        if (!astermargin?.hasSearchIndexAccess || !astermargin.libraryScopeInitialized || !astermargin.db) return undefined;
+        const account = astermargin.account;
+        if (!account || !astermargin.searchableLibraryIds) return undefined;
+        const generation = account.getGeneration();
+        const accountId = account.getSnapshot().session?.user.id;
+        if (!accountId) return undefined;
+        const libraryIds = [...astermargin.searchableLibraryIds].sort((a, b) => a - b);
+        const localId = getZoteroUserIdentifier().localUserKey;
+        const libraries = new Map<number, SearchIndexLibraryState>();
+        const scopes = new Map<number, string>();
+        for (const id of libraryIds) {
+            const ref = libraryRefForLibraryID(id);
+            const scope = getIndexScopeRef(id);
+            if (!ref || !scope) return undefined;
+            libraries.set(id, { library_ref: ref, total: 0, indexed: 0, unavailable: 0 });
+            scopes.set(id, scope);
+        }
+        const rows = await astermargin.db.getSearchPreparationRows(libraryIds);
+        const states = new Map(rows.map(row => [`${row.libraryId}:${row.key}`, row]));
+        if (libraryIds.length) await Zotero.DB.queryAsync(
+            `SELECT i.libraryID, i.key, a.contentType, a.path
+             FROM items i JOIN itemAttachments a USING (itemID)
+             WHERE i.libraryID IN (${libraryIds.map(() => '?').join(',')})
+               AND a.linkMode != ?
+               AND ${processableAttachmentSql('a')}
+               AND NOT EXISTS (SELECT 1 FROM deletedItems d WHERE d.itemID = i.itemID)
+               AND NOT EXISTS (SELECT 1 FROM deletedItems d WHERE d.itemID = a.parentItemID)`,
+            [...libraryIds, Zotero.Attachments.LINK_MODE_LINKED_URL],
+            { onRow: (result: any) => {
+                const kind = processableKindFromStoredFields(result.getResultByIndex(2), result.getResultByIndex(3));
+                if (!kind) return;
+                const id = Number(result.getResultByIndex(0));
+                const summary = libraries.get(id)!;
+                summary.total++;
+                const row = states.get(`${id}:${result.getResultByIndex(1)}`);
+                if (!row || row.contentKind !== kind) return;
+                const state = classifySearchPreparation(row, { accountId, localId, scopeRef: scopes.get(id)! });
+                if (state !== 'pending') summary[state]++;
+            } },
+        );
+        if (account.getGeneration() !== generation || !astermargin.hasSearchIndexAccess
+            || !astermargin.libraryScopeInitialized
+            || JSON.stringify([...astermargin.searchableLibraryIds].sort((a, b) => a - b)) !== JSON.stringify(libraryIds)) return undefined;
+        return { version: 1, libraries: [...libraries.values()] };
+    } catch (error) {
+        logger(`Search preparation snapshot unavailable: ${error}`, 2);
+        return undefined;
+    }
+}

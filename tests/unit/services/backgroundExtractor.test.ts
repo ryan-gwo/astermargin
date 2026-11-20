@@ -1,0 +1,3197 @@
+import { AsterMarginInstance } from '../../../src/runtime/instance';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+    AsterMarginDB,
+    BackgroundJobPayload,
+} from '../../../src/services/database';
+import type {
+    JobExecutionContext,
+    JobExecutor,
+    JobOutcome,
+} from '../../../src/services/backgroundQueue/jobExecutor';
+import { MockDBConnection } from '../../mocks/mockDBConnection';
+
+declare const Zotero: any;
+
+const mockState = {
+    extractCalls: [] as any[],
+    nextResult: { kind: 'ok' } as any,
+    hotPendingCount: 0,
+    hotQueuedCount: 0,
+    /** The background worker client, or null before it was created. */
+    background: null as null | {
+        inFlight: number;
+        queued: number;
+        warm: boolean;
+        prewarm: ReturnType<typeof vi.fn>;
+        isWarm: () => boolean;
+    },
+    mainWindow: null as any,
+    extractResolve: null as null | ((value: any) => void),
+    disposeCalls: [] as Array<string | undefined>,
+};
+
+vi.mock('../../../src/services/documentExtractionCore', () => ({
+    extractAndCacheDocument: vi.fn(async (args: any) => {
+        mockState.extractCalls.push(args);
+        if (typeof mockState.nextResult === 'function') {
+            return await mockState.nextResult(args);
+        }
+        if (mockState.nextResult instanceof Promise) {
+            return await mockState.nextResult;
+        }
+        return mockState.nextResult;
+    }),
+}));
+
+vi.mock('../../../src/astermargin-extract', () => ({
+    disposeMuPDFWorker: vi.fn(async (name?: string) => {
+        mockState.disposeCalls.push(name);
+    }),
+    getExistingMuPDFWorkerClient: vi.fn((name: string = 'hot') => {
+        if (name === 'background') return mockState.background;
+        return {
+            get inFlight() { return mockState.hotPendingCount; },
+            get queued() { return mockState.hotQueuedCount; },
+            getStats: () => ({ pendingCount: mockState.hotPendingCount, queuedCount: mockState.hotQueuedCount }),
+        };
+    }),
+    getMuPDFWorkerClient: vi.fn((name: string = 'hot') => {
+        if (name !== 'background') throw new Error('hot client is not mocked');
+        mockState.background ??= backgroundClient(false);
+        return mockState.background;
+    }),
+}));
+
+/** A background worker client stub; `prewarm` resolves when the test says so. */
+function backgroundClient(warm: boolean) {
+    const client = {
+        inFlight: 0,
+        queued: 0,
+        warm,
+        prewarm: vi.fn(() => Promise.resolve()),
+        isWarm: () => client.warm,
+    };
+    return client;
+}
+
+// `backgroundExtractor.ts` imports `safeIsInTrash` from `zoteroItemUtils`
+// (the react-free helper module), not `zoteroUtils`.
+vi.mock('../../../src/utils/zoteroItemUtils', () => ({
+    safeIsInTrash: vi.fn(() => false),
+}));
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({
+    logger: vi.fn(),
+}));
+
+// Default to "always idle" so existing test cases (which enqueue
+// priority-100 jobs) clear the idle gate without modification. Specific
+// new cases override `getSystemIdleTimeMs` per-test to simulate active use.
+vi.mock('../../../src/utils/idleService', () => ({
+    getSystemIdleTimeMs: vi.fn(() => Number.MAX_SAFE_INTEGER),
+    registerIdleObserver: vi.fn(() => () => {}),
+}));
+
+function payload(overrides: Partial<BackgroundJobPayload> = {}): BackgroundJobPayload {
+    return {
+        content_kind: 'pdf',
+        maxPages: 200,
+        timeoutSeconds: 120,
+        ...overrides,
+    };
+}
+
+function okResult(zoteroKey = 'AAAAAAAA') {
+    return {
+        kind: 'ok',
+        cached: false,
+        result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+        totalPages: 1,
+        resolvedAttachment: { libraryId: 1, zoteroKey },
+        contentType: 'application/pdf',
+    };
+}
+
+function ocrExecutor(
+    execute: JobExecutor['execute'],
+    describeFailure?: JobExecutor['describeFailure'],
+): JobExecutor {
+    return {
+        jobType: 'document_ocr',
+        execute,
+        describeFailure,
+    };
+}
+
+function setupZoteroGlobal() {
+    const item = {
+        libraryID: 1,
+        key: 'AAAAAAAA',
+        isAttachment: () => true,
+        isPDFAttachment: () => true,
+        attachmentContentType: 'application/pdf',
+    };
+    const win: any = {};
+    // Extend the shared setup.ts stub rather than replace it — initDatabase
+    // and AsterMarginDB both read `Zotero.Prefs.get`, which the global setup
+    // already provides.
+    const base = (globalThis as any).Zotero ?? {};
+    (globalThis as any).Zotero = {
+        ...base,
+        getMainWindow: vi.fn(() => win),
+        Items: {
+            getByLibraryAndKeyAsync: vi.fn(async (_libraryId: number, _key: string) => item),
+        },
+        AsterMargin: {} as any,
+        // Reset shutdown flag explicitly: a previous test's leak would
+        // otherwise cause processOnce to short-circuit with 'shutting_down'.
+        __astermarginShuttingDown: undefined,
+    };
+    // Reset nested state that the shallow spread above shares with the
+    // setup.ts stubs — a previous test mutating these would otherwise
+    // bleed across cases.
+    if ((globalThis as any).Zotero.Sync?.Runner) {
+        (globalThis as any).Zotero.Sync.Runner.syncInProgress = false;
+    }
+    (globalThis as any).Zotero.Prefs.get = vi.fn((pref: string) =>
+        pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled'
+            ? true
+            : undefined);
+    mockState.mainWindow = win;
+    return { win, item };
+}
+
+async function loadProcessor() {
+    return await import('../../../src/services/backgroundExtractor');
+}
+
+/** Wait for every job the dispatcher has launched to settle. */
+async function settleLanes(proc: unknown): Promise<void> {
+    const lanes = (proc as { laneInFlight: Map<string, Map<number, { promise: Promise<void> }>> }).laneInFlight;
+    await Promise.all([...lanes.values()].flatMap((lane) => [...lane.values()].map((entry) => entry.promise)));
+}
+
+describe('BackgroundExtractor', () => {
+    let conn: MockDBConnection;
+    let db: AsterMarginDB;
+
+    beforeEach(async () => {
+        vi.resetModules();
+        vi.clearAllMocks();
+        mockState.extractCalls = [];
+        mockState.nextResult = { kind: 'ok' };
+        mockState.hotPendingCount = 0;
+        mockState.hotQueuedCount = 0;
+        mockState.background = null;
+        mockState.disposeCalls = [];
+        mockState.extractResolve = null;
+        setupZoteroGlobal();
+        conn = new MockDBConnection();
+        db = new AsterMarginDB(conn);
+        await db.initDatabase('0.99.0');
+        // The dispatcher claims nothing until the searchable-library scope is
+        // mirrored, so every case starts with library 1 (the id all fixtures
+        // use) in scope.
+        (Zotero as any).AsterMargin = {
+            hasOcrAccess: true,
+            hasSearchIndexAccess: true,
+            runtime: new AsterMarginInstance(),
+            db,
+            libraryScopeInitialized: true,
+            searchableLibraryIds: [1],
+        };
+    });
+
+    afterEach(async () => {
+        await conn.closeDatabase();
+    });
+
+    it('gates promoted index jobs while extraction, OCR and cleanup continue', async () => {
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const execute = vi.fn(async (): Promise<JobOutcome> => ({ kind: 'retry', error: 'busy',
+            countsAsAttempt: false, retryAfterMs: 30_000, laneCooldownMs: 30_000 }));
+        proc.registerExecutor({ jobType: 'fulltext_upsert', execute }, { maxInFlight: 2 });
+        const first = await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1,
+            zoteroKey: 'AAAAAAAA', contentKind: 'pdf', payloadKind: 'structured', now: Date.now() });
+        await proc.processOnce({ awaitLaunchedJobs: true });
+        await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1,
+            zoteroKey: 'AAAAAAAA', contentKind: 'pdf', payloadKind: 'structured', now: Date.now(), priority: 1 });
+        const queued = (await db.peekBackgroundJobs()).find((job) => job.id === first.id)!;
+        expect(queued.availableAt).toBeLessThanOrEqual(Date.now());
+        const other = vi.fn(async (): Promise<JobOutcome> => ({ kind: 'complete', reason: 'done' }));
+        for (const jobType of ['document_extract', 'document_ocr', 'fulltext_untag'] as const) {
+            proc.registerExecutor({ jobType, execute: other }, { maxInFlight: 1 });
+            await db.enqueueBackgroundJob({ jobType, libraryId: 1, zoteroKey: 'BBBBBBBB',
+                contentKind: 'pdf', payloadKind: 'structured', now: Date.now() });
+        }
+        proc.requestImmediateDrain();
+        proc.notify();
+        await proc.processOnce({ awaitLaunchedJobs: true });
+        expect(other).toHaveBeenCalledTimes(3);
+        expect(execute).toHaveBeenCalledOnce();
+        expect(await db.peekBackgroundJobs()).toHaveLength(1);
+        expect(proc.getLaneStatus().fulltext_upsert?.pauseReason).toBe('busy');
+    });
+
+    it('never shortens a cooldown when a concurrent shorter failure arrives later', async () => {
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        let settleShort!: (value: JobOutcome) => void;
+        const short = new Promise<JobOutcome>((resolve) => { settleShort = resolve; });
+        const execute = vi.fn().mockResolvedValueOnce({ kind: 'retry', error: 'long', countsAsAttempt: false,
+            retryAfterMs: 60_000, laneCooldownMs: 60_000 }).mockReturnValueOnce(short);
+        proc.registerExecutor({ jobType: 'fulltext_upsert', execute }, { maxInFlight: 2 });
+        for (const zoteroKey of ['AAAAAAAA', 'BBBBBBBB']) await db.enqueueBackgroundJob({
+            jobType: 'fulltext_upsert', libraryId: 1, zoteroKey, contentKind: 'pdf', payloadKind: 'structured', now: 0 });
+        // Hold both responses until both requests have started.
+        let settleLong!: (value: JobOutcome) => void;
+        execute.mockReset().mockImplementationOnce(() => new Promise((resolve) => { settleLong = resolve; }))
+            .mockReturnValueOnce(short);
+        await proc.processOnce();
+        settleLong({ kind: 'retry', error: 'long', countsAsAttempt: false, retryAfterMs: 60_000, laneCooldownMs: 60_000 });
+        await vi.waitFor(() => expect(proc.getLaneStatus().fulltext_upsert?.pauseUntil).toBeGreaterThan(Date.now()));
+        const deadline = proc.getLaneStatus().fulltext_upsert!.pauseUntil;
+        settleShort({ kind: 'retry', error: 'short', countsAsAttempt: false, retryAfterMs: 1_000, laneCooldownMs: 1_000 });
+        await vi.waitFor(() => expect(proc.getLaneStatus().fulltext_upsert?.inFlight).toBe(0));
+        expect(proc.getLaneStatus().fulltext_upsert?.pauseUntil).toBe(deadline);
+    });
+
+    it('releases a replaced executor’s late retry without pausing its replacement', async () => {
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        let settle!: (value: JobOutcome) => void;
+        const execute = vi.fn(() => new Promise<JobOutcome>((resolve) => { settle = resolve; }));
+        proc.registerExecutor({ jobType: 'fulltext_upsert', execute }, { maxInFlight: 2 });
+        await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1, zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf', payloadKind: 'structured', now: 0 });
+        await proc.processOnce();
+        const replacement = vi.fn(async (): Promise<JobOutcome> => ({ kind: 'complete', reason: 'done' }));
+        proc.registerExecutor({ jobType: 'fulltext_upsert', execute: replacement }, { maxInFlight: 2 });
+        settle({ kind: 'retry', error: 'old account busy', countsAsAttempt: false, retryAfterMs: 60_000, laneCooldownMs: 60_000 });
+        await vi.waitFor(() => expect(proc.getLaneStatus().fulltext_upsert?.inFlight).toBe(0));
+        expect(proc.getLaneStatus().fulltext_upsert?.pauseUntil).toBeUndefined();
+        expect((await db.peekBackgroundJobs())[0].attemptCount).toBe(0);
+        await proc.processOnce({ awaitLaunchedJobs: true });
+        expect(replacement).toHaveBeenCalledOnce();
+        expect(await db.peekBackgroundJobs()).toEqual([]);
+    });
+
+    it('wakes automatically at the cooldown deadline using the dispatcher timer', async () => {
+        vi.useFakeTimers();
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        try {
+            const execute = vi.fn().mockResolvedValueOnce({ kind: 'retry', error: 'busy',
+                countsAsAttempt: false, retryAfterMs: 5_000, laneCooldownMs: 5_000 })
+                .mockResolvedValue({ kind: 'complete', reason: 'recovered' });
+            proc.registerExecutor({ jobType: 'fulltext_upsert', execute }, { maxInFlight: 2 });
+            await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1, zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf', payloadKind: 'structured', now: Date.now() });
+            proc.start();
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(execute).toHaveBeenCalledOnce();
+            proc.notify();
+            proc.requestImmediateDrain();
+            await vi.advanceTimersByTimeAsync(4_999);
+            expect(execute).toHaveBeenCalledOnce();
+            await vi.advanceTimersByTimeAsync(1);
+            expect(execute).toHaveBeenCalledTimes(2);
+            expect(await db.peekBackgroundJobs()).toEqual([]);
+        } finally {
+            await proc.stop();
+            vi.useRealTimers();
+        }
+    });
+
+    it.each(['drain', 'idle'].flatMap((mode) =>
+        ['startup_delay', 'sync_in_progress', 'hot_busy', 'library_scope_unknown', 'disabled']
+            .map((blocker) => [mode, blocker]),
+    ))('keeps the backlog gate closed in %s mode while blocked by %s', async (mode, blocker) => {
+        (Zotero as any).Prefs.get = vi.fn((pref: string) =>
+            pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled' ? true : undefined);
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        if (mode === 'drain') proc.requestImmediateDrain();
+        expect(proc.isBacklogGateOpen()).toBe(true);
+        if (blocker === 'startup_delay') (proc as any).startupDelayUntil = Date.now() + 30_000;
+        if (blocker === 'sync_in_progress') (proc as any).syncInProgress = true;
+        if (blocker === 'hot_busy') mockState.hotPendingCount = 1;
+        if (blocker === 'library_scope_unknown') (Zotero as any).AsterMargin.libraryScopeInitialized = false;
+        if (blocker === 'disabled') (proc as any).prefEnabled = false;
+        expect(proc.getDispatchBlocker()).toBe(blocker);
+        expect(proc.isBacklogGateOpen()).toBe(false);
+        if (blocker !== 'startup_delay') expect(await proc.processOnce()).toMatchObject({ processed: false, reason: blocker });
+    });
+
+    it('continues instance dispatch with no main window', async () => {
+        (Zotero as any).getMainWindow = vi.fn(() => null);
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+
+        const result = await proc.processOnce();
+
+        expect(result).toEqual({ processed: false, reason: 'empty' });
+        expect(mockState.extractCalls).toHaveLength(0);
+    });
+
+    it('returns hot_busy when the hot worker has pending dispatches', async () => {
+        mockState.hotPendingCount = 1;
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(false);
+        expect(result.reason).toBe('hot_busy');
+        expect(mockState.extractCalls).toHaveLength(0);
+    });
+
+    describe('interactive overflow', () => {
+        const enqueueExtract = (zoteroKey = 'AAAAAAAA') => db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey,
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        it('does not claim jobs while hot has queued work but nothing pending', async () => {
+            mockState.hotQueuedCount = 1;
+            await enqueueExtract();
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+
+            expect(await proc.processOnce()).toEqual({ processed: false, reason: 'hot_busy' });
+            expect(mockState.extractCalls).toHaveLength(0);
+        });
+
+        it('holds new claims while an overflow request holds the lane and resumes when it is released', async () => {
+            await enqueueExtract();
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            try {
+                mockState.background = backgroundClient(true);
+                mockState.hotPendingCount = 1;
+                const route = await proc.interactiveOverflow.acquire();
+                expect(route.slot).toBe('background');
+                // Hot drained, but the overflow request still owns the background worker.
+                mockState.hotPendingCount = 0;
+                expect(await proc.processOnce()).toEqual({ processed: false, reason: 'hot_busy' });
+                expect(mockState.extractCalls).toHaveLength(0);
+
+                const notify = vi.spyOn(proc, 'notify');
+                route.release();
+                expect(notify).toHaveBeenCalled();
+                expect(await proc.processOnce()).toMatchObject({ processed: true });
+                expect(mockState.extractCalls).toHaveLength(1);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('releases a job claimed while an overflow request took the background worker', async () => {
+            await enqueueExtract();
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            try {
+                mockState.background = backgroundClient(true);
+                let route: { slot: string; release(): void } | undefined;
+                const claim = db.claimNextBackgroundJob.bind(db);
+                vi.spyOn(db, 'claimNextBackgroundJob').mockImplementation(async (...args) => {
+                    const record = await claim(...args);
+                    // Interactive work arrives while the claim is in flight.
+                    mockState.hotPendingCount = 1;
+                    route ??= await proc.interactiveOverflow.acquire();
+                    mockState.hotPendingCount = 0;
+                    return record;
+                });
+
+                await proc.processOnce();
+
+                expect(route?.slot).toBe('background');
+                expect(mockState.extractCalls).toHaveLength(0);
+                const [job] = await db.peekBackgroundJobs();
+                expect(job.availableAt).toBeLessThanOrEqual(Date.now());
+                route!.release();
+                expect(await proc.processOnce()).toMatchObject({ processed: true });
+                expect(mockState.extractCalls).toHaveLength(1);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('holds new claims while the background worker warms up for overflow', async () => {
+            await enqueueExtract();
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            try {
+                let finishWarmup!: () => void;
+                mockState.background = backgroundClient(false);
+                mockState.background.prewarm.mockImplementation(() => new Promise<void>((resolve) => {
+                    finishWarmup = resolve;
+                }));
+                mockState.hotPendingCount = 1;
+                const route = await proc.interactiveOverflow.acquire();
+                expect(route).toMatchObject({ slot: 'hot', overflowSkip: 'bg_not_warm' });
+                expect(mockState.background.prewarm).toHaveBeenCalledTimes(1);
+
+                // The waiting request finished on hot; the warm-up still runs.
+                mockState.hotPendingCount = 0;
+                route.release();
+                expect(await proc.processOnce()).toEqual({ processed: false, reason: 'hot_busy' });
+
+                const notify = vi.spyOn(proc, 'notify');
+                mockState.background.warm = true;
+                finishWarmup();
+                await vi.waitFor(() => expect(notify).toHaveBeenCalled());
+                expect(await proc.processOnce()).toMatchObject({ processed: true });
+                expect(mockState.extractCalls).toHaveLength(1);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('never overflows onto a running OCR job and leaves it running', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_ocr',
+                libraryId: 1,
+                zoteroKey: 'BBBBBBBB',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            try {
+                let finishOcr!: () => void;
+                let ocrSignal: AbortSignal | undefined;
+                let inLane = false;
+                proc.registerExecutor(
+                    ocrExecutor(async (_record, ctx: JobExecutionContext) => {
+                        ocrSignal = ctx.externalAbortSignal;
+                        // Remote work outside the lane, then the local re-extraction in it.
+                        await new Promise<void>((resolve) => {
+                            finishOcr = resolve;
+                        });
+                        return await ctx.runOnMuPDFWorker(async () => {
+                            inLane = true;
+                            await new Promise<void>((resolve) => {
+                                finishOcr = resolve;
+                            });
+                            return { kind: 'complete', reason: 'ocr_ok' };
+                        });
+                    }),
+                    { maxInFlight: 1 },
+                );
+                const pass = proc.processOnce({ awaitLaunchedJobs: true });
+                await vi.waitFor(() => expect(finishOcr).toBeDefined());
+
+                mockState.background = backgroundClient(true);
+                mockState.hotPendingCount = 1;
+                // Between lane uses: the lane is free, but the job is still running.
+                const between = await proc.interactiveOverflow.acquire();
+                expect(between).toMatchObject({ slot: 'hot', overflowSkip: 'lane_busy' });
+                between.release();
+
+                finishOcr();
+                await vi.waitFor(() => expect(inLane).toBe(true));
+                const inside = await proc.interactiveOverflow.acquire();
+                expect(inside).toMatchObject({ slot: 'hot', overflowSkip: 'lane_busy' });
+                inside.release();
+                expect(mockState.background.prewarm).not.toHaveBeenCalled();
+                expect(ocrSignal?.aborted).toBe(false);
+
+                finishOcr();
+                await pass;
+                expect(await db.peekBackgroundJobs()).toEqual([]);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('hands the background worker to a waiting request when the running job settles, before new jobs', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_ocr',
+                libraryId: 1,
+                zoteroKey: 'BBBBBBBB',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            try {
+                let finishOcr: (() => void) | undefined;
+                proc.registerExecutor(
+                    ocrExecutor(async (_record, ctx: JobExecutionContext) => ctx.runOnMuPDFWorker(async () => {
+                        await new Promise<void>((resolve) => {
+                            finishOcr = resolve;
+                        });
+                        return { kind: 'complete', reason: 'ocr_ok' };
+                    })),
+                    { maxInFlight: 1 },
+                );
+                const pass = proc.processOnce({ awaitLaunchedJobs: true });
+                await vi.waitFor(() => expect(finishOcr).toBeDefined());
+
+                mockState.background = backgroundClient(true);
+                const hot = await proc.interactiveOverflow.acquire();
+                expect(hot.slot).toBe('hot');
+                let claimed: { slot: string; release(): void } | undefined;
+                const waiting = proc.interactiveOverflow.acquire().then((route) => {
+                    claimed = route;
+                    return route;
+                });
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                expect(claimed).toBeUndefined();
+                await enqueueExtract();
+
+                finishOcr!();
+                await pass;
+                expect((await waiting).slot).toBe('background');
+                // Interactive work still holds both workers; the queued job waits.
+                expect(await proc.processOnce()).toEqual({ processed: false, reason: 'hot_busy' });
+                expect(mockState.extractCalls).toHaveLength(0);
+
+                claimed!.release();
+                hot.release();
+                expect(await proc.processOnce()).toMatchObject({ processed: true });
+                expect(mockState.extractCalls).toHaveLength(1);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('lets maintenance wait for an overflow request before disposing the background worker', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            mockState.background = backgroundClient(true);
+            mockState.hotPendingCount = 1;
+            const route = await proc.interactiveOverflow.acquire();
+            expect(route.slot).toBe('background');
+
+            let suspended = false;
+            const suspension = proc.suspendForMaintenance().then((resume) => {
+                suspended = true;
+                return resume;
+            });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(suspended).toBe(false);
+            expect(mockState.disposeCalls).toEqual([]);
+            // No new overflow while suspending.
+            expect(await proc.interactiveOverflow.acquire()).toMatchObject({ slot: 'hot', overflowSkip: 'disabled' });
+
+            route.release();
+            await suspension;
+            expect(mockState.disposeCalls).toEqual(['background']);
+        });
+    });
+
+    it('waits for a dispatcher pass to finish before allowing cache maintenance', async () => {
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        let release!: () => void;
+        const barrier = new Promise<void>((resolve) => { release = resolve; });
+        vi.spyOn(proc, 'processOnce').mockImplementation(async () => {
+            await barrier;
+            return { processed: false, reason: 'empty' };
+        });
+        const tick = (proc as any).tick();
+        let suspended = false;
+        const suspension = proc.suspendForMaintenance().then(() => { suspended = true; });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(suspended).toBe(false);
+        release();
+        await tick;
+        await suspension;
+        expect(suspended).toBe(true);
+    });
+
+    describe('searchable-library boundary', () => {
+        const enqueueJob = async (libraryId: number) => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+        };
+
+        it('claims nothing while the library scope is unknown', async () => {
+            (Zotero as any).AsterMargin.libraryScopeInitialized = false;
+            (Zotero as any).AsterMargin.searchableLibraryIds = undefined;
+            await enqueueJob(1);
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const result = await new BackgroundExtractor().processOnce();
+
+            expect(result).toEqual({ processed: false, reason: 'library_scope_unknown' });
+            expect(mockState.extractCalls).toHaveLength(0);
+            // The row is left queued so it runs once the scope is known.
+            await expect(db.peekBackgroundJobs()).resolves.toHaveLength(1);
+        });
+
+        it.each(['unresolved', 'mid-claim', 'signed-out', 'signout-mid-claim'])('waits for known scope for every lane: %s', async (scenario) => {
+            let session: any = scenario === 'signed-out' ? null : { user: { id: 'owner' } };
+            Zotero.AsterMargin.account = { getSnapshot: () => ({ session }) };
+            Zotero.AsterMargin.libraryScopeInitialized = scenario === 'mid-claim' || scenario === 'signout-mid-claim';
+            await enqueueJob(1);
+            for (const jobType of ['document_ocr', 'fulltext_upsert', 'fulltext_untag'] as const) {
+                await db.enqueueBackgroundJob({
+                    jobType, libraryId: 1, zoteroKey: 'BBBBBBBB', contentKind: 'pdf',
+                    payloadKind: 'structured', now: 0,
+                    payload: { ...payload(), doc_hash: 'a'.repeat(64), index_account_id: 'owner',
+                        index_scope_ref: 'g123', index_local_id: 'DEVICE' },
+                });
+            }
+            const realClaim = db.claimNextBackgroundJob.bind(db);
+            const claim = vi.spyOn(db, 'claimNextBackgroundJob').mockImplementation(async (...args) => {
+                const record = await realClaim(...args);
+                if (scenario === 'mid-claim') Zotero.AsterMargin.libraryScopeInitialized = false;
+                if (scenario === 'signout-mid-claim') {
+                    session = null;
+                    Zotero.AsterMargin.libraryScopeInitialized = false;
+                }
+                return record;
+            });
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const cleanup = vi.fn(async () => ({ kind: 'complete', reason: 'index_untagged' } as const));
+            const other = vi.fn(async () => ({ kind: 'complete', reason: 'unexpected' } as const));
+            for (const jobType of ['document_ocr', 'fulltext_upsert', 'fulltext_untag'] as const) {
+                proc.registerExecutor({ jobType, execute: jobType === 'fulltext_untag' ? cleanup : other }, { maxInFlight: 1, survivesLibraryExclusion: jobType === 'fulltext_untag' });
+            }
+            expect((await proc.processOnce({ awaitLaunchedJobs: true })).processed).toBe(false);
+            expect(cleanup).not.toHaveBeenCalled();
+            expect(other).not.toHaveBeenCalled();
+            expect(mockState.extractCalls).toHaveLength(0);
+            expect(await db.peekBackgroundJobs()).toHaveLength(4);
+            expect(claim).toHaveBeenCalledTimes(scenario.endsWith('mid-claim') ? 1 : 0);
+            expect(proc.isBacklogGateOpen()).toBe(false);
+        });
+
+        it('runs authenticated cleanup for an excluded library once scope is known', async () => {
+            Zotero.AsterMargin.account = { getGeneration: () => 1, getSnapshot: () => ({ session: { user: { id: 'owner' } } }) };
+            Zotero.AsterMargin.libraryScopeInitialized = true;
+            Zotero.AsterMargin.searchableLibraryIds = [];
+            await db.enqueueBackgroundJob({ jobType: 'fulltext_untag', libraryId: 1, zoteroKey: 'BBBBBBBB',
+                contentKind: 'pdf', payloadKind: 'structured', now: 0, payload: payload() });
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const cleanup = vi.fn(async () => ({ kind: 'complete', reason: 'index_untagged' } as const));
+            proc.registerExecutor({ jobType: 'fulltext_untag', execute: cleanup }, { maxInFlight: 1, survivesLibraryExclusion: true });
+            await proc.processOnce({ awaitLaunchedJobs: true });
+            expect(cleanup).toHaveBeenCalledTimes(1);
+            expect(await db.peekBackgroundJobs()).toEqual([]);
+        });
+
+        it('releases (not retires) a claimed row when the scope goes unknown mid-claim', async () => {
+            await enqueueJob(1);
+            const realClaim = db.claimNextBackgroundJob.bind(db);
+            vi.spyOn(db, 'claimNextBackgroundJob').mockImplementation(async (...claimArgs) => {
+                const record = await realClaim(...(claimArgs as Parameters<typeof realClaim>));
+                // Logout lands while the claim is in flight.
+                (Zotero as any).AsterMargin.libraryScopeInitialized = false;
+                return record;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const beforeReleaseMs = Date.now();
+            const result = await new BackgroundExtractor().processOnce();
+
+            expect(result.processed).toBe(false);
+            expect(mockState.extractCalls).toHaveLength(0);
+            // Queued work must survive an account switch rather than be dropped.
+            const rows = await db.peekBackgroundJobs();
+            expect(rows).toHaveLength(1);
+            expect(rows[0].attemptCount).toBe(0);
+            // Released now, not left invisible for the claim-visibility window.
+            expect(rows[0].availableAt).toBeGreaterThanOrEqual(beforeReleaseMs - 1_000);
+            expect(rows[0].availableAt).toBeLessThan(beforeReleaseMs + 60_000);
+        });
+
+        it('settles jobs launched earlier in the pass when a later lane loses scope', async () => {
+            // document_extract is registered first (constructor), so it launches
+            // before the OCR lane's claim observes the scope going unknown.
+            await enqueueJob(1);
+            await db.enqueueBackgroundJob({
+                jobType: 'document_ocr',
+                libraryId: 1,
+                zoteroKey: 'BBBBBBBB',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                payload: null,
+                now: 0,
+            });
+            const realClaim = db.claimNextBackgroundJob.bind(db);
+            vi.spyOn(db, 'claimNextBackgroundJob').mockImplementation(async (...claimArgs) => {
+                const record = await realClaim(...(claimArgs as Parameters<typeof realClaim>));
+                if ((claimArgs[3] as string[] | undefined)?.includes('document_ocr')) {
+                    (Zotero as any).AsterMargin.libraryScopeInitialized = false;
+                }
+                return record;
+            });
+
+            // Hold the extraction open so "returned before it settled" is
+            // observable rather than hidden by an instant mock.
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.registerExecutor(
+                ocrExecutor(async () => ({ kind: 'complete', reason: 'ok' })),
+                { maxInFlight: 1 },
+            );
+
+            const passPromise = proc.processOnce({ awaitLaunchedJobs: true });
+            const raced = await Promise.race([
+                passPromise.then(() => 'pass-returned'),
+                new Promise((resolve) => setTimeout(() => resolve('still-awaiting'), 50)),
+            ]);
+            // Losing scope on a later lane must not abandon the launched job.
+            expect(raced).toBe('still-awaiting');
+
+            mockState.extractResolve!(okResult());
+            await passPromise;
+
+            // The extract job settled before the pass returned; only the
+            // released OCR row is left behind.
+            const rows = await db.peekBackgroundJobs();
+            expect(rows.map((row) => row.jobType)).toEqual(['document_ocr']);
+        });
+
+        it('completes a queued job whose library is no longer searchable', async () => {
+            (Zotero as any).AsterMargin.searchableLibraryIds = [2];
+            await enqueueJob(1);
+
+            const reasons: string[] = [];
+            Zotero.AsterMargin.runtime.subscribe('background-job:done', (event) => {
+                reasons.push(event.reason);
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const result = await new BackgroundExtractor().processOnce();
+
+            expect(result.processed).toBe(true);
+            expect(mockState.extractCalls).toHaveLength(0);
+            expect(reasons).toEqual(['library_excluded']);
+            await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+        });
+
+        it('leaves a row for a library missing on this device to the executor', async () => {
+            // UNRESOLVED_LIBRARY_ID is "not present here", not "excluded": it
+            // must keep the executor's own item_missing handling.
+            await enqueueJob(0);
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const result = await new BackgroundExtractor().processOnce({
+                awaitLaunchedJobs: true,
+            });
+
+            expect(result.processed).toBe(true);
+            expect(mockState.extractCalls).toHaveLength(0);
+            await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+        });
+
+        it('aborts an in-flight job whose library leaves the searchable set', async () => {
+            await enqueueJob(1);
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const processOncePromise = proc.processOnce();
+            await new Promise((r) => setTimeout(r, 0));
+            expect(mockState.extractCalls).toHaveLength(1);
+            const signal: AbortSignal = mockState.extractCalls[0].externalAbortSignal;
+            expect(signal.aborted).toBe(false);
+
+            // The user excludes the library mid-extraction.
+            (Zotero as any).AsterMargin.searchableLibraryIds = [];
+            proc.abortJobsWithoutAccess();
+
+            expect(signal.aborted).toBe(true);
+            mockState.extractResolve!({
+                kind: 'external_abort',
+                phase: 'external_abort',
+                pageCount: null,
+                resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            });
+            await processOncePromise;
+        });
+
+        it('leaves in-flight jobs alone when their library stays searchable', async () => {
+            await enqueueJob(1);
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const processOncePromise = proc.processOnce();
+            await new Promise((r) => setTimeout(r, 0));
+            const signal: AbortSignal = mockState.extractCalls[0].externalAbortSignal;
+
+            // A different library was excluded; this job must keep running.
+            (Zotero as any).AsterMargin.searchableLibraryIds = [1];
+            proc.abortJobsWithoutAccess();
+
+            expect(signal.aborted).toBe(false);
+            mockState.extractResolve!(okResult());
+            await processOncePromise;
+        });
+
+        describe('DocumentExtractExecutor re-check', () => {
+            // The lane serializes on the MuPDF worker, so scope can change
+            // between the dispatcher's claim and the job actually running.
+            const runClaimedJob = async (
+                onWorker: () => void = () => {},
+            ): Promise<{ kind: string; reason?: string }> => {
+                await enqueueJob(1);
+                const record = await db.claimNextBackgroundJob(Date.now(), 60_000);
+                const { DocumentExtractExecutor } = await import(
+                    '../../../src/services/backgroundQueue/documentExtractExecutor'
+                );
+                return await new DocumentExtractExecutor().execute(record!, {
+                    db: db as any,
+                    runOnMuPDFWorker: async (fn) => {
+                        onWorker();
+                        return await fn();
+                    },
+                    externalAbortSignal: new AbortController().signal,
+                    shouldSkipDbWrites: () => false,
+                    enqueue: async () => {},
+                });
+            };
+
+            it('completes when the library is excluded after the claim', async () => {
+                const outcome = await runClaimedJob(() => {
+                    (Zotero as any).AsterMargin.searchableLibraryIds = [];
+                });
+
+                expect(outcome).toEqual({ kind: 'complete', reason: 'library_excluded' });
+                expect(mockState.extractCalls).toHaveLength(0);
+            });
+
+            it('releases when the scope becomes unknown after the claim', async () => {
+                const outcome = await runClaimedJob(() => {
+                    (Zotero as any).AsterMargin.libraryScopeInitialized = false;
+                });
+
+                expect(outcome).toEqual({ kind: 'release', reason: 'library_scope_unknown' });
+                expect(mockState.extractCalls).toHaveLength(0);
+            });
+
+            /** Flip the mirror while the item lookup is pending. */
+            const lookupThatChangesScope = (mutate: () => void) => {
+                (Zotero as any).Items.getByLibraryAndKeyAsync = vi.fn(async () => {
+                    mutate();
+                    return {
+                        libraryID: 1,
+                        key: 'AAAAAAAA',
+                        isAttachment: () => true,
+                        isPDFAttachment: () => true,
+                        attachmentContentType: 'application/pdf',
+                    };
+                });
+            };
+
+            it('completes when the library is excluded during the item lookup', async () => {
+                lookupThatChangesScope(() => {
+                    (Zotero as any).AsterMargin.searchableLibraryIds = [];
+                });
+
+                const outcome = await runClaimedJob();
+
+                expect(outcome).toEqual({ kind: 'complete', reason: 'library_excluded' });
+                expect(mockState.extractCalls).toHaveLength(0);
+            });
+
+            it('does not inspect the item once its library is excluded', async () => {
+                const { safeIsInTrash } = await import('../../../src/utils/zoteroItemUtils');
+                lookupThatChangesScope(() => {
+                    (Zotero as any).AsterMargin.searchableLibraryIds = [];
+                });
+
+                await runClaimedJob();
+
+                // Item metadata is off limits after revocation, so the boundary
+                // check has to land before the first read of the resolved item.
+                expect(safeIsInTrash).not.toHaveBeenCalled();
+            });
+
+            it('releases when the scope becomes unknown during the item lookup', async () => {
+                // A logout mid-lookup is transient, not an exclusion: the row
+                // must survive to run under the next session.
+                lookupThatChangesScope(() => {
+                    (Zotero as any).AsterMargin.libraryScopeInitialized = false;
+                });
+
+                const outcome = await runClaimedJob();
+
+                expect(outcome).toEqual({ kind: 'release', reason: 'library_scope_unknown' });
+                expect(mockState.extractCalls).toHaveLength(0);
+            });
+        });
+    });
+
+    it('completes the job when the item is in the trash', async () => {
+        const { safeIsInTrash } = await import('../../../src/utils/zoteroItemUtils');
+        (safeIsInTrash as any).mockReturnValueOnce(true);
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(0);
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(0);
+    });
+
+    it('completes stale rows when the live attachment content kind changed', async () => {
+        const item = {
+            libraryID: 1,
+            key: 'AAAAAAAA',
+            isAttachment: () => true,
+            isPDFAttachment: () => false,
+            attachmentContentType: 'application/epub+zip',
+        };
+        (Zotero as any).Items.getByLibraryAndKeyAsync = vi.fn(async () => item);
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const reasons: string[] = [];
+        Zotero.AsterMargin.runtime.subscribe('background-job:done', (event) => {
+            reasons.push(event.reason);
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(0);
+        await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+        expect(reasons).toEqual(['content_kind_stale']);
+    });
+
+    it('completes unsupported non-PDF jobs without requiring a payload', async () => {
+        const item = {
+            libraryID: 1,
+            key: 'AAAAAAAA',
+            isAttachment: () => true,
+            isPDFAttachment: () => false,
+            attachmentContentType: 'application/epub+zip',
+        };
+        (Zotero as any).Items.getByLibraryAndKeyAsync = vi.fn(async () => item);
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'epub',
+            payloadKind: 'structured',
+            payload: null,
+            now: 0,
+        });
+
+        const reasons: string[] = [];
+        Zotero.AsterMargin.runtime.subscribe('background-job:done', (event) => {
+            reasons.push(event.reason);
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(0);
+        await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+        expect(reasons).toEqual(['unsupported_content_kind']);
+    });
+
+    it('completes PDF jobs with null payload as missing_payload', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: null,
+            now: 0,
+        });
+
+        const reasons: string[] = [];
+        Zotero.AsterMargin.runtime.subscribe('background-job:done', (event) => {
+            reasons.push(event.reason);
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(0);
+        await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+        expect(reasons).toEqual(['missing_payload']);
+    });
+
+    it('allows PDF retries queued against a regular parent item to reach extraction', async () => {
+        const item = {
+            libraryID: 1,
+            key: 'AAAAAAAA',
+            isAttachment: () => false,
+            isRegularItem: () => true,
+        };
+        (Zotero as any).Items.getByLibraryAndKeyAsync = vi.fn(async () => item);
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'ok',
+            cached: false,
+            result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'PDFCHILD' },
+            contentType: 'application/pdf',
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(1);
+        expect(mockState.extractCalls[0]).toMatchObject({
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            mode: 'structured',
+            workerName: 'background',
+        });
+        await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+    });
+
+    it('removes the row on kind=ok and routes through the background worker', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload({ timeoutSeconds: 120 }),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'ok',
+            cached: false,
+            result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            contentType: 'application/pdf',
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(1);
+        expect(mockState.extractCalls[0].workerName).toBe('background');
+        expect(mockState.extractCalls[0].mode).toBe('structured');
+        expect(mockState.extractCalls[0].timeoutSeconds).toBe(120);
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(0);
+    });
+
+    it('completes a structured retry as item_missing when Zotero returns bare false', async () => {
+        Zotero.Items.getByLibraryAndKeyAsync = vi.fn(() => false);
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            priority: 50,
+            payload: payload(),
+            now: 0,
+        });
+        const { DocumentExtractExecutor } = await import(
+            '../../../src/services/backgroundQueue/documentExtractExecutor'
+        );
+        const execute = vi.spyOn(DocumentExtractExecutor.prototype, 'execute');
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+
+        try {
+            expect((await proc.processOnce()).processed).toBe(true);
+            expect(execute).toHaveBeenCalledOnce();
+            await expect(execute.mock.results[0].value).resolves.toEqual({
+                kind: 'complete',
+                reason: 'item_missing',
+            });
+            expect(await db.peekBackgroundJobs()).toHaveLength(0);
+            expect(mockState.extractCalls).toHaveLength(0);
+            expect(await db.getAttachmentProcessingState(1, 'AAAAAAAA')).toBeNull();
+        } finally {
+            execute.mockRestore();
+        }
+    });
+
+    it('does not stamp the structured ledger for a markdown extraction job', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'markdown',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = okResult();
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        expect((await proc.processOnce()).processed).toBe(true);
+        expect(await db.getAttachmentProcessingState(1, 'AAAAAAAA')).toBeNull();
+    });
+
+    it('rejects an excluded library before looking up the queued item', async () => {
+        (Zotero as any).AsterMargin = {
+            hasOcrAccess: true,
+            hasSearchIndexAccess: true,
+            runtime: new AsterMarginInstance(),
+            db,
+            libraryScopeInitialized: true,
+            searchableLibraryIds: [],
+        };
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        expect((await proc.processOnce()).processed).toBe(true);
+        expect(Zotero.Items.getByLibraryAndKeyAsync).not.toHaveBeenCalled();
+        expect(mockState.extractCalls).toHaveLength(0);
+    });
+
+    it.each([
+        ['encrypted'],
+        ['invalid_pdf'],
+        ['no_text_layer'],
+    ])('terminal cached_error %s completes the job', async (code: string) => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'cached_error',
+            code,
+            message: 'cached err',
+            pageCount: 5,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(0);
+    });
+
+    it.each([
+        ['too_many_pages'],
+        ['file_missing'],
+        ['file_too_large'],
+        ['not_pdf'],
+        ['mode_mismatch'],
+        ['pdf_parser_crash'],
+        ['pdf_too_complex'],
+    ])('terminal response_error %s completes the job without retry', async (code: string) => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'response_error',
+            code,
+            message: 'terminal',
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const result = await proc.processOnce();
+
+        expect(result.processed).toBe(true);
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(0);
+    });
+
+    it.each([
+        ['download_failed'],
+        ['extraction_failed'],
+        ['worker_unavailable'],
+        ['file_permission_denied'],
+    ])('transient response_error %s bumps attempt_count and slides availability out', async (code: string) => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'response_error',
+            code,
+            message: 'transient',
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        await proc.processOnce();
+
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(1);
+        expect(rows[0].lastError).toContain(code);
+    });
+
+    it('timeout kind counts as a transient failure', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'timeout',
+            phase: 'pdf_extract',
+            timeoutSeconds: 120,
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        await proc.processOnce();
+
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(1);
+        expect(rows[0].lastError).toContain('timeout');
+    });
+
+    it.each(['external_abort', 'access_revoked'])('%s releases the job without bumping attempt_count', async (cancellation) => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'external_abort',
+            phase: 'external_abort',
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        };
+
+        if (cancellation === 'access_revoked') {
+            // A structural error also covers calls across bundle boundaries.
+            mockState.nextResult = () => { throw { code: 'DOCUMENT_ACCESS_REVOKED' }; };
+        }
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        await proc.processOnce();
+
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(0);
+        expect(rows[0].lastError).toBeNull();
+    });
+
+    it('publishes background job transitions through the instance', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const events: string[] = [];
+        Zotero.AsterMargin.runtime.subscribe('background-job:start', () => events.push('start'));
+        Zotero.AsterMargin.runtime.subscribe('background-job:done', () => events.push('done'));
+        mockState.nextResult = {
+            kind: 'ok',
+            cached: false,
+            result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            contentType: 'application/pdf',
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        await proc.processOnce();
+
+        expect(events).toEqual(['start', 'done']);
+    });
+
+    it('emits worker status only on processing transitions while auto-draining', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 1,
+        });
+
+        const events: boolean[] = [];
+        Zotero.AsterMargin.runtime.subscribe('background-worker:status', (event) => {
+            const detail = event;
+            events.push(detail.running);
+        });
+        mockState.nextResult = {
+            kind: 'ok',
+            cached: false,
+            result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            contentType: 'application/pdf',
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        // A started dispatcher's settles wake it; drive those ticks by hand.
+        (proc as any).started = true;
+        vi.spyOn(proc as any, 'scheduleTick').mockImplementation(() => {});
+        try {
+            await (proc as any).tick();
+            expect(proc.getStatus()).toEqual({ running: true });
+            await settleLanes(proc);
+            expect(proc.getStatus()).toEqual({ running: true });
+            expect(events).toEqual([true]);
+
+            await (proc as any).tick();
+            await settleLanes(proc);
+            expect(proc.getStatus()).toEqual({ running: true });
+            expect(events).toEqual([true]);
+
+            await (proc as any).tick();
+            expect(proc.getStatus()).toEqual({ running: false });
+            expect(events).toEqual([true, false]);
+        } finally {
+            await proc.stop();
+        }
+    });
+
+    it('instance events remain safe with no window subscribers', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'ok',
+            cached: false,
+            result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            contentType: 'application/pdf',
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        // First call: real window so the job is processed.
+        await proc.processOnce();
+        // Then null-window for a follow-up — should be a clean no-op
+        (Zotero as any).getMainWindow = vi.fn(() => null);
+        const result = await proc.processOnce();
+        expect(result).toEqual({ processed: false, reason: 'empty' });
+    });
+
+    it('stop() aborts an in-flight job and disposes the background worker', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = new Promise<any>((resolve) => {
+            mockState.extractResolve = resolve;
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const processOncePromise = proc.processOnce();
+
+        // Give the extractor a chance to claim and start the job. After
+        // the claim, `available_at` has been bumped by VISIBILITY_TIMEOUT_MS
+        // (~6 minutes) — capture it so the post-release assertion below
+        // verifies the row was actually released, not just left untouched.
+        await new Promise((r) => setTimeout(r, 0));
+        const claimedRows = await db.peekBackgroundJobs();
+        expect(claimedRows).toHaveLength(1);
+        const claimedAvailableAt = claimedRows[0].availableAt;
+        const beforeReleaseMs = Date.now();
+
+        const stopPromise = proc.stop();
+        // Resolve the suspended extraction with an external_abort outcome.
+        mockState.extractResolve!({
+            kind: 'external_abort',
+            phase: 'external_abort',
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        });
+
+        await processOncePromise;
+        await stopPromise;
+
+        // Job released (not failed), and available_at reset by
+        // releaseBackgroundJob so the row is immediately retryable —
+        // NOT left hidden for the visibility timeout.
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(0);
+        expect(rows[0].availableAt).toBeLessThan(claimedAvailableAt);
+        expect(rows[0].availableAt).toBeGreaterThanOrEqual(beforeReleaseMs);
+        // Worker dispose called for background slot.
+        expect(mockState.disposeCalls).toContain('background');
+    });
+
+    it('stop() prevents a job claimed mid-pass from launching after worker disposal', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        const originalClaim = db.claimNextBackgroundJob.bind(db);
+        let releaseClaim!: () => void;
+        vi.spyOn(db, 'claimNextBackgroundJob').mockImplementation(
+            async (...args: Parameters<typeof db.claimNextBackgroundJob>) => {
+                await new Promise<void>((resolve) => {
+                    releaseClaim = resolve;
+                });
+                return await originalClaim(...args);
+            },
+        );
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const processOncePromise = proc.processOnce();
+
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const stopPromise = proc.stop();
+        await stopPromise;
+
+        releaseClaim();
+        const result = await processOncePromise;
+
+        expect(result).toEqual({ processed: false, reason: 'empty' });
+        expect(mockState.extractCalls).toHaveLength(0);
+        expect(mockState.disposeCalls).toContain('background');
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(0);
+        expect(rows[0].lastError).toBeNull();
+    });
+
+    it('abortInFlight() releases the in-flight job without stopping the processor or disposing the worker', async () => {
+        // Models the window-unload-but-app-alive case
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = new Promise<any>((resolve) => {
+            mockState.extractResolve = resolve;
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const processOncePromise = proc.processOnce();
+
+        await new Promise((r) => setTimeout(r, 0));
+        const claimedRows = await db.peekBackgroundJobs();
+        expect(claimedRows).toHaveLength(1);
+        const claimedAvailableAt = claimedRows[0].availableAt;
+        const beforeReleaseMs = Date.now();
+
+        // Abort without stopping. The processor should NOT mark itself
+        // stopped and should NOT dispose the worker.
+        const abortPromise = proc.abortInFlight();
+        mockState.extractResolve!({
+            kind: 'external_abort',
+            phase: 'external_abort',
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        });
+        await abortPromise;
+        await processOncePromise;
+
+        // Row released — available_at reset to roughly now(), well under
+        // the visibility-timeout-bump value captured pre-release. The
+        // attempt count is untouched (no failBackgroundJob fired).
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(0);
+        expect(rows[0].availableAt).toBeLessThan(claimedAvailableAt);
+        expect(rows[0].availableAt).toBeGreaterThanOrEqual(beforeReleaseMs);
+
+        // abortInFlight does NOT dispose the background worker — the
+        // caller (onMainWindowUnload) does that as a separate step.
+        expect(mockState.disposeCalls).not.toContain('background');
+
+        // The processor is still runnable — a subsequent processOnce
+        // would attempt to claim again (proves we did not mark
+        // stopRequested / set started=false).
+        mockState.nextResult = { kind: 'ok', cached: false, result: {} as any, totalPages: 0, resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' }, contentType: 'application/pdf' };
+        const followup = await proc.processOnce();
+        // The released row's available_at is ~now(), so the next claim
+        // should pick it up immediately and complete it.
+        expect(followup.processed).toBe(true);
+        expect(mockState.extractCalls).toHaveLength(2);
+    });
+
+    it('abortInFlight() is a no-op when there is no in-flight job', async () => {
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        await expect(proc.abortInFlight()).resolves.toBeUndefined();
+        expect(mockState.disposeCalls).toHaveLength(0);
+    });
+
+    it('launches extract and OCR lanes concurrently while awaiting the extract lane', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        let resolveExtract!: (value: any) => void;
+        let resolveOcr!: (value: JobOutcome) => void;
+        const events: string[] = [];
+        mockState.nextResult = new Promise<any>((resolve) => {
+            resolveExtract = resolve;
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            ocrExecutor(async () => {
+                events.push('ocr:start');
+                return await new Promise<JobOutcome>((resolve) => {
+                    resolveOcr = resolve;
+                });
+            }),
+            { maxInFlight: 1 },
+        );
+
+        const processOncePromise = proc.processOnce();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(mockState.extractCalls).toHaveLength(1);
+        expect(events).toEqual(['ocr:start']);
+        expect(proc.getLaneStatus()).toMatchObject({
+            document_extract: { inFlight: 1, capacity: 1 },
+            document_ocr: { inFlight: 1, capacity: 1 },
+        });
+
+        resolveExtract!(okResult('AAAAAAAA'));
+        await processOncePromise;
+        expect(proc.getLaneStatus().document_ocr?.inFlight).toBe(1);
+
+        resolveOcr!({ kind: 'complete', reason: 'ocr_ok' });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(proc.getLaneStatus().document_ocr?.inFlight).toBe(0);
+    });
+
+    it.each([false, true])('retires budget-limited preparation only if it was not promoted (%s)', async (promoted) => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr', libraryId: 1, zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf', payloadKind: 'structured', priority: 105,
+            payload: payload({ prepare_cache: true }), now: 0,
+        });
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const claimedPriorities: number[] = [];
+        proc.registerExecutor(ocrExecutor(async (record) => {
+            claimedPriorities.push(record.priority);
+            if (record.priority < 100) return { kind: 'complete', reason: 'ocr_ok' };
+            // The claimed record stays at 105 while a user request changes the
+            // persisted priority during the executor's asynchronous work.
+            if (promoted) await db.promotePendingBackgroundJob('document_ocr', 1, 'BBBBBBBB', 'structured', 90);
+            return { kind: 'complete', reason: 'cache_budget_reached' };
+        }), { maxInFlight: 1 });
+
+        expect((await proc.processOnce({ awaitLaunchedJobs: true })).processed).toBe(true);
+        const remaining = await db.peekBackgroundJobs();
+        if (promoted) {
+            expect(remaining).toHaveLength(1);
+            expect(remaining[0].priority).toBe(90);
+            expect(remaining[0].availableAt).toBeLessThanOrEqual(Date.now());
+            expect((await proc.processOnce({ awaitLaunchedJobs: true })).processed).toBe(true);
+            expect(claimedPriorities).toEqual([105, 90]);
+        } else {
+            expect(claimedPriorities).toEqual([105]);
+        }
+        expect(await db.peekBackgroundJobs()).toEqual([]);
+    });
+
+    it('parks the row and frees the slot on a defer outcome', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            ocrExecutor(async () => ({ kind: 'defer', reason: 'ocr_polling' })),
+            { maxInFlight: 1 },
+        );
+
+        const result = await proc.processOnce({ awaitLaunchedJobs: true });
+
+        expect(result.processed).toBe(true);
+        // The slot is released; a deferred job holds no in-flight slot.
+        expect(proc.getLaneStatus().document_ocr?.inFlight).toBe(0);
+
+        // The row is neither completed nor released-to-now: it stays parked at
+        // the visibility deadline the claim set, so it is not claimable now.
+        const rows = await db.peekBackgroundJobs();
+        expect(rows.map((r) => r.zoteroKey)).toEqual(['BBBBBBBB']);
+        const claimed = await db.claimNextBackgroundJob(Date.now(), 1000, undefined, ['document_ocr']);
+        expect(claimed).toBeNull();
+    });
+
+    it('disposes registered executors on stop()', async () => {
+        const disposeSpy = vi.fn();
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            {
+                jobType: 'document_ocr',
+                execute: async () => ({ kind: 'complete', reason: 'ocr_ok' }),
+                dispose: disposeSpy,
+            },
+            { maxInFlight: 1 },
+        );
+        proc.start();
+
+        await proc.stop();
+
+        expect(disposeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('suspends reusable executors for maintenance and keeps terminal stop distinct', async () => {
+        const suspendSpy = vi.fn(async () => undefined);
+        const disposeSpy = vi.fn();
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            {
+                jobType: 'document_ocr',
+                execute: async () => ({ kind: 'complete', reason: 'ocr_ok' }),
+                suspend: suspendSpy,
+                dispose: disposeSpy,
+            },
+            { maxInFlight: 1 },
+        );
+        proc.start();
+
+        const resume = await proc.suspendForMaintenance();
+        expect(suspendSpy).toHaveBeenCalledTimes(1);
+        expect(disposeSpy).not.toHaveBeenCalled();
+
+        await proc.stop();
+        expect(disposeSpy).toHaveBeenCalledTimes(1);
+        resume();
+        expect(await proc.processOnce()).toEqual({ processed: false, reason: 'stopped' });
+    });
+
+    it('rejects maintenance suspension when an executor cannot quiesce', async () => {
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            {
+                jobType: 'document_ocr',
+                execute: async () => ({ kind: 'complete', reason: 'ocr_ok' }),
+                suspend: () => { throw new Error('track did not settle'); },
+            },
+            { maxInFlight: 1 },
+        );
+        proc.start();
+
+        await expect(proc.suspendForMaintenance()).rejects.toThrow('track did not settle');
+        expect(await proc.processOnce()).toEqual({ processed: false, reason: 'stopped' });
+        expect(mockState.disposeCalls).toContain('background');
+    });
+
+    it('unregisters and disposes only the executor that owns the lane', async () => {
+        const firstDispose = vi.fn();
+        const secondDispose = vi.fn();
+        const first = ocrExecutor(async () => ({ kind: 'complete', reason: 'first' }));
+        first.dispose = firstDispose;
+        const second = ocrExecutor(async () => ({ kind: 'complete', reason: 'second' }));
+        second.dispose = secondDispose;
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(first, { maxInFlight: 1 });
+        proc.registerExecutor(second, { maxInFlight: 1 });
+
+        proc.unregisterExecutor('document_ocr', first);
+        expect(proc.getLaneStatus().document_ocr).toEqual({ inFlight: 0, capacity: 1, runsWhileActive: false, remoteWaiting: 0 });
+
+        proc.unregisterExecutor('document_ocr', second);
+        expect(proc.getLaneStatus().document_ocr).toBeUndefined();
+        expect(firstDispose).toHaveBeenCalledTimes(1);
+        expect(secondDispose).toHaveBeenCalledTimes(1);
+    });
+
+    it('aborts already-claimed work when its lane is unregistered', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        let executionSignal: AbortSignal | undefined;
+        const executor = ocrExecutor(async (_record, ctx) => {
+            executionSignal = ctx.externalAbortSignal;
+            await new Promise<void>((resolve) => {
+                if (ctx.externalAbortSignal.aborted) resolve();
+                else ctx.externalAbortSignal.addEventListener('abort', () => resolve(), { once: true });
+            });
+            return { kind: 'release', reason: 'aborted' };
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(executor, { maxInFlight: 1 });
+        await proc.processOnce();
+
+        expect(executionSignal?.aborted).toBe(false);
+        proc.unregisterExecutor('document_ocr', executor);
+        expect(executionSignal?.aborted).toBe(true);
+
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const rows = await db.peekBackgroundJobs();
+        expect(rows.map((row) => row.zoteroKey)).toEqual(['BBBBBBBB']);
+    });
+
+    it('does not let an extract backlog starve an OCR lane', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'CCCCCCCC',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 1,
+        });
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        const ocrRuns: string[] = [];
+        mockState.nextResult = okResult('AAAAAAAA');
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            ocrExecutor(async (record) => {
+                ocrRuns.push(record.zoteroKey);
+                return { kind: 'complete', reason: 'ocr_ok' };
+            }),
+            { maxInFlight: 1 },
+        );
+
+        const result = await proc.processOnce({ awaitLaunchedJobs: true });
+
+        expect(result.processed).toBe(true);
+        expect(ocrRuns).toEqual(['BBBBBBBB']);
+        const remaining = await db.peekBackgroundJobs();
+        expect(remaining.map((row) => row.zoteroKey)).toEqual(['CCCCCCCC']);
+    });
+
+    it('serializes extract and OCR final extraction through the MuPDF lane', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        let resolveExtract!: () => void;
+        let resolveOcr!: () => void;
+        let active = 0;
+        let maxActive = 0;
+        const events: string[] = [];
+        const enter = (name: string) => {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            events.push(`${name}:start`);
+        };
+        const leave = (name: string) => {
+            events.push(`${name}:end`);
+            active -= 1;
+        };
+        mockState.nextResult = async () => {
+            enter('extract');
+            await new Promise<void>((resolve) => {
+                resolveExtract = resolve;
+            });
+            leave('extract');
+            return okResult('AAAAAAAA');
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            ocrExecutor(async (_record, ctx: JobExecutionContext) => {
+                return await ctx.runOnMuPDFWorker(async () => {
+                    enter('ocr');
+                    await new Promise<void>((resolve) => {
+                        resolveOcr = resolve;
+                    });
+                    leave('ocr');
+                    return { kind: 'complete', reason: 'ocr_ok' };
+                });
+            }),
+            { maxInFlight: 1 },
+        );
+
+        const processOncePromise = proc.processOnce({ awaitLaunchedJobs: true });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(events).toEqual(['extract:start']);
+
+        resolveExtract!();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(events).toEqual(['extract:start', 'extract:end', 'ocr:start']);
+
+        resolveOcr!();
+        await processOncePromise;
+        expect(maxActive).toBe(1);
+        expect(events).toEqual([
+            'extract:start',
+            'extract:end',
+            'ocr:start',
+            'ocr:end',
+        ]);
+    });
+
+    it('stop() aborts and awaits multiple in-flight lane jobs', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const aborted: string[] = [];
+        mockState.nextResult = async (args: any) => {
+            return await new Promise<any>((resolve) => {
+                args.externalAbortSignal.addEventListener('abort', () => {
+                    aborted.push('extract');
+                    resolve({
+                        kind: 'external_abort',
+                        phase: 'external_abort',
+                        pageCount: null,
+                        resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+                    });
+                });
+            });
+        };
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            ocrExecutor(async (_record, ctx) => {
+                return await new Promise<JobOutcome>((resolve) => {
+                    ctx.externalAbortSignal.addEventListener('abort', () => {
+                        aborted.push('ocr');
+                        resolve({ kind: 'release', reason: 'external_abort' });
+                    });
+                });
+            }),
+            { maxInFlight: 1 },
+        );
+
+        const processOncePromise = proc.processOnce();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(proc.getLaneStatus().document_extract?.inFlight).toBe(1);
+        expect(proc.getLaneStatus().document_ocr?.inFlight).toBe(1);
+
+        await proc.stop();
+        await processOncePromise;
+
+        expect(aborted.sort()).toEqual(['extract', 'ocr']);
+        expect(proc.getLaneStatus().document_extract?.inFlight).toBe(0);
+        expect(proc.getLaneStatus().document_ocr?.inFlight).toBe(0);
+    });
+
+    it('failPermanent writes a document processing failure and completes the queue row', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_ocr',
+            libraryId: 1,
+            zoteroKey: 'BBBBBBBB',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        proc.registerExecutor(
+            ocrExecutor(async () => ({
+                kind: 'failPermanent',
+                reason: 'terminal:OCR_NO_TEXT',
+                failure: {
+                    fileHash: 'hash-b',
+                    task: 'ocr',
+                    engineVersion: 'engine-1',
+                    sourceType: 'zotero',
+                    sourceKey: '1-BBBBBBBB',
+                    error: 'no text',
+                    terminalCode: 'OCR_NO_TEXT',
+                },
+            })),
+            { maxInFlight: 1 },
+        );
+
+        const result = await proc.processOnce({ awaitLaunchedJobs: true });
+
+        expect(result.processed).toBe(true);
+        await expect(db.peekBackgroundJobs()).resolves.toHaveLength(0);
+        await expect(
+            db.getDocumentProcessingFailure('hash-b', 'ocr', 'engine-1'),
+        ).resolves.toMatchObject({
+            fileHash: 'hash-b',
+            task: 'ocr',
+            terminalCode: 'OCR_NO_TEXT',
+            lastError: 'no text',
+        });
+    });
+
+    it('marks extraction failed when its final retry dead-letters', async () => {
+        await db.ensureAttachmentProcessingState({
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+        });
+        const enqueued = await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            await db.failBackgroundJob(enqueued.id, 'temporary extraction error', {
+                maxAttempts: 3,
+                backoffMs: () => 0,
+                now: attempt,
+            });
+        }
+        const [record] = await db.peekBackgroundJobs();
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const executor = (proc as any).executors.get('document_extract').executor;
+        await (proc as any).recordRetryFailure(
+            record,
+            executor,
+            {
+                kind: 'retry', error: 'final extraction error',
+                attemptedExtractionSource: 'local:123:456',
+            },
+            db,
+            Date.now(),
+        );
+
+        expect(await db.getAttachmentProcessingState(1, 'AAAAAAAA')).toMatchObject({
+            extractStatus: 'failed', extractionSource: 'local:123:456',
+        });
+        expect((await db.getBackgroundQueueStats(Date.now())).dead).toBe(1);
+    });
+
+    it('latches db-write disable when stop() is called during shutdown', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = new Promise<any>((resolve) => {
+            mockState.extractResolve = resolve;
+        });
+
+        const { BackgroundExtractor } = await loadProcessor();
+        const proc = new BackgroundExtractor();
+        const processOncePromise = proc.processOnce();
+
+        // Let the claim happen and processJob enter the extract await.
+        await new Promise((r) => setTimeout(r, 0));
+        const claimedRows = await db.peekBackgroundJobs();
+        expect(claimedRows).toHaveLength(1);
+        const claimedAvailableAt = claimedRows[0].availableAt;
+
+        // Shutdown begins; stop() observes the flag and latches.
+        (Zotero as any).__astermarginShuttingDown = true;
+        const stopPromise = proc.stop();
+
+        // Cleanup runs to completion elsewhere and clears the global
+        // flag BEFORE the trailing extract resolves.
+        (Zotero as any).__astermarginShuttingDown = undefined;
+
+        // Trailing async now resolves with an `ok` result that would
+        // normally trigger completeBackgroundJob. The latched flag
+        // must suppress it.
+        mockState.extractResolve!({
+            kind: 'ok',
+            cached: false,
+            result: {} as any,
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            contentType: 'application/pdf',
+        });
+
+        await processOncePromise;
+        await stopPromise;
+
+        // Row unchanged: no completion, no release, available_at
+        // exactly where the claim left it.
+        const rows = await db.peekBackgroundJobs();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].attemptCount).toBe(0);
+        expect(rows[0].availableAt).toBe(claimedAvailableAt);
+    });
+
+    it('returns shutting_down and does not claim when Zotero.__astermarginShuttingDown is set', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        // Snapshot the row BEFORE shutdown so we can assert nothing changed.
+        const before = await db.peekBackgroundJobs();
+        expect(before).toHaveLength(1);
+        const beforeAvailableAt = before[0].availableAt;
+
+        (Zotero as any).__astermarginShuttingDown = true;
+
+        try {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const result = await proc.processOnce();
+
+            expect(result).toEqual({ processed: false, reason: 'shutting_down' });
+            // No claim happened — extract was not called, available_at
+            // unchanged (would have been bumped by VISIBILITY_TIMEOUT_MS).
+            expect(mockState.extractCalls).toHaveLength(0);
+            const after = await db.peekBackgroundJobs();
+            expect(after).toHaveLength(1);
+            expect(after[0].availableAt).toBe(beforeAvailableAt);
+        } finally {
+            (Zotero as any).__astermarginShuttingDown = undefined;
+        }
+    });
+
+    it('skips DB writes when Zotero.__astermarginShuttingDown is true', async () => {
+        // Models the trailing-async scenario
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'ok',
+            cached: false,
+            result: {} as any,
+            totalPages: 1,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+            contentType: 'application/pdf',
+        };
+        (Zotero as any).__astermarginShuttingDown = true;
+
+        try {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.processOnce();
+
+            // Row was claimed but the success path's completeBackgroundJob
+            // was skipped — row remains, attempt_count untouched.
+            const rows = await db.peekBackgroundJobs();
+            expect(rows).toHaveLength(1);
+            expect(rows[0].attemptCount).toBe(0);
+        } finally {
+            (Zotero as any).__astermarginShuttingDown = undefined;
+        }
+    });
+
+    describe('notify()', () => {
+        it('is a no-op before start() — does not schedule a tick', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const initialCalls = setTimeoutSpy.mock.calls.length;
+
+            proc.notify();
+
+            expect(setTimeoutSpy.mock.calls.length).toBe(initialCalls);
+            setTimeoutSpy.mockRestore();
+        });
+
+        it('after start(), reschedules the next tick to 0ms', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+            // start() schedules the first tick at STARTUP_DELAY_MS.
+            proc.start();
+            // Pretend the startup delay has elapsed so this test can
+            // assert the post-delay 0-delay wake behavior of notify().
+            // The startup-delay clamp is exercised by its own case.
+            (proc as any).startupDelayUntil = 0;
+            try {
+                const callsAfterStart = setTimeoutSpy.mock.calls.length;
+                expect(callsAfterStart).toBeGreaterThan(0);
+                const startDelay = setTimeoutSpy.mock.calls[callsAfterStart - 1][1];
+                expect(startDelay).toBeGreaterThan(0);
+
+                proc.notify();
+
+                // notify() should have installed a fresh setTimeout
+                // with delay 0.
+                const lastCall = setTimeoutSpy.mock.calls.at(-1);
+                expect(lastCall?.[1]).toBe(0);
+            } finally {
+                await proc.stop();
+                setTimeoutSpy.mockRestore();
+            }
+        });
+
+        it('is a no-op after stop()', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            await proc.stop();
+
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            proc.notify();
+            expect(setTimeoutSpy).not.toHaveBeenCalled();
+            setTimeoutSpy.mockRestore();
+        });
+
+        it('schedules a wake while a job is in flight so free lanes can refill', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+            payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            // Drive the tick once by calling processOnce directly so we
+            // can observe an in-flight job without racing the timer.
+            const processOncePromise = proc.processOnce();
+            await new Promise((r) => setTimeout(r, 0));
+
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            proc.notify();
+            expect(setTimeoutSpy).toHaveBeenCalled();
+            expect((proc as any).pendingWake).toBe(false);
+            setTimeoutSpy.mockRestore();
+
+            // Clean up: let the in-flight job finish so stop() returns.
+            mockState.extractResolve!({
+                kind: 'ok',
+                cached: false,
+                result: {} as any,
+                totalPages: 1,
+                resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+                contentType: 'application/pdf',
+            });
+            await processOncePromise;
+            await proc.stop();
+        });
+
+        it('is a no-op when Zotero.__astermarginShuttingDown is set', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            (Zotero as any).__astermarginShuttingDown = true;
+
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            try {
+                proc.notify();
+                expect(setTimeoutSpy).not.toHaveBeenCalled();
+            } finally {
+                setTimeoutSpy.mockRestore();
+                (Zotero as any).__astermarginShuttingDown = undefined;
+                await proc.stop();
+            }
+        });
+
+        it('active tick consumes pendingWake and reschedules at 0 instead of IDLE_INTERVAL_MS', async () => {
+            // Queue intentionally empty: processOnce returns 'empty' and
+            // tick would normally reschedule at IDLE_INTERVAL_MS (30s).
+            // With pendingWake set, the tick must reschedule at 0 so an
+            // enqueue that raced with this tick is picked up immediately.
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            // Bypass the startup-delay clamp; the clamp is covered by
+            // its own test.
+            (proc as any).startupDelayUntil = 0;
+
+            // Simulate a notify() that arrived while the tick was active.
+            (proc as any).pendingWake = true;
+
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            try {
+                // Drive a tick body directly to avoid racing real timers.
+                await (proc as any).tick();
+                const lastCall = setTimeoutSpy.mock.calls.at(-1);
+                expect(lastCall?.[1]).toBe(0);
+                // Wake consumed.
+                expect((proc as any).pendingWake).toBe(false);
+            } finally {
+                setTimeoutSpy.mockRestore();
+                await proc.stop();
+            }
+        });
+
+        it('re-entrant tick() bails out cleanly so two ticks do not run processOnce in parallel', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            // Suspend the first tick's pass so a second tick can start
+            // against the same processor instance.
+            let resolvePass!: (result: { processed: boolean; reason: string }) => void;
+            const processOnce = vi.spyOn(proc, 'processOnce').mockImplementation(
+                () => new Promise((resolve) => { resolvePass = resolve as typeof resolvePass; }),
+            );
+
+            const t1 = (proc as any).tick();
+            expect((proc as any).tickRunning).toBe(true);
+
+            // Second tick fires concurrently — must short-circuit via
+            // the re-entrancy guard without entering processOnce.
+            await (proc as any).tick();
+            expect(processOnce).toHaveBeenCalledTimes(1);
+
+            resolvePass({ processed: false, reason: 'empty' });
+            await t1;
+            expect((proc as any).tickRunning).toBe(false);
+            // The finished tick armed the next one; leaving it running would
+            // let this processor claim a later test's rows.
+            await proc.stop();
+        });
+    });
+
+    describe('tick rescheduling', () => {
+        it('follows a pass that launched work with a short re-tick', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+            mockState.nextResult = {
+                kind: 'ok',
+                cached: false,
+                result: { mode: 'structured', document: { pageCount: 1, pages: [] } },
+                totalPages: 1,
+                resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+                contentType: 'application/pdf',
+            };
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            try {
+                await (proc as any).tick();
+                expect(setTimeoutSpy.mock.calls.at(-1)?.[1]).toBe(10);
+            } finally {
+                setTimeoutSpy.mockRestore();
+                await proc.stop();
+            }
+        });
+
+        it('falls back to the slow backstop when a job is in flight but nothing was claimed', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+            // Park the extract so the lane stays occupied across the tick
+            // that follows.
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const processOncePromise = proc.processOnce();
+            await new Promise((r) => setTimeout(r, 0));
+            expect((proc as any).totalInFlight()).toBe(1);
+
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            try {
+                // Queue is empty and the only lane is full, so this pass
+                // claims nothing: the settle handler, not a fast poll, is
+                // what has to move the queue on.
+                await (proc as any).tick();
+                expect(setTimeoutSpy.mock.calls.at(-1)?.[1]).toBe(500);
+            } finally {
+                setTimeoutSpy.mockRestore();
+                mockState.extractResolve!({
+                    kind: 'ok',
+                    cached: false,
+                    result: {} as any,
+                    totalPages: 1,
+                    resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+                    contentType: 'application/pdf',
+                });
+                await processOncePromise;
+                await proc.stop();
+            }
+        });
+    });
+
+    describe('good-citizen gates', () => {
+        it('returns disabled when the kill-switch pref is false at start()', async () => {
+            (Zotero as any).Prefs.get = vi.fn(() => false);
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.start();
+            try {
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract',
+                    libraryId: 1,
+                    zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf',
+            payloadKind: 'structured',
+                    payload: payload(),
+                    now: 0,
+                });
+                const result = await proc.processOnce();
+                expect(result).toEqual({ processed: false, reason: 'disabled' });
+                expect(mockState.extractCalls).toHaveLength(0);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('pref observer flipping back to true triggers a wake and re-arms claiming', async () => {
+            (Zotero as any).Prefs.get = vi.fn((pref: string) =>
+                pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled'
+                    ? true
+                    : false);
+            const registerObserver = vi.fn(
+                (_pref: string, _handler: (v: unknown) => void, _global?: boolean) => Symbol('pref-obs'),
+            );
+            (Zotero as any).Prefs.registerObserver = registerObserver;
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.start();
+            try {
+                expect(registerObserver).toHaveBeenCalled();
+                const handler = registerObserver.mock.calls[0]![1]!;
+                // Pref flips back to true — handler must re-enable the loop.
+                handler(true);
+
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract',
+                    libraryId: 1,
+                    zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf',
+            payloadKind: 'structured',
+                    payload: payload(),
+                    now: 0,
+                });
+                const result = await proc.processOnce();
+                expect(result.processed).toBe(true);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('returns sync_in_progress when Zotero.Sync.Runner.syncInProgress is true at start()', async () => {
+            (Zotero as any).Sync.Runner.syncInProgress = true;
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.start();
+            try {
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract',
+                    libraryId: 1,
+                    zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf',
+            payloadKind: 'structured',
+                    payload: payload(),
+                    now: 0,
+                });
+                const result = await proc.processOnce();
+                expect(result).toEqual({ processed: false, reason: 'sync_in_progress' });
+                expect(mockState.extractCalls).toHaveLength(0);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('sync stop notifier clears the in-progress flag and schedules a wake', async () => {
+            (Zotero as any).Sync.Runner.syncInProgress = true;
+            const registerObserver = vi.fn(
+                (
+                    _observer: { notify: (event: string, type: string, ids: number[], extra: unknown) => void },
+                    _types: string[],
+                    _id: string,
+                ) => 'astermargin-bg-extractor',
+            );
+            (Zotero as any).Notifier.registerObserver = registerObserver;
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.start();
+            try {
+                expect(registerObserver).toHaveBeenCalled();
+                const observer = registerObserver.mock.calls[0]![0]!;
+                observer.notify('stop', 'sync', [], {});
+
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract',
+                    libraryId: 1,
+                    zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf',
+            payloadKind: 'structured',
+                    payload: payload(),
+                    now: 0,
+                });
+                const result = await proc.processOnce();
+                expect(result.processed).toBe(true);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('not idle + priority=100 job in queue returns empty (gated by maxPriority)', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            const claimSpy = vi.spyOn(db, 'claimNextBackgroundJob');
+            try {
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract',
+                    libraryId: 1,
+                    zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf',
+            payloadKind: 'structured',
+                    priority: 100,
+                    payload: payload(),
+                    now: 0,
+                });
+
+                const { BackgroundExtractor } = await loadProcessor();
+                const proc = new BackgroundExtractor();
+                const result = await proc.processOnce();
+
+                expect(result).toEqual({ processed: false, reason: 'empty' });
+                expect(claimSpy).toHaveBeenCalledWith(
+                    expect.any(Number),
+                    expect.any(Number),
+                    100,
+                    ['document_extract'],
+                );
+                expect(mockState.extractCalls).toHaveLength(0);
+            } finally {
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(
+                    Number.MAX_SAFE_INTEGER,
+                );
+                claimSpy.mockRestore();
+            }
+        });
+
+        it('keeps an active-use lane claiming backlog at its reduced width while the user is active', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const settles: Array<() => void> = [];
+            const execute = vi.fn(() => new Promise<JobOutcome>((resolve) => {
+                settles.push(() => resolve({ kind: 'complete', reason: 'done' }));
+            }));
+            proc.registerExecutor({ jobType: 'fulltext_upsert', execute },
+                { maxInFlight: 4, activeMaxInFlight: 2 });
+            try {
+                for (const zoteroKey of ['AAAAAAA1', 'AAAAAAA2', 'AAAAAAA3', 'AAAAAAA4', 'AAAAAAA5']) {
+                    await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1, zoteroKey,
+                        contentKind: 'pdf', payloadKind: 'structured', priority: 115, now: 0 });
+                }
+                await db.enqueueBackgroundJob({ jobType: 'document_extract', libraryId: 1,
+                    zoteroKey: 'BBBBBBBB', contentKind: 'pdf', payloadKind: 'structured',
+                    priority: 110, payload: payload(), now: 0 });
+
+                expect(proc.isBacklogGateOpen()).toBe(false);
+                await proc.processOnce();
+                expect(execute).toHaveBeenCalledTimes(2);
+                expect(mockState.extractCalls).toHaveLength(0);
+                expect(proc.getLaneStatus().fulltext_upsert).toMatchObject({
+                    inFlight: 2, capacity: 4, runsWhileActive: true,
+                });
+
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+                await proc.processOnce();
+                expect(execute).toHaveBeenCalledTimes(4);
+                expect(mockState.extractCalls).toHaveLength(1);
+            } finally {
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+                for (const settle of settles) settle();
+                await settleLanes(proc);
+                await proc.stop();
+            }
+        });
+
+        it('keeps active-use lanes paused when backlog processing is turned off', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            (Zotero.Prefs.get as any).mockImplementation((pref: string) =>
+                pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled' ? false : undefined);
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const execute = vi.fn(async (): Promise<JobOutcome> => ({ kind: 'complete', reason: 'done' }));
+            proc.registerExecutor({ jobType: 'fulltext_upsert', execute },
+                { maxInFlight: 4, activeMaxInFlight: 2 });
+            try {
+                await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1, zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf', payloadKind: 'structured', priority: 115, now: 0 });
+                await proc.processOnce({ awaitLaunchedJobs: true });
+                expect(execute).not.toHaveBeenCalled();
+            } finally {
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+                await proc.stop();
+            }
+        });
+
+        it('resizes a lane only for the executor that owns it', async () => {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const owner = { jobType: 'fulltext_upsert' as const, execute: vi.fn() };
+            proc.registerExecutor(owner, { maxInFlight: 4 });
+
+            proc.setLaneCapacity('fulltext_upsert', { jobType: 'fulltext_upsert', execute: vi.fn() },
+                { maxInFlight: 8, activeMaxInFlight: 4 });
+            expect(proc.getLaneStatus().fulltext_upsert).toMatchObject({ capacity: 4, runsWhileActive: false });
+
+            proc.setLaneCapacity('fulltext_upsert', owner, { maxInFlight: 8, activeMaxInFlight: 12 });
+            expect(proc.getLaneStatus().fulltext_upsert).toMatchObject({ capacity: 8, runsWhileActive: true });
+            // The active width never exceeds the lane's full width.
+            expect((proc as any).executors.get('fulltext_upsert').activeMaxInFlight).toBe(8);
+            await proc.stop();
+        });
+
+        it('refills IO lane slots while an extraction is still running', async () => {
+            await db.enqueueBackgroundJob({ jobType: 'document_extract', libraryId: 1,
+                zoteroKey: 'AAAAAAAA', contentKind: 'pdf', payloadKind: 'structured',
+                payload: payload(), now: 0 });
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            (proc as any).started = true;
+            vi.spyOn(proc as any, 'scheduleTick').mockImplementation(() => {});
+            const execute = vi.fn(async (): Promise<JobOutcome> => ({ kind: 'complete', reason: 'done' }));
+            proc.registerExecutor({ jobType: 'fulltext_upsert', execute }, { maxInFlight: 1 });
+            for (const zoteroKey of ['BBBBBBB1', 'BBBBBBB2']) {
+                await db.enqueueBackgroundJob({ jobType: 'fulltext_upsert', libraryId: 1, zoteroKey,
+                    contentKind: 'pdf', payloadKind: 'structured', now: 0 });
+            }
+            try {
+                // The tick returns while the extraction is still parked.
+                await (proc as any).tick();
+                await vi.waitFor(() => expect(proc.getLaneStatus().fulltext_upsert?.inFlight).toBe(0));
+                expect(execute).toHaveBeenCalledTimes(1);
+
+                await (proc as any).tick();
+                await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+                expect(mockState.extractCalls).toHaveLength(1);
+                expect(proc.getLaneStatus().document_extract?.inFlight).toBe(1);
+            } finally {
+                mockState.extractResolve!({
+                    kind: 'ok',
+                    cached: false,
+                    result: {} as any,
+                    totalPages: 1,
+                    resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+                    contentType: 'application/pdf',
+                });
+                await settleLanes(proc);
+                await proc.stop();
+            }
+        });
+
+        it('master processing toggle pauses backlog jobs without blocking hot jobs', async () => {
+            (Zotero.Prefs.get as any).mockImplementation((pref: string) =>
+                pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled'
+                    ? false
+                    : undefined);
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'BACKLOG1',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                priority: 110,
+                payload: payload(),
+                now: 0,
+            });
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'HOTPATH1',
+                contentKind: 'pdf',
+                payloadKind: 'structured',
+                priority: 50,
+                payload: payload(),
+                now: 0,
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            expect((await proc.processOnce()).processed).toBe(true);
+            expect((await db.peekBackgroundJobs()).map((job) => job.zoteroKey))
+                .toEqual(['BACKLOG1']);
+        });
+
+        it('not idle + priority=50 job in queue still claims and runs', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValueOnce(0);
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+            payloadKind: 'structured',
+                priority: 50,
+                payload: payload(),
+                now: 0,
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const result = await proc.processOnce();
+
+            expect(result.processed).toBe(true);
+            expect(mockState.extractCalls).toHaveLength(1);
+        });
+
+        it('idle + priority=100 job claims with maxPriority=undefined', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValueOnce(Number.MAX_SAFE_INTEGER);
+            const claimSpy = vi.spyOn(db, 'claimNextBackgroundJob');
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+            payloadKind: 'structured',
+                priority: 100,
+                payload: payload(),
+                now: 0,
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            const result = await proc.processOnce();
+
+            expect(result.processed).toBe(true);
+            expect(claimSpy).toHaveBeenCalledWith(
+                expect.any(Number),
+                expect.any(Number),
+                undefined,
+                ['document_extract'],
+            );
+            claimSpy.mockRestore();
+        });
+
+        it('a requested drain claims backlog while active and clears once the queue is empty', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            const claimSpy = vi.spyOn(db, 'claimNextBackgroundJob');
+            try {
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract',
+                    libraryId: 1,
+                    zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf',
+                    payloadKind: 'structured',
+                    priority: 110,
+                    payload: payload(),
+                    now: 0,
+                });
+
+                const { BackgroundExtractor } = await loadProcessor();
+                const proc = new BackgroundExtractor();
+                expect(proc.isBacklogGateOpen()).toBe(false);
+
+                proc.requestImmediateDrain();
+                expect(proc.isImmediateDrainRequested()).toBe(true);
+                expect(proc.isBacklogGateOpen()).toBe(true);
+
+                const first = await proc.processOnce({ awaitLaunchedJobs: true });
+                expect(first.processed).toBe(true);
+                expect(claimSpy).toHaveBeenCalledWith(
+                    expect.any(Number),
+                    expect.any(Number),
+                    undefined,
+                    ['document_extract'],
+                );
+                expect(mockState.extractCalls).toHaveLength(1);
+                // The bypass outlives the first pass: only an empty pass clears it.
+                expect(proc.isImmediateDrainRequested()).toBe(true);
+
+                const second = await proc.processOnce({ awaitLaunchedJobs: true });
+                expect(second).toEqual({ processed: false, reason: 'empty' });
+                expect(proc.isImmediateDrainRequested()).toBe(false);
+                expect(proc.isBacklogGateOpen()).toBe(false);
+            } finally {
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+                claimSpy.mockRestore();
+            }
+        });
+
+        it('keeps an immediate drain through parked OCR and its subsequent index job', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            try {
+                const input = {
+                    libraryId: 1, zoteroKey: 'BBBBBBBB', contentKind: 'pdf' as const,
+                    payloadKind: 'structured' as const, priority: 110, payload: payload(), now: 0,
+                };
+                await db.enqueueBackgroundJob({ ...input, jobType: 'document_ocr' });
+                const { BackgroundExtractor } = await loadProcessor();
+                const proc = new BackgroundExtractor();
+                let resumed = false;
+                proc.registerExecutor(ocrExecutor(async () => {
+                    if (!resumed) return { kind: 'defer', reason: 'ocr_polling' };
+                    await db.enqueueBackgroundJob({ ...input, jobType: 'fulltext_upsert' });
+                    return { kind: 'complete', reason: 'ocr_done' };
+                }), { maxInFlight: 1 });
+                const indexed = vi.fn(async () => ({ kind: 'complete' as const, reason: 'indexed' }));
+                proc.requestImmediateDrain();
+                await proc.processOnce({ awaitLaunchedJobs: true });
+                expect(proc.getLaneStatus().document_ocr?.inFlight).toBe(0);
+                expect(await proc.processOnce()).toMatchObject({ processed: false });
+                expect(proc.isImmediateDrainRequested()).toBe(true);
+
+                const [parked] = await db.peekBackgroundJobs();
+                resumed = true;
+                await db.releaseBackgroundJob(parked.id, Date.now());
+                await proc.processOnce({ awaitLaunchedJobs: true });
+                proc.registerExecutor({ jobType: 'fulltext_upsert', execute: indexed }, { maxInFlight: 1 });
+                await proc.processOnce({ awaitLaunchedJobs: true });
+                expect(indexed).toHaveBeenCalledTimes(1);
+                await proc.processOnce();
+                expect(proc.isImmediateDrainRequested()).toBe(false);
+            } finally {
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+            }
+        });
+
+        it('ends an immediate drain when only an unregistered lane has parked work', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_ocr', libraryId: 1, zoteroKey: 'BBBBBBBB',
+                contentKind: 'pdf', payloadKind: 'structured', payload: payload(),
+                now: Date.now() + 60_000,
+            });
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.requestImmediateDrain();
+            await proc.processOnce();
+            expect(proc.isImmediateDrainRequested()).toBe(false);
+        });
+
+        it('in-flight job continues even when sync starts and the OS goes active mid-run', async () => {
+            await db.enqueueBackgroundJob({
+                jobType: 'document_extract',
+                libraryId: 1,
+                zoteroKey: 'AAAAAAAA',
+                contentKind: 'pdf',
+            payloadKind: 'structured',
+                payload: payload(),
+                now: 0,
+            });
+            mockState.nextResult = new Promise<any>((resolve) => {
+                mockState.extractResolve = resolve;
+            });
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.start();
+            try {
+                const processOncePromise = proc.processOnce();
+                await new Promise((r) => setTimeout(r, 0));
+
+                // Flip both gates AFTER the claim is in flight. Neither
+                // should abort the in-flight job — they only affect the
+                // next claim.
+                (proc as any).syncInProgress = true;
+                const idleMod = await import('../../../src/utils/idleService');
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+
+                mockState.extractResolve!({
+                    kind: 'ok',
+                    cached: false,
+                    result: {} as any,
+                    totalPages: 1,
+                    resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+                    contentType: 'application/pdf',
+                });
+                const result = await processOncePromise;
+                expect(result.processed).toBe(true);
+                const rows = await db.peekBackgroundJobs();
+                expect(rows).toHaveLength(0);
+            } finally {
+                await proc.stop();
+            }
+        });
+
+        it('cancelImmediateDrain restores the idle gate while the user is active', async () => {
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            try {
+                proc.requestImmediateDrain();
+                expect(proc.isImmediateDrainRequested()).toBe(true);
+                expect(proc.isBacklogGateOpen()).toBe(true);
+                proc.cancelImmediateDrain();
+                expect(proc.isImmediateDrainRequested()).toBe(false);
+                expect(proc.isBacklogGateOpen()).toBe(false);
+            } finally {
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+            }
+        });
+
+        it('cancels an immediate drain on disable even when re-enabled before the next pass', async () => {
+            let enabled = true;
+            (Zotero as any).Prefs.get = vi.fn((pref: string) =>
+                pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled' ? enabled : undefined);
+            const registerObserver = vi.fn(
+                (_pref: string, _handler: (v: unknown) => void) => Symbol('pref-obs'),
+            );
+            (Zotero as any).Prefs.registerObserver = registerObserver;
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.getSystemIdleTimeMs as any).mockReturnValue(0);
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            proc.start();
+            try {
+                await db.enqueueBackgroundJob({
+                    jobType: 'document_extract', libraryId: 1, zoteroKey: 'AAAAAAAA',
+                    contentKind: 'pdf', payloadKind: 'structured', priority: 110, payload: payload(), now: 0,
+                });
+                proc.requestImmediateDrain();
+                expect(proc.isImmediateDrainRequested()).toBe(true);
+                const handler = registerObserver.mock.calls.find(([pref]) =>
+                    pref === 'extensions.zotero.astermargin.backgroundProcessingEnabled')![1];
+                enabled = false;
+                handler(false);
+                expect(proc.isImmediateDrainRequested()).toBe(false);
+                proc.requestImmediateDrain();
+                expect(proc.isImmediateDrainRequested()).toBe(false);
+                enabled = true;
+                handler(true);
+                expect(proc.isBacklogGateOpen()).toBe(false);
+                expect(await proc.processOnce()).toMatchObject({ processed: false });
+                expect(await db.peekBackgroundJobs()).toHaveLength(1);
+            } finally {
+                await proc.stop();
+                (idleMod.getSystemIdleTimeMs as any).mockReturnValue(Number.MAX_SAFE_INTEGER);
+            }
+        });
+
+        it('stop() unregisters pref, notifier, and idle observers', async () => {
+            const prefDisposer = vi.fn();
+            const notifierDisposer = vi.fn();
+            const idleDisposer = vi.fn();
+            (Zotero as any).Prefs.unregisterObserver = prefDisposer;
+            (Zotero as any).Notifier.unregisterObserver = notifierDisposer;
+            const idleMod = await import('../../../src/utils/idleService');
+            (idleMod.registerIdleObserver as any).mockReturnValueOnce(idleDisposer);
+
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.start();
+            await proc.stop();
+
+            expect(prefDisposer).toHaveBeenCalledTimes(2);
+            expect(notifierDisposer).toHaveBeenCalledTimes(1);
+            expect(idleDisposer).toHaveBeenCalledTimes(1);
+        });
+
+        it('startup-delay clamp: notify() during the first 30s schedules at ~STARTUP_DELAY_MS', async () => {
+            vi.useFakeTimers();
+            try {
+                const { BackgroundExtractor } = await loadProcessor();
+                const proc = new BackgroundExtractor();
+                const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+                proc.start();
+                // Drop the initial start() tick scheduling from the assertions
+                // by snapshotting the call index BEFORE notify().
+                const initialCalls = setTimeoutSpy.mock.calls.length;
+
+                proc.notify();
+
+                // The next scheduled tick must be clamped close to the
+                // remaining startup delay, not 0.
+                const lastCall = setTimeoutSpy.mock.calls.at(-1);
+                expect(setTimeoutSpy.mock.calls.length).toBeGreaterThan(initialCalls);
+                expect(lastCall?.[1]).toBeGreaterThan(0);
+                expect(lastCall?.[1]).toBeLessThanOrEqual(30_000);
+
+                await proc.stop();
+                setTimeoutSpy.mockRestore();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+    });
+
+    it('skips failBackgroundJob during shutdown so transient errors do not write', async () => {
+        await db.enqueueBackgroundJob({
+            jobType: 'document_extract',
+            libraryId: 1,
+            zoteroKey: 'AAAAAAAA',
+            contentKind: 'pdf',
+            payloadKind: 'structured',
+            payload: payload(),
+            now: 0,
+        });
+        mockState.nextResult = {
+            kind: 'timeout',
+            phase: 'pdf_extract',
+            pageCount: null,
+            resolvedAttachment: { libraryId: 1, zoteroKey: 'AAAAAAAA' },
+        };
+        (Zotero as any).__astermarginShuttingDown = true;
+
+        try {
+            const { BackgroundExtractor } = await loadProcessor();
+            const proc = new BackgroundExtractor();
+            await proc.processOnce();
+
+            // recordFailure's failBackgroundJob was skipped — attempt_count
+            // unchanged, no dead-letter row created.
+            const rows = await db.peekBackgroundJobs();
+            expect(rows).toHaveLength(1);
+            expect(rows[0].attemptCount).toBe(0);
+            const stats = await db.getBackgroundQueueStats(Date.now());
+            expect(stats.dead).toBe(0);
+        } finally {
+            (Zotero as any).__astermarginShuttingDown = undefined;
+        }
+    });
+});

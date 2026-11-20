@@ -1,0 +1,175 @@
+import React, { useMemo, useRef } from 'react';
+import { AgentRunStatus, ModelResponse, ToolCallPart } from '@astermargin/agent-core/agents/types';
+import { TextPartView } from './TextPartView';
+import { ThinkingPartView } from './ThinkingPartView';
+import { ToolCallPartView } from './ToolCallPartView';
+import { isAnnotationToolResult } from '@astermargin/agent-core/run-state/toolResultTypes';
+import { hasDrawnContent, isThinkingInProgress } from '@astermargin/agent-core/agents/messageVisibility';
+import ContextMenu from '@astermargin/agent-ui/primitives/ContextMenu';
+import useSelectionContextMenu from '../../hooks/useSelectionContextMenu';
+import { buildEditNoteRenderItems, getEditNoteGroupInstanceId } from './editNoteShared';
+import { getHost } from '@astermargin/agent-ui/host';
+import { GenericAgentActionView } from './GenericAgentActionView';
+
+interface ModelResponseViewProps {
+    /** The model response */
+    message: ModelResponse;
+    /** Whether the response is streaming */
+    isStreaming: boolean;
+    /** Whether the previous message has a tool call */
+    previousMessageHasToolCall: boolean;
+    /** Run ID for element identification */
+    runId: string;
+    /** Index of this response within the run (for unique DOM IDs) */
+    responseIndex: number;
+    /** Run status */
+    runStatus: AgentRunStatus;
+}
+
+/**
+ * Renders a single model response with all its parts.
+ * Parts are rendered in order: thinking, text, and tool calls.
+ * All edit_note runs are routed through EditNoteGroupView, including
+ * single-call runs, so note edits have one container path.
+ */
+export const ModelResponseView: React.FC<ModelResponseViewProps> = React.memo(function ModelResponseView({
+    message,
+    isStreaming,
+    previousMessageHasToolCall,
+    runId,
+    responseIndex,
+    runStatus,
+}) {
+    const contentRef = useRef<HTMLDivElement | null>(null);
+    
+    const { 
+        isMenuOpen: isSelectionMenuOpen, 
+        menuPosition: selectionMenuPosition,
+        closeMenu: closeSelectionMenu,
+        handleContextMenu,
+        menuItems: selectionMenuItems
+    } = useSelectionContextMenu(contentRef);
+
+    // Separate parts by type for rendering
+    const thinkingParts = message.parts.filter(part => part.part_kind === 'thinking');
+    const textParts = message.parts.filter(part => part.part_kind === 'text');
+    // Memoized so the arrays keep their identity across unrelated re-renders
+    // (e.g. selection-menu state): they feed EditNoteGroupView's memoized
+    // per-part state and its React.memo'd rows.
+    const toolCallParts = useMemo(
+        () => message.parts.filter(
+            (part): part is ToolCallPart =>
+                part.part_kind === 'tool-call' && part.tool_name !== 'return_suggestions',
+        ),
+        [message.parts],
+    );
+    const editNoteRenderItems = useMemo(
+        () => buildEditNoteRenderItems(toolCallParts),
+        [toolCallParts],
+    );
+
+    // Nothing visible: no parts, or only an auto-loading capability call.
+    if (!hasDrawnContent(message)) {
+        return null;
+    }
+
+    // Generate a unique ID for this response (used for DOM identification and UI state persistence)
+    // Note: This is NOT used for proposed actions - those will use runId directly once migrated
+    const responseId = `${runId}-response-${responseIndex}`;
+
+    return (
+        <div
+            id={`response-${responseId}`}
+            className={`hover-trigger user-select-text ${previousMessageHasToolCall ? '-mt-1' : ''}`}
+            ref={contentRef}
+            onContextMenu={handleContextMenu}
+        >
+            {/* Thinking parts (collapsible) */}
+            {thinkingParts.length > 0 && (
+                <ThinkingPartView
+                    key={`${responseId}-thinking`}
+                    parts={thinkingParts}
+                    isThinking={isStreaming && isThinkingInProgress(message)}
+                    hasFollowingContent={textParts.length > 0 || toolCallParts.length > 0}
+                    thinkingId={`${responseId}-thinking`}
+                />
+            )}
+
+            {/* Text parts (markdown rendered) */}
+            {textParts.length > 0 && (
+                <div>
+                    {textParts.map((part, index) => (
+                        part.part_kind === 'text' && (
+                            <TextPartView
+                                key={`text-${index}`}
+                                part={part}
+                            />
+                        )
+                    ))}
+                </div>
+            )}
+
+            {/* Tool call parts */}
+            {toolCallParts.length > 0 && (
+                <div className="display-flex flex-col py-2 gap-1">
+                    {editNoteRenderItems.map((item) => {
+                        if (item.kind === 'edit-note-group') {
+                            // Agent-action UI is host-injected; non-Zotero clients
+                            // get a request-side summary via the generic fallback.
+                            return (
+                                <React.Fragment key={`edit-note-group-${getEditNoteGroupInstanceId(item.parts)}`}>
+                                    {getHost().components?.agentActionInStream({
+                                        kind: 'edit-note-group',
+                                        parts: item.parts,
+                                        target: item.target,
+                                        runId,
+                                        responseIndex,
+                                        runStatus,
+                                    }) ?? <GenericAgentActionView editNoteParts={item.parts} runStatus={runStatus} />}
+                                </React.Fragment>
+                            );
+                        }
+
+                        const part = item.part;
+
+                        // Use specialized (host-injected) view for annotation tools
+                        if (isAnnotationToolResult(part.tool_name)) {
+                            return (
+                                <React.Fragment key={`tool-${part.tool_call_id}`}>
+                                    {getHost().components?.agentActionInStream({
+                                        kind: 'annotation',
+                                        part,
+                                        runId,
+                                        runStatus,
+                                    }) ?? <GenericAgentActionView part={part} runStatus={runStatus} />}
+                                </React.Fragment>
+                            );
+                        }
+
+                        // Default view for other tools
+                        return (
+                            <ToolCallPartView
+                                key={`tool-${responseIndex}-${part.tool_call_id}`}
+                                part={part}
+                                runId={runId}
+                                responseIndex={responseIndex}
+                                runStatus={runStatus}
+                            />
+                        );
+                    })}
+                </div>
+            )}
+
+            {/* Text selection context menu */}
+            <ContextMenu
+                menuItems={selectionMenuItems}
+                isOpen={isSelectionMenuOpen}
+                onClose={closeSelectionMenu}
+                position={selectionMenuPosition}
+                useFixedPosition={true}
+            />
+        </div>
+    );
+});
+
+export default ModelResponseView;

@@ -1,0 +1,393 @@
+import { CollectionResolutionError, serializeCollectionAncestors, serializeCollectionIdentity } from '../collections/collectionIdentity';
+import { cleanMetadataUrl } from '../../utils/metadataUrl';
+/**
+ * Agent Data Provider
+ * 
+ * This service provides WebSocket communication for agent runs,
+ * enabling bidirectional communication between the Zotero plugin and the backend.
+ * 
+ * The AsterMargin agent is the primary agent that handles chat completions and tool execution.
+ */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    ItemProjectionDetail,
+    WSGetMetadataRequest,
+    WSGetMetadataResponse,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import { AttachmentInfo, ItemStub } from '@astermargin/agent-core/types/zotero';
+import { serializeNote, serializeAnnotation, serializeItemStub } from '../../utils/zoteroSerializers';
+import { formatItemReference } from '../../utils/itemReference';
+import { getItemDisplayName } from '../../utils/itemDisplayName';
+import { libraryRefForLibraryID, modelObjectId, resolveItemReference, resolveObjectId, UNRESOLVED_LIBRARY_ID } from '../../utils/libraryIdentity';
+import { checkLibraryExcluded, getAttachmentInfoForItem, degradedAttachmentInfo, formatCreatorsString, extractYear } from './utils';
+import { loadQuickSearchHitData, toQuickSearchHit } from './itemSearchSerialization';
+import { getCreatorTypeInfo } from '../../utils/zoteroUtils';
+
+
+/**
+ * Enrich an item's collection memberships into {collection_key, name} objects
+ * so the agent sees meaningful names instead of opaque keys. Nested
+ * memberships also carry their complete ancestor chain.
+ */
+function enrichItemCollections(item: Zotero.Item) {
+    return item.getCollections().map((collId: number) => {
+        const coll = Zotero.Collections.get(collId);
+        const ancestors = coll ? serializeCollectionAncestors(coll) : undefined;
+        return {
+            ...(coll ? serializeCollectionIdentity(coll) : {}),
+            collection_key: coll ? coll.key : String(collId),
+            name: coll ? coll.name : String(collId),
+            ...(ancestors ? { ancestors } : {}),
+        };
+    });
+}
+
+/**
+ * Handle get_metadata request from backend.
+ * Returns Zotero metadata for specific items.
+ *
+ * `detail: 'full'` (the default) gives regular items the rich toJSON
+ * passthrough plus optional attachment/note children. Directly-requested
+ * attachments, notes, and annotations are normalized into the same shapes used
+ * elsewhere in the agent surface (AttachmentInfo, serializeNote,
+ * serializeAnnotation) so the backend can return a consistent, type-appropriate
+ * result rather than raw toJSON.
+ *
+ * `detail: 'compact'` gives one `QuickSearchHit` per item instead — the same
+ * projection quick search serves, so a bare reference from thread history
+ * renders as the chip it was without pulling the whole item across the wire.
+ */
+export async function handleGetMetadataRequest(
+    request: WSGetMetadataRequest
+): Promise<WSGetMetadataResponse> {
+    const detail: ItemProjectionDetail = request.detail === 'compact' ? 'compact' : 'full';
+    logger(`handleGetMetadataRequest: Getting metadata for ${request.item_ids.length} items (${detail})`, 1);
+
+    const items: Record<string, any>[] = [];
+    const notFound: string[] = [];
+
+    for (const itemId of request.item_ids) {
+        try {
+            // Parse item_id format: either the portable "<library_ref>-<zotero_key>"
+            // or the legacy "<library_id>-<zotero_key>".
+            const parsedRef = resolveObjectId(itemId);
+            if (!parsedRef) {
+                notFound.push(itemId);
+                continue;
+            }
+
+            // Never serve metadata for items in libraries the user excluded from
+            // AsterMargin; report them as not found so no data leaks. Skip the check
+            // for an unresolved portable ref (no local library to check yet) —
+            // the lookup below reports it as not found either way.
+            if (parsedRef.library_id !== UNRESOLVED_LIBRARY_ID && checkLibraryExcluded(parsedRef.library_id)) {
+                notFound.push(itemId);
+                continue;
+            }
+
+            // Get the item. This response shape only carries a flat not_found
+            // list, so an unavailable library and a genuinely missing key are
+            // both reported as not found.
+            const resolved = await resolveItemReference(parsedRef);
+            if (resolved.status !== 'found') {
+                notFound.push(itemId);
+                continue;
+            }
+            const item = resolved.item;
+            const libraryId = item.libraryID;
+
+            // --- Compact: one chip-sized row per item, whatever its type ---
+            if (detail === 'compact') {
+                // Loads exactly what the compact row reads — including the
+                // note text and parent chain a bare itemData/creators load
+                // leaves behind, which this projection needs precisely because
+                // it serves notes and child items as well as regular ones.
+                await loadQuickSearchHitData([item]);
+                items.push({
+                    item_id: modelObjectId(item.libraryID, item.key),
+                    ...toQuickSearchHit(item),
+                });
+                continue;
+            }
+
+            // Load necessary data types before accessing item data
+            // Always load itemData and creators for basic fields
+            await Zotero.Items.loadDataTypes(
+                [item],
+                ['itemData', 'creators', 'relations', 'tags', 'collections', 'childItems']
+            );
+
+            // --- Attachment: normalize to the unified AttachmentInfo shape ---
+            if (item.isAttachment()) {
+                // Resolve the parent via parentItemID + getAsync rather than the
+                // synchronous `parentItem` getter, which returns undefined when
+                // the parent shell isn't cached (common for a cold WS fetch).
+                const parentId = item.parentItemID;
+                const parent = parentId ? await Zotero.Items.getAsync(parentId) : null;
+                let parentItemId: string | undefined;
+                let parentSummary: ItemStub | null = null;
+                let isPrimary = false;
+                if (parent) {
+                    parentItemId = modelObjectId(parent.libraryID, parent.key);
+                    await Zotero.Items.loadDataTypes([parent], ['primaryData', 'itemData', 'creators']);
+                    parentSummary = serializeItemStub(parent);
+                    try {
+                        const best = await parent.getBestAttachment();
+                        isPrimary = best ? best.id === item.id : false;
+                    } catch {
+                        // getBestAttachment failure is non-fatal — is_primary stays false.
+                    }
+                }
+                let info: AttachmentInfo;
+                try {
+                    info = await getAttachmentInfoForItem(item, {
+                        parentItemId,
+                        isPrimary,
+                        includeAnnotationsCount: true,
+                        skipWorkerFallback: true,
+                    });
+                } catch (error) {
+                    // Isolate the row so one unreadable record does not fail the
+                    // whole batch. Unlike a child attachment (dropped by the loop
+                    // below), a requested item must still come back — the model
+                    // asked for it by id and needs to know it exists.
+                    logger(`handleGetMetadataRequest: Degrading unreadable attachment ${item.key}: ${error}`, 2);
+                    info = degradedAttachmentInfo(item, parentItemId ?? null, isPrimary);
+                }
+                items.push({
+                    ...info,
+                    item_id: modelObjectId(item.libraryID, item.key),
+                    itemType: 'attachment',
+                    parent_item: parentSummary,
+                    collections: enrichItemCollections(item),
+                    tags: item.getTags(),
+                    // Emit ISO-8601 to match the regular-item toJSON path (the
+                    // backend tolerates raw SQL too, but keep the wire consistent).
+                    dateAdded: item.dateAdded ? Zotero.Date.sqlToISO8601(item.dateAdded) : null,
+                    dateModified: item.dateModified ? Zotero.Date.sqlToISO8601(item.dateModified) : null,
+                });
+                continue;
+            }
+
+            // --- Note: structured fields only (no body) ---
+            if (item.isNote()) {
+                const parentId = item.parentItemID;
+                const parent = parentId ? await Zotero.Items.getAsync(parentId) : null;
+                let parentSummary: ItemStub | null = null;
+                if (parent) {
+                    await Zotero.Items.loadDataTypes([parent], ['primaryData', 'itemData', 'creators']);
+                    parentSummary = serializeItemStub(parent);
+                }
+                items.push({
+                    ...serializeNote(item, parentSummary),
+                    itemType: 'note',
+                });
+                continue;
+            }
+
+            // --- Annotation: normalize via serializeAnnotation (type/text/comment/page/parents) ---
+            if (item.isAnnotation()) {
+                // Annotation field getters (annotationType/Text/Comment/Color/
+                // AuthorName) require the 'annotation' data type, and
+                // annotationPosition requires 'annotationDeferred'. Neither is in
+                // the shared load above, so without this the getters throw
+                // UnloadedDataException and the annotation is wrongly reported as
+                // not_found. Load them before serializing.
+                await Zotero.Items.loadDataTypes([item], ['annotation', 'annotationDeferred']);
+
+                // The annotation's parent is the attachment (the PDF); the
+                // attachment's parent is the bibliographic regular item. Resolve
+                // both async so a cold cache doesn't drop the parent linkage.
+                const attachmentId = item.parentItemID;
+                const attachment = attachmentId ? await Zotero.Items.getAsync(attachmentId) : null;
+                let attachmentInfo: { item_id: string } | null = null;
+                let itemInfo: {
+                    item_id: string;
+                    item_type?: string | null;
+                    title: string;
+                    creators?: string | null;
+                    year?: number | null;
+                } | null = null;
+                if (attachment) {
+                    attachmentInfo = { item_id: modelObjectId(attachment.libraryID, attachment.key) };
+                    const regularId = attachment.parentItemID;
+                    const regular = regularId ? await Zotero.Items.getAsync(regularId) : null;
+                    if (regular) {
+                        await Zotero.Items.loadDataTypes([regular], ['itemData', 'creators']);
+                        itemInfo = {
+                            item_id: modelObjectId(regular.libraryID, regular.key),
+                            item_type: regular.itemType,
+                            title: regular.getDisplayTitle?.() || '',
+                            creators: formatCreatorsString(regular.getCreators?.()),
+                            year: extractYear(regular.getField('date')),
+                        };
+                    }
+                }
+                // serializeAnnotation sets item_id to the bibliographic parent and
+                // annotation_id to the annotation itself. The backend correlates
+                // annotations by annotation_id, so do NOT overwrite item_id here;
+                // only tag the type for the backend's per-type branch.
+                items.push({
+                    ...serializeAnnotation(item, attachmentInfo, itemInfo),
+                    itemType: 'annotation',
+                });
+                continue;
+            }
+
+            // Get full item data via toJSON({ mode: 'full' }) - includes all fields
+            const itemData: Record<string, any> = item.toJSON({ mode: 'full' });
+            itemData.item_id = modelObjectId(item.libraryID, item.key);
+            if ('url' in itemData) itemData.url = cleanMetadataUrl(itemData.url);
+            itemData.library_ref = libraryRefForLibraryID(libraryId) ?? undefined;
+            
+            // Return all fields (including tags and collections)
+            const result: Record<string, any> = { ...itemData };
+
+            // The citation-shaped labels, which `toJSON` does not carry. Only
+            // for regular items: a note or attachment has no reference to
+            // render. Guarded because these read a wider slice of the item API
+            // than the field reads above, and a hover-card label must not cost
+            // the whole row.
+            if (item.isRegularItem()) {
+                try {
+                    result.formatted_citation = formatItemReference(item) || null;
+                } catch {
+                    result.formatted_citation = null;
+                }
+                try {
+                    result.display_name = getItemDisplayName(item) || null;
+                } catch {
+                    result.display_name = null;
+                }
+            }
+
+            // Enrich collection keys with names for agent readability
+            // toJSON() returns collections as plain key strings: ["ABCD1234", ...]
+            // Exclude trash before attaching names, portable identities and
+            // ancestor chains.
+            if (Array.isArray(result.collections)) {
+                result.collections = result.collections.flatMap((collKey: string) => {
+                    try {
+                        const coll = Zotero.Collections.getByLibraryAndKey(libraryId, collKey);
+                        if (!coll || coll.deleted) return [];
+                        const ancestors = serializeCollectionAncestors(coll);
+                        return {
+                            ...serializeCollectionIdentity(coll),
+                            collection_key: collKey,
+                            name: coll.name,
+                            ...(ancestors ? { ancestors } : {}),
+                        };
+                    } catch (error) {
+                        if (error instanceof CollectionResolutionError) throw error;
+                        return { collection_key: collKey, name: collKey };
+                    }
+                });
+            }
+
+            // Surface the item type's creator vocabulary alongside its fields.
+            // toJSON() reports the item's current creators but not which types
+            // its schema permits, and `author` is invalid for many types
+            // (patent -> inventor, film -> director, presentation -> presenter,
+            // ...). Without this the agent has to guess a creator type and
+            // learn the right one from a rejected edit.
+            const creatorTypes = getCreatorTypeInfo(item.itemTypeID);
+            if (creatorTypes) {
+                result.valid_creator_types = creatorTypes.valid;
+                result.primary_creator_type = creatorTypes.primary;
+            }
+
+            // Handle attachments if requested
+            if (request.include_attachments && item.isRegularItem()) {
+                const attachmentIds = item.getAttachments();
+                if (attachmentIds.length > 0) {
+                    // Batch fetch all attachments at once
+                    const attachmentItems = await Zotero.Items.getAsync(attachmentIds);
+                    
+                    // Ensure attachment data is loaded
+                    await Zotero.Items.loadDataTypes(attachmentItems, ['primaryData', 'itemData', 'tags', 'collections', 'childItems']);
+                    
+                    const attachments: any[] = [];
+                    const bestAttachment = await item.getBestAttachment();
+                    
+                    for (const attachment of attachmentItems) {
+                        if (!attachment) continue;
+                        
+                        try {
+                            const attachmentInfo = await getAttachmentInfoForItem(attachment, {
+                                parentItemId: modelObjectId(item.libraryID, item.key),
+                                isPrimary: bestAttachment ? attachment.id === bestAttachment.id : false,
+                                includeAnnotationsCount: true,
+                                skipWorkerFallback: true,
+                            });
+                            attachments.push({
+                                ...attachmentInfo,
+                                url: cleanMetadataUrl(attachment.getField('url')),
+                            });
+                        } catch (error) {
+                            logger(`handleGetMetadataRequest: Error processing attachment ${attachment.key}: ${error}`, 2);
+                        }
+                    }
+                    
+                    if (attachments.length > 0) {
+                        result.attachments = attachments;
+                    }
+                }
+            }
+            
+            // Handle notes if requested
+            if (request.include_notes && item.isRegularItem()) {
+                const noteIds = item.getNotes();
+                if (noteIds.length > 0) {
+                    // Batch fetch all notes at once
+                    const noteItems = await Zotero.Items.getAsync(noteIds);
+
+                    // Ensure note data is loaded
+                    await Zotero.Items.loadDataTypes(noteItems, ['primaryData', 'itemData']);
+
+                    const notes: any[] = [];
+                    // The requested regular item is the parent; it was loaded with
+                    // itemData + creators above, so the bibliographic anchor is
+                    // available without another load.
+                    const parentSummary = serializeItemStub(item);
+
+                    for (const note of noteItems) {
+                        if (!note || !note.isNote()) continue;
+
+                        try {
+                            notes.push(serializeNote(note, parentSummary));
+                        } catch (error) {
+                            logger(`handleGetMetadataRequest: Error processing note ${note.key}: ${error}`, 2);
+                        }
+                    }
+
+                    if (notes.length > 0) {
+                        result.notes = notes;
+                    }
+                }
+            }
+            
+            items.push(result);
+            
+        } catch (error) {
+            if (error instanceof CollectionResolutionError) {
+                return {
+                    type: 'get_metadata', request_id: request.request_id, items: [], detail,
+                    not_found: notFound, error: error.message, error_code: error.code,
+                };
+            }
+            logger(`handleGetMetadataRequest: Failed to get item ${itemId}: ${error}`, 1);
+            notFound.push(itemId);
+        }
+    }
+    
+    logger(`handleGetMetadataRequest: Returning ${items.length} items, ${notFound.length} not found`, 1);
+    
+    return {
+        type: 'get_metadata',
+        request_id: request.request_id,
+        items,
+        detail,
+        not_found: notFound,
+    };
+}

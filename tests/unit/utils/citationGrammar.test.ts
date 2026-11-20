@@ -1,0 +1,415 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+    baseCitationKey,
+    citationIndexCandidateIdsForLocator,
+    externalCompatKey,
+    getPageLocator,
+    getRequestedRef,
+    getResolvedRef,
+    isRecordIdRange,
+    locatorFromLegacyPage,
+    locatorIdScheme,
+    locatorValues,
+    normalizeCitationTag,
+    parseLoc,
+    parseZoteroId,
+    requestedCitationKey,
+    parseRawCitationAttributes,
+} from '@astermargin/agent-core/citations/citationGrammar';
+
+describe('citationGrammar', () => {
+    it('parses registered locator prefixes and ranges', () => {
+        expect(parseLoc('p10')).toEqual({ kind: 'paragraph', value: '10', raw: 'p10' });
+        expect(parseLoc('page12')).toEqual({ kind: 'page', value: '12', raw: 'page12' });
+        expect(parseLoc('pageiv')).toEqual({ kind: 'page', value: 'iv', raw: 'pageiv' });
+        expect(parseLoc('s343')).toEqual({ kind: 'sentence', value: '343', raw: 's343' });
+        expect(parseLoc('s0-s8')).toEqual({ kind: 'sentence', value: '0-8', raw: 's0-s8' });
+        expect(parseLoc('l34')).toEqual({ kind: 'line', value: '34', raw: 'l34' });
+        expect(parseLoc('l34-l38')).toEqual({ kind: 'line', value: '34-38', raw: 'l34-l38' });
+        expect(parseLoc('paragraph12')).toEqual({ kind: 'paragraph', value: '12', raw: 'paragraph12' });
+        expect(parseLoc('heading3')).toEqual({ kind: 'heading', value: '3', raw: 'heading3' });
+        expect(parseLoc('list8')).toEqual({ kind: 'list', value: '8', raw: 'list8' });
+        expect(parseLoc('list5')).toEqual({ kind: 'list', value: '5', raw: 'list5' });
+        expect(parseLoc('caption12')).toEqual({ kind: 'caption', value: '12', raw: 'caption12' });
+        expect(parseLoc('footnote4')).toEqual({ kind: 'footnote', value: '4', raw: 'footnote4' });
+        expect(parseLoc('margin6')).toEqual({ kind: 'margin', value: '6', raw: 'margin6' });
+        expect(parseLoc('fig2')).toEqual({ kind: 'figure', value: '2', raw: 'fig2' });
+        expect(parseLoc('eq4')).toEqual({ kind: 'equation', value: '4', raw: 'eq4' });
+        expect(parseLoc('table3')).toEqual({ kind: 'table', value: '3', raw: 'table3' });
+        expect(parseLoc('tab3')).toEqual({ kind: 'table', value: '3', raw: 'tab3' });
+        expect(parseLoc('p10-p12')).toEqual({ kind: 'paragraph', value: '10-12', raw: 'p10-p12' });
+    });
+
+    it('maps accepted locator aliases to structured citation index ids', () => {
+        expect(citationIndexCandidateIdsForLocator(parseLoc('paragraph12')!)).toEqual(['p12']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('l34-l38')!)).toEqual(['l34', 'l38']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('tab3')!)).toEqual(['table3']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('p10-p12')!)).toEqual(['p10', 'p12']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('heading3')!)).toEqual(['heading3']);
+    });
+
+    it('parses page-scoped record ids and ranges', () => {
+        expect(parseLoc('s5.6')).toEqual({ kind: 'sentence', value: '5.6', raw: 's5.6' });
+        expect(parseLoc('p12.3')).toEqual({ kind: 'paragraph', value: '12.3', raw: 'p12.3' });
+        expect(parseLoc('heading5.1')).toEqual({ kind: 'heading', value: '5.1', raw: 'heading5.1' });
+        expect(parseLoc('caption5.2')).toEqual({ kind: 'caption', value: '5.2', raw: 'caption5.2' });
+        expect(citationIndexCandidateIdsForLocator(parseLoc('caption5.2')!)).toEqual(['caption5.2']);
+        expect(parseLoc('paragraph5.2')).toEqual({ kind: 'paragraph', value: '5.2', raw: 'paragraph5.2' });
+        expect(parseLoc('s5.6-s5.9')).toEqual({ kind: 'sentence', value: '5.6-5.9', raw: 's5.6-s5.9' });
+        // Cross-page and reversed ranges keep their ends as written.
+        expect(parseLoc('s5.30-s6.2')).toEqual({ kind: 'sentence', value: '5.30-6.2', raw: 's5.30-s6.2' });
+        expect(parseLoc('s6.2-s5.30')).toEqual({ kind: 'sentence', value: '6.2-5.30', raw: 's6.2-s5.30' });
+        // A bare page-scoped right end is the full form without its prefix.
+        expect(parseLoc('s5.6-5.9')).toEqual({ kind: 'sentence', value: '5.6-5.9', raw: 's5.6-5.9' });
+    });
+
+    it('expands the same-page shorthand and keeps the raw locator as the key', () => {
+        const loc = parseLoc('s5.6-9')!;
+        expect(loc).toEqual({ kind: 'sentence', value: '5.6-5.9', raw: 's5.6-9' });
+        expect(citationIndexCandidateIdsForLocator(loc)).toEqual(['s5.6', 's5.9']);
+        expect(requestedCitationKey({ kind: 'zotero', library_id: 1, zotero_key: 'ABCD1234', loc }))
+            .toBe('zotero:1-ABCD1234:s5.6-9');
+        // The document-wide shorthand and page ranges are unchanged.
+        expect(parseLoc('s12-15')).toEqual({ kind: 'sentence', value: '12-15', raw: 's12-15' });
+        expect(parseLoc('page5.1-7')).toEqual({ kind: 'page', value: '5.1-7', raw: 'page5.1-7' });
+    });
+
+    it('rejects ranges that mix id schemes', () => {
+        for (const raw of ['s243-s5.6', 's5.6-s243', 's243-5.6']) {
+            const loc = parseLoc(raw)!;
+            expect(loc).toEqual({ kind: 'unknown', value: raw, raw });
+            expect(citationIndexCandidateIdsForLocator(loc)).toEqual([]);
+            expect(locatorIdScheme(loc)).toBeNull();
+        }
+    });
+
+    it('maps page-scoped locators to citation index ids by their ends', () => {
+        expect(citationIndexCandidateIdsForLocator(parseLoc('s5.6')!)).toEqual(['s5.6']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('s5.30-s6.2')!)).toEqual(['s5.30', 's6.2']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('paragraph5.2')!)).toEqual(['p5.2']);
+        expect(citationIndexCandidateIdsForLocator(parseLoc('tab3.1-tab4.1')!)).toEqual(['table3.1', 'table4.1']);
+    });
+
+    it('names the id scheme of record-id locators only', () => {
+        expect(locatorIdScheme(parseLoc('s243')!)).toBe('document');
+        expect(locatorIdScheme(parseLoc('s243-s250')!)).toBe('document');
+        expect(locatorIdScheme(parseLoc('s5.6')!)).toBe('page');
+        expect(locatorIdScheme(parseLoc('s5.6-9')!)).toBe('page');
+        expect(locatorIdScheme(parseLoc('fig2.1')!)).toBe('page');
+        expect(locatorIdScheme(parseLoc('page5')!)).toBeNull();
+        expect(locatorIdScheme(parseLoc('l34')!)).toBeNull();
+        expect(locatorIdScheme(parseLoc('intro')!)).toBeNull();
+    });
+
+    it('keeps unknown and legacy page locators stable', () => {
+        expect(parseLoc('10-12')).toEqual({ kind: 'unknown', value: '10-12', raw: '10-12' });
+        expect(parseLoc('paragraph')).toEqual({ kind: 'unknown', value: 'paragraph', raw: 'paragraph' });
+        expect(parseLoc('paragraphIntro')).toEqual({ kind: 'unknown', value: 'paragraphIntro', raw: 'paragraphIntro' });
+        expect(locatorFromLegacyPage('222, 237-238')).toEqual({
+            kind: 'page',
+            value: '222, 237-238',
+            raw: '222, 237-238',
+        });
+    });
+
+    it('strictly parses Zotero IDs', () => {
+        expect(parseZoteroId('1-ABC-DEF')).toEqual({ library_id: 1, zotero_key: 'ABC-DEF' });
+        expect(parseZoteroId('user-content-2-KEY')).toEqual({ library_id: 2, zotero_key: 'KEY' });
+        expect(parseZoteroId('0-ABC')).toBeNull();
+        expect(parseZoteroId('ABC')).toBeNull();
+        expect(parseZoteroId('1-')).toBeNull();
+        // ext-<KEY> is not a Zotero reference; the caller must match it first.
+        expect(parseZoteroId('ext-AB12CD34')).toBeNull();
+    });
+
+    it('normalizes new, legacy, external, and invalid citation tags', () => {
+        expect(normalizeCitationTag({ id: '1-ABC', loc: 'page3' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'zotero', library_id: 1, zotero_key: 'ABC', loc: { kind: 'page', value: '3', raw: 'page3' } },
+        });
+        expect(normalizeCitationTag({ att_id: '1-ATT', sid: 's0-s8' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'zotero', library_id: 1, zotero_key: 'ATT', loc: { kind: 'sentence', value: '0-8', raw: 's0-s8' } },
+        });
+        expect(normalizeCitationTag({ att_id: '1-ATT', sid: 'heading3' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'zotero', library_id: 1, zotero_key: 'ATT', loc: { kind: 'heading', value: '3', raw: 'heading3' } },
+        });
+        expect(normalizeCitationTag({ att_id: '1-ATT', loc: 'p12' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'zotero', library_id: 1, zotero_key: 'ATT', loc: { kind: 'paragraph', value: '12', raw: 'p12' } },
+        });
+        expect(normalizeCitationTag({ item_id: '1-ABC', page: '10-12' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'zotero', loc: { kind: 'page', value: '10-12', raw: '10-12' } },
+        });
+        expect(normalizeCitationTag({ external_id: 'W12345' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'external', external_id: 'W12345' },
+        });
+        expect(normalizeCitationTag({})).toMatchObject({ ok: false, reason: 'missing_identity' });
+        expect(normalizeCitationTag({ id: 'bad', external_id: 'W1' })).toMatchObject({ ok: false, reason: 'conflicting_identity' });
+        expect(normalizeCitationTag({ id: 'bad' })).toMatchObject({ ok: false, reason: 'invalid_zotero_id', rawIdentity: 'bad' });
+        expect(normalizeCitationTag({ external_id: '   ' })).toMatchObject({ ok: false, reason: 'invalid_external_id' });
+    });
+
+    it('parses escaped quote citation attributes', () => {
+        expect(parseRawCitationAttributes('att_id=\\"1-NLNMPWNQ\\" sid=\\"heading3\\"')).toEqual({
+            att_id: '1-NLNMPWNQ',
+            sid: 'heading3',
+        });
+    });
+
+    it('builds requested, base, and external compatibility keys', () => {
+        const zotero = normalizeCitationTag({ id: '1-ABC', loc: 'page3' });
+        expect(zotero.ok && requestedCitationKey(zotero.ref)).toBe('zotero:1-ABC:page3');
+        expect(zotero.ok && baseCitationKey(zotero.ref)).toBe('zotero:1-ABC');
+        expect(zotero.ok && getPageLocator(zotero.ref)).toBe('3');
+
+        expect(externalCompatKey('W1')).toBe('external:W1');
+        expect(requestedCitationKey({ kind: 'external', external_id: 'W1', source: 'openalex' })).toBe('external:openalex:W1');
+    });
+
+    it('prefers backend refs and back-fills missing loc from raw tags', () => {
+        const requested = getRequestedRef({
+            requested_ref: { kind: 'zotero', library_id: 1, zotero_key: 'REQUESTED' },
+            raw_tag: '<citation item_id="1-ORIGINAL" page="4"/>',
+        });
+        expect(requested).toEqual({
+            kind: 'zotero',
+            library_id: 1,
+            zotero_key: 'REQUESTED',
+            loc: { kind: 'page', value: '4', raw: '4' },
+        });
+
+        const resolved = getResolvedRef({
+            resolved_ref: { kind: 'external', external_id: 'W123', source: 'openalex' },
+            raw_tag: '<citation external_id="W123" loc="page3"/>',
+        });
+        expect(resolved).toEqual({
+            kind: 'external',
+            external_id: 'W123',
+            source: 'openalex',
+            loc: { kind: 'page', value: '3', raw: 'page3' },
+        });
+
+        const resolvedWithRequestedLoc = getResolvedRef({
+            requested_ref: {
+                kind: 'zotero',
+                library_id: 1,
+                zotero_key: 'ATTACHMENT',
+                loc: { kind: 'page', value: '4', raw: 'page4' },
+            },
+            resolved_ref: { kind: 'zotero', library_id: 1, zotero_key: 'PARENT' },
+        });
+        expect(resolvedWithRequestedLoc).toEqual({
+            kind: 'zotero',
+            library_id: 1,
+            zotero_key: 'PARENT',
+            loc: { kind: 'page', value: '4', raw: 'page4' },
+        });
+    });
+});
+
+describe('sentence lists', () => {
+    it.each([
+        // A passage continuing on the next page, piece by piece.
+        ['s7.45,s8.3', 'sentence', '7.45,8.3'],
+        ['s7.44-s7.45,s8.1-s8.2', 'sentence', '7.44-7.45,8.1-8.2'],
+        ['s7.44-45, s8.3', 'sentence', '7.44-7.45,8.3'],
+        ['s7.45;s8.3', 'sentence', '7.45,8.3'],
+        ['s3.40,s4.1-s5.2,s6.1', 'sentence', '3.40,4.1-5.2,6.1'],
+        // Every piece is kept, wherever it sits.
+        ['s3.58,s3.63', 'sentence', '3.58,3.63'],
+        ['s2.36,s2.42-s2.43', 'sentence', '2.36,2.42-2.43'],
+        ['s2.36, s2.40', 'sentence', '2.36,2.40'],
+        ['s2.3,s9.4', 'sentence', '2.3,9.4'],
+        ['s8.3,s7.45', 'sentence', '8.3,7.45'],
+        ['s7.45,s8.3,s8.5', 'sentence', '7.45,8.3,8.5'],
+        ['s7.45,s8.1,s12.3', 'sentence', '7.45,8.1,12.3'],
+        ['s2.36,,s2.40,', 'sentence', '2.36,2.40'],
+        // Lists with any other piece parse as one token, as before.
+        ['s3.5,s243', 'unknown', 's3.5,s243'],
+        ['s3.5,page4', 'unknown', 's3.5,page4'],
+        ['s3.5,heading4.1', 'unknown', 's3.5,heading4.1'],
+        ['s12,s40', 'unknown', 's12,s40'],
+        ['page3,page5', 'page', '3,page5'],
+        ['heading3.1,s4.2', 'unknown', 'heading3.1,s4.2'],
+    ])('parses %s like the backend', (raw, kind, value) => {
+        expect(parseLoc(raw)).toEqual({ kind, value, raw });
+    });
+
+    it('addresses the ends of every piece and names the page-scoped scheme', () => {
+        const loc = parseLoc('s7.44-s7.45,s8.3')!;
+        expect(locatorValues(loc)).toEqual(['7.44-7.45', '8.3']);
+        expect(citationIndexCandidateIdsForLocator(loc)).toEqual(['s7.44', 's7.45', 's8.3']);
+        expect(locatorIdScheme(loc)).toBe('page');
+        expect(isRecordIdRange(loc)).toBe(true);
+    });
+
+    it('addresses every piece of a same-page list', () => {
+        const loc = parseLoc('s2.36,s2.42-s2.43')!;
+        expect(locatorValues(loc)).toEqual(['2.36', '2.42-2.43']);
+        expect(citationIndexCandidateIdsForLocator(loc)).toEqual(['s2.36', 's2.42', 's2.43']);
+    });
+
+    it.each([
+        ['s2.36,s2.42-s2.43', true],
+        ['s7.45,s8.1', true],
+        ['s3.40,s4.1-s5.2,s6.1', true],
+        ['s2.3,s9.4', false],
+        ['s7.45,s8.1,s12.3', false],
+    ])('treats %s as one page range: %s', (raw, expected) => {
+        expect(isRecordIdRange(parseLoc(raw)!)).toBe(expected);
+    });
+
+    it('keeps the raw list as the citation key', () => {
+        const loc = parseLoc('s7.45,s8.3')!;
+        expect(requestedCitationKey({ kind: 'zotero', library_id: 1, zotero_key: 'ABCD1234', loc }))
+            .toBe('zotero:1-ABCD1234:s7.45,s8.3');
+    });
+});
+
+describe('portable Zotero ids (u-<KEY> / g<groupID>-<KEY>)', () => {
+    const zotero = (globalThis as any).Zotero;
+    const originalLibraries = zotero.Libraries;
+    const originalGroups = zotero.Groups;
+    const getLibraryIDFromGroupID = vi.fn();
+
+    beforeEach(() => {
+        getLibraryIDFromGroupID.mockReset();
+        zotero.Libraries = { ...originalLibraries, userLibraryID: 1 };
+        zotero.Groups = { getLibraryIDFromGroupID };
+    });
+
+    afterEach(() => {
+        zotero.Libraries = originalLibraries;
+        zotero.Groups = originalGroups;
+    });
+
+    it('resolves a portable personal-library id to this device\'s library', () => {
+        expect(parseZoteroId('u-ABCD1234')).toEqual({ library_id: 1, library_ref: 'u', zotero_key: 'ABCD1234' });
+    });
+
+    it('resolves a portable group id with a local mapping', () => {
+        getLibraryIDFromGroupID.mockReturnValue(7);
+        expect(parseZoteroId('g42-ABCD1234')).toEqual({ library_id: 7, library_ref: 'g42', zotero_key: 'ABCD1234' });
+    });
+
+    it('marks a portable group id without a local mapping as unresolved, keeping library_ref', () => {
+        getLibraryIDFromGroupID.mockReturnValue(false);
+        expect(parseZoteroId('g42-ABCD1234')).toEqual({ library_id: 0, library_ref: 'g42', zotero_key: 'ABCD1234' });
+    });
+
+    it('flows a portable group id through normalizeCitationTag', () => {
+        getLibraryIDFromGroupID.mockReturnValue(7);
+        expect(normalizeCitationTag({ id: 'g42-ABCD1234', loc: 'page3' })).toMatchObject({
+            ok: true,
+            ref: { kind: 'zotero', library_id: 7, library_ref: 'g42', zotero_key: 'ABCD1234', loc: { kind: 'page', value: '3', raw: 'page3' } },
+        });
+    });
+
+    it('keys portable references by stable library_ref instead of local library_id', () => {
+        const onFirstDevice = { kind: 'zotero' as const, library_id: 7, library_ref: 'g42', zotero_key: 'ABCD1234' };
+        const onSecondDevice = { ...onFirstDevice, library_id: 19 };
+        const unavailable = { ...onFirstDevice, library_id: 0 };
+        const differentUnavailableGroup = { ...unavailable, library_ref: 'g99' };
+
+        expect(baseCitationKey(onFirstDevice)).toBe('zotero:g42-ABCD1234');
+        expect(baseCitationKey(onSecondDevice)).toBe(baseCitationKey(onFirstDevice));
+        expect(baseCitationKey(unavailable)).toBe(baseCitationKey(onFirstDevice));
+        expect(baseCitationKey(differentUnavailableGroup)).not.toBe(baseCitationKey(unavailable));
+    });
+
+    it('keeps legacy numeric keys when no portable library_ref is available', () => {
+        expect(baseCitationKey({ kind: 'zotero', library_id: 7, zotero_key: 'ABCD1234' }))
+            .toBe('zotero:7-ABCD1234');
+    });
+});
+
+describe('external file citations (ext-<KEY>)', () => {
+    it('parses ext ids under the generic id attribute and normalizes the key', () => {
+        for (const raw of ['ext-AB12CD34', 'ext-ab12cd34', 'EXT-ab12cd34']) {
+            const normalized = normalizeCitationTag({ id: raw, loc: 'page2' });
+            expect(normalized.ok).toBe(true);
+            if (normalized.ok) {
+                expect(normalized.ref).toEqual({
+                    kind: 'external_file',
+                    ext_key: 'AB12CD34',
+                    loc: { kind: 'page', value: '2', raw: 'page2' },
+                });
+            }
+        }
+    });
+
+    it('rejects malformed ext ids as invalid zotero ids', () => {
+        // wrong key length / characters fall through to the Zotero parse
+        const normalized = normalizeCitationTag({ id: 'ext-SHORT' });
+        expect(normalized.ok).toBe(false);
+    });
+
+    it('builds extfile citation keys with and without locators', () => {
+        const ref = { kind: 'external_file' as const, ext_key: 'AB12CD34' };
+        expect(baseCitationKey(ref)).toBe('extfile:AB12CD34');
+        expect(requestedCitationKey({
+            ...ref,
+            loc: { kind: 'page' as const, value: '2', raw: 'page2' },
+        })).toBe('extfile:AB12CD34:page2');
+    });
+
+    it('resolves external file refs through getRequestedRef/getResolvedRef', () => {
+        const citation = {
+            requested_ref: { kind: 'external_file' as const, ext_key: 'AB12CD34' },
+            resolved_ref: { kind: 'external_file' as const, ext_key: 'AB12CD34' },
+            raw_tag: '<citation id="ext-AB12CD34" loc="page2"/>',
+        };
+        // loc recovered from the raw tag when refs lack it
+        expect(getRequestedRef(citation)).toEqual({
+            kind: 'external_file',
+            ext_key: 'AB12CD34',
+            loc: { kind: 'page', value: '2', raw: 'page2' },
+        });
+        expect(getResolvedRef(citation)).toEqual({
+            kind: 'external_file',
+            ext_key: 'AB12CD34',
+            loc: { kind: 'page', value: '2', raw: 'page2' },
+        });
+    });
+});
+
+describe('unknown / future ref kinds (cross-app forward compat)', () => {
+    // A newer backend (or another connected app) may send a ref kind this
+    // client doesn't model. Keying must degrade gracefully — stable,
+    // kind-namespaced, non-colliding — rather than assuming a closed set.
+    it('builds a stable, kind-namespaced base key for unknown kinds', () => {
+        const ref = { kind: 'obsidian_note', note_path: 'vault/Note A.md' } as any;
+        const key = baseCitationKey(ref);
+        expect(key.startsWith('obsidian_note:')).toBe(true);
+        expect(key).toContain('Note A.md');
+    });
+
+    it('does not collide two distinct unknown-kind refs onto one key', () => {
+        const a = baseCitationKey({ kind: 'obsidian_note', note_path: 'A.md' } as any);
+        const b = baseCitationKey({ kind: 'obsidian_note', note_path: 'B.md' } as any);
+        expect(a).not.toBe(b);
+    });
+
+    it('excludes loc from the base key so markers stay location-independent', () => {
+        const withLoc = baseCitationKey({
+            kind: 'obsidian_note',
+            note_path: 'A.md',
+            loc: { kind: 'page', value: '2', raw: 'page2' },
+        } as any);
+        const withoutLoc = baseCitationKey({ kind: 'obsidian_note', note_path: 'A.md' } as any);
+        expect(withLoc).toBe(withoutLoc);
+    });
+
+    it('appends the locator only in the full requested key', () => {
+        const ref = {
+            kind: 'obsidian_note',
+            note_path: 'A.md',
+            loc: { kind: 'page', value: '2', raw: 'page2' },
+        } as any;
+        expect(requestedCitationKey(ref)).toBe(`${baseCitationKey(ref)}:page2`);
+    });
+});

@@ -1,0 +1,79 @@
+import React, { useEffect, useRef } from 'react';
+import { useSetAtom, useAtomValue } from 'jotai';
+import {
+    activeDialogAtom,
+    isErrorReportDialogVisibleAtom,
+    errorReportTextAtom,
+    isErrorReportSendingAtom,
+    isExternalReferenceDetailsDialogVisibleAtom,
+    selectedExternalReferenceAtom,
+    DialogType,
+} from '../../atoms/ui';
+import ErrorReportDialog from './ErrorReportDialog';
+import ExternalReferenceDetailsDialog from './ExternalReferenceDetailsDialog';
+import { getDocumentFromElement } from '@astermargin/agent-ui/utils/windowContext';
+
+const dialogs: Record<Exclude<DialogType, null>, React.ComponentType<any>> = {
+    errorReport: ErrorReportDialog,
+    externalReferenceDetails: ExternalReferenceDetailsDialog,
+};
+
+const DialogContainer: React.FC = () => {
+    const containerRef = useRef<HTMLDivElement>(null);
+    const activeDialog = useAtomValue(activeDialogAtom);
+    const isSendingError = useAtomValue(isErrorReportSendingAtom);
+    const setIsErrorReportDialogVisible = useSetAtom(isErrorReportDialogVisibleAtom);
+    const setErrorReportText = useSetAtom(errorReportTextAtom);
+    const setIsExternalReferenceDetailsVisible = useSetAtom(isExternalReferenceDetailsDialogVisibleAtom);
+    const setSelectedExternalReference = useSetAtom(selectedExternalReferenceAtom);
+
+    const handleClose = () => {
+        if (activeDialog === 'errorReport') {
+            if (isSendingError) return;
+            setIsErrorReportDialogVisible(false);
+            setErrorReportText('');
+        } else if (activeDialog === 'externalReferenceDetails') {
+            setIsExternalReferenceDetailsVisible(false);
+            setSelectedExternalReference(null);
+        }
+    };
+
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'Escape' && activeDialog) {
+                handleClose();
+            }
+        };
+
+        if (activeDialog) {
+            // Get the correct document context for this component
+            const doc = getDocumentFromElement(containerRef.current);
+            if (!doc) return;
+            doc.addEventListener('keydown', handleKeyDown);
+            return () => doc.removeEventListener('keydown', handleKeyDown);
+        }
+    }, [activeDialog, isSendingError]);
+
+    if (!activeDialog) return null;
+
+    const DialogContent = dialogs[activeDialog];
+
+    return (
+        <div
+            ref={containerRef}
+            className="absolute inset-0 z-50 pointer-events-auto"
+            onClick={handleClose}
+        >
+            {/* Overlay backdrop */}
+            <div
+                className="absolute inset-0 opacity-80 bg-overlay"
+            />
+            {/* Dialog container */}
+            <div className="absolute inset-0 display-flex items-center justify-center shadow-lg">
+                <DialogContent />
+            </div>
+        </div>
+    );
+};
+
+export default DialogContainer;

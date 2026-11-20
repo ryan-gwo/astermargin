@@ -1,0 +1,266 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  checkLibraryExcluded: vi.fn(),
+  resolveItemReference: vi.fn(),
+  resolveLibraryRef: vi.fn(),
+}));
+
+vi.mock("../../../src/utils/libraryIdentity", async () => ({
+  libraryRefForLibraryID: vi.fn(() => null),
+  modelObjectIdFromReference: vi.fn(
+    ({ library_ref, library_id, zotero_key }) =>
+      `${library_ref ?? library_id}-${zotero_key}`,
+  ),
+  resolveItemReference: mocks.resolveItemReference,
+  resolveLibraryRef: mocks.resolveLibraryRef,
+  // The real predicate, not a stand-in: it decides whether a portable-only
+  // reference reaches the exclusion gate at all, so a stub would let a
+  // regression in the grammar check pass unnoticed.
+  hasLibraryIdentity: (await import("@astermargin/agent-core/identity/libraryRef"))
+    .hasLibraryIdentity,
+}));
+
+vi.mock("../../../src/services/agentDataProvider/utils", () => ({
+  checkLibraryExcluded: mocks.checkLibraryExcluded,
+  excludedLibraryMessage: vi.fn(
+    (libraryID: number) => `Library ${libraryID} is excluded`,
+  ),
+  getAttachmentFileStatus: vi.fn(),
+  getDeferredToolPreference: vi.fn(() => "always_ask"),
+  validateLibraryAccess: vi.fn(),
+}));
+
+vi.mock("../../../src/services/annotations/createAnnotation", () => {
+  class AnnotationError extends Error {
+    code = "annotation_error";
+    reason = "annotation_error";
+  }
+  return {
+    EpubAnnotationError: AnnotationError,
+    MissingPageGeometryError: AnnotationError,
+    SnapshotAnnotationError: AnnotationError,
+    HighlightPageSpanError: AnnotationError,
+    highlightPageSpan: vi.fn(),
+    createEpubHighlightAnnotation: vi.fn(),
+    createPdfHighlightForItem: vi.fn(),
+    createHighlightAnnotation: vi.fn(),
+    createSnapshotHighlightAnnotation: vi.fn(),
+    createEpubNoteAnnotation: vi.fn(),
+    createNoteAnnotation: vi.fn(),
+    createSnapshotNoteAnnotation: vi.fn(),
+    prepareSnapshotAnnotationDocument: vi.fn(),
+  };
+});
+
+vi.mock(
+  "../../../src/services/documentExtraction/attachmentResolution",
+  () => ({
+    getReadableContentKind: vi.fn(() => "pdf"),
+  }),
+);
+
+vi.mock("../../../src/utils/zoteroUtils", () => ({
+  canSetField: vi.fn(),
+  resolveFieldForItemType: vi.fn(),
+  sanitizeCreators: vi.fn((creators: any[]) => creators),
+  SETTABLE_PRIMARY_FIELDS: [],
+  shortItemTitle: vi.fn(),
+}));
+
+vi.mock("@astermargin/agent-core/platform/logger", () => ({
+  logger: vi.fn(),
+}));
+
+vi.mock("../../../react/store", () => ({
+  store: { get: vi.fn(() => [7]) },
+}));
+
+vi.mock("../../../react/atoms/profile", () => ({
+  searchableLibraryIdsAtom: Symbol("searchableLibraryIdsAtom"),
+}));
+
+vi.mock("../../../react/utils/sourceUtils", () => ({
+  clearNoteEditorSelection: vi.fn(),
+}));
+
+vi.mock("@astermargin/agent-core/transport/supabaseClient", () => ({
+  supabase: {
+    auth: { getSession: vi.fn() },
+  },
+}));
+
+import {
+  executeCreateHighlightAnnotationsAction,
+  validateCreateHighlightAnnotationsAction,
+} from "../../../src/services/agentDataProvider/actions/createHighlightAnnotations";
+import {
+  executeCreateNoteAnnotationsAction,
+  validateCreateNoteAnnotationsAction,
+} from "../../../src/services/agentDataProvider/actions/createNoteAnnotations";
+import {
+  executeEditMetadataAction,
+  validateEditMetadataAction,
+} from "../../../src/services/agentDataProvider/actions/editMetadata";
+import {
+  executeEditNoteAction,
+  validateEditNoteAction,
+} from "../../../src/services/agentDataProvider/actions/editNote";
+import {
+  executeEditNoteBatchAction,
+  validateEditNoteBatchAction,
+} from "../../../src/services/agentDataProvider/actions/editNoteBatch";
+
+const reference = {
+  library_id: 1,
+  library_ref: "g42",
+  zotero_key: "ITEM1234",
+};
+
+const annotationData = {
+  requested_ref: reference,
+  resolved_ref: reference,
+  items: [{ index: 0, client_item_id: "client-1" }],
+};
+
+/** The same target named portably only — what the backend sends once it stops pinning a rowid. */
+const portableOnlyReference = { library_ref: "g42", zotero_key: "ITEM1234" };
+
+const editNoteData = {
+  ...reference,
+  old_string: "before",
+  new_string: "after",
+};
+
+// Non-empty edits[]: the batch shape guard runs before the exclusion gate.
+const editNoteBatchData = {
+  ...reference,
+  edits: [{ index: 0, old_string: "before", new_string: "after" }],
+};
+
+/** Same as `validationCases`, with every numeric `library_id` stripped from the action data. */
+function portableOnly(actionData: Record<string, any>): Record<string, any> {
+  if ("resolved_ref" in actionData) {
+    return {
+      ...actionData,
+      requested_ref: portableOnlyReference,
+      resolved_ref: portableOnlyReference,
+    };
+  }
+  const { library_id: _dropped, ...rest } = actionData;
+  return { ...rest, ...portableOnlyReference };
+}
+
+const validationCases = [
+  [
+    "create_highlight_annotations",
+    validateCreateHighlightAnnotationsAction,
+    annotationData,
+  ],
+  [
+    "create_note_annotations",
+    validateCreateNoteAnnotationsAction,
+    annotationData,
+  ],
+  [
+    "edit_metadata",
+    validateEditMetadataAction,
+    { ...reference, edits: [{ field: "title", value: "New" }] },
+  ],
+  ["edit_note", validateEditNoteAction, editNoteData],
+  ["edit_note_batch", validateEditNoteBatchAction, editNoteBatchData],
+] as const;
+
+const executionCases = [
+  [
+    "create_highlight_annotations",
+    executeCreateHighlightAnnotationsAction,
+    annotationData,
+  ],
+  [
+    "create_note_annotations",
+    executeCreateNoteAnnotationsAction,
+    annotationData,
+  ],
+  [
+    "edit_metadata",
+    executeEditMetadataAction,
+    { ...reference, edits: [{ field: "title", value: "New" }] },
+  ],
+  ["edit_note", executeEditNoteAction, editNoteData],
+  ["edit_note_batch", executeEditNoteBatchAction, editNoteBatchData],
+] as const;
+
+describe("agent action library-exclusion ordering", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.resolveLibraryRef.mockReturnValue(7);
+    mocks.checkLibraryExcluded.mockReturnValue({
+      message: "The library is excluded from AsterMargin",
+    });
+  });
+
+  it.each(validationCases)(
+    "gates %s validation before item resolution",
+    async (actionType, validate, actionData) => {
+      const response = await validate({
+        event: "agent_action_validate",
+        request_id: `validate-${actionType}`,
+        action_type: actionType,
+        action_data: actionData,
+      } as any);
+
+      expect(response).toMatchObject({
+        valid: false,
+        error_code: "library_not_searchable",
+      });
+      expect(mocks.resolveLibraryRef).toHaveBeenCalled();
+      expect(mocks.checkLibraryExcluded).toHaveBeenCalledWith(7);
+      expect(mocks.resolveItemReference).not.toHaveBeenCalled();
+    },
+  );
+
+  // A portable `library_ref` is a complete target: the identity guards must not
+  // bail out before the exclusion gate just because no rowid came with it.
+  it.each(validationCases)(
+    "reaches the %s exclusion gate with a portable-only reference",
+    async (actionType, validate, actionData) => {
+      const response = await validate({
+        event: "agent_action_validate",
+        request_id: `validate-portable-${actionType}`,
+        action_type: actionType,
+        action_data: portableOnly(actionData),
+      } as any);
+
+      expect(response).toMatchObject({
+        valid: false,
+        error_code: "library_not_searchable",
+      });
+      expect(mocks.checkLibraryExcluded).toHaveBeenCalledWith(7);
+      expect(mocks.resolveItemReference).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(executionCases)(
+    "gates %s execution before item resolution",
+    async (actionType, execute, actionData) => {
+      const response = await execute(
+        {
+          event: "agent_action_execute",
+          request_id: `execute-${actionType}`,
+          action_type: actionType,
+          action_data: actionData,
+        } as any,
+        {} as any,
+      );
+
+      expect(response).toMatchObject({
+        success: false,
+        error_code: "library_not_searchable",
+      });
+      expect(mocks.resolveLibraryRef).toHaveBeenCalled();
+      expect(mocks.checkLibraryExcluded).toHaveBeenCalledWith(7);
+      expect(mocks.resolveItemReference).not.toHaveBeenCalled();
+    },
+  );
+});

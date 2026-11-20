@@ -1,0 +1,5353 @@
+import { LocalHistory } from './threads/localHistory';
+import type { SearchPreparationRow } from './searchIndexState';
+import { buildUntagJobInput, indexCleanupIdentity } from './backgroundProcessing/utils';
+import { v4 as uuidv4 } from 'uuid';
+import { ProcessingProgressStore, type ProcessingProgressScope } from './backgroundProcessing/progress';
+import { ThreadData } from '../../react/atoms/threads';
+import { getPref } from '../utils/prefs';
+import {
+    isExtractContentKind,
+    parseCachedDocumentMetadata,
+} from '@astermargin/agent-core/extract/document/shared/contentKinds';
+import {
+    parseBackgroundJobPayload,
+    type BackgroundJobPayload,
+} from './documentExtraction/shared/backgroundJobPayloads';
+import type {
+    CachedDocumentMetadata,
+    DocumentCachePageLabels,
+    ExtractContentKind,
+} from '@astermargin/agent-core/extract/document/shared/contentKinds';
+import {
+    processingIssuesSql,
+    PROCESSING_ISSUE_REASON_ORDER,
+    type AttachmentProcessingIssueRow,
+    type BackgroundQueueDeadRow,
+    type IssueEntitlements,
+    type ProcessingIssueSummary,
+    type ProcessingIssueReason,
+    type ProcessingIssueItem,
+} from './backgroundProcessing/issues';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { OCR_SERVICE_UNAVAILABLE } from './ocr/constants';
+
+export type { DocumentCachePageLabels } from '@astermargin/agent-core/extract/document/shared/contentKinds';
+
+type PdfCachedDocumentMetadata = Extract<CachedDocumentMetadata, { content_kind: 'pdf' }>;
+
+/**
+ * Splice NULL parameters into the SQL text so nothing null is ever bound.
+ *
+ * Zotero does not bind NULL parameters. `Zotero.DBConnection.parseQueryAndParams`
+ * replaces them with a literal NULL in the SQL, locating the placeholder to
+ * replace by scanning for `/\s*[=,(]\s*\?/g` and advancing that scan once per
+ * parameter. A placeholder in any other position — `IS ?`, `IS NOT ?`,
+ * `CASE WHEN ?` — is invisible to the scan, so a single NULL parameter
+ * desynchronizes it: the NULL lands on an unrelated placeholder (silently
+ * mangling the statement) or the scan runs out and the query throws
+ * "Null parameter provided for a query without placeholders".
+ *
+ * Doing the substitution ourselves, positionally, is exactly equivalent to
+ * binding NULL and keeps null-safe `IS ?` guards usable. `undefined` is left
+ * alone so Zotero still rejects it as the programming error it is.
+ */
+export function inlineNullParams(sql: string, params: readonly unknown[]): [string, unknown[]] {
+    if (!params.some((param) => param === null)) return [sql, [...params]];
+
+    let out = '';
+    const remaining: unknown[] = [];
+    let paramIndex = 0;
+    let i = 0;
+    while (i < sql.length) {
+        const char = sql[i];
+        // Skip over anything a bare `?` could hide in.
+        if (char === "'" || char === '"') {
+            let end = i + 1;
+            while (end < sql.length) {
+                if (sql[end] === char) {
+                    if (sql[end + 1] === char) end += 2; // doubled quote escape
+                    else break;
+                } else end += 1;
+            }
+            out += sql.slice(i, end + 1);
+            i = end + 1;
+            continue;
+        }
+        if (char === '-' && sql[i + 1] === '-') {
+            const end = sql.indexOf('\n', i);
+            const stop = end === -1 ? sql.length : end;
+            out += sql.slice(i, stop);
+            i = stop;
+            continue;
+        }
+        if (char === '/' && sql[i + 1] === '*') {
+            const end = sql.indexOf('*/', i + 2);
+            const stop = end === -1 ? sql.length : end + 2;
+            out += sql.slice(i, stop);
+            i = stop;
+            continue;
+        }
+        if (char === '?') {
+            if (sql[i + 1] !== undefined && /\d/.test(sql[i + 1])) {
+                throw new Error(`Numbered SQL placeholders are not supported [QUERY: ${sql}]`);
+            }
+            const value = params[paramIndex];
+            paramIndex += 1;
+            if (value === null) out += 'NULL';
+            else {
+                out += '?';
+                remaining.push(value);
+            }
+            i += 1;
+            continue;
+        }
+        out += char;
+        i += 1;
+    }
+    if (paramIndex !== params.length) {
+        throw new Error(
+            `Incorrect number of parameters provided for query (${params.length}, expecting ${paramIndex}) [QUERY: ${sql}]`,
+        );
+    }
+    return [out, remaining];
+}
+
+/* 
+ * Interface for the 'embeddings' table row
+ * 
+ * Table stores paper embeddings for semantic search.
+ * Embeddings are generated from title + abstract text.
+ */
+export interface EmbeddingRecord {
+    item_id: number;                    // Zotero item ID
+    library_id: number;                 // Zotero library ID
+    zotero_key: string;                 // Zotero item key
+    version: number;                    // Zotero item version at embedding time
+    client_date_modified: string;       // Item's clientDateModified at embedding time
+    content_hash: string;               // Hash of title+abstract for change detection
+    embedding: Uint8Array;              // Int8 embedding stored as BLOB
+    dimensions: number;                 // Embedding dimensions (256 or 512)
+    model_id: string;                   // Model identifier (e.g., "voyage-3-int8-512")
+    indexed_at: string;                 // When the embedding was created
+}
+
+/**
+ * Interface for the 'embedding_index_state' table row
+ * 
+ * Tracks the state of the embedding index for each library.
+ * Used to optimize startup by skipping full diff when nothing changed.
+ */
+export interface EmbeddingIndexStateRecord {
+    library_id: number;                  // Zotero library ID
+    last_scan_timestamp: string;         // When we last ran a full scan (ISO string)
+    max_client_date_modified: string;    // MAX(clientDateModified) from Zotero at last scan
+    item_count: number;                  // Count of regular items in Zotero at last scan
+    embedding_count: number;             // Count of embeddings at last scan
+}
+
+/**
+ * Interface for the 'failed_embeddings' table row
+ * 
+ * Tracks items that failed to embed, with retry backoff logic.
+ * Items are retried with exponential backoff based on failure_count.
+ */
+export interface FailedEmbeddingRecord {
+    item_id: number;                     // Zotero item ID
+    library_id: number;                  // Zotero library ID
+    failure_count: number;               // Number of consecutive failures
+    last_error: string;                  // Last error message
+    last_attempt: string;                // When the last attempt was made (ISO string)
+    next_retry_after: string;            // Don't retry before this time (ISO string)
+}
+
+export type DocumentCacheExtractionMode = 'structured' | 'markdown';
+export type DocumentCachePayloadKind = 'structured' | 'markdown';
+
+/** Authoritative error reason for a cached document; `null` marks a successful extraction. */
+export type DocumentCacheErrorCode = 'encrypted' | 'invalid_pdf' | 'no_text_layer';
+
+export interface DocumentCacheFileSignature {
+    mtime_ms: number;
+    size_bytes: number;
+}
+
+export interface DocumentCacheMetadataRecord {
+    id: number;
+    itemId: number;
+    libraryId: number;
+    zoteroKey: string;
+    contentKind: ExtractContentKind;
+    filePath: string;
+    fileSignature: DocumentCacheFileSignature;
+    sourceSizeBytes: number;
+    contentType: string;
+    documentMetadata: CachedDocumentMetadata | null;
+    pageCount: number | null;
+    pageLabels: DocumentCachePageLabels | null;
+    /** See `CachedDocumentMetadata.derivedPageLabels`; `undefined` = not known. */
+    derivedPageLabels: DocumentCachePageLabels | null | undefined;
+    pages: PdfCachedDocumentMetadata['pages'];
+    errorCode: DocumentCacheErrorCode | null;
+    extractionSchemaVersion: string;
+    metadataFormatVersion: number;
+    createdAt: string;
+    updatedAt: string;
+    lastAccessedAt: string | null;
+}
+
+export interface DocumentCachePayloadRecord {
+    extractionSource?: "native" | "ocr";
+    id: number;
+    metadataId: number;
+    itemId: number;
+    libraryId: number;
+    zoteroKey: string;
+    payloadKind: DocumentCachePayloadKind;
+    contentKind: ExtractContentKind;
+    sourceFilePath: string;
+    sourceFileSignature: DocumentCacheFileSignature;
+    sourceSizeBytes: number;
+    payloadPath: string;
+    payloadSizeBytes: number;
+    payloadSha256: string | null;
+    /**
+     * md5 of the source file bytes a protected OCR payload was prepared from.
+     * Lets a renamed or touched file be verified without a processing ledger row.
+     */
+    sourceMd5?: string | null;
+    extractionSchemaVersion: string;
+    cacheFormatVersion: number;
+    createdAt: string;
+    updatedAt: string;
+    lastAccessedAt: string | null;
+}
+
+export type DocumentCacheMetadataInput = Omit<
+    DocumentCacheMetadataRecord,
+    | 'id'
+    | 'createdAt'
+    | 'updatedAt'
+    | 'lastAccessedAt'
+    | 'documentMetadata'
+    | 'pageCount'
+    | 'pageLabels'
+    | 'derivedPageLabels'
+    | 'pages'
+> & {
+    documentMetadata: CachedDocumentMetadata;
+};
+
+export type DocumentCachePayloadInput = Omit<
+    DocumentCachePayloadRecord,
+    'id' | 'createdAt' | 'updatedAt' | 'lastAccessedAt'
+>;
+
+export type { BackgroundJobPayload } from './documentExtraction/shared/backgroundJobPayloads';
+
+/** Content kinds supported for user-attached external files. */
+export type ExternalFileContentKind = 'pdf' | 'epub' | 'text' | 'image';
+
+/**
+ * One row in `external_files`: a user-attached file from disk, copied into the
+ * AsterMargin-managed external-files folder at attach time. `extKey` is the
+ * 8-character key behind the model-facing `ext-<KEY>` id. `originalPath` is
+ * informational and local-only — it is never sent off-device.
+ */
+export interface ExternalFileRecord {
+    extKey: string;
+    filename: string;
+    originalPath: string | null;
+    storedPath: string;
+    contentKind: ExternalFileContentKind;
+    mimeType: string;
+    fileSize: number;
+    mtimeMs: number;
+    pageCount: number | null;
+    /** SHA-256 of the file content (hex). Null when hashing failed at attach time. */
+    sha256: string | null;
+    createdAt: string;
+}
+
+export type ExternalFileInput = Omit<ExternalFileRecord, 'createdAt'>;
+
+const EXTERNAL_FILE_CONTENT_KINDS: ReadonlySet<string> = new Set(['pdf', 'epub', 'text', 'image']);
+
+export function isExternalFileContentKind(value: string): value is ExternalFileContentKind {
+    return EXTERNAL_FILE_CONTENT_KINDS.has(value);
+}
+
+/**
+ * One retained version in `table_recovery_shadow`: what *this device* last
+ * wrote to a stored table, kept outside the table's own storage directory so it
+ * survives that directory being replaced wholesale by a sync conflict
+ * resolution. See `src/services/artifacts/recoveryShadow.ts`.
+ */
+export interface TableShadowRecord {
+    libraryId: number;
+    zoteroKey: string;
+    version: number;
+    /** SHA-256 of the serialised spec this device wrote for that version. */
+    sha256: string;
+    /** ISO timestamp of the write. */
+    writtenAt: string;
+    /** Gzipped spec on disk, or null when it was too large to retain. */
+    payloadPath: string | null;
+    payloadSizeBytes: number;
+}
+
+/** Background processing job kinds. */
+export type BackgroundJobType =
+    | 'document_extract'
+    | 'document_ocr'
+    | 'fulltext_upsert'
+    | 'fulltext_untag';
+
+/**
+ * Single row in `background_jobs`. Timestamps are epoch milliseconds so
+ * `MIN(available_at, ?)` UPSERTs compare arithmetically.
+ */
+export interface BackgroundJobRecord {
+    id: number;
+    jobType: BackgroundJobType;
+    libraryId: number;
+    itemId: number | null;
+    zoteroKey: string;
+    contentKind: ExtractContentKind;
+    payloadKind: DocumentCachePayloadKind;
+    priority: number;
+    payload: BackgroundJobPayload | null;
+    enqueuedAt: number;
+    availableAt: number;
+    attemptCount: number;
+    lastError: string | null;
+}
+
+export interface BackgroundJobInput {
+    jobType: BackgroundJobType;
+    libraryId: number;
+    itemId?: number | null;
+    zoteroKey: string;
+    contentKind: ExtractContentKind;
+    payloadKind: DocumentCachePayloadKind;
+    priority?: number;
+    payload?: BackgroundJobPayload | null;
+    /** Epoch ms. Used for both `enqueued_at` and `available_at`. */
+    now: number;
+}
+
+export interface BackgroundJobEnqueueResult {
+    enqueued: boolean;
+    id: number;
+}
+
+export type DocumentProcessingTask = 'ocr' | 'fulltext_upsert';
+
+export interface DocumentProcessingFailureInput {
+    /** Content identity, usually the attachment hash/MD5. */
+    fileHash: string;
+    task: DocumentProcessingTask;
+    /** OCR engine id; empty for tasks without engine versioning. */
+    engineVersion?: string;
+    /** Attribution only; suppression is keyed by file hash, task, and engine. */
+    sourceType?: string;
+    /** Attribution only, e.g. "<libraryId>-<zoteroKey>" for Zotero. */
+    sourceKey?: string;
+    error: string;
+    /** Permanent failure marker; null/undefined records a transient backoff. */
+    terminalCode?: string | null;
+}
+
+export interface DocumentProcessingFailureRecord {
+    fileHash: string;
+    task: DocumentProcessingTask;
+    engineVersion: string;
+    sourceType: string | null;
+    sourceKey: string | null;
+    failureCount: number;
+    terminalCode: string | null;
+    lastError: string | null;
+    lastAttempt: string;
+    nextRetryAfter: string;
+}
+
+export interface BackgroundQueueStats {
+    pending: number;
+    available: number;
+    deferred: number;
+    dead: number;
+    byJobType: Record<string, number>;
+    /**
+     * Distinct attachments with a queued job. One attachment can hold more
+     * than one job (an upsert parked behind the extraction that refills its
+     * cache), so this is the queue depth in files rather than jobs.
+     */
+    attachments: number;
+}
+
+export type AttachmentExtractStatus = 'done' | 'failed' | 'skipped' | null;
+export type AttachmentOcrStatus = 'na' | 'needed' | 'done' | 'failed' | null;
+export type AttachmentUpsertStatus = 'done' | 'failed' | null;
+
+export interface MarkAttachmentUpsertDoneInput {
+    libraryId: number;
+    zoteroKey: string;
+    structuredDocumentHash: string;
+    upsertIndexVersion: string;
+    remoteIdentity?: AttachmentProcessingStateRecord['upsertRemoteIdentity'];
+    expectedUpsertStatus?: AttachmentUpsertStatus;
+    expectedUpsertIndexVersion?: string | null;
+    expectedExtractStatus?: AttachmentExtractStatus;
+    /**
+     * Also retire this account's pending cleanup of the membership just
+     * confirmed. Only for callers holding the attachment's index lock.
+     */
+    supersedeIndexCleanup?: boolean;
+}
+
+/** Durable per-attachment progress ledger for whole-library processing. */
+export interface AttachmentProcessingStateRecord {
+    libraryId: number;
+    zoteroKey: string;
+    itemId: number | null;
+    contentKind: Extract<ExtractContentKind, 'pdf' | 'epub' | 'snapshot'>;
+    fileMtimeMs: number | null;
+    fileSizeBytes: number | null;
+    fileHash: string | null;
+    structuredDocumentHash: string | null;
+    extractStatus: AttachmentExtractStatus;
+    extractSchemaVersion: string | null;
+    ocrStatus: AttachmentOcrStatus;
+    ocrEngineVersion: string | null;
+    upsertStatus: AttachmentUpsertStatus;
+    upsertIndexVersion: string | null;
+    upsertRemoteIdentity?: { index_account_id: string; index_scope_ref: string; index_local_id: string } | null;
+    lastError: string | null;
+    createdAt: string;
+    updatedAt: string;
+    /** Source identity belonging to the accepted extraction verdict, including failures. */
+    extractionSource: string | null;
+}
+
+export interface AttachmentProcessingStateInput {
+    libraryId: number;
+    zoteroKey: string;
+    itemId?: number | null;
+    contentKind: AttachmentProcessingStateRecord['contentKind'];
+}
+
+export interface AttachmentProcessingAggregates {
+    total: number;
+    /** Mutually exclusive text-readiness counts for the requested OCR target. */
+    readable: number;
+    unreadable: number;
+    awaitingOcr: number;
+    extracted: number;
+    ocrNeeded: number;
+    ocrDone: number;
+    upserted: number;
+    failed: number;
+    skipped: number;
+    oldestPendingAt: string | null;
+}
+
+export interface BackgroundProcessingFailureSummary {
+    source: 'ledger' | 'dead_letter' | 'content_failure';
+    stage: string;
+    libraryId: number | null;
+    zoteroKey: string | null;
+    error: string | null;
+    attempts: number | null;
+    timestamp: string | number | null;
+}
+
+/** Cheap per-library cursor used to avoid unnecessary attachment scans. */
+export interface ProcessingIndexStateRecord {
+    libraryId: number;
+    maxClientDateModified: string | null;
+    attachmentCount: number;
+    ledgerRowCount: number;
+    lastScanTimestamp: number;
+}
+
+const BACKGROUND_JOB_COLUMNS = `
+    id, job_type, library_id, item_id, zotero_key,
+    content_kind, payload_kind, priority, payload_json,
+    enqueued_at, available_at, attempt_count, last_error
+`;
+
+const ATTACHMENT_PROCESSING_COLUMNS = `
+    library_id, zotero_key, item_id, content_kind,
+    file_mtime_ms, file_size_bytes, file_hash, structured_document_hash,
+    extract_status, extract_schema_version, ocr_status, ocr_engine_version,
+    upsert_status, upsert_index_version, last_error, created_at, updated_at, extraction_source, upsert_remote_identity
+`;
+
+/**
+ * Maximum number of failures before an item is considered permanently failed.
+ * After this many failures, the item won't be retried automatically.
+ */
+export const MAX_EMBEDDING_FAILURES = 5;
+
+/**
+ * Base delay for retry backoff in milliseconds.
+ * Actual delay = BASE_DELAY * 2^(failure_count - 1)
+ * So delays are: 1h, 2h, 4h, 8h, 16h
+ */
+export const EMBEDDING_RETRY_BASE_DELAY_MS = 60 * 60 * 1000; // 1 hour
+
+export const MAX_OCR_FAILURES = 5;
+export const MAX_UPSERT_FAILURES = 5;
+export const DOC_PROCESSING_RETRY_BASE_DELAY_MS = 60 * 60 * 1000; // 1 hour
+
+// Cache schema changes require a preserving migration. Queue and processing
+// tables remain disposable; bump their versions when their shape changes.
+export const DOCUMENT_CACHE_SCHEMA_VERSION = 2;
+export const BACKGROUND_JOBS_SCHEMA_VERSION = 2;
+export const ATTACHMENT_PROCESSING_STATE_SCHEMA_VERSION = 1;
+export const PROCESSING_INDEX_STATE_SCHEMA_VERSION = 1;
+
+
+/* 
+ * Interface for the 'threads' table row
+ * 
+ * Table stores chat threads, mirroring the backend postgres structure.
+ * Corresponds to the ThreadModel and threads table in the backend.
+ * 
+ */
+export interface ThreadRecord {
+    id: string;
+    user_id: string;
+    name: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+type SyncType = 'initial' | 'incremental' | 'consistency' | 'verification';
+type SyncMethod = 'version' | 'date_modified';
+
+/* 
+ * Interface for the 'sync_logs' table row
+ *
+ * Table stores the sync logs for each sync session.
+ */
+export interface SyncLogsRecord {
+    id: string; // Primary key
+    session_id: string;
+    user_id: string;
+    sync_type: SyncType;
+    method: SyncMethod;
+    zotero_local_id: string;
+    zotero_user_id?: string | null;
+    library_id: number;
+    total_upserts: number;
+    total_deletions: number;
+    library_version: number;
+    library_date_modified: string;
+    timestamp: string;
+}
+
+/**
+ * Manages the astermargin SQLite database using Zotero's DBConnection.
+ */
+export class AsterMarginDB {
+    public readonly localHistory = new LocalHistory((sql,args) => this.queryAsync(sql,args), work => this.conn.executeTransaction(work));
+    private conn: any; // Instance of Zotero.DBConnection
+
+    /**
+     * @param dbConnection An initialized Zotero.DBConnection instance for 'astermargin'.
+     */
+    constructor(dbConnection: any) {
+        if (!dbConnection) {
+            throw new Error("AsterMarginDB requires a valid Zotero.DBConnection instance.");
+        }
+        this.conn = dbConnection;
+    }
+
+    /**
+     * Every AsterMarginDB query runs through here so NULL parameters are spliced
+     * into the SQL rather than bound; see `inlineNullParams` for why Zotero
+     * cannot be trusted to do that itself.
+     */
+    private processingListeners = new Set<() => void>();
+    private processingProgress = new ProcessingProgressStore((...args) => this.queryAsync(...args));
+
+    public subscribeProcessingChanges(listener: () => void): () => void {
+        this.processingListeners.add(listener);
+        return () => { this.processingListeners.delete(listener); };
+    }
+
+    public async configureProcessingProgress(scope: ProcessingProgressScope): Promise<void> {
+        await this.conn.executeTransaction(() => this.processingProgress.configure(scope));
+    }
+
+    public getProcessingProgress(discovering: boolean, inFlight: number, libraryId?: number, jobTypes?: string[], pausedTypes: string[] = []) {
+        return this.processingProgress.read(discovering, inFlight, libraryId, jobTypes, pausedTypes);
+    }
+
+    private queryAsync(
+        sql: string,
+        params: readonly unknown[] = [],
+        options?: { onRow?: (row: any) => void },
+    ): Promise<any[]> {
+        const [preparedSql, preparedParams] = inlineNullParams(sql, params);
+        const result = this.conn.queryAsync(preparedSql, preparedParams, options);
+        if (/^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql)
+            && /\b(attachment_processing_state|background_jobs|background_jobs_dead)\b/.test(sql)) {
+            return result.then((rows: any[]) => {
+                for (const listener of this.processingListeners) {
+                    try { listener(); } catch (error) { logger(`Processing status listener: ${error}`, 2); }
+                }
+                return rows;
+            });
+        }
+        return result;
+    }
+
+    /**
+     * Initialize the database by creating tables if they don't exist.
+     * Should be called once after constructing the class.
+     */
+    public async initDatabase(pluginVersion: string): Promise<void> {
+
+        await this.queryAsync(`PRAGMA foreign_keys = ON`);
+
+        // Tracks the schema version of the disposable drop-and-recreate tables
+        // (document cache, background queue). Created first so the version
+        // checks below can read it. Outlives those tables' drops.
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS schema_versions (
+                component  TEXT PRIMARY KEY,
+                version    INTEGER NOT NULL
+            );
+        `);
+
+        await this.localHistory.initialize();
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS threads (
+                id                       TEXT(36) PRIMARY KEY,
+                user_id                  TEXT(36) NOT NULL,
+                name                     TEXT,
+                created_at               TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at               TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS messages (
+                id                       TEXT(36) PRIMARY KEY,
+                user_id                  TEXT(36) NOT NULL,
+                thread_id                TEXT(36) NOT NULL,
+                role                     TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+                content                  TEXT,
+                reasoning_content        TEXT,
+                tool_calls               TEXT,
+                reader_state             TEXT,
+                attachments              TEXT,
+                tool_request             TEXT,
+                status                   TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('in_progress', 'completed', 'canceled', 'error')),
+                created_at               TEXT NOT NULL DEFAULT (datetime('now')),
+                metadata                 TEXT,
+                error                    TEXT,
+                FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS sync_logs (
+                id                       TEXT(36) PRIMARY KEY,
+                session_id               TEXT(36) NOT NULL,
+                user_id                  TEXT(36) NOT NULL,
+                sync_type                TEXT NOT NULL,
+                method                   TEXT NOT NULL,
+                zotero_local_id          TEXT NOT NULL,
+                zotero_user_id           TEXT,
+                library_id               INTEGER NOT NULL,
+                total_upserts            INTEGER NOT NULL DEFAULT 0,
+                total_deletions          INTEGER NOT NULL DEFAULT 0,
+                library_version          INTEGER NOT NULL,
+                library_date_modified    TEXT NOT NULL,
+                timestamp                TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS embeddings (
+                item_id                  INTEGER NOT NULL,
+                library_id               INTEGER NOT NULL,
+                zotero_key               TEXT NOT NULL,
+                version                  INTEGER NOT NULL,
+                client_date_modified     TEXT NOT NULL,
+                content_hash             TEXT NOT NULL,
+                embedding                BLOB NOT NULL,
+                dimensions               INTEGER NOT NULL,
+                model_id                 TEXT NOT NULL,
+                indexed_at               TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (item_id)
+            );
+        `);
+
+        // Table for tracking embedding index state per library
+        // Used to optimize startup by skipping full diff when nothing changed
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS embedding_index_state (
+                library_id               INTEGER PRIMARY KEY,
+                last_scan_timestamp      TEXT NOT NULL,
+                max_client_date_modified TEXT NOT NULL,
+                item_count               INTEGER NOT NULL,
+                embedding_count          INTEGER NOT NULL
+            );
+        `);
+
+        // Table for tracking failed embedding attempts
+        // Items are retried with exponential backoff
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS failed_embeddings (
+                item_id                  INTEGER PRIMARY KEY,
+                library_id               INTEGER NOT NULL,
+                failure_count            INTEGER NOT NULL DEFAULT 1,
+                last_error               TEXT NOT NULL,
+                last_attempt             TEXT NOT NULL DEFAULT (datetime('now')),
+                next_retry_after         TEXT NOT NULL
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS document_processing_failures (
+                file_hash        TEXT NOT NULL,
+                task             TEXT NOT NULL,
+                engine_version   TEXT NOT NULL DEFAULT '',
+                source_type      TEXT,
+                source_key       TEXT,
+                failure_count    INTEGER NOT NULL DEFAULT 1,
+                terminal_code    TEXT,
+                last_error       TEXT,
+                last_attempt     TEXT NOT NULL DEFAULT (datetime('now')),
+                next_retry_after TEXT NOT NULL,
+                UNIQUE(file_hash, task, engine_version)
+            );
+        `);
+
+        // Cleanup identities are durable even when the derived queue schema resets.
+        await this.queryAsync(`CREATE TABLE IF NOT EXISTS index_cleanup_outbox (
+            identity TEXT PRIMARY KEY, account_id TEXT NOT NULL, job_json TEXT NOT NULL
+        )`);
+
+        // Attachment progress is derived and recoverable during the pre-GA
+        // schema-churn period. Version both new tables through the same
+        // drop/recreate framework as the document cache and queue.
+        if (await this.disposableSchemaNeedsReset(
+            'attachment_processing_state',
+            ATTACHMENT_PROCESSING_STATE_SCHEMA_VERSION,
+            ['attachment_processing_state'],
+            () => this.attachmentProcessingStateSchemaIsCurrent(),
+        )) {
+            await this.queryAsync(`DROP TABLE IF EXISTS attachment_processing_state`);
+            await this.setSchemaVersion(
+                'attachment_processing_state',
+                ATTACHMENT_PROCESSING_STATE_SCHEMA_VERSION,
+            );
+        }
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS attachment_processing_state (
+                library_id                 INTEGER NOT NULL,
+                zotero_key                 TEXT NOT NULL,
+                item_id                    INTEGER,
+                content_kind               TEXT NOT NULL,
+                file_mtime_ms              INTEGER,
+                file_size_bytes            INTEGER,
+                file_hash                  TEXT,
+                structured_document_hash   TEXT,
+                extract_status             TEXT,
+                extract_schema_version     TEXT,
+                ocr_status                 TEXT,
+                ocr_engine_version         TEXT,
+                upsert_status              TEXT,
+                upsert_index_version       TEXT,
+                last_error                 TEXT,
+                created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(library_id, zotero_key)
+            );
+        `);
+        if (!(await this.getTableColumns('attachment_processing_state')).has('upsert_remote_identity')) {
+            await this.queryAsync('ALTER TABLE attachment_processing_state ADD COLUMN upsert_remote_identity TEXT');
+        }
+        // Extend the ledger in place: completed index membership must survive upgrades.
+        if (!(await this.getTableColumns('attachment_processing_state')).has('extraction_source')) {
+            await this.queryAsync('ALTER TABLE attachment_processing_state ADD COLUMN extraction_source TEXT');
+        }
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS attachment_reading_state (
+                library_id INTEGER NOT NULL,
+                zotero_key TEXT NOT NULL,
+                content_kind TEXT NOT NULL,
+                error_code TEXT,
+                attempted_at INTEGER NOT NULL,
+                PRIMARY KEY (library_id, zotero_key)
+            );
+        `);
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_attachment_processing_extract
+            ON attachment_processing_state(library_id, extract_status);
+        `);
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_attachment_processing_ocr
+            ON attachment_processing_state(library_id, ocr_status);
+        `);
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_attachment_processing_upsert
+            ON attachment_processing_state(library_id, upsert_status);
+        `);
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_attachment_processing_file_hash
+            ON attachment_processing_state(file_hash);
+        `);
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_attachment_processing_document_hash
+            ON attachment_processing_state(structured_document_hash);
+        `);
+
+        if (await this.disposableSchemaNeedsReset(
+            'processing_index_state',
+            PROCESSING_INDEX_STATE_SCHEMA_VERSION,
+            ['processing_index_state'],
+            () => this.processingIndexStateSchemaIsCurrent(),
+        )) {
+            await this.queryAsync(`DROP TABLE IF EXISTS processing_index_state`);
+            await this.setSchemaVersion(
+                'processing_index_state',
+                PROCESSING_INDEX_STATE_SCHEMA_VERSION,
+            );
+        }
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS processing_index_state (
+                library_id                 INTEGER PRIMARY KEY,
+                max_client_date_modified   TEXT,
+                attachment_count           INTEGER NOT NULL,
+                ledger_row_count           INTEGER NOT NULL,
+                last_scan_timestamp        INTEGER NOT NULL
+            );
+        `);
+
+        // DB indexes
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_messages_user_thread
+            ON messages(user_id, thread_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_threads_user_updated
+            ON threads(user_id, updated_at DESC);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_messages_user_thread_created
+            ON messages(user_id, thread_id, created_at);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_sync_logs_user_library
+            ON sync_logs(user_id, library_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_sync_logs_user_library_version
+            ON sync_logs(user_id, library_id, library_version DESC);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_sync_logs_user_library_date
+            ON sync_logs(user_id, library_id, library_date_modified DESC);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_sync_logs_session
+            ON sync_logs(session_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_embeddings_library
+            ON embeddings(library_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_embeddings_content_hash
+            ON embeddings(content_hash);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_embeddings_zotero_key
+            ON embeddings(zotero_key);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_failed_embeddings_library
+            ON failed_embeddings(library_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_failed_embeddings_retry
+            ON failed_embeddings(next_retry_after);
+        `);
+
+        await this.queryAsync(`
+            DROP INDEX IF EXISTS idx_doc_proc_failures_retry;
+        `);
+
+        await this.queryAsync(`DROP TABLE IF EXISTS attachment_file_cache`);
+        await this.queryAsync(`DROP TABLE IF EXISTS document_cache_recovery`);
+
+        // Compatible cache upgrades preserve prepared text and its source identity.
+        if ((await this.getSchemaVersion('document_cache') ?? 0) > DOCUMENT_CACHE_SCHEMA_VERSION) {
+            throw new Error('Document cache was written by a newer AsterMargin version; retained without modification.');
+        }
+        if (await this.tableExists('document_cache_payloads') || await this.tableExists('document_cache_metadata')) {
+            if (!(await this.documentCacheSchemaIsCurrent())) {
+                throw new Error('Document cache needs a compatible migration; prepared OCR data has been retained.');
+            }
+            const columns = await this.getTableColumns('document_cache_payloads');
+            if (!columns.has('extraction_source')) {
+                await this.conn.executeTransaction(async () => {
+                    await this.queryAsync(`ALTER TABLE document_cache_payloads
+                        ADD COLUMN extraction_source TEXT NOT NULL DEFAULT 'native'`);
+                    if (await this.tableExists('attachment_processing_state')) {
+                        await this.queryAsync(`UPDATE document_cache_payloads SET extraction_source = 'ocr'
+                            WHERE EXISTS (SELECT 1 FROM attachment_processing_state s
+                                WHERE s.library_id = document_cache_payloads.library_id
+                                AND s.zotero_key = document_cache_payloads.zotero_key
+                                AND s.ocr_status = 'done'
+                                AND ((s.file_mtime_ms IS NULL AND s.file_size_bytes IS NULL)
+                                    OR (s.file_mtime_ms = document_cache_payloads.source_file_mtime_ms
+                                        AND s.file_size_bytes = document_cache_payloads.source_file_size_bytes)))`);
+                    }
+                });
+            }
+            // Nullable and ignored by older builds, so the schema version stays put.
+            if (!columns.has('source_md5')) {
+                await this.queryAsync(`ALTER TABLE document_cache_payloads ADD COLUMN source_md5 TEXT`);
+            }
+        }
+        await this.setSchemaVersion('document_cache', DOCUMENT_CACHE_SCHEMA_VERSION);
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS document_cache_metadata (
+                id                         INTEGER PRIMARY KEY,
+                item_id                    INTEGER NOT NULL,
+                library_id                 INTEGER NOT NULL,
+                zotero_key                 TEXT NOT NULL,
+                content_kind               TEXT NOT NULL,
+                file_path                  TEXT NOT NULL,
+                file_mtime_ms              INTEGER NOT NULL,
+                file_size_bytes            INTEGER NOT NULL,
+                source_size_bytes          INTEGER NOT NULL,
+                content_type               TEXT NOT NULL,
+                document_metadata_json     TEXT NOT NULL,
+                error_code                 TEXT,
+                extraction_schema_version  TEXT NOT NULL,
+                metadata_format_version    INTEGER NOT NULL,
+                created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accessed_at           TEXT,
+                UNIQUE(library_id, zotero_key)
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcm_item_id
+            ON document_cache_metadata(item_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcm_library
+            ON document_cache_metadata(library_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS document_cache_payloads (
+                id                         INTEGER PRIMARY KEY,
+                metadata_id                INTEGER NOT NULL,
+                item_id                    INTEGER NOT NULL,
+                library_id                 INTEGER NOT NULL,
+                zotero_key                 TEXT NOT NULL,
+                payload_kind               TEXT NOT NULL,
+                content_kind               TEXT NOT NULL,
+                source_file_path           TEXT NOT NULL,
+                source_file_mtime_ms       INTEGER NOT NULL,
+                source_file_size_bytes     INTEGER NOT NULL,
+                source_size_bytes          INTEGER NOT NULL,
+                payload_path               TEXT NOT NULL,
+                payload_size_bytes         INTEGER NOT NULL,
+                payload_sha256             TEXT,
+                extraction_source          TEXT NOT NULL DEFAULT 'native',
+                source_md5                 TEXT,
+                extraction_schema_version  TEXT NOT NULL,
+                cache_format_version       INTEGER NOT NULL,
+                created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accessed_at           TEXT,
+                FOREIGN KEY (metadata_id)
+                    REFERENCES document_cache_metadata(id)
+                    ON DELETE CASCADE,
+                UNIQUE(metadata_id, payload_kind)
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcp_metadata_id
+            ON document_cache_payloads(metadata_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcp_item_id
+            ON document_cache_payloads(item_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcp_library
+            ON document_cache_payloads(library_id);
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcp_library_key_payload_kind
+            ON document_cache_payloads(library_id, zotero_key, payload_kind);
+        `);
+
+        // Orders the size-budget eviction scan (least-recently-used first).
+        // Must index the ORDER BY expression itself: a plain last_accessed_at
+        // index cannot satisfy COALESCE(last_accessed_at, created_at) and
+        // leaves every batch sorting the whole table. The `id` tie-breaker
+        // needs no column — it is the rowid, which every index carries.
+        await this.queryAsync(`DROP INDEX IF EXISTS idx_dcp_last_accessed`);
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_dcp_lru
+            ON document_cache_payloads(COALESCE(last_accessed_at, created_at));
+        `);
+
+        // Retain reading failures discovered before the shared outcome inventory existed.
+        await this.queryAsync(`
+            INSERT OR IGNORE INTO attachment_reading_state
+                (library_id, zotero_key, content_kind, error_code, attempted_at)
+            SELECT library_id, zotero_key, content_kind,
+                CASE WHEN content_kind = 'pdf' AND error_code = 'no_text_layer'
+                    THEN 'ocr_required' ELSE error_code END,
+                CAST(strftime('%s', updated_at) AS INTEGER) * 1000
+            FROM document_cache_metadata WHERE error_code IS NOT NULL AND library_id > 0;
+        `);
+
+        // User-attached external files (registry behind the `ext-<KEY>` ids).
+        // One row per attached file; the copy lives in the AsterMargin-managed
+        // external-files folder at stored_path.
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS external_files (
+                ext_key        TEXT PRIMARY KEY,
+                filename       TEXT NOT NULL,
+                original_path  TEXT,
+                stored_path    TEXT NOT NULL,
+                content_kind   TEXT NOT NULL CHECK (content_kind IN ('pdf','epub','text','image')),
+                mime_type      TEXT NOT NULL,
+                file_size      INTEGER NOT NULL,
+                mtime_ms       INTEGER NOT NULL,
+                page_count     INTEGER,
+                sha256         TEXT,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        `);
+
+        // Pre-release tables were created without the sha256 column; add it
+        // in place rather than dropping the registry.
+        const externalFileColumns: string[] = [];
+        await this.queryAsync(`PRAGMA table_info(external_files)`, [], {
+            onRow: (row: any) => externalFileColumns.push(row.getResultByIndex(1)),
+        });
+        if (!externalFileColumns.includes('sha256')) {
+            await this.queryAsync(`ALTER TABLE external_files ADD COLUMN sha256 TEXT`);
+        }
+
+        // Content-hash lookup for attach-time deduplication (non-unique:
+        // dedup is best-effort and concurrent attaches may race).
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_external_files_sha256
+            ON external_files(sha256);
+        `);
+
+        // What this device last wrote to each stored table, kept here rather
+        // than in the table's storage directory: that directory is what syncs,
+        // and a Zotero file-conflict resolution replaces it whole. A row per
+        // retained version, newest first by `written_at`; `payload_path` points
+        // at the compressed spec so a version lost to a conflict can be restored
+        // rather than only reported. See artifacts/recoveryShadow.ts.
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS table_recovery_shadow (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_id          INTEGER NOT NULL,
+                zotero_key          TEXT NOT NULL,
+                version             INTEGER NOT NULL,
+                sha256              TEXT NOT NULL,
+                written_at          TEXT NOT NULL,
+                payload_path        TEXT,
+                payload_size_bytes  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(library_id, zotero_key, version)
+            );
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_table_shadow_table
+            ON table_recovery_shadow(library_id, zotero_key, written_at DESC);
+        `);
+
+        // Drop and recreate the ephemeral queue when its schema version changes.
+        // Jobs are re-enqueued on demand, so resetting is safe. Bump
+        // BACKGROUND_JOBS_SCHEMA_VERSION on any change to the queue tables below,
+        // including the dedupe UNIQUE key.
+        if (await this.disposableSchemaNeedsReset(
+            'background_jobs',
+            BACKGROUND_JOBS_SCHEMA_VERSION,
+            ['background_jobs', 'background_jobs_dead'],
+            () => this.backgroundJobsSchemaIsCurrent(),
+        )) {
+            await this.queryAsync(`DROP TABLE IF EXISTS background_jobs_dead`);
+            await this.queryAsync(`DROP TABLE IF EXISTS background_jobs`);
+            await this.setSchemaVersion('background_jobs', BACKGROUND_JOBS_SCHEMA_VERSION);
+        }
+
+        // Background job queue: one row per logical request. `dedupe_key`
+        // separates multiple content-addressed untag intents for one item.
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS background_jobs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type        TEXT NOT NULL,
+                library_id      INTEGER NOT NULL,
+                item_id         INTEGER,
+                zotero_key      TEXT NOT NULL,
+                content_kind    TEXT NOT NULL,
+                payload_kind    TEXT NOT NULL,
+                dedupe_key      TEXT NOT NULL DEFAULT '',
+                priority        INTEGER NOT NULL DEFAULT 100,
+                payload_json    TEXT,
+                enqueued_at     INTEGER NOT NULL,
+                available_at    INTEGER NOT NULL,
+                attempt_count   INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT,
+                UNIQUE(job_type, library_id, zotero_key, payload_kind, dedupe_key)
+            );
+        `);
+
+        await this.queryAsync(`
+            DELETE FROM background_jobs
+            WHERE job_type NOT IN ('document_extract','document_ocr','fulltext_upsert','fulltext_untag')
+        `);
+
+        await this.queryAsync(`
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_visible
+            ON background_jobs (available_at, priority);
+        `);
+
+        // Dead-letter table for jobs that exceeded MAX_ATTEMPTS. Surfaced
+        // through the dev queue-stats endpoint; no automatic retry.
+        await this.queryAsync(`
+            CREATE TABLE IF NOT EXISTS background_jobs_dead (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type        TEXT NOT NULL,
+                library_id      INTEGER NOT NULL,
+                zotero_key      TEXT NOT NULL,
+                content_kind    TEXT NOT NULL,
+                payload_kind    TEXT NOT NULL,
+                payload_json    TEXT,
+                enqueued_at     INTEGER NOT NULL,
+                died_at         INTEGER NOT NULL,
+                attempt_count   INTEGER NOT NULL,
+                last_error      TEXT
+            );
+        `);
+        await this.processingProgress.init();
+    }
+
+    /**
+     * Close the database connection permanently.
+     *
+     * Every caller is a teardown path, and each plugin instance opens its own
+     * connection. A non-permanent close lets `Zotero.DBConnection` reopen on
+     * the next query, and it keeps the connection's idle observer (backup +
+     * vacuum) registered with the app. After a plugin reload or a quit, a late
+     * query or an idle callback would then reopen a connection nothing closes,
+     * and Sqlite.sys.mjs blocks app shutdown waiting for it.
+     */
+    public async closeDatabase(): Promise<void> {
+        await this.conn.closeDatabase(true);
+    }
+
+    /**
+     * Helper method to construct ThreadRecord from a database row
+     */
+    private static rowToThreadRecord(row: any): ThreadRecord {
+        return {
+            id: row.id,
+            user_id: row.user_id,
+            name: row.name,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        };
+    }
+
+    /**
+     * Convert ThreadRecord to ThreadData (application-facing format)
+     */
+    private static threadRecordToData(record: ThreadRecord): ThreadData {
+        return {
+            id: record.id,
+            name: record.name || '', // Convert null to empty string
+            createdAt: record.created_at,
+            updatedAt: record.updated_at,
+            // Pinning is a backend-thread feature; the local thread table has
+            // no column for it and no surface that offers it.
+            isPinned: false,
+        };
+    }
+
+    /**
+     * Convert ThreadData to ThreadRecord format (for database operations)
+     */
+    private static threadDataToRecord(data: Partial<ThreadData>): Partial<ThreadRecord> {
+        const record: Partial<ThreadRecord> = {};
+        
+        if (data.id !== undefined) record.id = data.id;
+        if (data.name !== undefined) record.name = data.name || null; // Convert empty string to null for database
+        if (data.createdAt !== undefined) record.created_at = data.createdAt;
+        if (data.updatedAt !== undefined) record.updated_at = data.updatedAt;
+        
+        return record;
+    }
+
+    /**
+     * Helper method to construct SyncLogsRecord from a database row
+     */
+    private static rowToSyncLogsRecord(row: any): SyncLogsRecord {
+        return {
+            id: row.id,
+            session_id: row.session_id,
+            user_id: row.user_id,
+            sync_type: row.sync_type as SyncType,
+            method: row.method as SyncMethod,
+            zotero_local_id: row.zotero_local_id,
+            zotero_user_id: row.zotero_user_id,
+            library_id: row.library_id,
+            total_upserts: row.total_upserts,
+            total_deletions: row.total_deletions,
+            library_version: row.library_version,
+            library_date_modified: row.library_date_modified,
+            timestamp: row.timestamp,
+        };
+    }
+
+    // --- Thread Methods ---
+
+    /**
+     * Create a new chat thread.
+     * @param user_id The user_id of the thread
+     * @param name Optional name for the thread
+     * @returns The complete ThreadData for the newly created thread
+     */
+    public async createThread(user_id: string, name: string = ''): Promise<ThreadData> {
+        const id = uuidv4();
+        const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+        const dbName = name || null; // Convert empty string to null for database
+        
+        await this.queryAsync(
+            `INSERT INTO threads (id, user_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+            [id, user_id, dbName, now, now]
+        );
+        
+        return {
+            id,
+            name,
+            createdAt: now,
+            updatedAt: now,
+            isPinned: false,
+        };
+    }
+
+    /**
+     * Retrieve a thread by its ID.
+     * @param user_id The user_id of the thread
+     * @param id The ID of the thread to retrieve
+     * @returns The ThreadData if found, otherwise null
+     */
+    public async getThread(user_id: string, id: string): Promise<ThreadData | null> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM threads WHERE user_id = ? AND id = ?`,
+            [user_id, id]
+        );
+        if (rows.length === 0) {
+            return null;
+        }
+        const record = AsterMarginDB.rowToThreadRecord(rows[0]);
+        return AsterMarginDB.threadRecordToData(record);
+    }
+
+    /**
+     * Get a paginated list of threads.
+     * @param user_id The user_id of the threads
+     * @param limit Number of threads per page
+     * @param offset Number of threads to skip
+     * @returns Object containing an array of ThreadData objects and a boolean indicating if there are more items
+     */
+    public async getThreadsPaginated(
+        user_id: string,
+        limit: number,
+        offset: number
+    ): Promise<{ threads: ThreadData[]; has_more: boolean }> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM threads WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+            [user_id, limit + 1, offset]
+        );
+
+        const threads = rows
+            .slice(0, limit)
+            .map((row: any) => {
+                const record = AsterMarginDB.rowToThreadRecord(row);
+                return AsterMarginDB.threadRecordToData(record);
+            });
+
+        return {
+            threads,
+            has_more: rows.length > limit,
+        };
+    }
+
+    /**
+     * Delete a thread and all its messages.
+     * @param user_id The user_id of the thread
+     * @param id The ID of the thread to delete
+     */
+    public async deleteThread(user_id: string, id: string): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM threads WHERE user_id = ? AND id = ?`,
+            [user_id, id]
+        );
+    }
+
+    /**
+     * Rename a thread.
+     * @param user_id The user_id of the thread
+     * @param id The ID of the thread to rename
+     * @param name The new name for the thread
+     */
+    public async renameThread(user_id: string, id: string, name: string): Promise<void> {
+        await this.queryAsync(
+            `UPDATE threads SET name = ?, updated_at = datetime('now') WHERE user_id = ? AND id = ?`,
+            [name, user_id, id]
+        );
+    }
+
+    /**
+     * Update a thread. Currently only supports renaming.
+     * @param user_id The user_id of the thread
+     * @param id The ID of the thread to update
+     * @param updates An object containing the fields to update (using ThreadData format)
+     */
+    public async updateThread(
+        user_id: string,
+        id: string,
+        updates: Partial<Omit<ThreadData, 'id' | 'createdAt'>>
+    ): Promise<void> {
+        const fieldsToUpdate: string[] = [];
+        const values: any[] = [];
+
+        if (updates.name !== undefined) {
+            fieldsToUpdate.push('name = ?');
+            values.push(updates.name || null); // Convert empty string to null for database
+        }
+
+        if (updates.updatedAt !== undefined) {
+            fieldsToUpdate.push('updated_at = ?');
+            values.push(updates.updatedAt);
+        } else if (fieldsToUpdate.length > 0) {
+            // Auto-update updated_at if we're making other changes
+            fieldsToUpdate.push('updated_at = datetime(\'now\')');
+        }
+
+        if (fieldsToUpdate.length === 0) {
+            return; // Nothing to update
+        }
+
+        values.push(user_id, id);
+        
+        await this.queryAsync(
+            `UPDATE threads SET ${fieldsToUpdate.join(', ')} WHERE user_id = ? AND id = ?`,
+            values
+        );
+    }
+
+    // --- Sync Logs Methods ---
+
+    /**
+     * Get sync log record for library_id and user_id with the highest library_version.
+     * @param user_id The user_id to filter by
+     * @param library_id The library_id to filter by
+     * @returns The SyncLogsRecord with highest library_version, or null if not found
+     */
+    public async getSyncLogWithHighestVersion(user_id: string, library_id: number): Promise<SyncLogsRecord | null> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM sync_logs 
+             WHERE user_id = ? AND library_id = ? 
+             ORDER BY library_version DESC 
+             LIMIT 1`,
+            [user_id, library_id]
+        );
+        
+        if (rows.length === 0) {
+            return null;
+        }
+        
+        return AsterMarginDB.rowToSyncLogsRecord(rows[0]);
+    }
+
+    /**
+     * Get sync log record for library_id and user_id with the most recent library_date_modified.
+     * @param user_id The user_id to filter by
+     * @param library_id The library_id to filter by
+     * @returns The SyncLogsRecord with most recent library_date_modified, or null if not found
+     */
+    public async getSyncLogWithMostRecentDate(user_id: string, library_id: number): Promise<SyncLogsRecord | null> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM sync_logs 
+             WHERE user_id = ? AND library_id = ? 
+             ORDER BY library_date_modified DESC 
+             LIMIT 1`,
+            [user_id, library_id]
+        );
+        
+        if (rows.length === 0) {
+            return null;
+        }
+        
+        return AsterMarginDB.rowToSyncLogsRecord(rows[0]);
+    }
+
+    // --- Embedding Methods ---
+
+    /**
+     * Helper method to construct EmbeddingRecord from a database row
+     */
+    private static rowToEmbeddingRecord(row: any): EmbeddingRecord {
+        return {
+            item_id: row.item_id,
+            library_id: row.library_id,
+            zotero_key: row.zotero_key,
+            version: row.version,
+            client_date_modified: row.client_date_modified,
+            content_hash: row.content_hash,
+            embedding: new Uint8Array(row.embedding),
+            dimensions: row.dimensions,
+            model_id: row.model_id,
+            indexed_at: row.indexed_at,
+        };
+    }
+
+    /**
+     * Convert Int8Array embedding to Uint8Array for BLOB storage.
+     * SQLite stores BLOBs as raw bytes; Int8Array and Uint8Array share the same buffer layout.
+     */
+    public static embeddingToBlob(embedding: Int8Array): Uint8Array {
+        return new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+    }
+
+    /**
+     * Convert BLOB (Uint8Array) back to Int8Array for similarity computation.
+     */
+    public static blobToEmbedding(blob: Uint8Array): Int8Array {
+        return new Int8Array(blob.buffer, blob.byteOffset, blob.byteLength);
+    }
+
+    /**
+     * Compute a hash for content change detection.
+     * Uses a simple but fast DJB2-style hash suitable for detecting text changes.
+     * @param text The text content to hash (title + abstract)
+     * @returns Hash string
+     */
+    public static computeContentHash(text: string): string {
+        let hash = 5381;
+        for (let i = 0; i < text.length; i++) {
+            const char = text.charCodeAt(i);
+            hash = ((hash << 5) + hash) ^ char;
+        }
+        // Convert to unsigned 32-bit and then to base36 for compact representation
+        return (hash >>> 0).toString(36);
+    }
+
+    /**
+     * Insert or update an embedding record.
+     * @param embedding The embedding data to store
+     */
+    public async upsertEmbedding(embedding: Omit<EmbeddingRecord, 'indexed_at'> & { indexed_at?: string }): Promise<void> {
+        const now = embedding.indexed_at || new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+        
+        await this.queryAsync(
+            `INSERT OR REPLACE INTO embeddings 
+             (item_id, library_id, zotero_key, version, client_date_modified, 
+              content_hash, embedding, dimensions, model_id, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                embedding.item_id,
+                embedding.library_id,
+                embedding.zotero_key,
+                embedding.version,
+                embedding.client_date_modified,
+                embedding.content_hash,
+                embedding.embedding,
+                embedding.dimensions,
+                embedding.model_id,
+                now
+            ]
+        );
+    }
+
+    /**
+     * Insert or update multiple embedding records in a batch.
+     * @param embeddings Array of embedding data to store
+     */
+    public async upsertEmbeddingsBatch(embeddings: Array<Omit<EmbeddingRecord, 'indexed_at'> & { indexed_at?: string }>): Promise<void> {
+        if (embeddings.length === 0) return;
+
+        const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+
+        // Use a transaction for batch insert
+        await this.conn.executeTransaction(async () => {
+            for (const embedding of embeddings) {
+                const indexedAt = embedding.indexed_at || now;
+                await this.queryAsync(
+                    `INSERT OR REPLACE INTO embeddings 
+                     (item_id, library_id, zotero_key, version, client_date_modified, 
+                      content_hash, embedding, dimensions, model_id, indexed_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        embedding.item_id,
+                        embedding.library_id,
+                        embedding.zotero_key,
+                        embedding.version,
+                        embedding.client_date_modified,
+                        embedding.content_hash,
+                        embedding.embedding,
+                        embedding.dimensions,
+                        embedding.model_id,
+                        indexedAt
+                    ]
+                );
+            }
+        });
+    }
+
+    /**
+     * Get an embedding record by item ID.
+     * @param itemId The Zotero item ID
+     * @returns The embedding record or null if not found
+     */
+    public async getEmbedding(itemId: number): Promise<EmbeddingRecord | null> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM embeddings WHERE item_id = ?`,
+            [itemId]
+        );
+        
+        if (rows.length === 0) {
+            return null;
+        }
+        
+        return AsterMarginDB.rowToEmbeddingRecord(rows[0]);
+    }
+
+    /**
+     * Get embedding records for multiple item IDs.
+     * @param itemIds Array of Zotero item IDs
+     * @returns Map of item ID to embedding record
+     */
+    public async getEmbeddingsBatch(itemIds: number[]): Promise<Map<number, EmbeddingRecord>> {
+        if (itemIds.length === 0) return new Map();
+
+        const result = new Map<number, EmbeddingRecord>();
+        const chunkSize = 500;
+
+        for (let i = 0; i < itemIds.length; i += chunkSize) {
+            const chunk = itemIds.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            
+            const rows = await this.queryAsync(
+                `SELECT * FROM embeddings WHERE item_id IN (${placeholders})`,
+                chunk
+            );
+            
+            for (const row of rows) {
+                result.set(row.item_id, AsterMarginDB.rowToEmbeddingRecord(row));
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Get all embeddings for a library.
+     * @param libraryId The Zotero library ID
+     * @returns Array of embedding records
+     */
+    public async getEmbeddingsByLibrary(libraryId: number): Promise<EmbeddingRecord[]> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM embeddings WHERE library_id = ?`,
+            [libraryId]
+        );
+        
+        return rows.map((row: any) => AsterMarginDB.rowToEmbeddingRecord(row));
+    }
+
+    /**
+     * Get all embeddings across all libraries.
+     * @returns Array of embedding records
+     */
+    public async getAllEmbeddings(): Promise<EmbeddingRecord[]> {
+        const rows = await this.queryAsync(
+            `SELECT * FROM embeddings ORDER BY library_id, item_id`
+        );
+        
+        return rows.map((row: any) => AsterMarginDB.rowToEmbeddingRecord(row));
+    }
+
+    /**
+     * Get embeddings for multiple libraries.
+     * @param libraryIds Array of library IDs
+     * @returns Array of embedding records
+     */
+    public async getEmbeddingsByLibraries(libraryIds: number[]): Promise<EmbeddingRecord[]> {
+        if (libraryIds.length === 0) return [];
+
+        const placeholders = libraryIds.map(() => '?').join(',');
+        const rows = await this.queryAsync(
+            `SELECT * FROM embeddings WHERE library_id IN (${placeholders})`,
+            libraryIds
+        );
+        
+        return rows.map((row: any) => AsterMarginDB.rowToEmbeddingRecord(row));
+    }
+
+    /**
+     * Get embeddings restricted to a set of item IDs, optionally also restricted to libraries.
+     * @param itemIds Array of Zotero item IDs; an empty array returns no results
+     * @param libraryIds Optional array of library IDs to additionally restrict results;
+     *                   an empty array returns no results
+     * @returns Array of embedding records
+     */
+    public async getEmbeddingsByItemIds(itemIds: number[], libraryIds?: number[]): Promise<EmbeddingRecord[]> {
+        if (itemIds.length === 0) return [];
+        if (libraryIds && libraryIds.length === 0) return [];
+
+        const libraryFilter = libraryIds ?? [];
+
+        // SQLite rejects statements over MAX_BOUND_PARAMS parameters, and the
+        // library IDs share that budget with the item IDs. A library filter too
+        // large to leave room for a useful item chunk is applied in JS instead.
+        const MAX_BOUND_PARAMS = 999;
+        const filterInSql = libraryFilter.length > 0 && libraryFilter.length * 2 <= MAX_BOUND_PARAMS;
+        const chunkSize = MAX_BOUND_PARAMS - (filterInSql ? libraryFilter.length : 0);
+        const libraryPlaceholders = libraryFilter.map(() => '?').join(',');
+
+        const records: EmbeddingRecord[] = [];
+        for (let i = 0; i < itemIds.length; i += chunkSize) {
+            const chunk = itemIds.slice(i, i + chunkSize);
+            const itemPlaceholders = chunk.map(() => '?').join(',');
+            const sql = filterInSql
+                ? `SELECT * FROM embeddings WHERE library_id IN (${libraryPlaceholders}) AND item_id IN (${itemPlaceholders})`
+                : `SELECT * FROM embeddings WHERE item_id IN (${itemPlaceholders})`;
+
+            const rows = await this.queryAsync(sql, filterInSql ? [...libraryFilter, ...chunk] : chunk);
+            records.push(...rows.map((row: any) => AsterMarginDB.rowToEmbeddingRecord(row)));
+        }
+
+        if (!filterInSql && libraryFilter.length > 0) {
+            const allowed = new Set(libraryFilter);
+            return records.filter(record => allowed.has(record.library_id));
+        }
+
+        return records;
+    }
+
+    /**
+     * Get content hashes for items to check what needs re-indexing.
+     * @param itemIds Array of Zotero item IDs
+     * @returns Map of item ID to content hash
+     */
+    public async getContentHashes(itemIds: number[]): Promise<Map<number, string>> {
+        if (itemIds.length === 0) return new Map();
+
+        const result = new Map<number, string>();
+        const chunkSize = 500;
+
+        for (let i = 0; i < itemIds.length; i += chunkSize) {
+            const chunk = itemIds.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            
+            const rows = await this.queryAsync(
+                `SELECT item_id, content_hash FROM embeddings WHERE item_id IN (${placeholders})`,
+                chunk
+            );
+            
+            for (const row of rows) {
+                result.set(row.item_id, row.content_hash);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Delete an embedding by item ID.
+     * @param itemId The Zotero item ID
+     */
+    public async deleteEmbedding(itemId: number): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM embeddings WHERE item_id = ?`,
+            [itemId]
+        );
+    }
+
+    /**
+     * Delete embeddings for multiple item IDs.
+     * @param itemIds Array of Zotero item IDs
+     */
+    public async deleteEmbeddingsBatch(itemIds: number[]): Promise<void> {
+        if (itemIds.length === 0) return;
+
+        const chunkSize = 500;
+        for (let i = 0; i < itemIds.length; i += chunkSize) {
+            const chunk = itemIds.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            await this.queryAsync(
+                `DELETE FROM embeddings WHERE item_id IN (${placeholders})`,
+                chunk
+            );
+        }
+    }
+
+    /**
+     * Delete all embeddings for a library.
+     * @param libraryId The Zotero library ID
+     */
+    public async deleteEmbeddingsByLibrary(libraryId: number): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM embeddings WHERE library_id = ?`,
+            [libraryId]
+        );
+    }
+
+    /**
+     * Get the count of embeddings for a library.
+     * @param libraryId The Zotero library ID
+     * @returns Number of embeddings
+     */
+    public async getEmbeddingCount(libraryId?: number): Promise<number> {
+        let sql = 'SELECT COUNT(*) as count FROM embeddings';
+        const params: any[] = [];
+
+        if (libraryId !== undefined) {
+            sql += ' WHERE library_id = ?';
+            params.push(libraryId);
+        }
+
+        const rows = await this.queryAsync(sql, params);
+        return rows[0]?.count || 0;
+    }
+
+    /**
+     * Get item IDs that have embeddings in a library.
+     * @param libraryId The Zotero library ID
+     * @returns Array of item IDs
+     */
+    public async getEmbeddedItemIds(libraryId?: number): Promise<number[]> {
+        let sql = 'SELECT item_id FROM embeddings';
+        const params: any[] = [];
+
+        if (libraryId !== undefined) {
+            sql += ' WHERE library_id = ?';
+            params.push(libraryId);
+        }
+
+        const rows = await this.queryAsync(sql, params);
+        return rows.map((row: any) => row.item_id);
+    }
+
+    /**
+     * Get distinct library IDs that have embeddings.
+     * Used to find libraries that may need cleanup when sync settings change.
+     * @returns Array of library IDs
+     */
+    public async getEmbeddedLibraryIds(): Promise<number[]> {
+        const rows = await this.queryAsync(
+            'SELECT DISTINCT library_id FROM embeddings'
+        );
+        return rows.map((row: any) => row.library_id);
+    }
+
+    /**
+     * Get all content hashes for embeddings, optionally filtered by library.
+     * More efficient than getContentHashes for full-database scans.
+     * @param libraryId Optional library ID to filter by
+     * @returns Map of item ID to content hash
+     */
+    public async getEmbeddingContentHashMap(libraryId?: number): Promise<Map<number, string>> {
+        let sql = 'SELECT item_id, content_hash FROM embeddings';
+        const params: any[] = [];
+
+        if (libraryId !== undefined) {
+            sql += ' WHERE library_id = ?';
+            params.push(libraryId);
+        }
+
+        const rows = await this.queryAsync(sql, params);
+        const result = new Map<number, string>();
+        
+        for (const row of rows) {
+            result.set(row.item_id, row.content_hash);
+        }
+
+        return result;
+    }
+
+    // =============================================
+    // Embedding Index State Methods
+    // =============================================
+
+    /**
+     * Get the embedding index state for a library.
+     * @param libraryId The Zotero library ID
+     * @returns The state record or null if not found
+     */
+    public async getEmbeddingIndexState(libraryId: number): Promise<EmbeddingIndexStateRecord | null> {
+        const sql = 'SELECT * FROM embedding_index_state WHERE library_id = ?';
+        const rows = await this.queryAsync(sql, [libraryId]);
+        
+        if (rows.length === 0) return null;
+        
+        const row = rows[0];
+        return {
+            library_id: row.library_id,
+            last_scan_timestamp: row.last_scan_timestamp,
+            max_client_date_modified: row.max_client_date_modified,
+            item_count: row.item_count,
+            embedding_count: row.embedding_count,
+        };
+    }
+
+    /**
+     * Update the embedding index state for a library.
+     * @param state The state to save
+     */
+    public async upsertEmbeddingIndexState(state: EmbeddingIndexStateRecord): Promise<void> {
+        const sql = `
+            INSERT INTO embedding_index_state 
+                (library_id, last_scan_timestamp, max_client_date_modified, item_count, embedding_count)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(library_id) DO UPDATE SET
+                last_scan_timestamp = excluded.last_scan_timestamp,
+                max_client_date_modified = excluded.max_client_date_modified,
+                item_count = excluded.item_count,
+                embedding_count = excluded.embedding_count
+        `;
+        
+        await this.queryAsync(sql, [
+            state.library_id,
+            state.last_scan_timestamp,
+            state.max_client_date_modified,
+            state.item_count,
+            state.embedding_count,
+        ]);
+    }
+
+    /**
+     * Delete the embedding index state for a library.
+     * @param libraryId The Zotero library ID
+     */
+    public async deleteEmbeddingIndexState(libraryId: number): Promise<void> {
+        await this.queryAsync(
+            'DELETE FROM embedding_index_state WHERE library_id = ?',
+            [libraryId]
+        );
+    }
+
+    /**
+     * Get MAX(client_date_modified) from embeddings for a library.
+     * @param libraryId The Zotero library ID
+     * @returns The max date or null if no embeddings exist
+     */
+    public async getEmbeddingsMaxClientDateModified(libraryId: number): Promise<string | null> {
+        const sql = 'SELECT MAX(client_date_modified) as max_date FROM embeddings WHERE library_id = ?';
+        const rows = await this.queryAsync(sql, [libraryId]);
+        return rows[0]?.max_date || null;
+    }
+
+    // =============================================
+    // Failed Embeddings Methods
+    // =============================================
+
+    /**
+     * Helper method to construct FailedEmbeddingRecord from a database row
+     */
+    private static rowToFailedEmbeddingRecord(row: any): FailedEmbeddingRecord {
+        return {
+            item_id: row.item_id,
+            library_id: row.library_id,
+            failure_count: row.failure_count,
+            last_error: row.last_error,
+            last_attempt: row.last_attempt,
+            next_retry_after: row.next_retry_after,
+        };
+    }
+
+    /**
+     * Calculate the next retry time based on failure count.
+     * Uses exponential backoff: 1h, 2h, 4h, 8h, 16h
+     * @param failureCount Number of consecutive failures
+     * @returns ISO string of next retry time
+     */
+    private static calculateNextRetryTime(failureCount: number): string {
+        const delayMs = EMBEDDING_RETRY_BASE_DELAY_MS * Math.pow(2, failureCount - 1);
+        const nextRetry = new Date(Date.now() + delayMs);
+        return nextRetry.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+    }
+
+    private static formatSqlDate(date = new Date()): string {
+        return date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+    }
+
+    private static maxDocumentProcessingFailures(task: DocumentProcessingTask): number {
+        return task === 'ocr' ? MAX_OCR_FAILURES : MAX_UPSERT_FAILURES;
+    }
+
+    private static calculateDocumentProcessingRetryTime(
+        failureCount: number,
+    ): string {
+        const delayMs = DOC_PROCESSING_RETRY_BASE_DELAY_MS * Math.pow(2, failureCount - 1);
+        return AsterMarginDB.formatSqlDate(new Date(Date.now() + delayMs));
+    }
+
+    private static rowToDocumentProcessingFailureRecord(
+        row: any,
+    ): DocumentProcessingFailureRecord {
+        return {
+            fileHash: row.getResultByIndex(0),
+            task: row.getResultByIndex(1) as DocumentProcessingTask,
+            engineVersion: row.getResultByIndex(2),
+            sourceType: row.getResultByIndex(3) ?? null,
+            sourceKey: row.getResultByIndex(4) ?? null,
+            failureCount: row.getResultByIndex(5),
+            terminalCode: row.getResultByIndex(6) ?? null,
+            lastError: row.getResultByIndex(7) ?? null,
+            lastAttempt: row.getResultByIndex(8),
+            nextRetryAfter: row.getResultByIndex(9),
+        };
+    }
+
+    /**
+     * Record a failed embedding attempt for an item.
+     * If the item already has failures, increments the counter.
+     * @param itemId The Zotero item ID
+     * @param libraryId The Zotero library ID
+     * @param error The error message
+     */
+    public async recordFailedEmbedding(itemId: number, libraryId: number, error: string): Promise<void> {
+        const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+        
+        // Check if already exists
+        const existing = await this.getFailedEmbedding(itemId);
+        
+        if (existing) {
+            // Increment failure count
+            const newFailureCount = existing.failure_count + 1;
+            const nextRetry = AsterMarginDB.calculateNextRetryTime(newFailureCount);
+            
+            await this.queryAsync(
+                `UPDATE failed_embeddings 
+                 SET failure_count = ?, last_error = ?, last_attempt = ?, next_retry_after = ?
+                 WHERE item_id = ?`,
+                [newFailureCount, error, now, nextRetry, itemId]
+            );
+        } else {
+            // Insert new record
+            const nextRetry = AsterMarginDB.calculateNextRetryTime(1);
+            
+            await this.queryAsync(
+                `INSERT INTO failed_embeddings 
+                 (item_id, library_id, failure_count, last_error, last_attempt, next_retry_after)
+                 VALUES (?, ?, 1, ?, ?, ?)`,
+                [itemId, libraryId, error, now, nextRetry]
+            );
+        }
+    }
+
+    /**
+     * Record multiple failed embedding attempts in a batch.
+     * @param items Array of {itemId, libraryId} pairs
+     * @param error The error message (same for all items in batch)
+     * @param options.incrementExisting When true (default), existing rows have
+     *   their failure_count bumped and next_retry_after pushed out per the
+     *   exponential backoff schedule. Use this for "real" failures from the
+     *   API or upsert path. When false, existing rows only refresh last_attempt
+     *   and last_error, and new rows are inserted in an immediately retryable
+     *   state so transient local failures do not start a backoff window.
+     */
+    public async recordFailedEmbeddingsBatch(
+        items: Array<{ itemId: number; libraryId: number }>,
+        error: string,
+        options: { incrementExisting?: boolean } = {}
+    ): Promise<void> {
+        if (items.length === 0) return;
+
+        const { incrementExisting = true } = options;
+
+        const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+        const itemIds = items.map(i => i.itemId);
+
+        // Get existing failed records
+        const existing = await this.getFailedEmbeddingsBatch(itemIds);
+        const existingMap = new Map(existing.map(r => [r.item_id, r]));
+
+        await this.conn.executeTransaction(async () => {
+            for (const item of items) {
+                const existingRecord = existingMap.get(item.itemId);
+
+                if (existingRecord) {
+                    if (incrementExisting) {
+                        const newFailureCount = existingRecord.failure_count + 1;
+                        const nextRetry = AsterMarginDB.calculateNextRetryTime(newFailureCount);
+
+                        await this.queryAsync(
+                            `UPDATE failed_embeddings
+                             SET failure_count = ?, last_error = ?, last_attempt = ?, next_retry_after = ?
+                             WHERE item_id = ?`,
+                            [newFailureCount, error, now, nextRetry, item.itemId]
+                        );
+                    } else {
+                        // Transient mode: refresh diagnostics but preserve the
+                        // existing failure_count and retry schedule. This keeps
+                        // healthy items from being escalated toward permanent
+                        // failure on a string of local DB errors.
+                        await this.queryAsync(
+                            `UPDATE failed_embeddings
+                             SET last_error = ?, last_attempt = ?
+                             WHERE item_id = ?`,
+                            [error, now, item.itemId]
+                        );
+                    }
+                } else {
+                    await this.queryAsync(
+                        `INSERT INTO failed_embeddings
+                         (item_id, library_id, failure_count, last_error, last_attempt, next_retry_after)
+                         VALUES (?, ?, ?, ?, ?, ?)`,
+                        [
+                            item.itemId,
+                            item.libraryId,
+                            incrementExisting ? 1 : 0,
+                            error,
+                            now,
+                            incrementExisting ? AsterMarginDB.calculateNextRetryTime(1) : now,
+                        ]
+                    );
+                }
+            }
+        });
+    }
+
+    /**
+     * Get a failed embedding record by item ID.
+     * @param itemId The Zotero item ID
+     * @returns The failed embedding record or null
+     */
+    public async getFailedEmbedding(itemId: number): Promise<FailedEmbeddingRecord | null> {
+        const rows = await this.queryAsync(
+            'SELECT * FROM failed_embeddings WHERE item_id = ?',
+            [itemId]
+        );
+        
+        if (rows.length === 0) return null;
+        return AsterMarginDB.rowToFailedEmbeddingRecord(rows[0]);
+    }
+
+    /**
+     * Get failed embedding records for multiple item IDs.
+     * @param itemIds Array of Zotero item IDs
+     * @returns Array of failed embedding records
+     */
+    public async getFailedEmbeddingsBatch(itemIds: number[]): Promise<FailedEmbeddingRecord[]> {
+        if (itemIds.length === 0) return [];
+
+        const results: FailedEmbeddingRecord[] = [];
+        const chunkSize = 500;
+
+        for (let i = 0; i < itemIds.length; i += chunkSize) {
+            const chunk = itemIds.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            
+            const rows = await this.queryAsync(
+                `SELECT * FROM failed_embeddings WHERE item_id IN (${placeholders})`,
+                chunk
+            );
+            
+            for (const row of rows) {
+                results.push(AsterMarginDB.rowToFailedEmbeddingRecord(row));
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Get all items that are ready for retry.
+     * Returns items where next_retry_after < now AND failure_count < MAX_EMBEDDING_FAILURES.
+     * @param libraryId Optional library ID to filter by
+     * @returns Array of item IDs ready for retry
+     */
+    public async getItemsReadyForRetry(libraryId?: number): Promise<number[]> {
+        const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+        
+        let sql = `SELECT item_id FROM failed_embeddings 
+                   WHERE next_retry_after <= ? AND failure_count < ?`;
+        const params: any[] = [now, MAX_EMBEDDING_FAILURES];
+        
+        if (libraryId !== undefined) {
+            sql += ' AND library_id = ?';
+            params.push(libraryId);
+        }
+        
+        const rows = await this.queryAsync(sql, params);
+        return rows.map((row: any) => row.item_id);
+    }
+
+    /**
+     * Get all permanently failed items (failure_count >= MAX_EMBEDDING_FAILURES).
+     * @param libraryId Optional library ID to filter by
+     * @returns Array of failed embedding records
+     */
+    public async getPermanentlyFailedItems(libraryId?: number): Promise<FailedEmbeddingRecord[]> {
+        let sql = `SELECT * FROM failed_embeddings WHERE failure_count >= ?`;
+        const params: any[] = [MAX_EMBEDDING_FAILURES];
+        
+        if (libraryId !== undefined) {
+            sql += ' AND library_id = ?';
+            params.push(libraryId);
+        }
+        
+        const rows = await this.queryAsync(sql, params);
+        return rows.map((row: any) => AsterMarginDB.rowToFailedEmbeddingRecord(row));
+    }
+
+    /**
+     * Remove a failed embedding record (call after successful indexing).
+     * @param itemId The Zotero item ID
+     */
+    public async removeFailedEmbedding(itemId: number): Promise<void> {
+        await this.queryAsync(
+            'DELETE FROM failed_embeddings WHERE item_id = ?',
+            [itemId]
+        );
+    }
+
+    /**
+     * Remove multiple failed embedding records in a batch.
+     * @param itemIds Array of Zotero item IDs
+     */
+    public async removeFailedEmbeddingsBatch(itemIds: number[]): Promise<void> {
+        if (itemIds.length === 0) return;
+
+        const chunkSize = 500;
+        for (let i = 0; i < itemIds.length; i += chunkSize) {
+            const chunk = itemIds.slice(i, i + chunkSize);
+            const placeholders = chunk.map(() => '?').join(',');
+            await this.queryAsync(
+                `DELETE FROM failed_embeddings WHERE item_id IN (${placeholders})`,
+                chunk
+            );
+        }
+    }
+
+    /**
+     * Delete all failed embedding records for a library.
+     * @param libraryId The Zotero library ID
+     */
+    public async deleteFailedEmbeddingsByLibrary(libraryId: number): Promise<void> {
+        await this.queryAsync(
+            'DELETE FROM failed_embeddings WHERE library_id = ?',
+            [libraryId]
+        );
+    }
+
+    /**
+     * Remove failed embedding records for items that no longer exist.
+     * @param itemIds Array of item IDs that should be removed
+     */
+    public async cleanupDeletedFailedEmbeddings(itemIds: number[]): Promise<void> {
+        await this.removeFailedEmbeddingsBatch(itemIds);
+    }
+
+    /**
+     * Get count of failed embeddings.
+     * @param libraryId Optional library ID to filter by
+     * @returns Number of failed embedding records
+     */
+    public async getFailedEmbeddingCount(libraryId?: number): Promise<number> {
+        let sql = 'SELECT COUNT(*) as count FROM failed_embeddings';
+        const params: any[] = [];
+
+        if (libraryId !== undefined) {
+            sql += ' WHERE library_id = ?';
+            params.push(libraryId);
+        }
+
+        const rows = await this.queryAsync(sql, params);
+        return rows[0]?.count || 0;
+    }
+
+    /**
+     * Record a content-keyed document processing failure.
+     */
+    public async recordDocumentProcessingFailure(
+        input: DocumentProcessingFailureInput,
+    ): Promise<void> {
+        const engineVersion = input.engineVersion ?? '';
+        const now = AsterMarginDB.formatSqlDate();
+        const nextRetryAfter = AsterMarginDB.calculateDocumentProcessingRetryTime(1);
+        const terminalCode = input.terminalCode ?? null;
+
+        await this.queryAsync(
+            `INSERT INTO document_processing_failures (
+                file_hash, task, engine_version, source_type, source_key,
+                failure_count, terminal_code, last_error, last_attempt,
+                next_retry_after
+             ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+             ON CONFLICT(file_hash, task, engine_version) DO UPDATE SET
+                 source_type = excluded.source_type,
+                 source_key = excluded.source_key,
+                 failure_count = document_processing_failures.failure_count + 1,
+                 terminal_code = COALESCE(
+                     excluded.terminal_code,
+                     document_processing_failures.terminal_code
+                 ),
+                 last_error = excluded.last_error,
+                 last_attempt = excluded.last_attempt,
+                 next_retry_after = datetime(
+                     strftime('%s', excluded.last_attempt)
+                     + (? * (1 << document_processing_failures.failure_count)),
+                     'unixepoch'
+                 )`,
+            [
+                input.fileHash,
+                input.task,
+                engineVersion,
+                input.sourceType ?? null,
+                input.sourceKey ?? null,
+                terminalCode,
+                input.error,
+                now,
+                nextRetryAfter,
+                DOC_PROCESSING_RETRY_BASE_DELAY_MS / 1000,
+            ],
+        );
+    }
+
+    /**
+     * Read a document processing failure by its suppression identity.
+     */
+    public async getDocumentProcessingFailure(
+        fileHash: string,
+        task: DocumentProcessingTask,
+        engineVersion = '',
+    ): Promise<DocumentProcessingFailureRecord | null> {
+        const records: DocumentProcessingFailureRecord[] = [];
+        await this.queryAsync(
+            `SELECT file_hash, task, engine_version, source_type, source_key,
+                    failure_count, terminal_code, last_error, last_attempt,
+                    next_retry_after
+             FROM document_processing_failures
+             WHERE file_hash = ? AND task = ? AND engine_version = ?
+             LIMIT 1`,
+            [fileHash, task, engineVersion],
+            {
+                onRow: (row: any) => {
+                    records.push(AsterMarginDB.rowToDocumentProcessingFailureRecord(row));
+                },
+            },
+        );
+        return records[0] ?? null;
+    }
+
+    /**
+     * Return true when a failure row suppresses future processing attempts.
+     */
+    public async isDocumentProcessingPermanentlyFailed(
+        fileHash: string,
+        task: DocumentProcessingTask,
+        engineVersion = '',
+    ): Promise<boolean> {
+        const record = await this.getDocumentProcessingFailure(fileHash, task, engineVersion);
+        if (!record) return false;
+        return (
+            record.terminalCode !== null
+            || record.failureCount >= AsterMarginDB.maxDocumentProcessingFailures(task)
+        );
+    }
+
+    /**
+     * Return true when a transient failure row can be retried at `now`.
+     */
+    public async isDocumentProcessingReadyForRetry(
+        fileHash: string,
+        task: DocumentProcessingTask,
+        engineVersion = '',
+        now = AsterMarginDB.formatSqlDate(),
+    ): Promise<boolean> {
+        const record = await this.getDocumentProcessingFailure(fileHash, task, engineVersion);
+        if (!record || record.terminalCode !== null) return false;
+        return record.nextRetryAfter <= now;
+    }
+
+    /**
+     * Clear a document processing failure after a successful processing pass.
+     */
+    public async clearDocumentProcessingFailure(
+        fileHash: string,
+        task: DocumentProcessingTask,
+        engineVersion = '',
+    ): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM document_processing_failures
+             WHERE file_hash = ? AND task = ? AND engine_version = ?`,
+            [fileHash, task, engineVersion],
+        );
+    }
+
+    // =====================================================================
+    // Attachment background-processing ledger and scan cursors
+    // =====================================================================
+
+    /**
+     * Create the identity row without touching executor-owned progress.
+     * Existing rows only refresh the convenient item id and current kind.
+     */
+    public async ensureAttachmentProcessingState(
+        input: AttachmentProcessingStateInput,
+    ): Promise<AttachmentProcessingStateRecord> {
+        await this.queryAsync(
+            `INSERT OR IGNORE INTO attachment_processing_state (
+                library_id, zotero_key, item_id, content_kind
+             ) VALUES (?, ?, ?, ?)`,
+            [input.libraryId, input.zoteroKey, input.itemId ?? null, input.contentKind],
+        );
+        await this.queryAsync(
+            `UPDATE attachment_processing_state
+             SET item_id = ?, content_kind = ?, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND (item_id IS NOT ? OR content_kind != ?)`,
+            [
+                input.itemId ?? null,
+                input.contentKind,
+                input.libraryId,
+                input.zoteroKey,
+                input.itemId ?? null,
+                input.contentKind,
+            ],
+        );
+        const row = await this.getAttachmentProcessingState(input.libraryId, input.zoteroKey);
+        if (!row) throw new Error('Failed to create attachment processing state');
+        return row;
+    }
+
+    public async getAttachmentProcessingState(
+        libraryId: number,
+        zoteroKey: string,
+    ): Promise<AttachmentProcessingStateRecord | null> {
+        const rows = await this.selectAttachmentProcessingStates(
+            `SELECT ${ATTACHMENT_PROCESSING_COLUMNS}
+             FROM attachment_processing_state
+             WHERE library_id = ? AND zotero_key = ? LIMIT 1`,
+            [libraryId, zoteroKey],
+        );
+        return rows[0] ?? null;
+    }
+
+    public async getAttachmentProcessingStatesByLibrary(
+        libraryId: number,
+    ): Promise<AttachmentProcessingStateRecord[]> {
+        return this.selectAttachmentProcessingStates(
+            `SELECT ${ATTACHMENT_PROCESSING_COLUMNS}
+             FROM attachment_processing_state
+             WHERE library_id = ? ORDER BY zotero_key`,
+            [libraryId],
+        );
+    }
+
+    /** Latest observed reading outcome, independent of cache retention and indexing history. */
+    public async recordAttachmentReadingOutcome(input: {
+        libraryId: number;
+        zoteroKey: string;
+        contentKind: string;
+        errorCode: string | null;
+        attemptedAt: number;
+    }): Promise<void> {
+        await this.queryAsync(
+            `INSERT INTO attachment_reading_state (library_id, zotero_key, content_kind, error_code, attempted_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(library_id, zotero_key) DO UPDATE SET
+                content_kind = excluded.content_kind, error_code = excluded.error_code,
+                attempted_at = excluded.attempted_at
+             WHERE excluded.attempted_at >= attachment_reading_state.attempted_at`,
+            [input.libraryId, input.zoteroKey, input.contentKind, input.errorCode, input.attemptedAt],
+        );
+    }
+
+    public async getAttachmentReadingError(libraryId: number, zoteroKey: string): Promise<string | null> {
+        let code: string | null = null;
+        await this.queryAsync(
+            `SELECT error_code FROM attachment_reading_state WHERE library_id = ? AND zotero_key = ?`,
+            [libraryId, zoteroKey],
+            { onRow: (row: any) => { code = row.getResultByIndex(0) ?? null; } },
+        );
+        return code;
+    }
+
+    public async getAttachmentReadingKeysByLibrary(libraryId: number): Promise<string[]> {
+        const keys: string[] = [];
+        await this.queryAsync(
+            `SELECT zotero_key FROM attachment_reading_state WHERE library_id = ?`,
+            [libraryId],
+            { onRow: (row: any) => keys.push(row.getResultByIndex(0)) },
+        );
+        return keys;
+    }
+
+    public async deleteAttachmentReadingState(libraryId: number, zoteroKey: string): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM attachment_reading_state WHERE library_id = ? AND zotero_key = ?`,
+            [libraryId, zoteroKey],
+        );
+    }
+
+    public async deleteAttachmentProcessingState(
+        libraryId: number,
+        zoteroKey: string,
+    ): Promise<AttachmentProcessingStateRecord | null> {
+        const existing = await this.getAttachmentProcessingState(libraryId, zoteroKey);
+        await this.deleteAttachmentReadingState(libraryId, zoteroKey);
+        if (!existing) return null;
+        await this.queryAsync(
+            `DELETE FROM attachment_processing_state
+             WHERE library_id = ? AND zotero_key = ?`,
+            [libraryId, zoteroKey],
+        );
+        return existing;
+    }
+
+    /**
+     * Drop ledger rows for attachments that left the library, queueing cleanup
+     * for any remote membership they record. Reading the row, queueing its
+     * cleanup and deleting it share one transaction, so a concurrent upsert or
+     * cleanup never observes a row whose deletion cleanup is already queued,
+     * and the cleanup always reflects the latest recorded owner.
+     */
+    public async retireAttachmentProcessingStates(libraryId: number, zoteroKeys: string[]): Promise<void> {
+        if (zoteroKeys.length === 0) return;
+        await this.conn.executeTransaction(async () => {
+            for (const zoteroKey of zoteroKeys) {
+                const row = await this.deleteAttachmentProcessingState(libraryId, zoteroKey);
+                if (row?.structuredDocumentHash && row.upsertRemoteIdentity) {
+                    await this.enqueueBackgroundJobInTransaction(buildUntagJobInput(row, Date.now()));
+                }
+            }
+        });
+    }
+
+    public async deleteAttachmentProcessingStatesByLibrary(libraryId: number): Promise<void> {
+        await this.queryAsync(`DELETE FROM attachment_reading_state WHERE library_id = ?`, [libraryId]);
+        await this.queryAsync(
+            `DELETE FROM attachment_processing_state WHERE library_id = ?`,
+            [libraryId],
+        );
+    }
+
+    /** Reset local progress while retaining the identities needed for remote cleanup. */
+    public async resetLocalProcessingState(libraryId?: number, discardRemoteState = false): Promise<void> {
+        const where = libraryId === undefined ? '' : ' WHERE library_id = ?';
+        const params = libraryId === undefined ? [] : [libraryId];
+        await this.conn.executeTransaction(async () => {
+            await this.queryAsync(`DELETE FROM attachment_reading_state${where}`, params);
+            for (const table of ['background_jobs', 'background_jobs_dead']) {
+                await this.queryAsync(
+                    `DELETE FROM ${table}${where}${discardRemoteState ? '' :
+                        ` ${where ? 'AND' : 'WHERE'} job_type != 'fulltext_untag'`}`, params,
+                );
+            }
+            if (discardRemoteState) {
+                await this.queryAsync(`DELETE FROM index_cleanup_outbox${libraryId === undefined ? '' :
+                    " WHERE json_extract(job_json, '$.libraryId') = ?"}`, params);
+                await this.queryAsync(`DELETE FROM attachment_processing_state${where}`, params);
+            } else {
+                // Keep hash and membership facts until a replacement extraction can
+                // retire the old remote reference, including after an offline reset.
+                await this.queryAsync(`UPDATE attachment_processing_state SET
+                    extract_status = NULL, ocr_status = CASE WHEN ocr_status = 'na' THEN 'na' ELSE NULL END,
+                    extraction_source = NULL, file_mtime_ms = NULL,
+                    file_size_bytes = NULL, ocr_engine_version = NULL,
+                    upsert_status = CASE WHEN upsert_status = 'done' THEN 'done' ELSE NULL END,
+                    last_error = NULL, updated_at = datetime('now')${where}`, params);
+            }
+            await this.queryAsync(`DELETE FROM processing_index_state${where}`, params);
+            if (libraryId === undefined) await this.queryAsync('DELETE FROM document_processing_failures');
+        });
+    }
+
+    /** Drop content-reading work when a library leaves AsterMargin's scope. */
+    public async deleteBackgroundJobsByLibrary(libraryId: number): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM background_jobs
+             WHERE library_id = ? AND job_type != 'fulltext_untag'`,
+            [libraryId],
+        );
+    }
+
+    /** Reconciler-owned reset of one processing stage back to "not started". */
+    private async resetAttachmentStatusColumn(
+        column: 'extract_status' | 'ocr_status' | 'upsert_status',
+        libraryId: number,
+        zoteroKey: string,
+        reason: string | null,
+    ): Promise<void> {
+        await this.queryAsync(
+            `UPDATE attachment_processing_state SET
+                ${column} = NULL,
+                last_error = ?,
+                updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?`,
+            [reason, libraryId, zoteroKey],
+        );
+    }
+
+    public async resetAttachmentExtraction(
+        libraryId: number,
+        zoteroKey: string,
+        reason: string | null = null,
+    ): Promise<void> {
+        await this.resetAttachmentStatusColumn('extract_status', libraryId, zoteroKey, reason);
+        // Scheduling work does not supersede the last observed reading outcome.
+        // The next actual read replaces it, whether that read succeeds or fails.
+    }
+
+    /** Adopt an identity only for an unchanged legacy success that has no identity yet. */
+    public async adoptAttachmentExtractionSource(input: {
+        libraryId: number;
+        zoteroKey: string;
+        source: string;
+        contentKind: AttachmentProcessingStateRecord['contentKind'];
+        fileMtimeMs: number;
+        fileSizeBytes: number;
+    }): Promise<boolean> {
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET extraction_source = ?
+             WHERE library_id = ? AND zotero_key = ? AND extraction_source IS NULL
+               AND extract_status = 'done' AND content_kind = ?
+               AND file_mtime_ms = ? AND file_size_bytes = ?`,
+            [input.source, input.libraryId, input.zoteroKey, input.contentKind,
+                input.fileMtimeMs, input.fileSizeBytes],
+        );
+    }
+
+    /** Swap the recorded source identity only while it still equals `expectedSource`. */
+    public async replaceAttachmentExtractionSource(input: {
+        libraryId: number;
+        zoteroKey: string;
+        expectedSource: string;
+        source: string;
+    }): Promise<boolean> {
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET extraction_source = ?
+             WHERE library_id = ? AND zotero_key = ? AND extraction_source = ?`,
+            [input.source, input.libraryId, input.zoteroKey, input.expectedSource],
+        );
+    }
+
+    /**
+     * Move a successful extraction to a new path or mtime of the same bytes.
+     * Applies only while the row still records `expectedSource` and the
+     * verified `fileHash`, so every downstream stage stays as it is.
+     */
+    public async relocateAttachmentExtractionSource(input: {
+        libraryId: number;
+        zoteroKey: string;
+        expectedSource: string;
+        fileHash: string;
+        source: string;
+        fileMtimeMs: number;
+    }): Promise<boolean> {
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET extraction_source = ?, file_mtime_ms = ?
+             WHERE library_id = ? AND zotero_key = ? AND extraction_source = ?
+               AND extract_status = 'done' AND file_hash = ?`,
+            [input.source, input.fileMtimeMs, input.libraryId, input.zoteroKey,
+                input.expectedSource, input.fileHash],
+        );
+    }
+
+    public async resetAttachmentOcr(
+        libraryId: number,
+        zoteroKey: string,
+        reason: string | null = null,
+    ): Promise<void> {
+        await this.resetAttachmentStatusColumn('ocr_status', libraryId, zoteroKey, reason);
+    }
+
+    /**
+     * Put a failed OCR stage back to "needed" so the reconciler and the retry
+     * path can ticket it again without re-running extraction.
+     */
+    public async requeueAttachmentOcr(
+        libraryId: number,
+        zoteroKey: string,
+        reason: string | null = null,
+    ): Promise<void> {
+        await this.queryAsync(
+            `UPDATE attachment_processing_state SET
+                ocr_status = 'needed',
+                last_error = ?,
+                updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?`,
+            [reason, libraryId, zoteroKey],
+        );
+    }
+
+    public async resetAttachmentUpsert(
+        libraryId: number,
+        zoteroKey: string,
+        reason: string | null = null,
+    ): Promise<void> {
+        await this.resetAttachmentStatusColumn('upsert_status', libraryId, zoteroKey, reason);
+    }
+
+    /**
+     * Executor-owned extract completion. The prior signature/hash predicates
+     * prevent a stale in-flight job from overwriting a newer completion.
+     */
+    public async markAttachmentExtracted(input: {
+        libraryId: number;
+        zoteroKey: string;
+        expectedFileMtimeMs: number | null;
+        expectedFileSizeBytes: number | null;
+        previousDocumentHash: string | null;
+        expectedExtractStatus: AttachmentExtractStatus;
+        fileMtimeMs: number;
+        fileSizeBytes: number;
+        fileHash: string | null;
+        structuredDocumentHash: string | null;
+        extractSchemaVersion: string;
+        extractionSource?: string | null;
+        ocrStatus: Extract<AttachmentOcrStatus, 'na' | 'needed'>;
+    }): Promise<boolean> {
+        const hashChanged = input.previousDocumentHash !== input.structuredDocumentHash;
+        const refreshDownstream = hashChanged || input.ocrStatus === 'needed';
+        let applied = false;
+        await this.conn.executeTransaction(async () => {
+            const previous = await this.getAttachmentProcessingState(input.libraryId, input.zoteroKey);
+            const changed = await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                file_mtime_ms = ?, file_size_bytes = ?, file_hash = ?,
+                structured_document_hash = ?, extract_status = 'done',
+                extract_schema_version = ?, extraction_source = ?,
+                ocr_status = CASE WHEN ? THEN ? ELSE ocr_status END,
+                ocr_engine_version = CASE WHEN ? THEN NULL ELSE ocr_engine_version END,
+                upsert_status = CASE WHEN ? THEN NULL ELSE upsert_status END,
+                upsert_index_version = CASE WHEN ? THEN NULL ELSE upsert_index_version END,
+                upsert_remote_identity = CASE WHEN ? THEN NULL ELSE upsert_remote_identity END,
+                last_error = NULL, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND file_mtime_ms IS ? AND file_size_bytes IS ?
+               AND structured_document_hash IS ? AND extract_status IS ?`,
+            [
+                input.fileMtimeMs,
+                input.fileSizeBytes,
+                input.fileHash,
+                input.structuredDocumentHash,
+                input.extractSchemaVersion,
+                input.extractionSource ?? null,
+                refreshDownstream ? 1 : 0,
+                input.ocrStatus,
+                refreshDownstream ? 1 : 0,
+                refreshDownstream ? 1 : 0,
+                refreshDownstream ? 1 : 0,
+                hashChanged ? 1 : 0,
+                input.libraryId,
+                input.zoteroKey,
+                input.expectedFileMtimeMs,
+                input.expectedFileSizeBytes,
+                input.previousDocumentHash,
+                input.expectedExtractStatus,
+            ],
+        );
+            if (changed) await this.enqueueReplacementUntag(previous, input.structuredDocumentHash);
+            applied = changed;
+        });
+        return applied;
+    }
+
+    /**
+     * Record a fresh scan detection for an OCR-prepared attachment that is being
+     * prepared again. Unlike {@link markAttachmentExtracted}, the prepared hash,
+     * OCR stage and index membership are kept, so search keeps serving the
+     * previous preparation until the OCR completion publishes its replacement.
+     */
+    public async markAttachmentExtractedForOcrRestore(input: {
+        libraryId: number;
+        zoteroKey: string;
+        expectedExtractStatus: AttachmentExtractStatus;
+        fileMtimeMs: number;
+        fileSizeBytes: number;
+        fileHash: string | null;
+        extractSchemaVersion: string;
+        extractionSource?: string | null;
+    }): Promise<boolean> {
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                extract_status = 'done', extract_schema_version = ?, extraction_source = ?,
+                last_error = NULL, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ? AND ocr_status = 'done'
+               AND file_mtime_ms IS ? AND file_size_bytes IS ? AND file_hash IS ?
+               AND extract_status IS ?`,
+            [
+                input.extractSchemaVersion,
+                input.extractionSource ?? null,
+                input.libraryId,
+                input.zoteroKey,
+                input.fileMtimeMs,
+                input.fileSizeBytes,
+                input.fileHash,
+                input.expectedExtractStatus,
+            ],
+        );
+    }
+
+    public async markAttachmentExtractFailure(input: {
+        libraryId: number;
+        zoteroKey: string;
+        status: Extract<AttachmentExtractStatus, 'failed' | 'skipped'>;
+        error: string;
+        attemptedAt: number;
+        extractionSource?: string | null;
+    }): Promise<void> {
+        const changed = await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                extract_status = ?, last_error = ?, extraction_source = ?, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ? AND extract_status IS NULL`,
+            [input.status, input.error, input.extractionSource ?? null, input.libraryId, input.zoteroKey],
+        );
+        if (changed) {
+            const row = await this.getAttachmentProcessingState(input.libraryId, input.zoteroKey);
+            if (row) await this.recordAttachmentReadingOutcome({
+                libraryId: input.libraryId, zoteroKey: input.zoteroKey,
+                contentKind: row.contentKind, errorCode: input.error, attemptedAt: input.attemptedAt,
+            });
+        }
+    }
+
+    /** OCR completion is guarded by the exact bytes hash the executor consumed. */
+    public async markAttachmentOcrDone(input: {
+        attemptedAt: number;
+        libraryId: number;
+        zoteroKey: string;
+        fileHash: string;
+        ocrEngineVersion: string;
+        structuredDocumentHash: string;
+        expectedOcrStatus: AttachmentOcrStatus;
+        expectedOcrEngineVersion: string | null;
+        expectedExtractStatus: AttachmentExtractStatus;
+    }): Promise<boolean> {
+        let applied = false;
+        await this.conn.executeTransaction(async () => {
+            const previous = await this.getAttachmentProcessingState(input.libraryId, input.zoteroKey);
+            const changed = await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                ocr_status = 'done', ocr_engine_version = ?,
+                structured_document_hash = ?,
+                upsert_status = CASE WHEN structured_document_hash IS NOT ? THEN NULL ELSE upsert_status END,
+                upsert_index_version = CASE WHEN structured_document_hash IS NOT ? THEN NULL ELSE upsert_index_version END,
+                upsert_remote_identity = CASE WHEN structured_document_hash IS NOT ? THEN NULL ELSE upsert_remote_identity END,
+                last_error = NULL, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ? AND file_hash = ?
+               AND ocr_status IS ? AND ocr_engine_version IS ?
+               AND extract_status IS ?`,
+            [
+                input.ocrEngineVersion,
+                input.structuredDocumentHash,
+                input.structuredDocumentHash,
+                input.structuredDocumentHash,
+                input.structuredDocumentHash,
+                input.libraryId,
+                input.zoteroKey,
+                input.fileHash,
+                input.expectedOcrStatus,
+                input.expectedOcrEngineVersion,
+                input.expectedExtractStatus,
+            ],
+        );
+            if (changed) {
+                await this.enqueueReplacementUntag(previous, input.structuredDocumentHash);
+                await this.recordAttachmentReadingOutcome({
+                    libraryId: input.libraryId, zoteroKey: input.zoteroKey,
+                    contentKind: 'pdf', errorCode: null, attemptedAt: input.attemptedAt,
+                });
+            }
+            applied = changed;
+        });
+        return applied;
+    }
+
+    /** OCR may originate from the on-demand detector before a backlog row exists. */
+    public async ensureAttachmentFileHash(
+        libraryId: number,
+        zoteroKey: string,
+        fileHash: string,
+    ): Promise<void> {
+        await this.queryAsync(
+            `UPDATE attachment_processing_state SET
+                file_hash = COALESCE(file_hash, ?), updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?`,
+            [fileHash, libraryId, zoteroKey],
+        );
+    }
+
+    public async markAttachmentOcrFailed(
+        libraryId: number,
+        zoteroKey: string,
+        fileHash: string,
+        error: string,
+    ): Promise<void> {
+        await this.queryAsync(
+            `UPDATE attachment_processing_state SET
+                ocr_status = 'failed', last_error = ?, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ? AND file_hash = ?`,
+            [error, libraryId, zoteroKey, fileHash],
+        );
+    }
+
+    /** Record a recoverable OCR admission failure without making the stage terminal. */
+    public async markAttachmentOcrUnavailable(
+        libraryId: number,
+        zoteroKey: string,
+        fileHash: string,
+        error: string,
+    ): Promise<boolean> {
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                last_error = ?, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND file_hash = ? AND extract_status = 'done' AND ocr_status = 'needed'`,
+            [error, libraryId, zoteroKey, fileHash],
+        );
+    }
+
+    /** Clear only the matching recoverable marker once the OCR API accepts work. */
+    public async clearAttachmentOcrUnavailable(
+        libraryId: number,
+        zoteroKey: string,
+        fileHash: string,
+    ): Promise<boolean> {
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                last_error = NULL, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND file_hash = ? AND extract_status = 'done' AND ocr_status = 'needed'
+               AND last_error = ?`,
+            [libraryId, zoteroKey, fileHash, OCR_SERVICE_UNAVAILABLE],
+        );
+    }
+
+    /** Move a parked attachment behind the others waiting for OCR admission. */
+    public async touchAttachmentOcrUnavailable(libraryId: number, zoteroKey: string): Promise<void> {
+        await this.queryAsync(
+            `UPDATE attachment_processing_state SET updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND extract_status = 'done' AND ocr_status = 'needed' AND last_error = ?`,
+            [libraryId, zoteroKey, OCR_SERVICE_UNAVAILABLE],
+        );
+    }
+
+    /**
+     * Rows parked by a closed OCR admission gate, oldest marker first.
+     * `ticketed` is true while an OCR job for the attachment is queued, running
+     * or waiting on the backend.
+     */
+    public async getOcrUnavailableAttachments(
+        libraryIds: number[],
+    ): Promise<Array<{ libraryId: number; zoteroKey: string; ticketed: boolean }>> {
+        if (libraryIds.length === 0) return [];
+        const rows: Array<{ libraryId: number; zoteroKey: string; ticketed: boolean }> = [];
+        await this.queryAsync(
+            `SELECT s.library_id, s.zotero_key, EXISTS (
+                    SELECT 1 FROM background_jobs j
+                    WHERE j.job_type = 'document_ocr'
+                      AND j.library_id = s.library_id AND j.zotero_key = s.zotero_key
+                )
+             FROM attachment_processing_state s
+             WHERE s.library_id IN (${libraryIds.map(() => '?').join(',')})
+               AND s.content_kind = 'pdf' AND s.extract_status = 'done'
+               AND s.ocr_status = 'needed' AND s.last_error = ?
+             ORDER BY s.updated_at, s.library_id, s.zotero_key`,
+            [...libraryIds, OCR_SERVICE_UNAVAILABLE],
+            { onRow: (row: any) => rows.push({
+                libraryId: row.getResultByIndex(0),
+                zoteroKey: row.getResultByIndex(1),
+                ticketed: Boolean(row.getResultByIndex(2)),
+            }) },
+        );
+        return rows;
+    }
+
+    private async enqueueReplacementUntag(previous: AttachmentProcessingStateRecord | null, newHash: string | null): Promise<void> {
+        if (previous?.upsertRemoteIdentity && previous.structuredDocumentHash && previous.structuredDocumentHash !== newHash) {
+            await this.enqueueBackgroundJobInTransaction(buildUntagJobInput(previous, Date.now(), { reason: 'replacement' }));
+        }
+    }
+
+    /** Preserve the previous owner's cleanup before transferring an unchanged document. */
+    public async recordAttachmentIndexIdentity(libraryId: number, zoteroKey: string, hash: string,
+        identity: NonNullable<AttachmentProcessingStateRecord['upsertRemoteIdentity']>): Promise<(AttachmentProcessingStateRecord & { structuredDocumentHash: string }) | null> {
+        let result: (AttachmentProcessingStateRecord & { structuredDocumentHash: string }) | null = null;
+        await this.conn.executeTransaction(async () => {
+            const previous = await this.getAttachmentProcessingState(libraryId, zoteroKey);
+            if (previous?.structuredDocumentHash !== hash || previous.extractStatus !== 'done') return;
+            const old = previous.upsertRemoteIdentity;
+            const transferred = !!old && (old.index_account_id !== identity.index_account_id
+                || old.index_scope_ref !== identity.index_scope_ref || old.index_local_id !== identity.index_local_id);
+            if (old && !transferred) {
+                result = { ...previous, structuredDocumentHash: hash };
+                return;
+            }
+            if (transferred) {
+                await this.enqueueBackgroundJobInTransaction(buildUntagJobInput(previous, Date.now(), { reason: 'replacement' }));
+            }
+            const applied = await this.executeChangedRow(`UPDATE attachment_processing_state SET upsert_remote_identity = ?,
+                upsert_status = CASE WHEN ? THEN NULL ELSE upsert_status END,
+                upsert_index_version = CASE WHEN ? THEN NULL ELSE upsert_index_version END
+                WHERE library_id = ? AND zotero_key = ? AND structured_document_hash = ? AND extract_status = 'done'`,
+                [JSON.stringify(identity), transferred ? 1 : 0, transferred ? 1 : 0, libraryId, zoteroKey, hash]);
+            if (applied) result = { ...previous, structuredDocumentHash: hash, upsertRemoteIdentity: identity,
+                upsertStatus: transferred ? null : previous.upsertStatus,
+                upsertIndexVersion: transferred ? null : previous.upsertIndexVersion };
+        });
+        return result;
+    }
+
+    public async markAttachmentUpsertDone(input: MarkAttachmentUpsertDoneInput): Promise<boolean> {
+        const identity = input.remoteIdentity;
+        if (!input.supersedeIndexCleanup || !identity) return await this.markAttachmentUpsertDoneRow(input);
+        let applied = false;
+        // The ledger now records exactly this membership, so a cleanup of it is
+        // superseded. Any later retirement re-queues cleanup from the ledger.
+        await this.conn.executeTransaction(async () => {
+            applied = await this.markAttachmentUpsertDoneRow(input);
+            if (!applied) return;
+            const job = { zoteroKey: input.zoteroKey,
+                payload: { ...identity, doc_hash: input.structuredDocumentHash } as BackgroundJobPayload };
+            const key = indexCleanupIdentity(job);
+            // A queued cleanup may belong to a deletion or exclusion that removes
+            // the ledger row next, outside this attachment's index lock. Keep its
+            // durable intent; the queued job settles it against the ledger itself.
+            const retired = await this.executeChangedRow(`DELETE FROM index_cleanup_outbox
+                WHERE identity = ? AND NOT EXISTS (SELECT 1 FROM background_jobs
+                    WHERE job_type = 'fulltext_untag' AND library_id = ? AND zotero_key = ?
+                      AND dedupe_key = ?)`, [key, input.libraryId, input.zoteroKey, key]);
+            if (retired) await this.deleteDeadIndexCleanupCopies(job);
+        });
+        return applied;
+    }
+
+    private async markAttachmentUpsertDoneRow(input: MarkAttachmentUpsertDoneInput): Promise<boolean> {
+        const guardStatus = input.expectedUpsertStatus !== undefined;
+        const guardVersion = input.expectedUpsertIndexVersion !== undefined;
+        const guardExtract = input.expectedExtractStatus !== undefined;
+        return await this.executeChangedRow(
+            `UPDATE attachment_processing_state SET
+                upsert_status = 'done', upsert_index_version = ?, upsert_remote_identity = COALESCE(upsert_remote_identity, ?),
+                last_error = NULL, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND structured_document_hash = ?
+               AND (? = 0 OR upsert_status IS ?)
+               AND (? = 0 OR upsert_index_version IS ?)
+               AND (? = 0 OR extract_status IS ?)
+               AND (? = 0 OR upsert_remote_identity IS NULL OR (
+                 json_extract(upsert_remote_identity, '$.index_account_id') = ? AND
+                 json_extract(upsert_remote_identity, '$.index_scope_ref') = ? AND
+                 json_extract(upsert_remote_identity, '$.index_local_id') = ?))`,
+            [
+                input.upsertIndexVersion,
+                input.remoteIdentity ? JSON.stringify(input.remoteIdentity) : null,
+                input.libraryId,
+                input.zoteroKey,
+                input.structuredDocumentHash,
+                guardStatus ? 1 : 0,
+                input.expectedUpsertStatus ?? null,
+                guardVersion ? 1 : 0,
+                input.expectedUpsertIndexVersion ?? null,
+                guardExtract ? 1 : 0,
+                input.expectedExtractStatus ?? null,
+                input.remoteIdentity ? 1 : 0,
+                input.remoteIdentity?.index_account_id ?? null,
+                input.remoteIdentity?.index_scope_ref ?? null,
+                input.remoteIdentity?.index_local_id ?? null,
+            ],
+        );
+    }
+
+    public async markAttachmentUpsertFailed(
+        libraryId: number,
+        zoteroKey: string,
+        structuredDocumentHash: string,
+        error: string,
+    ): Promise<void> {
+        await this.queryAsync(
+            `UPDATE attachment_processing_state SET
+                upsert_status = 'failed', last_error = ?, updated_at = datetime('now')
+             WHERE library_id = ? AND zotero_key = ?
+               AND structured_document_hash = ?`,
+            [error, libraryId, zoteroKey, structuredDocumentHash],
+        );
+    }
+
+    /** Compact preparation facts; reading successes supersede earlier file limitations. */
+    public async getSearchPreparationRows(libraryIds: number[]): Promise<SearchPreparationRow[]> {
+        if (!libraryIds.length) return [];
+        const rows: SearchPreparationRow[] = [];
+        await this.queryAsync(
+            `SELECT s.library_id, s.zotero_key, s.content_kind, s.extract_status,
+                s.extract_schema_version, s.ocr_status, s.upsert_status, s.upsert_index_version,
+                s.upsert_remote_identity, s.last_error,
+                CASE WHEN r.library_id IS NOT NULL AND r.error_code IS NULL THEN 1 ELSE 0 END
+             FROM attachment_processing_state s
+             LEFT JOIN attachment_reading_state r USING (library_id, zotero_key)
+             WHERE s.library_id IN (${libraryIds.map(() => '?').join(',')})`, libraryIds,
+            { onRow: (row: any) => rows.push({
+                libraryId: row.getResultByIndex(0), key: row.getResultByIndex(1),
+                contentKind: row.getResultByIndex(2), extractStatus: row.getResultByIndex(3),
+                extractSchemaVersion: row.getResultByIndex(4), ocrStatus: row.getResultByIndex(5),
+                upsertStatus: row.getResultByIndex(6), upsertIndexVersion: row.getResultByIndex(7),
+                remoteIdentity: row.getResultByIndex(8), error: row.getResultByIndex(9),
+                readingSucceeded: row.getResultByIndex(10) === 1,
+            }) },
+        );
+        return rows;
+    }
+
+    public async getAttachmentProcessingAggregates(
+        libraryId?: number,
+        targets: { ocr?: boolean; upsert?: boolean } = {},
+    ): Promise<AttachmentProcessingAggregates> {
+        const rows: AttachmentProcessingAggregates[] = [];
+        const where = libraryId == null ? '' : ' WHERE library_id = ?';
+        const params = libraryId == null ? [] : [libraryId];
+        const pendingConditions = ['extract_status IS NULL'];
+        if (targets.ocr) pendingConditions.push(`(ocr_status = 'needed' AND last_error IS NOT '${OCR_SERVICE_UNAVAILABLE}')`);
+        if (targets.upsert) {
+            pendingConditions.push(`(
+                upsert_status IS NULL
+                AND structured_document_hash IS NOT NULL
+                AND (ocr_status IS NULL OR ocr_status IN ('na', 'done'))
+            )`);
+        }
+        await this.queryAsync(
+            `SELECT
+                COUNT(*),
+                SUM(CASE WHEN extract_status = 'done' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ocr_status = 'needed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ocr_status = 'done' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN upsert_status = 'done' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN extract_status = 'failed' OR ocr_status = 'failed' OR upsert_status = 'failed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN extract_status = 'skipped' THEN 1 ELSE 0 END),
+                MIN(CASE WHEN ${pendingConditions.join(' OR ')} THEN created_at END),
+                SUM(CASE WHEN extract_status = 'done' AND (ocr_status IS NULL OR ocr_status IN ('na', 'done')) THEN 1 ELSE 0 END),
+                SUM(CASE WHEN extract_status IN ('failed', 'skipped')
+                    OR (extract_status = 'done' AND (ocr_status = 'failed'
+                        OR (ocr_status = 'needed' AND (${targets.ocr ? `last_error IS '${OCR_SERVICE_UNAVAILABLE}'` : '1'})))) THEN 1 ELSE 0 END),
+                SUM(CASE WHEN extract_status = 'done' AND ocr_status = 'needed'
+                    AND last_error IS NOT '${OCR_SERVICE_UNAVAILABLE}' AND ${targets.ocr ? '1' : '0'} THEN 1 ELSE 0 END)
+             FROM attachment_processing_state${where}`,
+            params,
+            {
+                onRow: (row: any) => rows.push({
+                    total: Number(row.getResultByIndex(0)) || 0,
+                    extracted: Number(row.getResultByIndex(1)) || 0,
+                    ocrNeeded: Number(row.getResultByIndex(2)) || 0,
+                    ocrDone: Number(row.getResultByIndex(3)) || 0,
+                    upserted: Number(row.getResultByIndex(4)) || 0,
+                    failed: Number(row.getResultByIndex(5)) || 0,
+                    skipped: Number(row.getResultByIndex(6)) || 0,
+                    oldestPendingAt: row.getResultByIndex(7) ?? null,
+                    readable: Number(row.getResultByIndex(8)) || 0,
+                    unreadable: Number(row.getResultByIndex(9)) || 0,
+                    awaitingOcr: Number(row.getResultByIndex(10)) || 0,
+                }),
+            },
+        );
+        return rows[0] ?? {
+            total: 0,
+            readable: 0,
+            unreadable: 0,
+            awaitingOcr: 0,
+            extracted: 0,
+            ocrNeeded: 0,
+            ocrDone: 0,
+            upserted: 0,
+            failed: 0,
+            skipped: 0,
+            oldestPendingAt: null,
+        };
+    }
+
+    /**
+     * Ledger rows that did not reach a readable state, most recent first:
+     * terminal extraction outcomes (`failed` / `skipped`), OCR and index
+     * failures, and scans still waiting for OCR. The caller decides which of
+     * these count as issues for the current entitlements. Omit limit when
+     * building the complete grouped inventory.
+     */
+    public async getAttachmentProcessingIssueRows(
+        limit?: number,
+    ): Promise<AttachmentProcessingIssueRow[]> {
+        const rows: AttachmentProcessingIssueRow[] = [];
+        await this.queryAsync(
+            `SELECT library_id, zotero_key, extract_status, ocr_status,
+                    upsert_status, last_error, updated_at, content_kind
+             FROM attachment_processing_state
+             WHERE extract_status IN ('failed', 'skipped')
+                OR ocr_status IN ('failed', 'needed')
+                OR upsert_status = 'failed'
+             ORDER BY updated_at DESC LIMIT ?`,
+            [limit === undefined ? -1 : Math.max(1, Math.floor(limit))],
+            { onRow: (row: any) => rows.push({
+                libraryId: row.getResultByIndex(0),
+                zoteroKey: row.getResultByIndex(1),
+                extractStatus: row.getResultByIndex(2) ?? null,
+                ocrStatus: row.getResultByIndex(3) ?? null,
+                upsertStatus: row.getResultByIndex(4) ?? null,
+                lastError: row.getResultByIndex(5) ?? null,
+                updatedAt: row.getResultByIndex(6) ?? null,
+                contentKind: row.getResultByIndex(7) ?? null,
+            }) },
+        );
+        return rows;
+    }
+
+    /** Count the complete current issue inventory without materializing attachments in JS. */
+    public async getProcessingIssueCounts(entitlements: IssueEntitlements): Promise<ProcessingIssueSummary[]> {
+        const counts = new Map<ProcessingIssueReason, number>();
+        await this.queryAsync(
+            `SELECT * FROM (${processingIssuesSql(entitlements)} SELECT reason, COUNT(*) FROM issues GROUP BY reason)`,
+            [],
+            { onRow: (row: any) => counts.set(row.getResultByIndex(0), Number(row.getResultByIndex(1))) },
+        );
+        return PROCESSING_ISSUE_REASON_ORDER.filter((reason) => counts.has(reason))
+            .map((reason) => ({ reason, count: counts.get(reason)! }));
+    }
+
+    /** Load a bounded page for an expanded issue group, most recent first with stable ties. */
+    public async getProcessingIssuePage(
+        entitlements: IssueEntitlements,
+        reason: ProcessingIssueReason,
+        offset = 0,
+        limit = 10,
+    ): Promise<ProcessingIssueItem[]> {
+        const items: ProcessingIssueItem[] = [];
+        await this.queryAsync(
+            `SELECT * FROM (${processingIssuesSql(entitlements)}
+             SELECT library_id, zotero_key, last_error, timestamp FROM issues WHERE reason = ?
+             ORDER BY timestamp DESC, library_id, zotero_key LIMIT ? OFFSET ?)`,
+            [reason, Math.min(100, Math.max(1, Math.floor(limit))), Math.max(0, Math.floor(offset))],
+            { onRow: (row: any) => items.push({
+                libraryId: row.getResultByIndex(0), zoteroKey: row.getResultByIndex(1),
+                error: row.getResultByIndex(2) ?? null, timestamp: row.getResultByIndex(3) ?? null,
+            }) },
+        );
+        return items;
+    }
+
+    /**
+     * Every attachment in one issue group, for a group-level retry. Bounded so a
+     * pathological ledger cannot materialize an unbounded array; the retry
+     * re-reads the group afterwards, so a second click picks up the remainder.
+     */
+    public async getProcessingIssueRefs(
+        entitlements: IssueEntitlements,
+        reason: ProcessingIssueReason,
+        limit = 5_000,
+    ): Promise<Array<{ libraryId: number; zoteroKey: string }>> {
+        const refs: Array<{ libraryId: number; zoteroKey: string }> = [];
+        await this.queryAsync(
+            `SELECT * FROM (${processingIssuesSql(entitlements)}
+             SELECT library_id, zotero_key FROM issues WHERE reason = ?
+             ORDER BY timestamp DESC, library_id, zotero_key LIMIT ?)`,
+            [reason, Math.max(1, Math.floor(limit))],
+            { onRow: (row: any) => refs.push({
+                libraryId: row.getResultByIndex(0), zoteroKey: row.getResultByIndex(1),
+            }) },
+        );
+        return refs;
+    }
+
+    /**
+     * Drop one attachment's dead-lettered processing jobs so a retry can
+     * re-enqueue them and the issues list stops reporting the old failure.
+     * Untag dead letters are remote-cleanup intents with their own redrive and
+     * are left alone.
+     */
+    public async deleteBackgroundDeadLetters(libraryId: number, zoteroKey: string): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM background_jobs_dead
+             WHERE library_id = ? AND zotero_key = ?
+               AND job_type IN ('document_extract', 'document_ocr', 'fulltext_upsert')`,
+            [libraryId, zoteroKey],
+        );
+    }
+
+    /** Dead letters, optionally restricted to current, unrecovered ledger entries. */
+    public async getBackgroundDeadLetters(
+        limit?: number,
+        onlyUnresolved = false,
+    ): Promise<BackgroundQueueDeadRow[]> {
+        const rows: BackgroundQueueDeadRow[] = [];
+        await this.queryAsync(
+            `SELECT d.job_type, d.library_id, d.zotero_key, d.last_error, d.died_at
+             FROM background_jobs_dead d
+             ${onlyUnresolved ? `WHERE EXISTS (
+                 SELECT 1 FROM attachment_processing_state s
+                 WHERE s.library_id = d.library_id AND s.zotero_key = d.zotero_key
+             ) AND NOT EXISTS (
+                 SELECT 1 FROM attachment_processing_state s
+                 WHERE s.library_id = d.library_id AND s.zotero_key = d.zotero_key
+                   AND ((d.job_type = 'document_extract' AND s.extract_status = 'done')
+                     OR (d.job_type = 'document_ocr' AND s.extract_status = 'done' AND s.ocr_status IN ('done', 'na'))
+                     OR (d.job_type = 'fulltext_upsert' AND s.upsert_status = 'done'))
+             )` : ''}
+             ORDER BY d.died_at DESC LIMIT ?`,
+            [limit === undefined ? -1 : Math.max(1, Math.floor(limit))],
+            { onRow: (row: any) => rows.push({
+                jobType: row.getResultByIndex(0),
+                libraryId: row.getResultByIndex(1) ?? null,
+                zoteroKey: row.getResultByIndex(2) ?? null,
+                lastError: row.getResultByIndex(3) ?? null,
+                diedAt: row.getResultByIndex(4) ?? null,
+            }) },
+        );
+        return rows;
+    }
+
+    public async getBackgroundProcessingFailures(
+        limit = 50,
+    ): Promise<BackgroundProcessingFailureSummary[]> {
+        const rows: BackgroundProcessingFailureSummary[] = [];
+        await this.queryAsync(
+            `SELECT library_id, zotero_key,
+                    CASE
+                        WHEN upsert_status = 'failed' THEN 'fulltext_upsert'
+                        WHEN ocr_status = 'failed' THEN 'document_ocr'
+                        ELSE 'document_extract'
+                    END,
+                    last_error, updated_at
+             FROM attachment_processing_state
+             WHERE extract_status = 'failed' OR ocr_status = 'failed' OR upsert_status = 'failed'
+             ORDER BY updated_at DESC LIMIT ?`,
+            [limit],
+            { onRow: (row: any) => rows.push({
+                source: 'ledger',
+                libraryId: row.getResultByIndex(0),
+                zoteroKey: row.getResultByIndex(1),
+                stage: row.getResultByIndex(2),
+                error: row.getResultByIndex(3) ?? null,
+                attempts: null,
+                timestamp: row.getResultByIndex(4) ?? null,
+            }) },
+        );
+        await this.queryAsync(
+            `SELECT job_type, library_id, zotero_key, last_error,
+                    attempt_count, died_at
+             FROM background_jobs_dead ORDER BY died_at DESC LIMIT ?`,
+            [limit],
+            { onRow: (row: any) => rows.push({
+                source: 'dead_letter',
+                stage: row.getResultByIndex(0),
+                libraryId: row.getResultByIndex(1),
+                zoteroKey: row.getResultByIndex(2),
+                error: row.getResultByIndex(3) ?? null,
+                attempts: row.getResultByIndex(4) ?? null,
+                timestamp: row.getResultByIndex(5) ?? null,
+            }) },
+        );
+        await this.queryAsync(
+            `SELECT task, source_key, last_error, failure_count, last_attempt
+             FROM document_processing_failures
+             ORDER BY last_attempt DESC LIMIT ?`,
+            [limit],
+            { onRow: (row: any) => {
+                const sourceKey = row.getResultByIndex(1) as string | null;
+                const match = sourceKey?.match(/^(\d+)-([A-Z0-9]{8})$/);
+                rows.push({
+                    source: 'content_failure',
+                    stage: row.getResultByIndex(0),
+                    libraryId: match ? Number(match[1]) : null,
+                    zoteroKey: match?.[2] ?? null,
+                    error: row.getResultByIndex(2) ?? null,
+                    attempts: row.getResultByIndex(3) ?? null,
+                    timestamp: row.getResultByIndex(4) ?? null,
+                });
+            } },
+        );
+        return rows.slice(0, limit);
+    }
+
+    public async getProcessingIndexState(
+        libraryId: number,
+    ): Promise<ProcessingIndexStateRecord | null> {
+        const rows: ProcessingIndexStateRecord[] = [];
+        await this.queryAsync(
+            `SELECT library_id, max_client_date_modified, attachment_count,
+                    ledger_row_count, last_scan_timestamp
+             FROM processing_index_state WHERE library_id = ? LIMIT 1`,
+            [libraryId],
+            {
+                onRow: (row: any) => rows.push({
+                    libraryId: row.getResultByIndex(0),
+                    maxClientDateModified: row.getResultByIndex(1) ?? null,
+                    attachmentCount: row.getResultByIndex(2),
+                    ledgerRowCount: row.getResultByIndex(3),
+                    lastScanTimestamp: row.getResultByIndex(4),
+                }),
+            },
+        );
+        return rows[0] ?? null;
+    }
+
+    public async upsertProcessingIndexState(state: ProcessingIndexStateRecord): Promise<void> {
+        await this.queryAsync(
+            `INSERT INTO processing_index_state (
+                library_id, max_client_date_modified, attachment_count,
+                ledger_row_count, last_scan_timestamp
+             ) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(library_id) DO UPDATE SET
+                max_client_date_modified = excluded.max_client_date_modified,
+                attachment_count = excluded.attachment_count,
+                ledger_row_count = excluded.ledger_row_count,
+                last_scan_timestamp = excluded.last_scan_timestamp`,
+            [
+                state.libraryId,
+                state.maxClientDateModified,
+                state.attachmentCount,
+                state.ledgerRowCount,
+                state.lastScanTimestamp,
+            ],
+        );
+    }
+
+    public async deleteProcessingIndexState(libraryId: number): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM processing_index_state WHERE library_id = ?`,
+            [libraryId],
+        );
+    }
+
+    /** Capture the mutation's own result before listeners or other writes can run. */
+    private async executeChangedRow(sql: string, params: readonly unknown[] = []): Promise<boolean> {
+        let changed = false;
+        await this.queryAsync(`${sql} RETURNING 1`, params, {
+            onRow: () => { changed = true; },
+        });
+        return changed;
+    }
+
+    private async selectAttachmentProcessingStates(
+        sql: string,
+        params: any[] = [],
+    ): Promise<AttachmentProcessingStateRecord[]> {
+        const rows: AttachmentProcessingStateRecord[] = [];
+        await this.queryAsync(sql, params, {
+            onRow: (row: any) => rows.push({
+                libraryId: row.getResultByIndex(0),
+                zoteroKey: row.getResultByIndex(1),
+                itemId: row.getResultByIndex(2) ?? null,
+                contentKind: row.getResultByIndex(3),
+                fileMtimeMs: row.getResultByIndex(4) ?? null,
+                fileSizeBytes: row.getResultByIndex(5) ?? null,
+                fileHash: row.getResultByIndex(6) ?? null,
+                structuredDocumentHash: row.getResultByIndex(7) ?? null,
+                extractStatus: row.getResultByIndex(8) ?? null,
+                extractSchemaVersion: row.getResultByIndex(9) ?? null,
+                ocrStatus: row.getResultByIndex(10) ?? null,
+                ocrEngineVersion: row.getResultByIndex(11) ?? null,
+                upsertStatus: row.getResultByIndex(12) ?? null,
+                upsertIndexVersion: row.getResultByIndex(13) ?? null,
+                lastError: row.getResultByIndex(14) ?? null,
+                createdAt: row.getResultByIndex(15),
+                updatedAt: row.getResultByIndex(16),
+                extractionSource: row.getResultByIndex(17) ?? null,
+                upsertRemoteIdentity: row.getResultByIndex(18) ? JSON.parse(row.getResultByIndex(18)) : null,
+            }),
+        });
+        return rows;
+    }
+
+    // =============================================
+    // Document Cache Methods
+    // =============================================
+
+    private static normalizeDocumentCacheContentKind(value: unknown): ExtractContentKind {
+        return typeof value === 'string' && isExtractContentKind(value)
+            ? value
+            : 'snapshot';
+    }
+
+    private static rowToDocumentCacheMetadataRecord(row: any): DocumentCacheMetadataRecord {
+        const contentKind = AsterMarginDB.normalizeDocumentCacheContentKind(row.content_kind);
+        const documentMetadata = parseCachedDocumentMetadata(
+            row.content_kind,
+            row.document_metadata_json,
+        );
+        const pdfMetadata = documentMetadata?.content_kind === 'pdf'
+            ? documentMetadata
+            : null;
+        return {
+            id: row.id,
+            itemId: row.item_id,
+            libraryId: row.library_id,
+            zoteroKey: row.zotero_key,
+            contentKind,
+            filePath: row.file_path,
+            fileSignature: {
+                mtime_ms: row.file_mtime_ms,
+                size_bytes: row.file_size_bytes,
+            },
+            sourceSizeBytes: row.source_size_bytes,
+            contentType: row.content_type,
+            documentMetadata,
+            pageCount: pdfMetadata?.pageCount ?? null,
+            pageLabels: pdfMetadata?.pageLabels ?? null,
+            derivedPageLabels: pdfMetadata?.derivedPageLabels,
+            pages: pdfMetadata?.pages ?? null,
+            errorCode: row.error_code ?? null,
+            extractionSchemaVersion: row.extraction_schema_version,
+            metadataFormatVersion: row.metadata_format_version,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            lastAccessedAt: row.last_accessed_at ?? null,
+        };
+    }
+
+    private static rowToDocumentCachePayloadRecord(row: any): DocumentCachePayloadRecord {
+        return {
+            id: row.id,
+            metadataId: row.metadata_id,
+            itemId: row.item_id,
+            libraryId: row.library_id,
+            zoteroKey: row.zotero_key,
+            payloadKind: row.payload_kind,
+            contentKind: AsterMarginDB.normalizeDocumentCacheContentKind(row.content_kind),
+            sourceFilePath: row.source_file_path,
+            sourceFileSignature: {
+                mtime_ms: row.source_file_mtime_ms,
+                size_bytes: row.source_file_size_bytes,
+            },
+            sourceSizeBytes: row.source_size_bytes,
+            payloadPath: row.payload_path,
+            payloadSizeBytes: row.payload_size_bytes,
+            payloadSha256: row.payload_sha256 ?? null,
+            extractionSource: row.extraction_source === "ocr" ? "ocr" : "native",
+            sourceMd5: row.source_md5 ?? null,
+            extractionSchemaVersion: row.extraction_schema_version,
+            cacheFormatVersion: row.cache_format_version,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            lastAccessedAt: row.last_accessed_at ?? null,
+        };
+    }
+
+    /** Read the recorded schema version for a disposable table group; null if unset. */
+    private async getSchemaVersion(component: string): Promise<number | null> {
+        let version: number | null = null;
+        await this.queryAsync(
+            `SELECT version FROM schema_versions WHERE component = ?`,
+            [component],
+            { onRow: (row: any) => { version = row.getResultByIndex(0); } },
+        );
+        return version;
+    }
+
+    /**
+     * Decide whether a disposable table group must be rebuilt.
+     *
+     * Missing version rows come from installs that predate `schema_versions`.
+     * If those tables already match the current shape, stamp the version
+     * without dropping data. A recorded older version still forces a rebuild.
+     *
+     * The version number is a fast path, not the authority: the stamp and the
+     * drop/recreate around it are separate auto-committed statements, so a DB
+     * can end up stamped current while the tables are still the previous shape
+     * — a state nothing else recovers from, since every later startup trusts
+     * the stamp and every write against the stale table fails. Re-checking the
+     * shape costs a few `pragma_table_info` reads per component at startup.
+     */
+    private async disposableSchemaNeedsReset(
+        component: string,
+        currentVersion: number,
+        tableNames: string[],
+        schemaIsCurrent: () => Promise<boolean>,
+    ): Promise<boolean> {
+        const recordedVersion = await this.getSchemaVersion(component);
+        if (recordedVersion === currentVersion) {
+            // Absent tables are the normal "stamped, then dropped by a reset
+            // that is about to recreate them" case, not drift.
+            if (await this.allTablesAbsent(tableNames)) return false;
+            if (await schemaIsCurrent()) return false;
+            logger(
+                `AsterMarginDB: ${component} is stamped v${currentVersion} but does not match `
+                + `that shape; rebuilding the table group`,
+                2,
+            );
+            return true;
+        }
+
+        if (recordedVersion === null) {
+            if (await this.allTablesAbsent(tableNames) || await schemaIsCurrent()) {
+                await this.setSchemaVersion(component, currentVersion);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** Record the schema version for a disposable table group. */
+    private async setSchemaVersion(component: string, version: number): Promise<void> {
+        await this.queryAsync(
+            `INSERT INTO schema_versions (component, version) VALUES (?, ?)
+             ON CONFLICT(component) DO UPDATE SET version = excluded.version`,
+            [component, version],
+        );
+    }
+
+    /** Return true only when none of the named tables exists. */
+    private async allTablesAbsent(tableNames: string[]): Promise<boolean> {
+        for (const tableName of tableNames) {
+            if (await this.tableExists(tableName)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Check for a SQLite table by name. */
+    private async tableExists(tableName: string): Promise<boolean> {
+        let exists = false;
+        await this.queryAsync(
+            `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+            [tableName],
+            { onRow: () => { exists = true; } },
+        );
+        return exists;
+    }
+
+    /** Verify unversioned document-cache tables already match the current shape. */
+    private async documentCacheSchemaIsCurrent(): Promise<boolean> {
+        if (
+            !(await this.tableExists('document_cache_metadata'))
+            || !(await this.tableExists('document_cache_payloads'))
+        ) {
+            return false;
+        }
+
+        const metadataColumns = await this.getTableColumns('document_cache_metadata');
+        const requiredMetadataColumns = [
+            'id',
+            'item_id',
+            'library_id',
+            'zotero_key',
+            'content_kind',
+            'file_path',
+            'file_mtime_ms',
+            'file_size_bytes',
+            'source_size_bytes',
+            'content_type',
+            'document_metadata_json',
+            'error_code',
+            'extraction_schema_version',
+            'metadata_format_version',
+            'created_at',
+            'updated_at',
+            'last_accessed_at',
+        ];
+        if (requiredMetadataColumns.some((col) => !metadataColumns.has(col))) {
+            return false;
+        }
+        const legacyMetadataColumns = [
+            'page_count',
+            'page_labels_json',
+            'pages_json',
+            'status',
+            'has_text_layer',
+            'needs_ocr',
+            'is_encrypted',
+            'is_invalid',
+        ];
+        if (legacyMetadataColumns.some((col) => metadataColumns.has(col))) {
+            return false;
+        }
+
+        const payloadColumns = await this.getTableColumns('document_cache_payloads');
+        const requiredPayloadColumns = [
+            'id',
+            'metadata_id',
+            'item_id',
+            'library_id',
+            'zotero_key',
+            'payload_kind',
+            'content_kind',
+            'source_file_path',
+            'source_file_mtime_ms',
+            'source_file_size_bytes',
+            'source_size_bytes',
+            'payload_path',
+            'payload_size_bytes',
+            'payload_sha256',
+            'extraction_schema_version',
+            'cache_format_version',
+            'created_at',
+            'updated_at',
+            'last_accessed_at',
+        ];
+        if (requiredPayloadColumns.some((col) => !payloadColumns.has(col))) {
+            return false;
+        }
+
+        return !payloadColumns.has('mode');
+    }
+
+    /** Verify unversioned background-queue tables already match the current shape. */
+    private async backgroundJobsSchemaIsCurrent(): Promise<boolean> {
+        if (
+            !(await this.tableExists('background_jobs'))
+            || !(await this.tableExists('background_jobs_dead'))
+        ) {
+            return false;
+        }
+
+        const liveColumns = await this.getTableColumns('background_jobs');
+        const requiredLiveColumns = [
+            'id',
+            'job_type',
+            'library_id',
+            'item_id',
+            'zotero_key',
+            'content_kind',
+            'payload_kind',
+            'dedupe_key',
+            'priority',
+            'payload_json',
+            'enqueued_at',
+            'available_at',
+            'attempt_count',
+            'last_error',
+        ];
+        if (requiredLiveColumns.some((col) => !liveColumns.has(col)) || liveColumns.has('mode')) {
+            return false;
+        }
+        if (!(await this.backgroundJobsUniqueKeyIsCurrent())) {
+            return false;
+        }
+
+        const deadColumns = await this.getTableColumns('background_jobs_dead');
+        const requiredDeadColumns = [
+            'id',
+            'job_type',
+            'library_id',
+            'zotero_key',
+            'content_kind',
+            'payload_kind',
+            'payload_json',
+            'enqueued_at',
+            'died_at',
+            'attempt_count',
+            'last_error',
+        ];
+        return requiredDeadColumns.every((col) => deadColumns.has(col)) && !deadColumns.has('mode');
+    }
+
+    private async attachmentProcessingStateSchemaIsCurrent(): Promise<boolean> {
+        if (!(await this.tableExists('attachment_processing_state'))) return false;
+        const columns = await this.getTableColumns('attachment_processing_state');
+        return [
+            'library_id',
+            'zotero_key',
+            'item_id',
+            'content_kind',
+            'file_mtime_ms',
+            'file_size_bytes',
+            'file_hash',
+            'structured_document_hash',
+            'extract_status',
+            'extract_schema_version',
+            'ocr_status',
+            'ocr_engine_version',
+            'upsert_status',
+            'upsert_index_version',
+            'last_error',
+            'created_at',
+            'updated_at',
+        ].every((column) => columns.has(column));
+    }
+
+    private async processingIndexStateSchemaIsCurrent(): Promise<boolean> {
+        if (!(await this.tableExists('processing_index_state'))) return false;
+        const columns = await this.getTableColumns('processing_index_state');
+        return [
+            'library_id',
+            'max_client_date_modified',
+            'attachment_count',
+            'ledger_row_count',
+            'last_scan_timestamp',
+        ].every((column) => columns.has(column));
+    }
+
+    /** Read SQLite table column names. */
+    private async getTableColumns(tableName: string): Promise<Set<string>> {
+        const columns = new Set<string>();
+        const escapedName = tableName.replace(/'/g, `''`);
+        await this.queryAsync(
+            `SELECT name FROM pragma_table_info('${escapedName}')`,
+            [],
+            { onRow: (row: any) => columns.add(row.getResultByIndex(0)) },
+        );
+        return columns;
+    }
+
+    /** Verify the live queue has the exact current dedupe key. */
+    private async backgroundJobsUniqueKeyIsCurrent(): Promise<boolean> {
+        const uniqueIndexNames: string[] = [];
+        await this.queryAsync(
+            `SELECT name, [unique] FROM pragma_index_list('background_jobs')`,
+            [],
+            {
+                onRow: (row: any) => {
+                    if (row.getResultByIndex(1) === 1) {
+                        uniqueIndexNames.push(row.getResultByIndex(0));
+                    }
+                },
+            },
+        );
+
+        const expected = [
+            'job_type', 'library_id', 'zotero_key', 'payload_kind', 'dedupe_key',
+        ];
+        for (const indexName of uniqueIndexNames) {
+            const escapedName = indexName.replace(/'/g, `''`);
+            const columns: string[] = [];
+            await this.queryAsync(
+                `SELECT name FROM pragma_index_info('${escapedName}') ORDER BY seqno`,
+                [],
+                { onRow: (row: any) => columns.push(row.getResultByIndex(0)) },
+            );
+            if (
+                columns.length === expected.length
+                && columns.every((column, index) => column === expected[index])
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async selectDocumentCacheMetadata(sql: string, params: any[] = []): Promise<DocumentCacheMetadataRecord[]> {
+        const rows: any[] = [];
+        await this.queryAsync(sql, params, {
+            onRow: (row: any) => {
+                // These indices must match the SELECT column order above.
+                rows.push({
+                    id: row.getResultByIndex(0),
+                    item_id: row.getResultByIndex(1),
+                    library_id: row.getResultByIndex(2),
+                    zotero_key: row.getResultByIndex(3),
+                    content_kind: row.getResultByIndex(4),
+                    file_path: row.getResultByIndex(5),
+                    file_mtime_ms: row.getResultByIndex(6),
+                    file_size_bytes: row.getResultByIndex(7),
+                    source_size_bytes: row.getResultByIndex(8),
+                    content_type: row.getResultByIndex(9),
+                    document_metadata_json: row.getResultByIndex(10),
+                    error_code: row.getResultByIndex(11),
+                    extraction_schema_version: row.getResultByIndex(12),
+                    metadata_format_version: row.getResultByIndex(13),
+                    created_at: row.getResultByIndex(14),
+                    updated_at: row.getResultByIndex(15),
+                    last_accessed_at: row.getResultByIndex(16),
+                });
+            },
+        });
+        return rows.map((row) => AsterMarginDB.rowToDocumentCacheMetadataRecord(row));
+    }
+
+    private async selectDocumentCachePayloads(sql: string, params: any[] = []): Promise<DocumentCachePayloadRecord[]> {
+        const rows: any[] = [];
+        await this.queryAsync(sql, params, {
+            onRow: (row: any) => {
+                // These indices must match the SELECT column order above.
+                rows.push({
+                    id: row.getResultByIndex(0),
+                    metadata_id: row.getResultByIndex(1),
+                    item_id: row.getResultByIndex(2),
+                    library_id: row.getResultByIndex(3),
+                    zotero_key: row.getResultByIndex(4),
+                    payload_kind: row.getResultByIndex(5),
+                    content_kind: row.getResultByIndex(6),
+                    source_file_path: row.getResultByIndex(7),
+                    source_file_mtime_ms: row.getResultByIndex(8),
+                    source_file_size_bytes: row.getResultByIndex(9),
+                    source_size_bytes: row.getResultByIndex(10),
+                    payload_path: row.getResultByIndex(11),
+                    payload_size_bytes: row.getResultByIndex(12),
+                    payload_sha256: row.getResultByIndex(13),
+                    extraction_schema_version: row.getResultByIndex(14),
+                    cache_format_version: row.getResultByIndex(15),
+                    created_at: row.getResultByIndex(16),
+                    updated_at: row.getResultByIndex(17),
+                    last_accessed_at: row.getResultByIndex(18),
+                    extraction_source: row.getResultByIndex(19),
+                    source_md5: row.getResultByIndex(20),
+                });
+            },
+        });
+        return rows.map((row) => AsterMarginDB.rowToDocumentCachePayloadRecord(row));
+    }
+
+    private static documentCacheMetadataSelect(): string {
+        return `SELECT id, item_id, library_id, zotero_key, content_kind,
+                       file_path, file_mtime_ms, file_size_bytes,
+                       source_size_bytes, content_type, document_metadata_json, error_code,
+                       extraction_schema_version, metadata_format_version,
+                       created_at, updated_at, last_accessed_at
+                FROM document_cache_metadata`;
+    }
+
+    private static documentCachePayloadSelect(): string {
+        return `SELECT id, metadata_id, item_id, library_id, zotero_key, payload_kind,
+                       content_kind, source_file_path, source_file_mtime_ms, source_file_size_bytes,
+                       source_size_bytes, payload_path, payload_size_bytes,
+                       payload_sha256, extraction_schema_version, cache_format_version,
+                       created_at, updated_at, last_accessed_at, extraction_source, source_md5
+                FROM document_cache_payloads`;
+    }
+
+    private static documentMetadataSourceChanged(
+        existing: DocumentCacheMetadataRecord,
+        incoming: DocumentCacheMetadataInput,
+    ): boolean {
+        return existing.filePath !== incoming.filePath
+            || existing.fileSignature.mtime_ms !== incoming.fileSignature.mtime_ms
+            || existing.fileSignature.size_bytes !== incoming.fileSignature.size_bytes
+            || existing.sourceSizeBytes !== incoming.sourceSizeBytes
+            || existing.extractionSchemaVersion !== incoming.extractionSchemaVersion
+            || existing.metadataFormatVersion !== incoming.metadataFormatVersion;
+    }
+
+    private static documentCacheMetadataMatches(
+        current: DocumentCacheMetadataRecord,
+        inspected: DocumentCacheMetadataRecord,
+    ): boolean {
+        return current.id === inspected.id
+            && current.itemId === inspected.itemId
+            && current.libraryId === inspected.libraryId
+            && current.zoteroKey === inspected.zoteroKey
+            && current.filePath === inspected.filePath
+            && current.fileSignature.mtime_ms === inspected.fileSignature.mtime_ms
+            && current.fileSignature.size_bytes === inspected.fileSignature.size_bytes
+            && current.sourceSizeBytes === inspected.sourceSizeBytes
+            && current.contentType === inspected.contentType
+            && current.contentKind === inspected.contentKind
+            && JSON.stringify(current.documentMetadata) === JSON.stringify(inspected.documentMetadata)
+            && current.errorCode === inspected.errorCode
+            && current.extractionSchemaVersion === inspected.extractionSchemaVersion
+            && current.metadataFormatVersion === inspected.metadataFormatVersion;
+    }
+
+    /** Insert or update document-cache metadata by library/key. */
+    public async upsertDocumentCacheMetadata(
+        record: DocumentCacheMetadataInput,
+    ): Promise<{ metadata: DocumentCacheMetadataRecord; deletedPayloads: DocumentCachePayloadRecord[] }> {
+        let deletedPayloads: DocumentCachePayloadRecord[] = [];
+        await this.conn.executeTransaction(async () => {
+            const existing = await this.getDocumentCacheMetadataByKey(record.libraryId, record.zoteroKey);
+            if (existing && AsterMarginDB.documentMetadataSourceChanged(existing, record)) {
+                deletedPayloads = await this.getDocumentCachePayloadsForMetadata(existing.id);
+                await this.deleteDocumentCachePayloadRowsForMetadata(existing.id);
+            }
+            await this.queryAsync(
+                `INSERT INTO document_cache_metadata
+                    (item_id, library_id, zotero_key, content_kind, file_path, file_mtime_ms,
+                     file_size_bytes, source_size_bytes, content_type, document_metadata_json, error_code,
+                     extraction_schema_version, metadata_format_version, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 ON CONFLICT(library_id, zotero_key) DO UPDATE SET
+                    item_id = excluded.item_id,
+                    content_kind = excluded.content_kind,
+                    file_path = excluded.file_path,
+                    file_mtime_ms = excluded.file_mtime_ms,
+                    file_size_bytes = excluded.file_size_bytes,
+                    source_size_bytes = excluded.source_size_bytes,
+                    content_type = excluded.content_type,
+                    document_metadata_json = excluded.document_metadata_json,
+                    error_code = excluded.error_code,
+                    extraction_schema_version = excluded.extraction_schema_version,
+                    metadata_format_version = excluded.metadata_format_version,
+                    updated_at = datetime('now')`,
+                [
+                    record.itemId,
+                    record.libraryId,
+                    record.zoteroKey,
+                    record.contentKind,
+                    record.filePath,
+                    record.fileSignature.mtime_ms,
+                    record.fileSignature.size_bytes,
+                    record.sourceSizeBytes,
+                    record.contentType,
+                    JSON.stringify(record.documentMetadata),
+                    record.errorCode,
+                    record.extractionSchemaVersion,
+                    record.metadataFormatVersion,
+                ],
+            );
+        });
+        const metadata = await this.getDocumentCacheMetadataByKey(record.libraryId, record.zoteroKey);
+        if (!metadata) {
+            throw new Error('Document cache metadata upsert failed');
+        }
+        return { metadata, deletedPayloads };
+    }
+
+    /** Get document-cache metadata by library/key. */
+    public async getDocumentCacheMetadataByKey(
+        libraryId: number,
+        zoteroKey: string,
+    ): Promise<DocumentCacheMetadataRecord | null> {
+        const rows = await this.selectDocumentCacheMetadata(
+            `${AsterMarginDB.documentCacheMetadataSelect()} WHERE library_id = ? AND zotero_key = ?`,
+            [libraryId, zoteroKey],
+        );
+        return rows[0] ?? null;
+    }
+
+    /** Get document-cache metadata by primary key. */
+    public async getDocumentCacheMetadataById(id: number): Promise<DocumentCacheMetadataRecord | null> {
+        const rows = await this.selectDocumentCacheMetadata(
+            `${AsterMarginDB.documentCacheMetadataSelect()} WHERE id = ?`,
+            [id],
+        );
+        return rows[0] ?? null;
+    }
+
+    /** Get all document-cache metadata rows. */
+    public async getAllDocumentCacheMetadata(): Promise<DocumentCacheMetadataRecord[]> {
+        return this.selectDocumentCacheMetadata(
+            `${AsterMarginDB.documentCacheMetadataSelect()} ORDER BY library_id, zotero_key`,
+        );
+    }
+
+    /** Delete one metadata row and return its payload rows for file cleanup. */
+    public async deleteDocumentCacheMetadata(
+        libraryId: number,
+        zoteroKey: string,
+    ): Promise<DocumentCachePayloadRecord[]> {
+        const metadata = await this.getDocumentCacheMetadataByKey(libraryId, zoteroKey);
+        if (!metadata) return [];
+        const payloads = await this.getDocumentCachePayloadsForMetadata(metadata.id);
+        await this.queryAsync(
+            `DELETE FROM document_cache_metadata WHERE library_id = ? AND zotero_key = ?`,
+            [libraryId, zoteroKey],
+        );
+        return payloads;
+    }
+
+    /**
+     * Point one attachment's cache metadata and payloads at a new path/mtime.
+     * Only rows that still record the `from` location are changed.
+     */
+    public async relocateDocumentCacheSource(
+        libraryId: number,
+        zoteroKey: string,
+        from: { filePath: string; mtimeMs: number; sizeBytes: number },
+        to: { filePath: string; mtimeMs: number },
+    ): Promise<boolean> {
+        let relocated = false;
+        await this.conn.executeTransaction(async () => {
+            const metadata = await this.getDocumentCacheMetadataByKey(libraryId, zoteroKey);
+            if (!metadata || metadata.filePath !== from.filePath
+                || metadata.fileSignature.mtime_ms !== from.mtimeMs
+                || metadata.fileSignature.size_bytes !== from.sizeBytes) return;
+            await this.queryAsync(
+                `UPDATE document_cache_payloads SET source_file_path = ?, source_file_mtime_ms = ?
+                 WHERE metadata_id = ? AND source_file_path = ?
+                   AND source_file_mtime_ms = ? AND source_file_size_bytes = ?`,
+                [to.filePath, to.mtimeMs, metadata.id, from.filePath, from.mtimeMs, from.sizeBytes],
+            );
+            relocated = await this.executeChangedRow(
+                `UPDATE document_cache_metadata SET file_path = ?, file_mtime_ms = ?
+                 WHERE id = ?`,
+                [to.filePath, to.mtimeMs, metadata.id],
+            );
+        });
+        return relocated;
+    }
+
+    /** Delete a metadata row only if it still matches the inspected record. */
+    public async deleteDocumentCacheMetadataIfUnchanged(
+        metadata: DocumentCacheMetadataRecord,
+    ): Promise<DocumentCachePayloadRecord[] | null> {
+        let deletedPayloads: DocumentCachePayloadRecord[] | null = null;
+        await this.conn.executeTransaction(async () => {
+            const current = await this.getDocumentCacheMetadataById(metadata.id);
+            if (!current) {
+                deletedPayloads = [];
+                return;
+            }
+            if (!AsterMarginDB.documentCacheMetadataMatches(current, metadata)) {
+                deletedPayloads = null;
+                return;
+            }
+
+            deletedPayloads = await this.getDocumentCachePayloadsForMetadata(metadata.id);
+            await this.queryAsync(
+                `DELETE FROM document_cache_metadata WHERE id = ?`,
+                [metadata.id],
+            );
+        });
+        return deletedPayloads;
+    }
+
+    /**
+     * Replace a row's document metadata when the row is still exactly the one
+     * inspected. Leaves `updated_at` alone: the content is unchanged, only a
+     * field the row was written without is filled in. Returns whether it wrote.
+     */
+    public async updateDocumentCacheDocumentMetadataIfUnchanged(
+        metadata: DocumentCacheMetadataRecord,
+        documentMetadata: CachedDocumentMetadata,
+    ): Promise<boolean> {
+        let updated = false;
+        await this.conn.executeTransaction(async () => {
+            const current = await this.getDocumentCacheMetadataById(metadata.id);
+            if (!current || !AsterMarginDB.documentCacheMetadataMatches(current, metadata)) return;
+            await this.queryAsync(
+                `UPDATE document_cache_metadata SET document_metadata_json = ? WHERE id = ?`,
+                [JSON.stringify(documentMetadata), metadata.id],
+            );
+            updated = true;
+        });
+        return updated;
+    }
+
+    /** Delete metadata rows for a library and return payload rows for file cleanup. */
+    public async deleteDocumentCacheMetadataByLibrary(libraryId: number): Promise<DocumentCachePayloadRecord[]> {
+        const payloads = await this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()} WHERE library_id = ?`,
+            [libraryId],
+        );
+        await this.queryAsync(
+            `DELETE FROM document_cache_metadata WHERE library_id = ?`,
+            [libraryId],
+        );
+        return payloads;
+    }
+
+    /**
+     * Delete a library's cached content except OCR payloads and their metadata,
+     * returning the deleted payload rows for file cleanup.
+     */
+    public async deleteUnprotectedDocumentCacheByLibrary(libraryId: number): Promise<DocumentCachePayloadRecord[]> {
+        let payloads: DocumentCachePayloadRecord[] = [];
+        await this.conn.executeTransaction(async () => {
+            payloads = await this.selectDocumentCachePayloads(
+                `${AsterMarginDB.documentCachePayloadSelect()} WHERE library_id = ? AND extraction_source != 'ocr'`,
+                [libraryId],
+            );
+            await this.queryAsync(
+                `DELETE FROM document_cache_payloads WHERE library_id = ? AND extraction_source != 'ocr'`,
+                [libraryId],
+            );
+            await this.queryAsync(
+                `DELETE FROM document_cache_metadata WHERE library_id = ? AND id NOT IN
+                    (SELECT metadata_id FROM document_cache_payloads WHERE extraction_source = 'ocr')`,
+                [libraryId],
+            );
+        });
+        return payloads;
+    }
+
+    /** Insert or update a document-cache payload by metadata/payload kind. */
+    public async upsertDocumentCachePayload(record: DocumentCachePayloadInput): Promise<DocumentCachePayloadRecord> {
+        await this.queryAsync(
+            `INSERT INTO document_cache_payloads
+                (metadata_id, item_id, library_id, zotero_key, payload_kind, content_kind,
+                 source_file_path, source_file_mtime_ms, source_file_size_bytes,
+                 source_size_bytes, payload_path, payload_size_bytes, payload_sha256,
+                 extraction_schema_version, cache_format_version, extraction_source, source_md5, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(metadata_id, payload_kind) DO UPDATE SET
+                metadata_id = excluded.metadata_id,
+                item_id = excluded.item_id,
+                library_id = excluded.library_id,
+                zotero_key = excluded.zotero_key,
+                content_kind = excluded.content_kind,
+                source_file_path = excluded.source_file_path,
+                source_file_mtime_ms = excluded.source_file_mtime_ms,
+                source_file_size_bytes = excluded.source_file_size_bytes,
+                source_size_bytes = excluded.source_size_bytes,
+                payload_path = excluded.payload_path,
+                payload_size_bytes = excluded.payload_size_bytes,
+                payload_sha256 = excluded.payload_sha256,
+                extraction_schema_version = excluded.extraction_schema_version,
+                cache_format_version = excluded.cache_format_version,
+                extraction_source = excluded.extraction_source,
+                source_md5 = excluded.source_md5,
+                updated_at = datetime('now')`,
+            [
+                record.metadataId,
+                record.itemId,
+                record.libraryId,
+                record.zoteroKey,
+                record.payloadKind,
+                record.contentKind,
+                record.sourceFilePath,
+                record.sourceFileSignature.mtime_ms,
+                record.sourceFileSignature.size_bytes,
+                record.sourceSizeBytes,
+                record.payloadPath,
+                record.payloadSizeBytes,
+                record.payloadSha256,
+                record.extractionSchemaVersion,
+                record.cacheFormatVersion,
+                record.extractionSource ?? "native",
+                record.sourceMd5 ?? null,
+            ],
+        );
+        const payload = await this.getDocumentCachePayload(record.libraryId, record.zoteroKey, record.payloadKind);
+        if (!payload) {
+            throw new Error('Document cache payload upsert failed');
+        }
+        return payload;
+    }
+
+    /** Get a payload row by library/key/payload kind. */
+    public async getDocumentCachePayload(
+        libraryId: number,
+        zoteroKey: string,
+        payloadKind: DocumentCachePayloadKind,
+    ): Promise<DocumentCachePayloadRecord | null> {
+        const rows = await this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()} WHERE library_id = ? AND zotero_key = ? AND payload_kind = ?`,
+            [libraryId, zoteroKey, payloadKind],
+        );
+        return rows[0] ?? null;
+    }
+
+    /** Get a payload row by primary key. */
+    public async getDocumentCachePayloadById(id: number): Promise<DocumentCachePayloadRecord | null> {
+        const rows = await this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()} WHERE id = ?`,
+            [id],
+        );
+        return rows[0] ?? null;
+    }
+
+    /** Get payload rows for one metadata row. */
+    public async getDocumentCachePayloadsForMetadata(metadataId: number): Promise<DocumentCachePayloadRecord[]> {
+        return this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()} WHERE metadata_id = ?`,
+            [metadataId],
+        );
+    }
+
+    /** Get all payload rows. */
+    public async getAllDocumentCachePayloads(): Promise<DocumentCachePayloadRecord[]> {
+        return this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()} ORDER BY library_id, zotero_key, payload_kind`,
+        );
+    }
+
+    /** Total compressed size of every cached payload, in bytes. */
+    public async getDocumentCachePayloadTotalBytes(): Promise<number> {
+        const rows: number[] = [];
+        await this.queryAsync(
+            `SELECT COALESCE(SUM(payload_size_bytes), 0) FROM document_cache_payloads`,
+            [],
+            { onRow: (row: any) => rows.push(Number(row.getResultByIndex(0))) },
+        );
+        return rows[0] ?? 0;
+    }
+
+    public async getProtectedDocumentCacheStats(versions: { metadata: number; payload: number; pdf: string | null }): Promise<{ bytes: number; incompatible: number }> {
+        const stats = { bytes: 0, incompatible: 0 };
+        await this.queryAsync(`SELECT COALESCE(SUM(p.payload_size_bytes), 0),
+            COUNT(DISTINCT CASE WHEN p.cache_format_version != ? OR p.extraction_schema_version != ?
+                OR m.metadata_format_version != ? OR m.extraction_schema_version != ?
+                THEN m.id END)
+            FROM document_cache_payloads p JOIN document_cache_metadata m ON m.id = p.metadata_id
+            WHERE p.extraction_source = 'ocr'`,
+        [versions.payload, versions.pdf, versions.metadata, versions.pdf], {
+            onRow: (row: any) => {
+                stats.bytes = Number(row.getResultByIndex(0));
+                stats.incompatible = Number(row.getResultByIndex(1));
+            },
+        });
+        return stats;
+    }
+
+    /** Attachment keys in one library whose retained OCR preparation is incompatible. */
+    public async getIncompatibleProtectedDocumentKeys(
+        libraryId: number,
+        versions: { metadata: number; payload: number; pdf: string | null },
+    ): Promise<string[]> {
+        const keys: string[] = [];
+        await this.queryAsync(`SELECT DISTINCT m.zotero_key
+            FROM document_cache_payloads p JOIN document_cache_metadata m ON m.id = p.metadata_id
+            WHERE p.extraction_source = 'ocr' AND m.library_id = ? AND m.content_kind = 'pdf'
+                AND (p.cache_format_version != ? OR p.extraction_schema_version != ?
+                    OR m.metadata_format_version != ? OR m.extraction_schema_version != ?)
+            ORDER BY m.zotero_key`,
+        [libraryId, versions.payload, versions.pdf, versions.metadata, versions.pdf], {
+            onRow: (row: any) => keys.push(row.getResultByIndex(0)),
+        });
+        return keys;
+    }
+
+    /**
+     * Get one batch of least-recently-used payload rows, oldest first.
+     *
+     * A never-read payload falls back to `created_at` rather than sorting
+     * first: during a backlog sweep it is the newest thing in the cache and is
+     * usually the one still awaiting an index upsert.
+     *
+     * `offset` lets a caller walk past rows it already examined and chose to
+     * keep. The order is fully deterministic (`id` breaks ties), so a caller
+     * that deletes some rows and skips `n` others can pass `offset = n` to
+     * reach unexamined rows in the next batch.
+     */
+    public async getDocumentCachePayloadsForEviction(
+        limit: number,
+        offset = 0,
+    ): Promise<DocumentCachePayloadRecord[]> {
+        return this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()}
+             ORDER BY COALESCE(last_accessed_at, created_at) ASC, id ASC
+             LIMIT ? OFFSET ?`,
+            [Math.max(1, Math.floor(limit)), Math.max(0, Math.floor(offset))],
+        );
+    }
+
+    private async deleteDocumentCachePayloadRowsForMetadata(metadataId: number): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM document_cache_payloads WHERE metadata_id = ?`,
+            [metadataId],
+        );
+    }
+
+    /** Delete a payload row and return it for file cleanup. */
+    public async deleteDocumentCachePayload(
+        libraryId: number,
+        zoteroKey: string,
+        payloadKind: DocumentCachePayloadKind,
+    ): Promise<DocumentCachePayloadRecord | null> {
+        const payload = await this.getDocumentCachePayload(libraryId, zoteroKey, payloadKind);
+        if (!payload) return null;
+        await this.queryAsync(
+            `DELETE FROM document_cache_payloads WHERE id = ?`,
+            [payload.id],
+        );
+        return payload;
+    }
+
+    /** Delete a payload row only if it still matches the inspected record. */
+    public async deleteDocumentCachePayloadIfUnchanged(
+        payload: DocumentCachePayloadRecord,
+    ): Promise<DocumentCachePayloadRecord | null> {
+        await this.queryAsync(
+            `DELETE FROM document_cache_payloads
+             WHERE id = ?
+               AND metadata_id = ?
+               AND item_id = ?
+               AND library_id = ?
+               AND zotero_key = ?
+               AND payload_kind = ?
+               AND content_kind = ?
+               AND source_file_path = ?
+               AND source_file_mtime_ms = ?
+               AND source_file_size_bytes = ?
+               AND source_size_bytes = ?
+               AND payload_path = ?
+               AND payload_size_bytes = ?
+               AND COALESCE(payload_sha256, '') = COALESCE(?, '')
+               AND extraction_schema_version = ?
+               AND cache_format_version = ?
+               AND extraction_source = ?`,
+            [
+                payload.id,
+                payload.metadataId,
+                payload.itemId,
+                payload.libraryId,
+                payload.zoteroKey,
+                payload.payloadKind,
+                payload.contentKind,
+                payload.sourceFilePath,
+                payload.sourceFileSignature.mtime_ms,
+                payload.sourceFileSignature.size_bytes,
+                payload.sourceSizeBytes,
+                payload.payloadPath,
+                payload.payloadSizeBytes,
+                payload.payloadSha256,
+                payload.extractionSchemaVersion,
+                payload.cacheFormatVersion,
+                payload.extractionSource ?? "native",
+            ],
+        );
+
+        const current = await this.getDocumentCachePayloadById(payload.id);
+        if (current && (
+            current.metadataId !== payload.metadataId
+            || current.itemId !== payload.itemId
+            || current.libraryId !== payload.libraryId
+            || current.zoteroKey !== payload.zoteroKey
+            || current.payloadKind !== payload.payloadKind
+            || current.contentKind !== payload.contentKind
+            || current.sourceFilePath !== payload.sourceFilePath
+            || current.sourceFileSignature.mtime_ms !== payload.sourceFileSignature.mtime_ms
+            || current.sourceFileSignature.size_bytes !== payload.sourceFileSignature.size_bytes
+            || current.sourceSizeBytes !== payload.sourceSizeBytes
+            || current.payloadPath !== payload.payloadPath
+            || current.payloadSizeBytes !== payload.payloadSizeBytes
+            || current.payloadSha256 !== payload.payloadSha256
+            || current.extractionSchemaVersion !== payload.extractionSchemaVersion
+            || current.cacheFormatVersion !== payload.cacheFormatVersion
+        )) {
+            return null;
+        }
+        return current ? null : payload;
+    }
+
+    /** Delete payload rows for one metadata row and return them for file cleanup. */
+    public async deleteDocumentCachePayloadsForMetadata(metadataId: number): Promise<DocumentCachePayloadRecord[]> {
+        const payloads = await this.getDocumentCachePayloadsForMetadata(metadataId);
+        await this.deleteDocumentCachePayloadRowsForMetadata(metadataId);
+        return payloads;
+    }
+
+    /** Delete all payload rows for a library and return them for file cleanup. */
+    public async deleteDocumentCachePayloadsByLibrary(libraryId: number): Promise<DocumentCachePayloadRecord[]> {
+        const payloads = await this.selectDocumentCachePayloads(
+            `${AsterMarginDB.documentCachePayloadSelect()} WHERE library_id = ?`,
+            [libraryId],
+        );
+        await this.queryAsync(
+            `DELETE FROM document_cache_payloads WHERE library_id = ?`,
+            [libraryId],
+        );
+        return payloads;
+    }
+
+    /** Mark a metadata row as accessed. */
+    public async touchDocumentCacheMetadata(id: number): Promise<void> {
+        await this.queryAsync(
+            `UPDATE document_cache_metadata SET last_accessed_at = datetime('now') WHERE id = ?`,
+            [id],
+        );
+    }
+
+    /** Mark a payload row as accessed. */
+    public async touchDocumentCachePayload(id: number): Promise<void> {
+        await this.queryAsync(
+            `UPDATE document_cache_payloads SET last_accessed_at = datetime('now') WHERE id = ?`,
+            [id],
+        );
+    }
+
+    /** Count document-cache metadata rows. */
+    public async getDocumentCacheMetadataCount(libraryId?: number): Promise<number> {
+        const rows: Array<{ count: number }> = [];
+        const sql = libraryId == null
+            ? `SELECT COUNT(*) FROM document_cache_metadata`
+            : `SELECT COUNT(*) FROM document_cache_metadata WHERE library_id = ?`;
+        await this.queryAsync(sql, libraryId == null ? [] : [libraryId], {
+            onRow: (row: any) => rows.push({ count: row.getResultByIndex(0) }),
+        });
+        return rows[0]?.count ?? 0;
+    }
+
+    /** Count registered, compatible documents without probing source or payload files. */
+    public async getCachedDocumentCount(versions: {
+        metadata: number;
+        payload: number;
+        pdf: string | null;
+        epub: string | null;
+        snapshot: string | null;
+    }): Promise<number> {
+        let count = 0;
+        await this.queryAsync(
+            `SELECT COUNT(*) FROM (
+                SELECT DISTINCT m.library_id, m.zotero_key
+                FROM document_cache_metadata m JOIN document_cache_payloads p ON p.metadata_id = m.id
+                WHERE m.error_code IS NULL AND m.document_metadata_json != 'null'
+                    AND m.metadata_format_version = ? AND p.cache_format_version = ?
+                    AND ((m.content_kind = 'pdf' AND m.extraction_schema_version = ?)
+                        OR (m.content_kind = 'epub' AND m.extraction_schema_version = ?)
+                        OR (m.content_kind = 'snapshot' AND m.extraction_schema_version = ?))
+                    AND p.extraction_schema_version = m.extraction_schema_version
+                    AND p.content_kind = m.content_kind AND p.source_file_path = m.file_path
+                    AND p.source_file_mtime_ms = m.file_mtime_ms AND p.source_file_size_bytes = m.file_size_bytes
+                    AND p.source_size_bytes = m.source_size_bytes
+            )`,
+            [versions.metadata, versions.payload, versions.pdf, versions.epub, versions.snapshot],
+            { onRow: (row: any) => { count = row.getResultByIndex(0); } },
+        );
+        return count;
+    }
+
+    /** Count document-cache payload rows. */
+    public async getDocumentCachePayloadCount(libraryId?: number): Promise<number> {
+        const rows: Array<{ count: number }> = [];
+        const sql = libraryId == null
+            ? `SELECT COUNT(*) FROM document_cache_payloads`
+            : `SELECT COUNT(*) FROM document_cache_payloads WHERE library_id = ?`;
+        await this.queryAsync(sql, libraryId == null ? [] : [libraryId], {
+            onRow: (row: any) => rows.push({ count: row.getResultByIndex(0) }),
+        });
+        return rows[0]?.count ?? 0;
+    }
+
+    /** Delete every document-cache metadata and payload row. */
+    public async deleteAllDocumentCache(): Promise<void> {
+        await this.conn.executeTransaction(async () => {
+            await this.queryAsync(`DELETE FROM document_cache_payloads`);
+            await this.queryAsync(`DELETE FROM document_cache_metadata`);
+        });
+    }
+
+    /**
+     * Processed files missing local content, ordered by recent use or addition.
+     * With `protectedVersions`, a retained OCR preparation that no longer
+     * carries those versions counts as missing, so it is prepared again.
+     */
+    public async getUncachedProcessingCandidates(options: {
+        libraryIds: number[]; hasOcrAccess: boolean; firstOnly?: boolean;
+        protectedVersions?: { metadata: number; payload: number; pdf: string | null };
+    }): Promise<Array<{ libraryId: number; zoteroKey: string }>> {
+        const result: Array<{ libraryId: number; zoteroKey: string }> = [];
+        if (options.libraryIds.length === 0) return result;
+        const versions = options.protectedVersions;
+        const incompatibleProtected = versions ? `OR EXISTS (SELECT 1 FROM document_cache_payloads OP
+                    JOIN document_cache_metadata OM ON OM.id = OP.metadata_id
+                    WHERE OP.library_id = S.library_id AND OP.zotero_key = S.zotero_key
+                        AND OP.extraction_source = 'ocr'
+                        AND (OP.cache_format_version != ? OR OP.extraction_schema_version != ?
+                            OR OM.metadata_format_version != ? OR OM.extraction_schema_version != ?))` : '';
+        await this.queryAsync(`SELECT S.library_id, S.zotero_key
+            FROM attachment_processing_state S
+            LEFT JOIN document_cache_metadata M
+                ON M.library_id = S.library_id AND M.zotero_key = S.zotero_key
+            WHERE S.library_id IN (${options.libraryIds.map(() => '?').join(',')})
+                AND S.extract_status = 'done'
+                AND (S.ocr_status = 'na' ${options.hasOcrAccess ? "OR S.ocr_status = 'done'" : ''})
+                AND (NOT EXISTS (SELECT 1 FROM document_cache_payloads P
+                    WHERE P.library_id = S.library_id AND P.zotero_key = S.zotero_key
+                        AND P.payload_kind = 'structured')
+                    ${incompatibleProtected})
+                AND NOT EXISTS (SELECT 1 FROM background_jobs J
+                    WHERE J.library_id = S.library_id AND J.zotero_key = S.zotero_key)
+                AND NOT EXISTS (SELECT 1 FROM background_jobs
+                    WHERE json_extract(payload_json, '$.prepare_cache') = 1)
+            ORDER BY COALESCE(M.last_accessed_at, S.created_at) DESC, S.library_id, S.zotero_key
+            ${options.firstOnly ? 'LIMIT 1' : ''}`, [
+            ...options.libraryIds,
+            ...(versions ? [versions.payload, versions.pdf, versions.metadata, versions.pdf] : []),
+        ], {
+            onRow: (row: any) => result.push({
+                libraryId: row.getResultByIndex(0), zoteroKey: row.getResultByIndex(1),
+            }),
+        });
+        return result;
+    }
+
+    // =====================================================================
+    // External files (user-attached files behind `ext-<KEY>` ids)
+    // =====================================================================
+
+    private static externalFileSelect(): string {
+        return `SELECT ext_key, filename, original_path, stored_path, content_kind,
+                       mime_type, file_size, mtime_ms, page_count, sha256, created_at
+                FROM external_files`;
+    }
+
+    /**
+     * Normalize SQLite's datetime('now') format ("YYYY-MM-DD HH:MM:SS", UTC
+     * with no timezone marker) to ISO-8601 UTC, so `new Date(createdAt)`
+     * never misparses it as local time. Attach-time records already carry
+     * ISO strings and pass through unchanged.
+     */
+    private static sqliteUtcToIso(value: string): string {
+        if (!value || value.includes('T')) return value;
+        return `${value.replace(' ', 'T')}Z`;
+    }
+
+    private async selectExternalFiles(sql: string, params: any[] = []): Promise<ExternalFileRecord[]> {
+        const rows: ExternalFileRecord[] = [];
+        await this.queryAsync(sql, params, {
+            onRow: (row: any) => {
+                // These indices must match the SELECT column order above.
+                rows.push({
+                    extKey: row.getResultByIndex(0),
+                    filename: row.getResultByIndex(1),
+                    originalPath: row.getResultByIndex(2) ?? null,
+                    storedPath: row.getResultByIndex(3),
+                    contentKind: row.getResultByIndex(4),
+                    mimeType: row.getResultByIndex(5),
+                    fileSize: row.getResultByIndex(6),
+                    mtimeMs: row.getResultByIndex(7),
+                    pageCount: row.getResultByIndex(8) ?? null,
+                    sha256: row.getResultByIndex(9) ?? null,
+                    createdAt: AsterMarginDB.sqliteUtcToIso(row.getResultByIndex(10)),
+                });
+            },
+        });
+        return rows;
+    }
+
+    /** Insert or replace the registry row for an external file. */
+    public async upsertExternalFile(input: ExternalFileInput): Promise<void> {
+        await this.queryAsync(
+            `INSERT INTO external_files (
+                ext_key, filename, original_path, stored_path, content_kind,
+                mime_type, file_size, mtime_ms, page_count, sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ext_key) DO UPDATE SET
+                filename = excluded.filename,
+                original_path = excluded.original_path,
+                stored_path = excluded.stored_path,
+                content_kind = excluded.content_kind,
+                mime_type = excluded.mime_type,
+                file_size = excluded.file_size,
+                mtime_ms = excluded.mtime_ms,
+                page_count = excluded.page_count,
+                sha256 = excluded.sha256`,
+            [
+                input.extKey,
+                input.filename,
+                input.originalPath,
+                input.storedPath,
+                input.contentKind,
+                input.mimeType,
+                input.fileSize,
+                input.mtimeMs,
+                input.pageCount,
+                input.sha256,
+            ],
+        );
+    }
+
+    /** Get one external file by its 8-character key. */
+    public async getExternalFileByKey(extKey: string): Promise<ExternalFileRecord | null> {
+        const rows = await this.selectExternalFiles(
+            `${AsterMarginDB.externalFileSelect()} WHERE ext_key = ?`,
+            [extKey],
+        );
+        return rows[0] ?? null;
+    }
+
+    /**
+     * Get the newest external file with the given content hash (attach-time
+     * deduplication). Returns null when no row carries the hash.
+     */
+    public async getExternalFileBySha256(sha256: string): Promise<ExternalFileRecord | null> {
+        const rows = await this.selectExternalFiles(
+            `${AsterMarginDB.externalFileSelect()} WHERE sha256 = ? ORDER BY created_at DESC, ext_key DESC LIMIT 1`,
+            [sha256],
+        );
+        return rows[0] ?? null;
+    }
+
+    /** Set the best-effort page count once it is known (async after attach). */
+    public async setExternalFilePageCount(extKey: string, pageCount: number | null): Promise<void> {
+        await this.queryAsync(
+            `UPDATE external_files SET page_count = ? WHERE ext_key = ?`,
+            [pageCount, extKey],
+        );
+    }
+
+    /** Delete one external file registry row. */
+    public async deleteExternalFile(extKey: string): Promise<void> {
+        await this.queryAsync(`DELETE FROM external_files WHERE ext_key = ?`, [extKey]);
+    }
+
+    /** List all external file registry rows (newest first). */
+    public async listExternalFiles(): Promise<ExternalFileRecord[]> {
+        return this.selectExternalFiles(
+            `${AsterMarginDB.externalFileSelect()} ORDER BY created_at DESC, ext_key DESC`,
+        );
+    }
+
+    /** Count and total size of all external file registry rows. */
+    public async getExternalFileStats(): Promise<{ count: number; totalBytes: number }> {
+        const rows: Array<{ count: number; totalBytes: number }> = [];
+        await this.queryAsync(
+            `SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM external_files`,
+            [],
+            {
+                onRow: (row: any) => rows.push({
+                    count: row.getResultByIndex(0),
+                    totalBytes: row.getResultByIndex(1),
+                }),
+            },
+        );
+        return rows[0] ?? { count: 0, totalBytes: 0 };
+    }
+
+    /** Delete every external file registry row. */
+    public async deleteAllExternalFiles(): Promise<void> {
+        await this.queryAsync(`DELETE FROM external_files`);
+    }
+
+    // =====================================================================
+    // Stored-table recovery shadow
+    // =====================================================================
+
+    private static tableShadowSelect(): string {
+        return `SELECT library_id, zotero_key, version, sha256, written_at,
+                       payload_path, payload_size_bytes
+                FROM table_recovery_shadow`;
+    }
+
+    private async selectTableShadows(sql: string, params: any[] = []): Promise<TableShadowRecord[]> {
+        const rows: TableShadowRecord[] = [];
+        await this.conn.queryAsync(sql, params, {
+            onRow: (row: any) => {
+                // These indices must match the SELECT column order above.
+                rows.push({
+                    libraryId: row.getResultByIndex(0),
+                    zoteroKey: row.getResultByIndex(1),
+                    version: row.getResultByIndex(2),
+                    sha256: row.getResultByIndex(3),
+                    writtenAt: row.getResultByIndex(4),
+                    payloadPath: row.getResultByIndex(5) ?? null,
+                    payloadSizeBytes: row.getResultByIndex(6) ?? 0,
+                });
+            },
+        });
+        return rows;
+    }
+
+    /**
+     * Record what this device wrote for one version of one table. A write that
+     * reuses its version number (the store's collapse rule) updates the row in
+     * place rather than adding one.
+     */
+    public async upsertTableShadow(input: TableShadowRecord): Promise<void> {
+        await this.conn.queryAsync(
+            `INSERT INTO table_recovery_shadow (
+                library_id, zotero_key, version, sha256, written_at,
+                payload_path, payload_size_bytes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(library_id, zotero_key, version) DO UPDATE SET
+                sha256 = excluded.sha256,
+                written_at = excluded.written_at,
+                payload_path = excluded.payload_path,
+                payload_size_bytes = excluded.payload_size_bytes`,
+            [
+                input.libraryId,
+                input.zoteroKey,
+                input.version,
+                input.sha256,
+                input.writtenAt,
+                input.payloadPath,
+                input.payloadSizeBytes,
+            ],
+        );
+    }
+
+    /** Every retained version for one table, most recently written first. */
+    public async getTableShadows(libraryId: number, zoteroKey: string): Promise<TableShadowRecord[]> {
+        return this.selectTableShadows(
+            `${AsterMarginDB.tableShadowSelect()} WHERE library_id = ? AND zotero_key = ?
+             ORDER BY written_at DESC, version DESC`,
+            [libraryId, zoteroKey],
+        );
+    }
+
+    /**
+     * Delete the named versions and return the rows that were removed, so the
+     * caller can delete their payload files. Deleting the rows first is
+     * deliberate: an orphaned file is a wasted byte, an orphaned row is a
+     * restore that promises a spec it cannot produce.
+     */
+    public async deleteTableShadowVersions(
+        libraryId: number,
+        zoteroKey: string,
+        versions: number[],
+    ): Promise<TableShadowRecord[]> {
+        if (versions.length === 0) return [];
+        const placeholders = versions.map(() => '?').join(', ');
+        const doomed = await this.selectTableShadows(
+            `${AsterMarginDB.tableShadowSelect()} WHERE library_id = ? AND zotero_key = ?
+             AND version IN (${placeholders})`,
+            [libraryId, zoteroKey, ...versions],
+        );
+        if (doomed.length === 0) return [];
+        await this.conn.queryAsync(
+            `DELETE FROM table_recovery_shadow
+             WHERE library_id = ? AND zotero_key = ? AND version IN (${placeholders})`,
+            [libraryId, zoteroKey, ...versions],
+        );
+        return doomed;
+    }
+
+    /** Delete every retained version for one table and return the removed rows. */
+    public async deleteTableShadows(libraryId: number, zoteroKey: string): Promise<TableShadowRecord[]> {
+        const doomed = await this.getTableShadows(libraryId, zoteroKey);
+        if (doomed.length === 0) return [];
+        await this.conn.queryAsync(
+            `DELETE FROM table_recovery_shadow WHERE library_id = ? AND zotero_key = ?`,
+            [libraryId, zoteroKey],
+        );
+        return doomed;
+    }
+
+    // =====================================================================
+    // Background job queue
+    // =====================================================================
+
+    /**
+     * Insert a new background job, or merge with the existing row that
+     * already covers the queue identity. Returns the job id
+     * and whether the row was newly inserted.
+     *
+     * Merge semantics:
+     *  - `priority` lowers to `MIN(existing, input)`.
+     *  - `available_at` lowers to `MIN(existing, input.now)` so an urgent
+     *    re-enqueue overrides a deferred prior visibility window.
+     *  - `content_kind` follows the incoming attachment state.
+     *  - `payload_json` overwrites when the content kind changes or the
+     *    incoming job has a strictly higher (lower-numbered) priority.
+     */
+    public async enqueueBackgroundJob(
+        input: BackgroundJobInput,
+    ): Promise<BackgroundJobEnqueueResult> {
+        const [result] = await this.enqueueBackgroundJobs([input]);
+        return result;
+    }
+
+    /**
+     * Enqueue a batch of background jobs in one transaction.
+     *
+     * Results are returned in input order. Duplicate jobs within the batch
+     * or already present in the queue use the same merge semantics as
+     * `enqueueBackgroundJob`.
+     */
+    public async enqueueBackgroundJobs(
+        inputs: BackgroundJobInput[],
+    ): Promise<BackgroundJobEnqueueResult[]> {
+        if (inputs.length === 0) return [];
+
+        const results: BackgroundJobEnqueueResult[] = [];
+
+        await this.conn.executeTransaction(async () => {
+            for (const input of inputs) {
+                results.push(await this.enqueueBackgroundJobInTransaction(input));
+            }
+        });
+
+        return results;
+    }
+
+    /**
+     * Insert or merge one background job. Must be called inside an active
+     * transaction so callers can choose single-job or batch atomicity.
+     */
+    private async enqueueBackgroundJobInTransaction(
+        input: BackgroundJobInput,
+    ): Promise<BackgroundJobEnqueueResult> {
+        if (input.jobType === 'fulltext_untag' && input.payload?.doc_hash) {
+            const payload = input.payload;
+            if (payload.index_account_id && payload.index_scope_ref && payload.index_local_id) {
+                await this.queryAsync(`INSERT OR REPLACE INTO index_cleanup_outbox
+                    (identity, account_id, job_json) VALUES (?, ?, ?)`,
+                    [indexCleanupIdentity(input), payload.index_account_id, JSON.stringify(input)]);
+            }
+        }
+        const priority = input.priority ?? 100;
+        const payloadJson = input.payload ? JSON.stringify(input.payload) : null;
+        const dedupeKey = input.jobType === 'fulltext_untag'
+            ? indexCleanupIdentity(input)
+            : '';
+        const itemId = input.itemId ?? null;
+
+        let enqueued = false;
+        let id = 0;
+
+        await this.queryAsync(
+            `INSERT OR IGNORE INTO background_jobs (
+                job_type, library_id, item_id, zotero_key, content_kind,
+                payload_kind, dedupe_key,
+                priority, payload_json, enqueued_at, available_at,
+                attempt_count, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
+            [
+                input.jobType,
+                input.libraryId,
+                itemId,
+                input.zoteroKey,
+                input.contentKind,
+                input.payloadKind,
+                dedupeKey,
+                priority,
+                payloadJson,
+                input.now,
+                input.now,
+            ],
+        );
+
+        const changesRows: number[] = [];
+        await this.queryAsync(`SELECT changes()`, [], {
+            onRow: (row: any) => {
+                changesRows.push(row.getResultByIndex(0));
+            },
+        });
+        enqueued = (changesRows[0] ?? 0) === 1;
+
+        if (!enqueued) {
+            await this.queryAsync(
+                `UPDATE background_jobs SET
+                    priority      = MIN(priority, ?),
+                    available_at  = CASE WHEN content_kind != ? OR ? < priority
+                                         THEN MIN(available_at, ?) ELSE available_at END,
+                    content_kind  = ?,
+                    payload_json  = CASE WHEN ? = 'fulltext_upsert' AND content_kind = ? AND ? >= priority
+                                              AND json_extract(payload_json, '$.cache_recovery') IS NOT NULL
+                                              AND json_extract(payload_json, '$.doc_hash') IS json_extract(?, '$.doc_hash')
+                                         THEN json_set(?, '$.cache_recovery',
+                                             json_extract(payload_json, '$.cache_recovery'))
+                                         WHEN content_kind = ? AND json_extract(?, '$.request_context') = 'interactive'
+                                         THEN json_set(COALESCE(payload_json, ?), '$.request_context', 'interactive')
+                                         WHEN priority >= 100 AND ? >= 100
+                                              AND json_extract(?, '$.prepare_cache') = 1 THEN ?
+                                         WHEN content_kind != ? OR ? < priority OR ? = 'fulltext_upsert'
+                                         THEN ? ELSE payload_json END,
+                    attempt_count = CASE WHEN content_kind != ? OR ? < priority
+                                         THEN 0 ELSE attempt_count END,
+                    last_error    = CASE WHEN content_kind != ? OR ? < priority
+                                         THEN NULL ELSE last_error END
+                 WHERE job_type = ? AND library_id = ? AND zotero_key = ?
+                   AND payload_kind = ? AND dedupe_key = ?`,
+                [
+                    priority,
+                    input.contentKind,
+                    priority,
+                    input.now,
+                    input.contentKind,
+                    input.jobType, input.contentKind, priority, payloadJson, payloadJson,
+                    input.contentKind, payloadJson, payloadJson,
+                    priority, payloadJson, payloadJson,
+                    input.contentKind, priority,
+                    input.jobType,
+                    payloadJson,
+                    input.contentKind, priority,
+                    input.contentKind, priority,
+                    input.jobType,
+                    input.libraryId,
+                    input.zoteroKey,
+                    input.payloadKind,
+                    dedupeKey,
+                ],
+            );
+        }
+
+        const idRows: number[] = [];
+        await this.queryAsync(
+            `SELECT id FROM background_jobs
+             WHERE job_type = ? AND library_id = ? AND zotero_key = ?
+               AND payload_kind = ? AND dedupe_key = ?`,
+            [input.jobType, input.libraryId, input.zoteroKey, input.payloadKind, dedupeKey],
+            {
+                onRow: (row: any) => {
+                    idRows.push(row.getResultByIndex(0));
+                },
+            },
+        );
+        id = idRows[0] ?? 0;
+
+        return { enqueued, id };
+    }
+
+    /** Replay only the authenticated account's unacknowledged cleanup identities. */
+    public async restoreIndexCleanup(accountId: string): Promise<number> {
+        let restored = 0;
+        // Acknowledgment takes the same transaction lock, so a selected
+        // identity cannot be acknowledged before its queue entry is restored.
+        await this.conn.executeTransaction(async () => {
+            const jobs: BackgroundJobInput[] = [];
+            await this.queryAsync(`SELECT job_json, EXISTS (
+                SELECT 1 FROM background_jobs WHERE job_type = 'fulltext_untag'
+                    AND library_id = json_extract(job_json, '$.libraryId')
+                    AND zotero_key = json_extract(job_json, '$.zoteroKey')
+                    AND payload_kind = json_extract(job_json, '$.payloadKind')
+                    AND dedupe_key = index_cleanup_outbox.identity
+            ) FROM index_cleanup_outbox WHERE account_id = ?`, [accountId], {
+                onRow: (row: any) => {
+                    if (!row.getResultByIndex(1)) jobs.push(JSON.parse(row.getResultByIndex(0)));
+                },
+            });
+            for (const job of jobs) {
+                await this.enqueueBackgroundJobInTransaction({ ...job, now: Date.now() });
+                restored++;
+            }
+        });
+        return restored;
+    }
+
+    /** Record on the durable intent that its owner has queued one reacquisition. */
+    public async markIndexCleanupReacquireAttempted(job: BackgroundJobRecord): Promise<void> {
+        await this.queryAsync(`UPDATE index_cleanup_outbox
+            SET job_json = json_set(job_json, '$.payload.index_reacquire_attempted', json('true'))
+            WHERE identity = ?`, [indexCleanupIdentity(job)]);
+    }
+
+    /** Retire an identity after removal, confirmed supersession, or terminal rejection. */
+    public async acknowledgeIndexCleanup(job: BackgroundJobRecord): Promise<void> {
+        await this.conn.executeTransaction(async () => {
+            await this.queryAsync('DELETE FROM index_cleanup_outbox WHERE identity = ?', [indexCleanupIdentity(job)]);
+            await this.deleteDeadIndexCleanupCopies(job);
+        });
+    }
+
+    /**
+     * A restored live job can still have a diagnostic dead-letter copy. Retire
+     * every copy of this exact remote identity with its intent. Must run inside
+     * the transaction that retires the intent.
+     */
+    private async deleteDeadIndexCleanupCopies(job: Pick<BackgroundJobInput, 'zoteroKey' | 'payload'>): Promise<void> {
+        await this.queryAsync(`DELETE FROM background_jobs_dead
+            WHERE job_type = 'fulltext_untag' AND zotero_key = ?
+              AND json_extract(payload_json, '$.index_account_id') IS ?
+              AND json_extract(payload_json, '$.index_scope_ref') IS ?
+              AND json_extract(payload_json, '$.index_local_id') IS ?
+              AND json_extract(payload_json, '$.doc_hash') IS ?`,
+            [job.zoteroKey, job.payload?.index_account_id ?? null, job.payload?.index_scope_ref ?? null,
+                job.payload?.index_local_id ?? null, job.payload?.doc_hash ?? null]);
+    }
+
+    /**
+     * Resolve a duplicate enqueue against the queue dedup key
+     * (`job_type, library_id, zotero_key, payload_kind, dedupe_key`) without
+     * re-inserting. Promotion targets ordinary jobs (`dedupe_key=''`).
+     *
+     * Lets a caller skip expensive pre-enqueue work (e.g. content hashing) when
+     * a ticket is already queued, while still promoting an on-demand request
+     * over a lower-priority backfill ticket. When a duplicate exists at a worse
+     * (higher-number) priority, its `priority` is lowered toward `priority`.
+     * Only that column is touched — `available_at` is deliberately left alone so
+     * a parked row's visibility window stays intact (a waiting row is re-ranked
+     * in claim order; an in-flight parked row is not disturbed).
+     *
+     * `promoted` is true only when an existing ticket's priority was actually
+     * improved, so callers can wake the dispatcher just for that case.
+     */
+    public async promotePendingBackgroundJob(
+        jobType: BackgroundJobType,
+        libraryId: number,
+        zoteroKey: string,
+        payloadKind: DocumentCachePayloadKind,
+        priority: number,
+        preparationPayload?: BackgroundJobPayload,
+    ): Promise<{ exists: boolean; promoted: boolean }> {
+        // Current priority doubles as the existence check (dedup key is UNIQUE).
+        const current: number[] = [];
+        const contexts: unknown[] = [];
+        await this.queryAsync(
+            `SELECT priority, json_extract(payload_json, '$.request_context') FROM background_jobs
+             WHERE job_type = ? AND library_id = ? AND zotero_key = ? AND payload_kind = ?
+               AND dedupe_key = ''
+             LIMIT 1`,
+            [jobType, libraryId, zoteroKey, payloadKind],
+            { onRow: (row: any) => {
+                current.push(row.getResultByIndex(0));
+                contexts.push(row.getResultByIndex(1));
+            } },
+        );
+        if (current.length === 0) return { exists: false, promoted: false };
+        // Fresh detection and its extraction continuation can ticket the same
+        // scan. Preserve the budget marker even when priority does not change.
+        if (preparationPayload?.prepare_cache && priority >= 100) {
+            await this.queryAsync(`UPDATE background_jobs SET payload_json = ?
+                WHERE job_type = ? AND library_id = ? AND zotero_key = ? AND payload_kind = ?
+                    AND dedupe_key = '' AND priority >= 100`,
+            [JSON.stringify(preparationPayload), jobType, libraryId, zoteroKey, payloadKind]);
+        }
+        // Semantic promotion is independent of local scheduling priority. Persist
+        // it without resetting attempts, cooldown or an active visibility lease.
+        const contextPromoted = preparationPayload?.request_context === 'interactive'
+            && contexts[0] !== 'interactive';
+        if (contextPromoted) {
+            await this.queryAsync(`UPDATE background_jobs SET payload_json =
+                json_set(COALESCE(payload_json, ?), '$.request_context', 'interactive')
+                WHERE job_type = ? AND library_id = ? AND zotero_key = ? AND payload_kind = ?
+                    AND dedupe_key = ''`,
+            [JSON.stringify(preparationPayload), jobType, libraryId, zoteroKey, payloadKind]);
+        }
+        if ((current[0] ?? 0) <= priority) return { exists: true, promoted: contextPromoted };
+
+        // Lower priority only. The `priority > ?` guard keeps the value
+        // monotonically decreasing if the row changed since the read above.
+        await this.queryAsync(
+            `UPDATE background_jobs SET priority = ?
+             WHERE job_type = ? AND library_id = ? AND zotero_key = ? AND payload_kind = ?
+               AND dedupe_key = ''
+               AND priority > ?`,
+            [priority, jobType, libraryId, zoteroKey, payloadKind, priority],
+        );
+        return { exists: true, promoted: true };
+    }
+
+    /** Mark a claimed upsert as waiting for this account's cached document. */
+    public async beginFulltextCacheRecovery(
+        job: BackgroundJobRecord,
+        accountId: string,
+        documentHash: string,
+        extractionSource: string | null,
+    ): Promise<boolean> {
+        const marker = JSON.stringify({ account_id: accountId, doc_hash: documentHash,
+            extraction_source: extractionSource, state: 'active' });
+        return this.executeChangedRow(`UPDATE background_jobs
+            SET payload_json = json_set(payload_json, '$.cache_recovery', json(?))
+            WHERE id = ? AND job_type = 'fulltext_upsert' AND payload_kind = 'structured'
+              AND library_id = ? AND zotero_key = ? AND available_at = ?
+              AND json_extract(payload_json, '$.cache_recovery') IS NULL`,
+        [marker, job.id, job.libraryId, job.zoteroKey, job.availableAt]);
+    }
+
+    /** Complete the active-to-deferred handoff after a payload cache miss. */
+    public async deferFulltextCacheRecovery(id: number, claimedAvailableAt: number, now: number): Promise<boolean> {
+        let woken = false;
+        await this.conn.executeTransaction(async () => {
+            woken = await this.executeChangedRow(`UPDATE background_jobs
+                SET available_at = ?, payload_json = json_remove(payload_json, '$.cache_recovery')
+                WHERE id = ? AND job_type = 'fulltext_upsert' AND available_at = ?
+                  AND json_extract(payload_json, '$.cache_recovery.state') = 'ready'`,
+            [now, id, claimedAvailableAt]);
+            if (!woken) {
+                await this.queryAsync(`UPDATE background_jobs
+                    SET payload_json = json_set(payload_json, '$.cache_recovery.state', 'deferred')
+                    WHERE id = ? AND job_type = 'fulltext_upsert' AND available_at = ?
+                      AND json_extract(payload_json, '$.cache_recovery.state') = 'active'`,
+                [id, claimedAvailableAt]);
+            }
+        });
+        return woken;
+    }
+
+    /** Wake only the upsert parked for the cache that extraction just rebuilt. */
+    public async finishFulltextCacheRecovery(input: {
+        libraryId: number; zoteroKey: string; accountId: string;
+        documentHash: string; extractionSource: string | null; now: number;
+    }): Promise<boolean> {
+        const match = `job_type = 'fulltext_upsert' AND payload_kind = 'structured'
+            AND library_id = ? AND zotero_key = ? AND available_at > ?
+            AND json_extract(payload_json, '$.cache_recovery.account_id') = ?
+            AND json_extract(payload_json, '$.cache_recovery.doc_hash') = ?
+            AND json_extract(payload_json, '$.cache_recovery.extraction_source') IS ?`;
+        const params = [input.libraryId, input.zoteroKey, input.now, input.accountId,
+            input.documentHash, input.extractionSource];
+        let woken = false;
+        await this.conn.executeTransaction(async () => {
+            woken = await this.executeChangedRow(`UPDATE background_jobs
+                SET available_at = ?, payload_json = json_remove(payload_json, '$.cache_recovery')
+                WHERE ${match} AND json_extract(payload_json, '$.cache_recovery.state') = 'deferred'`,
+            [input.now, ...params]);
+            if (!woken) {
+                await this.queryAsync(`UPDATE background_jobs
+                    SET payload_json = json_set(payload_json, '$.cache_recovery.state', 'ready')
+                    WHERE ${match} AND json_extract(payload_json, '$.cache_recovery.state') = 'active'`,
+                params);
+            }
+        });
+        return woken;
+    }
+
+    /** Remove a wait marker when the recovery enqueue itself failed. */
+    public async cancelFulltextCacheRecovery(id: number, claimedAvailableAt: number): Promise<void> {
+        await this.queryAsync(`UPDATE background_jobs
+            SET payload_json = json_remove(payload_json, '$.cache_recovery')
+            WHERE id = ? AND job_type = 'fulltext_upsert' AND available_at = ?
+              AND json_extract(payload_json, '$.cache_recovery') IS NOT NULL`,
+        [id, claimedAvailableAt]);
+    }
+
+    /**
+     * Claim the next visible job (pgmq-style): pick lowest-priority, then
+     * oldest-available row whose `available_at <= now`, then bump its
+     * `available_at` forward by `visibilityTimeoutMs` so a crash/abort
+     * leaves the row safe to re-pick later.
+     *
+     * `maxPriority` is an exclusive upper bound — when provided, only rows
+     * with `priority < maxPriority` are eligible. Used by the background
+     * extractor to gate library-scale work (priority >= 100) behind user
+     * idleness while still letting hot-path retries (priority < 100) run.
+     *
+     * Selection, visibility update and returned ownership form one SQL statement.
+     * Returns `null` when no eligible row is visible.
+     */
+    public async claimNextBackgroundJob(
+        now: number,
+        visibilityTimeoutMs: number,
+        maxPriority?: number,
+        jobTypes?: BackgroundJobType[],
+    ): Promise<BackgroundJobRecord | null> {
+        const params: unknown[] = [now + visibilityTimeoutMs, now];
+        let priorityClause = '';
+        if (maxPriority !== undefined) {
+            priorityClause = ' AND priority < ?';
+            params.push(maxPriority);
+        }
+        let jobTypesClause = '';
+        if (jobTypes && jobTypes.length > 0) {
+            jobTypesClause = ` AND job_type IN (${jobTypes.map(() => '?').join(',')})`;
+            params.push(...jobTypes);
+        }
+        const claimed = await this.selectBackgroundJobs(
+            `UPDATE background_jobs SET available_at = ?,
+                payload_json = CASE WHEN job_type = 'fulltext_upsert'
+                    THEN json_remove(payload_json, '$.cache_recovery') ELSE payload_json END
+             WHERE id = (
+                 SELECT id FROM background_jobs
+                 WHERE available_at <= ?${priorityClause}${jobTypesClause}
+                 ORDER BY priority ASC, available_at ASC, id ASC
+                 LIMIT 1
+             )
+             RETURNING ${BACKGROUND_JOB_COLUMNS}`,
+            params,
+        );
+        return claimed[0] ?? null;
+    }
+
+    /** Read up to `limit` jobs (default 100) without claiming. */
+    public async peekBackgroundJobs(limit = 100): Promise<BackgroundJobRecord[]> {
+        return this.selectBackgroundJobs(
+            `SELECT ${BACKGROUND_JOB_COLUMNS}
+             FROM background_jobs
+             ORDER BY priority ASC, available_at ASC
+             LIMIT ?`,
+            [limit],
+        );
+    }
+
+    /** Mark a claimed job as completed by removing its row. */
+    public async completeBackgroundJob(id: number): Promise<void> {
+        await this.queryAsync(
+            `DELETE FROM background_jobs WHERE id = ?`,
+            [id],
+        );
+    }
+
+    /** Retire budget-limited work only while it is still background priority. */
+    public async completeBackgroundPreparationJob(id: number, now: number): Promise<boolean> {
+        let retired = true;
+        await this.conn.executeTransaction(async () => {
+            if (await this.executeChangedRow(`DELETE FROM background_jobs WHERE id = ? AND priority >= 100`, [id])) return;
+            // A foreground request may have promoted the claimed ticket while
+            // its executor was waiting. Make that work immediately claimable.
+            retired = !(await this.executeChangedRow(`UPDATE background_jobs SET available_at = ? WHERE id = ? AND priority < 100`, [now, id]));
+        });
+        return retired;
+    }
+
+    /**
+     * Record a failed attempt. After `maxAttempts` total attempts the row
+     * moves to `background_jobs_dead`. Otherwise the attempt counter
+     * bumps and `available_at` slides forward by `backoffMs(attempt)`.
+     */
+    public async failBackgroundJob(
+        id: number,
+        error: string,
+        opts: {
+            maxAttempts: number;
+            backoffMs: (attempt: number) => number;
+            now: number;
+        },
+    ): Promise<{ dead: boolean }> {
+        const rows = await this.selectBackgroundJobs(
+            `SELECT ${BACKGROUND_JOB_COLUMNS}
+             FROM background_jobs
+             WHERE id = ?`,
+            [id],
+        );
+        if (rows.length === 0) return { dead: false };
+        const current = rows[0];
+        const nextAttempt = current.attemptCount + 1;
+
+        if (nextAttempt >= opts.maxAttempts) {
+            await this.conn.executeTransaction(async () => {
+                await this.queryAsync(
+                    `INSERT INTO background_jobs_dead (
+                        job_type, library_id, zotero_key, content_kind,
+                        payload_kind, payload_json, enqueued_at, died_at,
+                        attempt_count, last_error
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        current.jobType,
+                        current.libraryId,
+                        current.zoteroKey,
+                        current.contentKind,
+                        current.payloadKind,
+                        current.payload ? JSON.stringify(current.payload) : null,
+                        current.enqueuedAt,
+                        opts.now,
+                        nextAttempt,
+                        error,
+                    ],
+                );
+                await this.queryAsync(
+                    `DELETE FROM background_jobs WHERE id = ?`,
+                    [id],
+                );
+            });
+            return { dead: true };
+        }
+
+        const nextAvailableAt = opts.now + opts.backoffMs(nextAttempt);
+        await this.queryAsync(
+            `UPDATE background_jobs
+             SET attempt_count = attempt_count + 1,
+                 last_error = ?,
+                 available_at = ?
+             WHERE id = ?`,
+            [error, nextAvailableAt, id],
+        );
+        return { dead: false };
+    }
+
+    /** Reschedule remote waiting without consuming the document's failure budget. */
+    public async rescheduleBackgroundJob(id: number, availableAt: number, error: string): Promise<void> {
+        await this.queryAsync(
+            `UPDATE background_jobs SET available_at = ?, last_error = ? WHERE id = ?`,
+            [availableAt, error, id],
+        );
+    }
+
+    /** Release interrupted work so its next owner can claim it immediately. */
+    public async releaseBackgroundJob(id: number, now: number): Promise<void> {
+        await this.queryAsync(
+            `UPDATE background_jobs SET available_at = ? WHERE id = ?`,
+            [now, id],
+        );
+    }
+
+    /**
+     * Attachment keys (`libraryId/zoteroKey`) with a queued `fulltext_upsert`
+     * job, whose executor reads the cached payload.
+     *
+     * Rows live in `background_jobs` until the job completes — claiming only
+     * pushes `available_at` forward — so this covers available, deferred and
+     * in-flight work, and survives a restart.
+     */
+    /** True while an upsert for this attachment is queued, parked or in flight. */
+    public async hasPendingFulltextUpsert(libraryId: number, zoteroKey: string): Promise<boolean> {
+        let pending = false;
+        await this.queryAsync(
+            `SELECT 1 FROM background_jobs
+             WHERE job_type = 'fulltext_upsert' AND library_id = ? AND zotero_key = ? LIMIT 1`,
+            [libraryId, zoteroKey],
+            { onRow: () => { pending = true; } },
+        );
+        return pending;
+    }
+
+    public async getPendingFulltextUpsertKeys(): Promise<Set<string>> {
+        const keys = new Set<string>();
+        await this.queryAsync(
+            `SELECT library_id, zotero_key FROM background_jobs
+             WHERE job_type = 'fulltext_upsert'`,
+            [],
+            {
+                onRow: (row: any) => {
+                    keys.add(`${row.getResultByIndex(0)}/${row.getResultByIndex(1)}`);
+                },
+            },
+        );
+        return keys;
+    }
+
+    /** Counts surfaced through the dev queue-stats endpoint. */
+    public async getBackgroundQueueStats(
+        now: number,
+        jobTypes?: string[],
+        pausedTypes: string[] = [],
+    ): Promise<BackgroundQueueStats> {
+        const laneFilter = jobTypes === undefined ? '1' : jobTypes.length === 0
+            ? '0' : `job_type IN (${jobTypes.map(() => '?').join(', ')})`;
+        const laneParams = jobTypes ?? [];
+        const runnable = pausedTypes.length ? ` AND job_type NOT IN (${pausedTypes.map(() => "?").join(", ")})` : "";
+        const stats: BackgroundQueueStats = {
+            pending: 0, available: 0, deferred: 0, attachments: 0, dead: 0, byJobType: {},
+        };
+        await this.queryAsync(`SELECT * FROM (
+            WITH jobs AS (SELECT * FROM background_jobs WHERE ${laneFilter})
+            SELECT NULL AS job_type, COUNT(*) AS pending,
+                COALESCE(SUM(CASE WHEN available_at <= ?${runnable} THEN 1 ELSE 0 END), 0) AS available,
+                COUNT(DISTINCT library_id || '/' || zotero_key) AS attachments,
+                (SELECT COUNT(*) FROM background_jobs_dead WHERE ${laneFilter}) AS dead
+            FROM jobs
+            UNION ALL
+            SELECT job_type, COUNT(*), 0, 0, 0 FROM jobs GROUP BY job_type
+        )`, [...laneParams, now, ...pausedTypes, ...laneParams], {
+            onRow: row => {
+                const type = row.getResultByIndex(0);
+                if (type === null) {
+                    stats.pending = Number(row.getResultByIndex(1));
+                    stats.available = Number(row.getResultByIndex(2));
+                    stats.attachments = Number(row.getResultByIndex(3));
+                    stats.dead = Number(row.getResultByIndex(4));
+                    stats.deferred = stats.pending - stats.available;
+                } else stats.byJobType[type] = Number(row.getResultByIndex(1));
+            },
+        });
+        return stats;
+    }
+
+    private async selectBackgroundJobs(
+        sql: string,
+        params: any[] = [],
+    ): Promise<BackgroundJobRecord[]> {
+        const rows: BackgroundJobRecord[] = [];
+        await this.queryAsync(sql, params, {
+            onRow: (row: any) => {
+                const contentKind = row.getResultByIndex(5);
+                const payloadJson = row.getResultByIndex(8);
+                const payload = parseBackgroundJobPayload(contentKind, payloadJson);
+                rows.push({
+                    id: row.getResultByIndex(0),
+                    jobType: row.getResultByIndex(1) as BackgroundJobType,
+                    libraryId: row.getResultByIndex(2),
+                    itemId: row.getResultByIndex(3) ?? null,
+                    zoteroKey: row.getResultByIndex(4),
+                    contentKind: contentKind as ExtractContentKind,
+                    payloadKind: row.getResultByIndex(6) as DocumentCachePayloadKind,
+                    priority: row.getResultByIndex(7),
+                    payload,
+                    enqueuedAt: row.getResultByIndex(9),
+                    availableAt: row.getResultByIndex(10),
+                    attemptCount: row.getResultByIndex(11),
+                    lastError: row.getResultByIndex(12) ?? null,
+                });
+            },
+        });
+        return rows;
+    }
+}

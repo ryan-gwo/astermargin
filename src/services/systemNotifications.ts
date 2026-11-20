@@ -1,0 +1,394 @@
+/**
+ * OS-native system notifications for events the user may miss while working
+ * outside the AsterMargin UI.
+ *
+ * Five events are surfaced:
+ *   - Deferred approval requests (note edit, metadata change, cost
+ *     confirmation, ...): the approval UI only renders inside the AsterMargin
+ *     sidebar, so if the user is elsewhere the task stalls waiting for a
+ *     decision (see notifyApprovalRequest).
+ *   - User questions (ask_user_question tool): the question panel only renders
+ *     inside the sidebar, so the run stalls until the user answers and a user
+ *     working elsewhere has no signal it is waiting (see notifyUserQuestion).
+ *   - Credit confirmations: the run pauses on a spending decision that can only
+ *     be answered in the sidebar (see notifyCreditConfirmation).
+ *   - Batch approvals: the run pauses before a batch starts changing the
+ *     library, and the card only renders in the sidebar (see
+ *     notifyBatchApproval).
+ *   - Completed responses: the reply only renders inside the sidebar, so a
+ *     user working elsewhere has no signal it is ready (see notifyRunComplete).
+ *
+ * All are gated on whether the user can currently see the AsterMargin UI. Three
+ * visibility scenarios are handled (see getAsterMarginVisibility):
+ *   A) AsterMargin UI is on screen and focused  -> no notification (user sees it).
+ *   B) A Zotero window is focused but AsterMargin is not visible -> no
+ *      notification: the run status popup in the main window's corner
+ *      (react/components/runStatusPopup) reports the event there.
+ *   C) Zotero is in the background -> system notification (only way to reach
+ *      the user).
+ *
+ * Clicking a notification focuses the Zotero/AsterMargin window and opens the
+ * AsterMargin sidebar so the user lands directly on the pending approval or reply.
+ */
+
+import { tryGetWindowRuntime } from '../../react/runtime/windowRuntime';
+
+import { config } from "../../package.json";
+import { logger } from "@astermargin/agent-core/platform/logger";
+import { getPref } from "../utils/prefs";
+import { store } from "../../react/store";
+import { isSidebarVisibleAtom } from "../../react/atoms/ui";
+import { AsterMarginUIFactory } from "../ui/ui";
+import {
+    WSAskUserQuestionRequest,
+    WSBatchApprovalRequest,
+    WSCreditConfirmationRequest,
+    WSDeferredApprovalRequest,
+} from "@astermargin/agent-core/protocol/agentProtocol";
+
+type AsterMarginVisibility = "astermargin-visible" | "zotero-focused" | "zotero-unfocused";
+
+const NOTIFICATION_ICON = `chrome://${config.addonRef}/content/icons/astermargin.png`;
+
+// Stable alert names: a new notification with the same name replaces the
+// previous one instead of stacking, so parallel approvals (or back-to-back
+// responses) never pile up. Separate names keep approval and response-ready
+// notifications from replacing each other.
+const APPROVAL_NOTIFICATION_NAME = "astermargin-approval";
+const QUESTION_NOTIFICATION_NAME = "astermargin-question";
+const CREDIT_CONFIRMATION_NOTIFICATION_NAME = "astermargin-credit-confirmation";
+const BATCH_APPROVAL_NOTIFICATION_NAME = "astermargin-batch-approval";
+const RUN_COMPLETE_NOTIFICATION_NAME = "astermargin-run-complete";
+
+// Notification bodies are one-liners in the OS shell; longer copy is elided
+// rather than wrapped. The card in the sidebar carries the full text.
+const MAX_BODY_CHARS = 160;
+
+// Parallel tool calls can queue several approvals in the same tick. Collect
+// them for a short window and surface a single notification with a count.
+const COALESCE_WINDOW_MS = 400;
+
+let queuedApprovals: WSDeferredApprovalRequest[] = [];
+let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Determine whether the user can currently see the AsterMargin UI.
+ */
+function getAsterMarginVisibility(): AsterMarginVisibility {
+    let mainWindowFocused = false;
+    try {
+        const mainWindow = tryGetWindowRuntime()?.hostWindow;
+        mainWindowFocused = mainWindow?.document?.hasFocus?.() === true;
+    } catch {
+        // Ignore — treat as not focused
+    }
+
+    let astermarginWindowFocused = false;
+    try {
+        const astermarginWindow = AsterMarginUIFactory.findAsterMarginWindow();
+        astermarginWindowFocused = astermarginWindow != null && !astermarginWindow.closed &&
+            astermarginWindow.__astermarginOwnerWindowRef?.deref() === tryGetWindowRuntime()?.hostWindow &&
+            astermarginWindow.document?.hasFocus?.() === true;
+    } catch {
+        // Ignore — treat as not focused
+    }
+
+    const sidebarVisible = store.get(isSidebarVisibleAtom) === true;
+
+    // Scenario A: the approval UI is in front of the user.
+    if (astermarginWindowFocused || (mainWindowFocused && sidebarVisible)) {
+        return "astermargin-visible";
+    }
+
+    // Scenario B: a Zotero window is focused, but AsterMargin is not visible.
+    if (mainWindowFocused) {
+        return "zotero-focused";
+    }
+
+    // Scenario C: Zotero is in the background.
+    return "zotero-unfocused";
+}
+
+/**
+ * Whether an event that stalls waiting for the user should surface an
+ * OS-native notification: the user opted in, and the AsterMargin UI is not already
+ * in front of them.
+ */
+function shouldNotifySystem(): boolean {
+    if (getPref("enableSystemNotifications") !== true) {
+        return false;
+    }
+
+    switch (getAsterMarginVisibility()) {
+        case "astermargin-visible":
+            // Scenario A: the pending UI is already on screen — nothing to do.
+            return false;
+        case "zotero-focused":
+            // Scenario B: Zotero is focused but AsterMargin is not visible. The run
+            // status popup in the main window's corner
+            // (react/components/runStatusPopup) already shows the pending
+            // decision or the finished response there, with its controls, so
+            // an OS notification on top of it would say the same thing twice.
+            return false;
+        case "zotero-unfocused":
+            // Scenario C: Zotero is in the background.
+            return true;
+    }
+}
+
+/**
+ * Human-readable notification text for an approval request.
+ */
+function describeApproval(event: WSDeferredApprovalRequest): { title: string; body: string } {
+    const title = "AsterMargin needs your approval";
+    switch (event.action_type) {
+        case "confirm_extraction":
+            return { title, body: "Approve text extraction to let the task continue." };
+        case "confirm_external_search":
+            return { title, body: "Approve an external literature search to let the task continue." };
+        case "edit_note":
+        case "edit_note_batch":
+            return { title, body: "Review a note edit to let the task continue." };
+        case "edit_annotations":
+            return { title, body: "Review an annotation change to let the task continue." };
+        case "edit_metadata":
+            return { title, body: "Review a metadata change to let the task continue." };
+        default:
+            return { title, body: "A task is waiting for your decision." };
+    }
+}
+
+/**
+ * Notification text for one or more queued approval requests. A single request
+ * gets a specific message; a burst collapses into a count.
+ */
+function describeApprovals(events: WSDeferredApprovalRequest[]): { title: string; body: string } {
+    if (events.length === 1) {
+        return describeApproval(events[0]);
+    }
+    return {
+        title: "AsterMargin needs your approval",
+        body: `${events.length} actions are waiting for your decision.`,
+    };
+}
+
+/**
+ * Focus the AsterMargin UI: raise the separate window if open, otherwise focus the
+ * main Zotero window and open the sidebar.
+ */
+function focusAsterMargin(): void {
+    try {
+        const astermarginWindow = AsterMarginUIFactory.findAsterMarginWindow();
+        if (astermarginWindow && !astermarginWindow.closed && astermarginWindow.__astermarginOwnerWindowRef?.deref() === tryGetWindowRuntime()?.hostWindow) {
+            astermarginWindow.focus();
+            return;
+        }
+
+        const mainWindow = tryGetWindowRuntime()?.hostWindow;
+        if (!mainWindow) return;
+        mainWindow.focus();
+
+        const eventBus = (mainWindow as any).__astermarginEventBus;
+        if (eventBus) {
+            eventBus.dispatchEvent(
+                new (mainWindow as any).CustomEvent("toggleChat", {
+                    detail: { forceOpen: true },
+                }),
+            );
+        }
+    } catch (error) {
+        logger(`systemNotifications: Failed to focus AsterMargin: ${error}`, 1);
+    }
+}
+
+/**
+ * Show an OS-native notification that focuses AsterMargin when clicked. `name`
+ * groups replaceable notifications: a later notification with the same name
+ * replaces the earlier one instead of stacking.
+ */
+function showNotification(title: string, body: string, name: string): void {
+    try {
+        const alertsService = (Components.classes as any)["@mozilla.org/alerts-service;1"]
+            .getService(Components.interfaces.nsIAlertsService);
+
+        const listener = {
+            observe(_subject: unknown, topic: string) {
+                if (topic === "alertclickcallback") {
+                    focusAsterMargin();
+                    // Dismiss the notification so it does not linger (e.g. in the
+                    // macOS Notification Center) after the user has acted on it.
+                    try {
+                        alertsService.closeAlert(name);
+                    } catch {
+                        // Best-effort: the OS usually clears the clicked alert itself.
+                    }
+                }
+            },
+        };
+
+        // `showAlert` + `nsIAlertNotification` works on every supported Zotero;
+        // the older `showAlertNotification` shorthand is gone in Firefox 153.
+        const alert = (Components.classes as any)["@mozilla.org/alert-notification;1"]
+            .createInstance(Components.interfaces.nsIAlertNotification);
+        alert.init(
+            name, // shared name so notifications replace, never stack
+            NOTIFICATION_ICON,
+            title,
+            body,
+            true, // text clickable
+            "", // cookie (unused — the click handler always focuses AsterMargin)
+        );
+        alertsService.showAlert(alert, listener);
+    } catch (error) {
+        // System notifications are best-effort; the in-sidebar UI remains the
+        // source of truth.
+        logger(`systemNotifications: Failed to show notification: ${error}`, 1);
+    }
+}
+
+/**
+ * Show an OS-native notification for one or more pending approval requests.
+ */
+function showSystemNotification(events: WSDeferredApprovalRequest[]): void {
+    if (events.length === 0) return;
+    const { title, body } = describeApprovals(events);
+    showNotification(title, body, APPROVAL_NOTIFICATION_NAME);
+}
+
+/**
+ * Surface the approvals collected during the coalescing window as one
+ * notification, then reset for the next batch.
+ */
+function flushQueuedApprovals(): void {
+    coalesceTimer = null;
+    const events = queuedApprovals;
+    queuedApprovals = [];
+    showSystemNotification(events);
+}
+
+/**
+ * Decide whether to surface a system notification for a pending approval
+ * request, based on whether the user can currently see the AsterMargin UI.
+ */
+export function notifyApprovalRequest(event: WSDeferredApprovalRequest): void {
+    if (!shouldNotifySystem()) {
+        return;
+    }
+
+    // Coalesce a burst of parallel approvals into a single notification. The
+    // window opens on the first queued request and flushes everything together.
+    queuedApprovals.push(event);
+    if (coalesceTimer === null) {
+        coalesceTimer = setTimeout(flushQueuedApprovals, COALESCE_WINDOW_MS);
+    }
+}
+
+/**
+ * Notification text for a pending user question. A single question shows its
+ * text directly; a burst of questions collapses into a count.
+ */
+function describeQuestions(event: WSAskUserQuestionRequest): { title: string; body: string } {
+    const title = "AsterMargin has a question";
+    const questions = event.questions ?? [];
+    if (questions.length <= 1) {
+        const question = questions[0]?.question?.trim();
+        return {
+            title,
+            body: question && question.length > 0
+                ? question
+                : "Answer a question to let the task continue.",
+        };
+    }
+    return {
+        title,
+        body: `${questions.length} questions are waiting for your answer.`,
+    };
+}
+
+/**
+ * Surface a system notification when the agent asks the user a question
+ * and the user can't currently see the AsterMargin UI.
+ */
+export function notifyUserQuestion(event: WSAskUserQuestionRequest): void {
+    if (!shouldNotifySystem()) {
+        return;
+    }
+
+    const { title, body } = describeQuestions(event);
+    showNotification(title, body, QUESTION_NOTIFICATION_NAME);
+}
+
+/** Shorten a body to one notification-sized line. */
+function truncateBody(text: string): string {
+    const cleaned = text.replace(/\s+/g, " ").trim();
+    return cleaned.length > MAX_BODY_CHARS
+        ? `${cleaned.slice(0, MAX_BODY_CHARS - 1).trimEnd()}…`
+        : cleaned;
+}
+
+/**
+ * Surface a system notification when a run pauses for a credit confirmation
+ * and the user can't currently see the AsterMargin UI.
+ *
+ * The title and body are the backend's own copy — this path composes no
+ * wording of its own, exactly as the card does.
+ */
+export function notifyCreditConfirmation(event: WSCreditConfirmationRequest): void {
+    if (!shouldNotifySystem()) {
+        return;
+    }
+
+    // Keep notification copy consistent with the backend-provided card text.
+    showNotification(
+        event.title,
+        truncateBody(event.message),
+        CREDIT_CONFIRMATION_NOTIFICATION_NAME,
+    );
+}
+
+/**
+ * Surface a system notification when a run pauses for a batch approval and the
+ * user can't currently see the AsterMargin UI.
+ *
+ * The title and body are the backend's own copy — this path composes no
+ * wording of its own, exactly as the card does.
+ *
+ * The body is the batch goal. The destructive warning stays on the card: it is
+ * a separate claim about what will be removed, it only reads as one in its own
+ * block, and appending it here would both invent a combined sentence and risk
+ * eliding a destruction claim mid-word at the one-line limit.
+ */
+export function notifyBatchApproval(event: WSBatchApprovalRequest): void {
+    if (!shouldNotifySystem()) {
+        return;
+    }
+
+    showNotification(
+        event.title,
+        truncateBody(event.message),
+        BATCH_APPROVAL_NOTIFICATION_NAME,
+    );
+}
+
+/**
+ * Surface a system notification when a response finishes and the user can't
+ * currently see the AsterMargin UI (working in another app, or Zotero focused but
+ * the sidebar hidden). Clicking opens AsterMargin on the completed response.
+ */
+export function notifyRunComplete(): void {
+    if (getPref("enableResponseCompleteNotifications") !== true) {
+        return;
+    }
+
+    // Only scenario C (Zotero in the background) is notified: in A the
+    // response is on screen, and in B the run status popup reports it.
+    if (getAsterMarginVisibility() !== "zotero-unfocused") {
+        return;
+    }
+
+    showNotification(
+        "AsterMargin finished",
+        "Your response is ready. Click to open AsterMargin.",
+        RUN_COMPLETE_NOTIFICATION_NAME,
+    );
+}

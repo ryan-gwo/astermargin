@@ -1,0 +1,519 @@
+import { regenerateFromRunAtom } from './atoms/agentRunAtoms';
+import { threadAdmissionAtom, threadConflictAtom } from './runtime/threadAdmission';
+import { openPreferencesWindow } from './ui/openPreferencesWindow';
+import { attachThreadAdmission } from "./runtime/threadAdmission";
+import { threadEntitiesAtom } from './atoms/threadList';
+import { currentThreadIdAtom, currentThreadNameAtom, activeRunAtom } from '@astermargin/agent-core/run-state/atoms';
+import { sendWSMessageAtom, closeWSConnectionAtom } from './atoms/agentRunAtoms';
+import { loadThreadAtom, newThreadAtom } from './atoms/threads';
+import { userIdAtom } from './atoms/auth';
+import { attachThreadProjection } from './runtime/threadProjection';
+import type { WSAgentActionExecuteRequest } from '@astermargin/agent-core/protocol/agentProtocol';
+import { ZOTERO_AGENT_NAME, ZOTERO_PLUGIN_CLIENT_TYPE } from '@astermargin/agent-core/protocol/agentProtocol';
+import { getTransportConfigurationError, setTransportConfig } from '@astermargin/agent-core/transport/config';
+import { setBackendAccessPolicy } from '@astermargin/agent-core/transport/backendAccessPolicy';
+import { setCredentialAdapter } from '@astermargin/agent-core/transport/credentials';
+import { setSupabaseClientProvider } from '@astermargin/agent-core/transport/supabaseClient';
+import { setThreadAgentName } from '@astermargin/agent-core/transport/threadService';
+import type { ActionCategoryFilter } from '@astermargin/agent-core/types/actions';
+import { setActionClient } from '@astermargin/agent-core/types/actions';
+import React from 'react';
+import type { WindowRuntime } from '../src/runtime/instance';
+import { registerTableLocalCommands } from '../src/services/artifacts/tableStore';
+import { activateStoredCitation } from './host/zotero/citationActivation';
+import { handleAgentActionExecuteRequest } from '../src/services/agentDataProvider/handleAgentActionExecuteRequest';
+import { registerZoteroBusyContext } from '../src/services/busyContext';
+import { registerZoteroSyncPause } from '../src/services/syncPause';
+import { registerZoteroClientIdentity } from '../src/services/zoteroClientIdentity';
+import { createZoteroDataProvider, registerZoteroDataProvider } from '../src/services/zoteroDataProvider';
+import { configurePDFForAsterMargin } from '../src/utils/configurePDFForAsterMargin';
+import { registerZoteroLibraryIdentity } from '../src/utils/libraryIdentity';
+import type { AgentAction } from './agents/agentActions';
+import { closeWSConnectionForShutdownAtom } from './atoms/agentRunAtoms';
+import { buildZoteroApplicationState } from './atoms/applicationState';
+import { sessionAtom } from './atoms/auth';
+import { isBackgroundWorkerRunningAtom } from './atoms/backgroundExtraction';
+import { currentMessageContentAtom, currentReaderAttachmentAtom, currentMessageItemsAtom, addItemToCurrentMessageItemsAtom, removeItemFromMessageAtom } from './atoms/messageComposition';
+import { allRunsAtom } from '@astermargin/agent-core/run-state/atoms';
+import { flattenRunParts, selectRunForInspection } from './runtime/runPartsInspector';
+import { threadWarningsAtom } from './atoms/warnings';
+import { isTableToolName } from '@astermargin/agent-core/run-state/tableResults';
+import { selectedModelAtom, validateSelectedModelAtom } from './atoms/models';
+import { isLocalMode } from './atoms/localMode';
+import { preferencesRevisionAtom } from './atoms/preferences';
+import { accountGenerationAtom, accountRevisionAtom, isProfileLoadedAtom, profileWithPlanAtom, searchableLibraryIdsAtom } from './atoms/profile';
+import { runStatusPopupEnabledAtom } from './atoms/runStatusPopup';
+import { isLibraryTabAtom, isSidebarVisibleAtom, PreferencePageTab, selectedZoteroTabIdAtom } from './atoms/ui';
+import { currentNoteItemAtom } from './atoms/zoteroContext';
+import FloatingPopupRoot from './components/FloatingPopupRoot';
+import PreferencesWindow from './components/PreferencesWindow';
+import WindowSidebar from './components/WindowSidebar';
+import TableTabView, { type TableViewCommands } from './components/tables/TableTabView';
+import type { TableRef } from '../src/services/artifacts/tableItemIdentity';
+import type { TableFocusTarget, TableTabHandle, TableTabMountOptions, TableTabRequest } from '../src/ui/tableTabTypes';
+import { eventManager } from './events/eventManager';
+import { useAuth } from './hooks/useAuth';
+import { useBackgroundProcessingStatus } from './hooks/useBackgroundProcessingStatus';
+import { useBackgroundProcessingWelcome } from './hooks/useBackgroundProcessingWelcome';
+import { useBackgroundWorkerStatus } from './hooks/useBackgroundWorkerStatus';
+import { useContextMenuActionHandler } from './hooks/useContextMenuActionHandler';
+import { useEmbeddingIndex } from './hooks/useEmbeddingIndex';
+import { registerWindowTestCommands } from './hooks/useHttpEndpoints';
+import { useInterruptedThreadPopup } from './hooks/useInterruptedThreadPopup';
+import { useOnboardingPopups } from './hooks/useOnboardingPopups';
+import { useProfileSync } from './hooks/useProfileSync';
+import { useReaderAnnotationActionHandler } from './hooks/useReaderAnnotationActionHandler';
+import { useReaderSelectionActionHandler } from './hooks/useReaderSelectionActionHandler';
+import { useReaderTabSelection } from './hooks/useReaderTabSelection';
+import { useReaderVisualizerActionHandler } from './hooks/useReaderVisualizerActionHandler';
+import { useRunStatusTip } from './hooks/useRunStatusTip';
+import { useNoteExportTip } from './hooks/useNoteExportTip';
+import { useSyncSuppression } from './hooks/useSyncSuppression';
+import { useThreadProtocolHandler } from './hooks/useThreadProtocolHandler';
+import { useToggleSidebar } from './hooks/useToggleSidebar';
+import { useUpgradeHandler } from './hooks/useUpgradeHandler';
+import { useZoteroContext } from './hooks/useZoteroContext';
+import { useZoteroTabSelection } from './hooks/useZoteroTabSelection';
+import { registerZoteroHost } from './host/zotero';
+import { attachAccountProjection } from './runtime/accountProjection';
+import { openNote, openReader } from './runtime/navigation';
+import { captureOperationContext } from './runtime/operationContext';
+import { getContextWindow, getWindowRuntime, initializeWindowRuntime } from './runtime/windowRuntime';
+import { store } from './store';
+import { renderSidebar } from './ui/sidebarMount';
+import { uiManager } from './ui/UIManager';
+import { mountedSurfaceCount, mountSurface, unmountAllSurfaces, unmountFromElement } from './ui/surfaceRoots';
+import { AsterMarginTemporaryAnnotations } from './utils/annotationUtils';
+import { undoEditNoteOrBatchAction } from './utils/editNoteActions';
+import { addPopupMessageAtom } from './utils/popupMessageUtils';
+import { selectItemById } from './utils/selectItem';
+
+// Configure the PDF package (webpack bundle copy). The esbuild bundle
+// configures its own copy from `src/hooks.ts`. Both must run because each
+// bundle has its own module-scope config in `src/astermargin-extract/config.ts`.
+// The cross-bundle `MuPDFWorkerClient` per-name singletons are shared via
+// `Zotero.__astermarginMuPDFWorkerClient_hot` / `_background` regardless.
+configurePDFForAsterMargin();
+
+// Register the Zotero client host so rendered chat-history components can
+// resolve host-specific navigation and data lookups. Non-Zotero clients omit
+// this and run the render surface with the default empty host.
+registerZoteroHost();
+
+// Register the Zotero agent data-provider as the default for AgentService and
+// ProviderConnection. Must run before either singleton serves its first
+// WebSocket data request (both resolve their provider lazily on first use, so
+// this only needs to land before that point, not before module load).
+registerZoteroDataProvider(options => createZoteroDataProvider({
+    ...options,
+    operationContext: () => captureOperationContext(options?.source !== "provider"),
+}));
+
+// Register the Zotero library-identity resolvers: the object-id resolver used
+// by citation and note-reference parsing (citationGrammar.ts) to resolve a
+// portable library_ref to this device's local library_id, and the reverse
+// lookup that stamps a local library_id with its portable ref. Must run before
+// any note or citation is read.
+registerZoteroLibraryIdentity();
+
+// Register the Zotero client identity provider used to build the auth
+// handshake's frontend_version/client_type/client_features/zotero_instance
+// fields. Must run before ProviderConnection opens its first connection.
+registerZoteroClientIdentity();
+
+// Declare the client actions are gated on, so a shared action declaring which
+// clients it supports is matched against this one. The esbuild bundle registers
+// the same value from `src/hooks.ts` for its own copy of that module state.
+setActionClient(ZOTERO_PLUGIN_CLIENT_TYPE);
+
+// Scope every thread list to the Zotero agent, matching the agent name the
+// backend stamps on threads this client creates. Without it the list would
+// also show threads created by the user's other AsterMargin clients.
+setThreadAgentName(ZOTERO_AGENT_NAME);
+
+const instanceAccount = Zotero.AsterMargin.account;
+if (!instanceAccount) throw new Error('Instance account service unavailable');
+// Register the backend endpoints. The `process.env` reads live here rather
+// than in the transport layer because they only work under a bundler that
+// substitutes them at build time; other hosts resolve the same values at
+// runtime. Must run before the first backend request or Supabase client use.
+setTransportConfig({
+    apiBaseUrl: process.env.API_BASE_URL ?? '',
+    supabaseUrl: process.env.SUPABASE_URL ?? '',
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY ?? '',
+}, instanceAccount.getTransportConfig());
+setSupabaseClientProvider(() => instanceAccount.client);
+setCredentialAdapter({
+    auth: instanceAccount.auth,
+    getGeneration: () => instanceAccount.getGeneration(),
+    reportSessionRejected: generation => { void instanceAccount.reportSessionRejected(generation); },
+});
+// Local mode reaches no AsterMargin server. Same probe as the plugin realm's, so
+// both bundles' copies of the transport layer agree: it answers from the
+// value at bundle load, which local mode is fixed to, and so keeps blocking
+// after the plugin object is torn down.
+const backendBlockedForLocalMode = isLocalMode();
+setBackendAccessPolicy(() => !backendBlockedForLocalMode);
+// Local mode never receives the backend model list, so a remembered hosted
+// model cannot run; fall back to a custom one before the first send.
+if (isLocalMode()) store.set(validateSelectedModelAtom);
+
+// Register the Zotero busy-context snapshot attached to outgoing WS
+// diagnostics, and the sync-pause resume handler released when a mutating
+// data request settles. Both are optional niceties (diagnostics, and
+// suppressing Zotero's own sync) rather than requirements for a correct
+// agent run, but the Zotero plugin always provides them.
+registerZoteroBusyContext();
+registerZoteroSyncPause();
+
+/**
+ * Initializes hooks once per main-window renderer and populates its local store.
+ */
+const GlobalContextInitializer = () => {
+    // Handle Supabase authentication
+    useAuth();
+
+    // Handle embedding index
+    useEmbeddingIndex();
+
+    // Handle plugin upgrade tasks
+    useUpgradeHandler();
+
+    // Suppress Zotero auto-sync while mutating agent runs are active.
+    useSyncSuppression();
+
+    // Realtime listener for user profile
+    useProfileSync();
+
+    // Control visibility of the sidebar (e.g., setup global listeners/state)
+    useToggleSidebar();
+
+    // Handle zotero://astermargin protocol links (thread deep-linking)
+    useThreadProtocolHandler();
+
+    // Handle context menu actions dispatched from Zotero 8 MenuManager
+    useContextMenuActionHandler();
+
+    // Handle reader text selection actions (Explain / Ask)
+    useReaderSelectionActionHandler();
+
+    // Handle reader annotation context menu actions (Explain / Ask)
+    useReaderAnnotationActionHandler();
+
+    // Handle dev-only extraction visualizer actions from the reader menu
+    useReaderVisualizerActionHandler();
+
+    // Handle first-install and first-reader onboarding popups
+    useOnboardingPopups();
+
+    // Offer to reopen a chat that was cut off when AsterMargin last shut down
+    useInterruptedThreadPopup();
+
+    // One-time tip that the corner card follows a run while the sidebar is closed
+    useRunStatusTip();
+
+    // One-time tip about exporting, once AsterMargin has created a note
+    useNoteExportTip();
+
+    // Mirror background extraction activity into the shared Jotai store
+    useBackgroundWorkerStatus();
+
+    useBackgroundProcessingWelcome();
+
+    // Command readiness follows the subscription effects above, not createRoot().render().
+    React.useEffect(() => {
+        const runtime = getWindowRuntime();
+        if (runtime.status === "attaching") runtime.status = "ready";
+    }, []);
+
+    const runtime = getWindowRuntime();
+    const [contextRevision, setContextRevision] = React.useState(0);
+    React.useEffect(() => {
+        const changed = () => setContextRevision((value) => value + 1);
+        runtime.events.addEventListener("contextWindowChanged", changed);
+        return () =>
+            runtime.events.removeEventListener("contextWindowChanged", changed);
+    }, [runtime]);
+    return <ZoteroContextInitializer key={contextRevision} />;
+};
+
+function ZoteroContextInitializer() {
+    useZoteroTabSelection();
+    useZoteroContext();
+    useReaderTabSelection();
+    return null;
+}
+
+/**
+ * Renders the GlobalContextInitializer into a dedicated DOM element.
+ * This should be called once per window.
+ */
+export function renderGlobalInitializer(domElement: HTMLElement) {
+    return mountSurface(domElement, <GlobalContextInitializer />);
+}
+
+/**
+ * Creates and renders a main window's sidebar, once. It serves library and
+ * reader tabs alike (see `react/ui/sidebarMount.tsx`).
+ */
+export { renderSidebar };
+
+/**
+ * Renders the WindowSidebar into the separate AsterMargin window.
+ * Uses this renderer’s own store and chat connection.
+ */
+export function renderWindowSidebar(domElement: HTMLElement) {
+    return mountSurface(domElement, <WindowSidebar />);
+}
+
+/**
+ * Renders a stored table into a AsterMargin tab of this main window
+ * (`src/ui/tableTab.ts` owns the tab and calls this), or into a table window
+ * (`src/ui/tableWindow.ts`, with `surface: 'window'`). The handle carries the
+ * open's warning in after the mount, without remounting the table, and the
+ * native menus' commands and state.
+ */
+export function renderTableTab(
+    domElement: HTMLElement,
+    tableRef: TableRef,
+    options: TableTabMountOptions,
+): TableTabHandle {
+    let warning: string | null = null;
+    const listeners = new Set<() => void>();
+    const reloadListeners = new Set<() => void>();
+    const focusListeners = new Set<(target: TableFocusTarget) => void>();
+    const requestListeners = new Set<(request: TableTabRequest) => void>();
+    const selectionListeners = new Set<() => void>();
+    const commands = React.createRef<TableViewCommands>();
+    const warnings = {
+        get: () => warning,
+        subscribe(listener: () => void) {
+            listeners.add(listener);
+            return () => { listeners.delete(listener); };
+        },
+        onReload(listener: () => void) {
+            reloadListeners.add(listener);
+            return () => { reloadListeners.delete(listener); };
+        },
+        onFocus(listener: (target: TableFocusTarget) => void) {
+            focusListeners.add(listener);
+            return () => { focusListeners.delete(listener); };
+        },
+        onRequest(listener: (request: TableTabRequest) => void) {
+            requestListeners.add(listener);
+            return () => { requestListeners.delete(listener); };
+        },
+        onSelectionChange(listener: () => void) {
+            selectionListeners.add(listener);
+            return () => { selectionListeners.delete(listener); };
+        },
+    };
+    mountSurface(domElement, <TableTabView tableRef={tableRef} options={options} warnings={warnings} commandsRef={commands} />);
+    return {
+        setWarning(next) {
+            if (next === warning) return;
+            warning = next;
+            for (const listener of listeners) listener();
+        },
+        reload() {
+            for (const listener of reloadListeners) listener();
+        },
+        focus(target) {
+            for (const listener of focusListeners) listener(target);
+        },
+        request(request) {
+            for (const listener of requestListeners) listener(request);
+        },
+        selectionChanged() {
+            for (const listener of selectionListeners) listener();
+        },
+        command(command) {
+            return commands.current?.command(command) ?? false;
+        },
+        menuState() {
+            return commands.current?.menuState() ?? null;
+        },
+    };
+}
+
+/**
+ * Renders the floating popup overlay into the main Zotero window.
+ * Displays notifications independent of the sidebar (bottom-right corner).
+ */
+export function renderFloatingPopup(domElement: HTMLElement) {
+    return mountSurface(domElement, <FloatingPopupRoot />);
+}
+
+/**
+ * Renders the PreferencesWindow into the separate preferences window.
+ * Uses the shared Jotai store for consistent state.
+ */
+export function renderPreferencesWindow(domElement: HTMLElement, initialTab?: PreferencePageTab | null, initialActionsCategoryFilter?: ActionCategoryFilter | null, initialActionId?: string | null) {
+    return mountSurface(domElement, (
+        <PreferencesWindow
+            initialTab={initialTab ?? undefined}
+            initialActionsCategoryFilter={initialActionsCategoryFilter ?? undefined}
+            initialActionId={initialActionId ?? undefined}
+        />
+    ));
+}
+
+export { unmountFromElement };
+
+/**
+ * Dev-only cleanup hook called by the esbuild bundle before React unmounts.
+ */
+export async function cleanupTemporaryAnnotations() {
+    if (process.env.NODE_ENV !== 'development') return;
+    await AsterMarginTemporaryAnnotations.cleanupAll();
+}
+
+/**
+ * Close this window's agent connection. Called synchronously from esbuild
+ * shutdown hooks — must not add an await to teardown.
+ *
+ * `rememberInterruptedThread` records the cut-off thread for the next session
+ * to offer. The caller decides — see `onMainWindowUnload`: closing one of
+ * several windows leaves AsterMargin running, so an offer announcing that it closed
+ * would be plainly wrong.
+ */
+export function closeAgentConnection(
+    reason: string,
+    options?: { rememberInterruptedThread?: boolean },
+) {
+    store.set(closeWSConnectionForShutdownAtom, reason, options);
+}
+
+/** Called by the plugin before mounting any surface. */
+export function initializeRuntime(runtime: WindowRuntime) {
+    registerWindowTestCommands(runtime, inspectRuntime);
+    initializeWindowRuntime(runtime);
+    Zotero.AsterMargin.runtime.addWindowCleanup(runtime, registerTableLocalCommands(runtime.hostWindow, runtime.id, { activateCitation: activateStoredCitation }));
+    runtime.hostWindow.__astermarginJotaiStore = store;
+    if (!getTransportConfigurationError()) attachAccountProjection(runtime);
+    Zotero.AsterMargin.runtime.subscribeWindow(runtime, 'notification:popup', detail => {
+        store.set(addPopupMessageAtom, detail);
+    });
+    // A table window shows one table: it has no chat, so it follows no thread.
+    if (runtime.kind === "table") return;
+    attachThreadProjection(runtime);
+    attachThreadAdmission(runtime);
+}
+
+export function disposeRuntime() {
+    eventManager.dispose();
+    unmountAllSurfaces();
+    uiManager.cleanup();
+}
+
+/** Native menu commands use the owning renderer's chat and preferences context. */
+export async function handleWindowMenuCommand(command: 'new-chat' | 'settings'): Promise<void> {
+    const runtime = getWindowRuntime();
+    if (runtime.status === 'closing' || runtime.hostWindow.closed) return;
+    if (command === 'new-chat') {
+        await store.set(newThreadAtom, { window: runtime.hostWindow });
+    } else if (command === 'settings') {
+        openPreferencesWindow();
+    }
+}
+
+/** Development commands execute inside the target renderer's atom graph. */
+export function inspectRuntime(request?: { runId?: string; command?: string; threadId?: string; text?: string; itemId?: number; draft?: string; mutation?: WSAgentActionExecuteRequest; undo?: AgentAction }) {
+    if (process.env.NODE_ENV !== 'development') return undefined;
+    const runtime = getWindowRuntime();
+    switch (request?.command) {
+        case 'table-conversation': {
+            const model = store.get(selectedModelAtom);
+            return {
+                selectedItems: store.get(currentMessageItemsAtom).map(item => ({ libraryID: item.libraryID, key: item.key })),
+                model: model ? { id: model.id, name: model.name, isCustom: model.is_custom, allowByok: model.allow_byok } : null,
+                runs: store.get(allRunsAtom).slice(-10).map(run => ({
+                    id: run.id, status: run.status, attachments: run.user_prompt.attachments,
+                    tables: run.model_messages.flatMap(message => message.kind === 'request'
+                        ? message.parts.filter(part => part.part_kind === 'tool-return' && isTableToolName(part.tool_name)) : []),
+                })),
+            };
+        }
+        case 'table-attach':
+        case 'table-remove': {
+            if (request.itemId === undefined) return { error: 'item_required' };
+            return Zotero.Items.getAsync(request.itemId).then(async item => {
+                if (!item) return { error: 'item_not_found' };
+                if (request.command === 'table-attach') await store.set(addItemToCurrentMessageItemsAtom, item);
+                else store.set(removeItemFromMessageAtom, item);
+                return { ok: true };
+            });
+        }
+        case 'admission': return { snapshot: store.get(threadAdmissionAtom), conflict: store.get(threadConflictAtom) };
+        case 'surface': return { contextId: runtime.contextWindow?.__astermarginRuntime?.id ?? null };
+        case 'open-preferences': openPreferencesWindow(); return { ok: true };
+        case 'thread-retry':
+            if (!request.runId) return { error: 'run_required' };
+            return store.set(regenerateFromRunAtom, { runId: request.runId }).then(() => ({ ok: true }));
+        case 'thread-cache':
+            return { entities: [...store.get(threadEntitiesAtom).values()] };
+        case 'thread-state':
+            return { id: runtime.id, threadId: store.get(currentThreadIdAtom), name: store.get(currentThreadNameAtom), run: store.get(activeRunAtom), draft: store.get(currentMessageContentAtom), presence: Zotero.AsterMargin.presence.getSnapshot() };
+        case 'run-parts': {
+            const target = selectRunForInspection(store.get(allRunsAtom), request.runId);
+            if (!target) return { error: 'run_not_found' };
+            return {
+                runId: target.id,
+                status: target.status,
+                parts: flattenRunParts(target),
+                warnings: store.get(threadWarningsAtom).filter(w => w.run_id === target.id).map(w => w.type),
+            };
+        }
+        case 'thread-send':
+            return store.set(sendWSMessageAtom, request.text ?? 'Reply with OK.').then(() => ({ ok: true }));
+        case 'thread-stop':
+            return store.set(closeWSConnectionAtom).then(() => ({ ok: true }));
+        case 'thread-load':
+            if (!request.threadId) return { error: 'thread_required' };
+            return store.set(loadThreadAtom, { threadId: request.threadId, user_id: store.get(userIdAtom) ?? '', preserveDraft: true, skipInstanceMismatchConfirm: true });
+        case 'execute-action':
+            if (!request.mutation) return { error: 'mutation_required' };
+            return handleAgentActionExecuteRequest({ ...request.mutation, operation: captureOperationContext() }, {
+                receivedAt: Date.now(), owner: runtime.id, reportPhase: () => {},
+                assertCurrent: () => {
+                    if (runtime.status === 'closing') throw Object.assign(new Error('Window closed'), { code: 'window_unavailable' });
+                },
+            });
+        case 'undo-note-action':
+            if (!request.undo) return { error: 'action_required' };
+            return undoEditNoteOrBatchAction(request.undo).then(() => ({ ok: true }));
+        case 'account-state':
+            return {
+                generation: store.get(accountGenerationAtom), revision: store.get(accountRevisionAtom),
+                authenticated: !!store.get(sessionAtom), profileLoaded: store.get(isProfileLoadedAtom),
+                identityMatches: store.get(sessionAtom)?.user.id === store.get(profileWithPlanAtom)?.user_id,
+                scope: store.get(searchableLibraryIdsAtom), preferencesRevision: store.get(preferencesRevisionAtom),
+                runStatusPopupEnabled: store.get(runStatusPopupEnabledAtom),
+            };
+        case 'open-reader':
+            if (request.itemId === undefined) return { error: 'item_required' };
+            return openReader(request.itemId).then(reader => ({ itemID: reader?.itemID, targetMatches: reader?._window === runtime.hostWindow }));
+        case 'open-note':
+            if (request.itemId === undefined) return { error: 'item_required' };
+            return openNote(request.itemId).then(editor => ({ itemID: editor?.itemID, tabID: editor?.tabID }));
+        case 'context':
+            return buildZoteroApplicationState(store.get);
+        case 'reveal':
+            if (request.itemId === undefined) return { error: 'item_required' };
+            return selectItemById(request.itemId, true, undefined, getContextWindow());
+        case 'draft':
+            if (request.draft !== undefined) store.set(currentMessageContentAtom, request.draft);
+            break;
+    }
+    return {
+        id: runtime.id,
+        draft: store.get(currentMessageContentAtom),
+        visible: store.get(isSidebarVisibleAtom),
+        isLibraryTab: store.get(isLibraryTabAtom),
+        selectedTabId: store.get(selectedZoteroTabIdAtom),
+        hasReaderAttachment: !!store.get(currentReaderAttachmentAtom),
+        noteItemId: store.get(currentNoteItemAtom)?.id ?? null,
+        backgroundRunning: store.get(isBackgroundWorkerRunningAtom),
+        roots: mountedSurfaceCount(),
+    };
+}

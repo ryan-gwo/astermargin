@@ -1,0 +1,217 @@
+import { resolveCollection } from '../../../../src/services/collections/collectionIdentity';
+import { resolveObjectId } from '../../../../src/utils/libraryIdentity';
+import React, { useEffect, useState } from 'react';
+import { CSSIcon, Icon, PlusSignIcon } from '../../../components/icons/icons';
+import { getHost } from '@astermargin/agent-ui/host';
+import { useItemContextMenu } from '@astermargin/agent-ui/chat/useItemContextMenu';
+import type { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import { libraryRefForLibraryID } from '../../../../src/utils/libraryIdentity';
+import { resolveLibraryRef } from '../../../../src/utils/libraryIdentity';
+
+type ActionStatus = 'pending' | 'applied' | 'rejected' | 'undone' | 'error' | 'awaiting';
+
+// Rows render full-width (flush to the card edges) so the hover highlight spans
+// the whole row; content is inset via internal padding. Subcollections indent
+// their content further to convey the parent → child hierarchy.
+const ROW_PADDING = '12px';
+const CHILD_ROW_PADDING = '32px';
+
+interface CreateCollectionPreviewProps {
+    /** Name of the collection to create */
+    name: string;
+    /** Resolved library id (from result_data, current_value, or action data) */
+    libraryId?: number | null;
+    /** Device-portable library identity, authoritative when present. */
+    libraryRef?: string | null;
+    /** Library name, used only to resolve the library when no id is available */
+    libraryName?: string;
+    /** Parent collection key (optional, for subcollections) */
+    parentKey?: string | null;
+    /** Number of items to add (from current_value or item_ids length) */
+    itemCount?: number;
+    /** Current status of the action */
+    status?: ActionStatus;
+    /** Result data (when status is 'applied') */
+    resultData?: {
+        collection_key?: string;
+        collection_id?: string | number;
+        library_ref?: string;
+        items_added?: number;
+    };
+}
+
+/**
+ * Preview component for create_collection actions.
+ * Shows details about the collection that will be created.
+ */
+export const CreateCollectionPreview: React.FC<CreateCollectionPreviewProps> = ({
+    name,
+    libraryId: libraryIdProp,
+    libraryRef,
+    libraryName,
+    parentKey,
+    itemCount = 0,
+    status = 'pending',
+    resultData,
+}) => {
+    const [parentName, setParentName] = useState<string | null>(null);
+    // Resolved library id, used to reveal the collections in the library view.
+    const [libraryId, setLibraryId] = useState<number | null>(null);
+    const [hoveredRow, setHoveredRow] = useState<'new' | 'parent' | null>(null);
+    const { openCollectionMenu, itemMenu } = useItemContextMenu();
+
+    useEffect(() => {
+        if (typeof Zotero === 'undefined') return;
+
+        try {
+            setLibraryId(null);
+            setParentName(null);
+
+            const identity = typeof resultData?.collection_id === 'string' ? resolveObjectId(resultData.collection_id) : null;
+            const resolvedLibraryId = resolveLibraryRef(identity ?? {
+                library_ref: libraryRef,
+                library_id: libraryIdProp,
+            });
+            let library = resolvedLibraryId
+                ? Zotero.Libraries.get(resolvedLibraryId) || undefined
+                : undefined;
+
+            // Name match is case-insensitive to mirror the action handler's resolution.
+            if (!library && !libraryRef && libraryName) {
+                library = Zotero.Libraries.getAll().find(
+                    l => l.name.toLowerCase() === libraryName.toLowerCase()
+                );
+            }
+
+            // Collections without any library reference belong to the user library.
+            if (!library && !libraryRef && libraryIdProp == null && !libraryName) {
+                library = Zotero.Libraries.userLibrary;
+            }
+
+            if (library) {
+                setLibraryId(library.libraryID);
+                if (parentKey) {
+                    const parent = resolveCollection(parentKey, { libraryID: library.libraryID, access: 'local' }).collection;
+                    if (parent) {
+                        setParentName(parent.name);
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn('Failed to resolve collection library/parent name:', e);
+        }
+    }, [parentKey, libraryIdProp, libraryRef, libraryName, resultData?.collection_id]);
+
+    const isApplied = status === 'applied';
+    const isError = status === 'error';
+    const isRejectedOrUndone = status === 'rejected' || status === 'undone';
+
+    // Once the action is applied, the collections exist and can be revealed in
+    // the library view. The newly created collection's key comes from resultData.
+    const newCollectionKey = typeof resultData?.collection_id === 'string' ? resultData.collection_id : resultData?.collection_key;
+    const canRevealNew = isApplied && !!newCollectionKey && libraryId != null;
+    const canRevealParent = isApplied && !!parentKey && libraryId != null;
+
+    const collectionRef = (collectionKey: string): ZoteroItemReference | null => {
+        if (libraryId == null) return null;
+        return resolveObjectId(collectionKey) ?? {
+            library_id: libraryId,
+            zotero_key: collectionKey,
+            library_ref: libraryRef ?? resultData?.library_ref ?? libraryRefForLibraryID(libraryId) ?? undefined,
+        };
+    };
+    const revealCollection = (collectionKey: string) => {
+        const ref = collectionRef(collectionKey);
+        if (ref) getHost().navigation?.revealCollection(ref);
+    };
+    // Right-click offers the same reveal as a click, once the collection exists.
+    const collectionMenuHandler = (collectionKey: string) => (event: React.MouseEvent) => {
+        const ref = collectionRef(collectionKey);
+        if (ref) openCollectionMenu(ref, event);
+    };
+
+    const getNewItemStyles = () => {
+        if (isApplied) return 'bg-transparent';
+        if (isRejectedOrUndone) return 'opacity-60';
+        if (isError) return 'bg-red-50/10';
+        // Pending state - highlight as new
+        return 'bg-green-500/10';
+    };
+
+    return (
+        <div className={`create-collection-preview overflow-hidden ${isRejectedOrUndone ? 'opacity-60' : ''}`}>
+            <div className="display-flex flex-col">
+
+                {/* Full-width clickable rows (flush to the card edges, content inset
+                    via internal padding; subcollections indent their content). */}
+                <div className="display-flex flex-col">
+                    {/* Parent Collection (if exists) */}
+                    {parentKey && (
+                        <div
+                            className={`display-flex flex-row items-center gap-2 py-1 transition-colors duration-150 ${canRevealParent ? 'cursor-pointer' : 'opacity-60'} ${canRevealParent && hoveredRow === 'parent' ? 'bg-quinary' : ''}`}
+                            style={{ paddingLeft: ROW_PADDING, paddingRight: ROW_PADDING }}
+                            onClick={canRevealParent ? () => revealCollection(parentKey) : undefined}
+                            onContextMenu={canRevealParent ? collectionMenuHandler(parentKey) : undefined}
+                            onMouseEnter={canRevealParent ? () => setHoveredRow('parent') : undefined}
+                            onMouseLeave={canRevealParent ? () => setHoveredRow(null) : undefined}
+                            title={canRevealParent ? 'Click to reveal in Zotero' : undefined}
+                        >
+                            <span className="scale-75 display-flex">
+                                <CSSIcon name="collection" className="icon-16" />
+                            </span>
+                            <span className="text-sm font-color-primary truncate">
+                                {parentName || 'Parent Collection'}
+                            </span>
+                        </div>
+                    )}
+
+                    {/* New Collection */}
+                    <div
+                        className={`display-flex flex-row items-center gap-2 py-15 transition-colors duration-150 ${canRevealNew ? 'cursor-pointer' : ''} ${canRevealNew ? (hoveredRow === 'new' ? 'bg-quinary' : 'bg-transparent') : getNewItemStyles()}`}
+                        style={{ paddingLeft: parentKey ? CHILD_ROW_PADDING : ROW_PADDING, paddingRight: ROW_PADDING }}
+                        onClick={canRevealNew ? () => revealCollection(newCollectionKey!) : undefined}
+                        onContextMenu={canRevealNew ? collectionMenuHandler(newCollectionKey!) : undefined}
+                        onMouseEnter={canRevealNew ? () => setHoveredRow('new') : undefined}
+                        onMouseLeave={canRevealNew ? () => setHoveredRow(null) : undefined}
+                        title={canRevealNew ? 'Click to reveal in Zotero' : undefined}
+                    >
+                        <span className="scale-75 display-flex">
+                            <CSSIcon name="collection" className="icon-16" />
+                        </span>
+                        <span className="text-sm font-color-primary font-medium truncate flex-1">
+                            {name}
+                        </span>
+                    </div>
+                </div>
+
+
+                {/* Footer Info */}
+                {itemCount > 0 && (
+                    <div
+                        className="display-flex flex-col gap-1 items-start mt-2 mb-1 text-sm font-color-secondary"
+                        style={{ paddingLeft: ROW_PADDING, paddingRight: ROW_PADDING }}
+                    >
+                        <div className="display-flex flex-row items-center gap-05">
+                            <Icon icon={PlusSignIcon} className="scale-90" />
+                            <span>
+                                {isApplied && resultData?.items_added !== undefined && (
+                                    <span className="ml-1">
+                                        Added {resultData.items_added} item{resultData.items_added !== 1 ? 's' : ''}
+                                    </span>
+                                )}
+                                {!isApplied && itemCount && itemCount > 0 && (
+                                    <span className="ml-1">
+                                        Adding {itemCount} item{itemCount !== 1 ? 's' : ''}
+                                    </span>
+                                )}
+                            </span>
+                        </div>
+                    </div>
+                )}
+            </div>
+            {itemMenu}
+        </div>
+    );
+};
+
+export default CreateCollectionPreview;

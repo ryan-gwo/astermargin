@@ -1,0 +1,735 @@
+/**
+ * Recognising and reading a stored table.
+ *
+ * The half of the stored-table surface that only needs Zotero: the marks that
+ * identify one of ours, where its files live, and how to read `table.json`, the
+ * file that is the table. Creation and every other write live in `tableItem.ts`,
+ * which re-exports everything here so a caller that wants both has one import.
+ *
+ * **The split is load-bearing, not tidiness.** This module is reachable from
+ * `src/hooks.ts`, so it is compiled into the *esbuild* bundle, where React, the
+ * Jotai store and `process` do not exist. `tableItem.ts` reaches the library
+ * exclusion check, which pulls in `agentDataProvider/utils` and from there the
+ * whole `react/` graph — importing it from an esbuild-side module makes the
+ * plugin's bundle throw `process is not defined` on load and the plugin does
+ * not start. Nothing here may import `react/*` or anything that reaches it;
+ * `eslint.config.mjs` enforces that for this whole subsystem.
+ *
+ * Nothing here is gated on library exclusion, and that is deliberate rather
+ * than convenient: exclusion governs writes, indexing and what leaves the
+ * machine, not whether the user may look at something already in their
+ * library.
+ */
+
+import { readSpec, type TableSpec } from '@astermargin/agent-core/layouts/table';
+import type { TableSummary } from '@astermargin/agent-core/layouts/tableMutations';
+import { logger } from '@astermargin/agent-core/platform/logger';
+
+// ---------------------------------------------------------------------------
+// Marks
+// ---------------------------------------------------------------------------
+
+/**
+ * The tag every stored table carries. Automatic (`addTag(name, 1)`) so it stays
+ * out of the user's own tag vocabulary.
+ */
+export const TABLE_TAG = 'astermargin-table';
+
+/**
+ * The row swatch. Zotero paints an emoji tag into the items-tree row, which is
+ * the only row-level marker a plugin can get — `itemTree._getIcon` picks the
+ * icon from the attachment's link mode and takes no plugin input.
+ */
+export const TABLE_EMOJI_TAG = '📊';
+
+/**
+ * Scheme of the item's `url` field. The URL field is required by the import API
+ * and is surfaced in the item pane as the "archived from" link; a generated
+ * table has no web origin, so a AsterMargin-owned scheme is used rather than a
+ * plausible-looking http URL that would misrepresent the item as a capture of a
+ * real page.
+ */
+export const TABLE_URL_PREFIX = 'astermargin://table/';
+
+/** Directory inside the attachment's storage folder for AsterMargin's own sidecars. */
+export const TABLE_SIDECAR_DIR = 'astermargin';
+
+/** The file that is the table, beside the rendered snapshot. */
+export const TABLE_FILE_NAME = 'table.json';
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/**
+ * One vocabulary for everything that can go wrong with a stored table, shared
+ * by creation here and by the store that writes revisions of it: a caller
+ * switching on a code must not have to know which module refused it.
+ */
+export type TableItemErrorCode =
+    | 'operation_mismatch'
+    | 'operation_pending'
+    | 'invalid_request'
+    | 'library_excluded'
+    | 'no_writable_library'
+    /** The library type cannot hold a table. */
+    | 'unsupported_library'
+    | 'invalid_target'
+    | 'import_failed'
+    | 'file_missing'
+    /** No item with that key in that library. */
+    | 'not_found'
+    /** The item exists but is not one of ours. */
+    | 'not_a_table'
+    /** The item carries no readable table. */
+    | 'no_spec'
+    /** Written in a format this build does not read (older or newer). */
+    | 'unsupported_version'
+    /** `table.json` is not a readable table. */
+    | 'invalid_spec'
+    /** `table.json` is gone beside a retained version history. */
+    | 'corrupt'
+    /** The write would grow the table past a limit. */
+    | 'too_large'
+    /** A stored version's file disagrees with what the version log recorded. */
+    | 'version_corrupt'
+    /** An `edit` whose `seq` is older than its session's last commit. */
+    | 'stale_seq'
+    /** A user's write while a fill of the table runs. */
+    | 'fill_running';
+
+export class TableItemError extends Error {
+    readonly code: TableItemErrorCode;
+
+    constructor(message: string, code: TableItemErrorCode) {
+        super(message);
+        this.name = 'TableItemError';
+        this.code = code;
+    }
+}
+
+/**
+ * Whether a library lets AsterMargin write a table's files: item edits and file
+ * edits, since a table is a stored file. Exclusion is checked separately.
+ */
+export function tableFilesEditable(library: { editable: boolean; filesEditable?: boolean } | false | null | undefined): boolean {
+    return !!library && !!library.editable && library.filesEditable !== false;
+}
+
+/**
+ * Whether the store's open repair runs for a table in this library: its files
+ * are editable and the library is not excluded (fail-closed until the library
+ * scope has loaded, as the store's exclusion check is).
+ */
+export function tableRepairAllowed(libraryID: number): boolean {
+    const astermargin = Zotero.AsterMargin;
+    return tableFilesEditable(Zotero.Libraries.get(libraryID))
+        && !!astermargin?.libraryScopeInitialized
+        && (astermargin.searchableLibraryIds ?? []).includes(libraryID);
+}
+
+/** Why a table's bookkeeping stays unrepaired where {@link tableRepairAllowed} is false. */
+export const TABLE_REPAIR_SKIPPED =
+    'This table needs a repair, but AsterMargin does not change tables in a read-only library or one excluded from AsterMargin.';
+
+/** Error constructors differ between the plugin and renderer bundles. */
+export function isTableItemError(error: unknown): error is TableItemError {
+    return !!error && typeof error === 'object'
+        && (error as TableItemError).name === 'TableItemError'
+        && typeof (error as TableItemError).code === 'string'
+        && typeof (error as TableItemError).message === 'string';
+}
+
+// ---------------------------------------------------------------------------
+// Recognising one of ours
+// ---------------------------------------------------------------------------
+
+/**
+ * Slug of a table's `url`, so Zotero derives a readable filename from it:
+ * `_getFileNameFromURL` takes the URL's last path segment and appends the
+ * extension for the content type, giving `<slug>.html` on disk and in the item
+ * pane.
+ */
+export function buildTableUrl(title: string): string {
+    const slug = title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60)
+        .replace(/-+$/g, '');
+    return `${TABLE_URL_PREFIX}${slug || 'table'}`;
+}
+
+/**
+ * The item's `url` field, or null when it cannot be read.
+ *
+ * An attachment's URL lives in `itemData`, which Zotero loads lazily, so this
+ * returns null rather than throwing on an item whose data has not been loaded —
+ * use {@link loadTableItemFields} first when the answer has to be trustworthy.
+ */
+function tableUrlField(item: Zotero.Item): string | null {
+    try {
+        return item.getField('url') || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Loads the fields {@link isTableItem} reads, for callers holding items that
+ * came out of a lazy path (`Zotero.Items.getAsync`, a search).
+ */
+export async function loadTableItemFields(items: Zotero.Item[]): Promise<void> {
+    if (items.length === 0) return;
+    await Zotero.Items.loadDataTypes(items, ['itemData', 'tags']);
+}
+
+/**
+ * Whether this item is a table AsterMargin stored.
+ *
+ * This is only a candidate check. The URL and attachment type narrow local
+ * discovery; explicit access validates the embedded document and identity.
+ * Cosmetic tags are not part of document identity.
+ *
+ * Synchronous. The tag and the attachment properties are on the item; the URL
+ * needs `itemData` loaded — see {@link loadTableItemFields}.
+ */
+export function isTableItem(item: Zotero.Item | null | undefined): boolean {
+    return isTableAttachment(item) && !!item?.hasTag(TABLE_TAG);
+}
+
+/** The primary-data half of {@link isTableAttachment}: a top-level HTML snapshot. */
+function hasTableShape(item: Zotero.Item): boolean {
+    return item.isAttachment()
+        && item.attachmentContentType === 'text/html'
+        && item.isTopLevelItem()
+        && item.attachmentLinkMode === Zotero.Attachments.LINK_MODE_IMPORTED_URL;
+}
+
+/**
+ * Candidate attachment for explicit addressing; the embedded document is checked on read.
+ *
+ * Also the boundary of AsterMargin's document processing: a table is never
+ * extracted, cached or indexed by AsterMargin, because its state is `table.json`
+ * and the snapshot only renders it. Zotero's own full-text index of the
+ * snapshot is separate and unaffected.
+ */
+export function isTableAttachment(item: Zotero.Item | null | undefined): boolean {
+    if (!item || !hasTableShape(item)) return false;
+    return tableUrlField(item)?.startsWith(TABLE_URL_PREFIX) ?? false;
+}
+
+/**
+ * {@link isTableAttachment} for an item from a lazy path (a Notifier event, a
+ * queued job): loads `itemData` first when the item has a table's shape, so
+ * an unloaded table is not mistaken for an ordinary snapshot.
+ */
+export async function loadIsTableAttachment(item: Zotero.Item): Promise<boolean> {
+    if (!hasTableShape(item)) return false;
+    await item.loadDataType('itemData');
+    return isTableAttachment(item);
+}
+
+/** `itemAttachments.linkMode` of `Zotero.Attachments.LINK_MODE_IMPORTED_URL`; a stored value, so fixed. */
+const IMPORTED_URL_LINK_MODE = 1;
+
+/**
+ * SQL condition matching {@link isTableAttachment} over Zotero's
+ * `itemAttachments` table, for scans that must leave tables out without
+ * loading each item. Built from constants only, so it is safe to inline.
+ *
+ * @param alias - alias of the `itemAttachments` table in the query, e.g. `IA`
+ */
+export function tableAttachmentSql(alias: string): string {
+    return `(${alias}.parentItemID IS NULL AND ${alias}.linkMode = ${IMPORTED_URL_LINK_MODE}`
+        + ` AND ${alias}.contentType = 'text/html' AND EXISTS (SELECT 1 FROM itemData TD`
+        + ` JOIN fields TF ON TF.fieldID = TD.fieldID JOIN itemDataValues TV ON TV.valueID = TD.valueID`
+        + ` WHERE TD.itemID = ${alias}.itemID AND TF.fieldName = 'url'`
+        // Not LIKE: Firefox's SQLite layer rejects a LIKE whose pattern is not a bound parameter.
+        + ` AND SUBSTR(TV.value, 1, ${TABLE_URL_PREFIX.length}) = '${TABLE_URL_PREFIX}'))`;
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/**
+ * The attachment's storage directory, which holds the rendered `.html` and
+ * everything AsterMargin keeps beside it. Null when the item has no key yet or the
+ * storage directory cannot be resolved.
+ */
+export function tableStorageDirectory(item: Zotero.Item): string | null {
+    try {
+        return Zotero.Attachments.getStorageDirectory(item).path;
+    } catch (error) {
+        logger(`tableStorageDirectory: ${String(error)}`, 2);
+        return null;
+    }
+}
+
+/** AsterMargin's own subdirectory inside the storage directory. */
+export function tableSidecarDirectory(item: Zotero.Item): string | null {
+    const dir = tableStorageDirectory(item);
+    return dir ? PathUtils.join(dir, TABLE_SIDECAR_DIR) : null;
+}
+
+/** Where `table.json` lives: the storage directory, beside the snapshot. */
+export function tableFilePath(item: Zotero.Item): string | null {
+    const dir = tableStorageDirectory(item);
+    return dir ? PathUtils.join(dir, TABLE_FILE_NAME) : null;
+}
+
+/** Where the edit history goes. */
+export function tableHistoryPath(item: Zotero.Item): string | null {
+    const dir = tableSidecarDirectory(item);
+    return dir ? PathUtils.join(dir, 'history.json') : null;
+}
+
+/** Where retained version `version` of the spec goes once it is no longer the tip. */
+export function tableVersionPath(
+    item: Zotero.Item,
+    version: number
+): string | null {
+    const dir = tableSidecarDirectory(item);
+    return dir ? PathUtils.join(dir, `v${version}.json`) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+/** Who wrote a version a `table.json` marker describes. */
+export interface TableMarkerMeta {
+    actor: 'agent' | 'user' | 'system';
+    run_id?: string;
+    thread_id?: string;
+    change?: string;
+}
+
+/** The identity of a retriable creation, committed with the table. */
+export interface TableCreationState {
+    operation_id: string;
+    request_sha256: string;
+    complete: boolean;
+    meta?: TableMarkerMeta;
+    /** The change list a creation from a request answered with; a replay returns it. */
+    changes?: unknown[];
+}
+
+/**
+ * The newest model edit (`apply_edit`) the table committed, written in the same
+ * `table.json` write as its spec. The version log records the same identity,
+ * but the log is rewritten after the commit point and can be lost; this marker
+ * cannot, so a retry whose log entry never landed still replays instead of
+ * applying the edit again. Later writes carry it until the next model edit
+ * replaces it.
+ */
+export interface TableEditMarker {
+    operation_id: string;
+    request_sha256: string;
+    /** The version the edit committed. */
+    version: number;
+    /** The spec hash of that version. */
+    sha256: string;
+    meta: TableMarkerMeta;
+    /** The change list the edit answered with; a replay returns it. */
+    changes: unknown[];
+}
+
+/**
+ * `table.json`: the spec, and the creation and edit markers that have to
+ * commit atomically with it, kept beside the spec so the spec's own bytes, and
+ * therefore its hash, never include them. Fields written by older builds (a
+ * `receipts` list) are ignored and dropped by the next write.
+ */
+export interface TableFile {
+    spec: TableSpec;
+    creation?: TableCreationState;
+    edit?: TableEditMarker;
+}
+
+export type ReadTableItemResult =
+    | { ok: true; spec: TableSpec; file: TableFile }
+    | {
+          ok: false;
+          code: 'not_a_table' | 'no_file' | 'no_spec' | 'unsupported_version' | 'invalid' | 'corrupt';
+          message: string;
+          specVersion?: number;
+      };
+
+/** `table.json` text as a validated file for `item`, or why it is not one. */
+export function parseTableFile(item: Zotero.Item, text: string): ReadTableItemResult {
+    let raw: unknown;
+    try {
+        raw = JSON.parse(text);
+    } catch (error) {
+        return { ok: false, code: 'invalid', message: `Table ${item.key} is not readable JSON: ${String(error)}` };
+    }
+    return tableFileFrom(item, raw);
+}
+
+/** A parsed `table.json` value as a validated file for `item`, or why it is not one. */
+function tableFileFrom(item: Zotero.Item, raw: unknown): ReadTableItemResult {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, code: 'invalid', message: `Table ${item.key} is not a table file.` };
+    }
+    const creation = creationFrom(item, raw);
+    if (creation && 'error' in creation) return { ok: false, code: 'invalid', message: creation.error };
+    const read = specFor(item, (raw as Partial<TableFile>).spec);
+    if (!read.ok) return read;
+    const edit = editFrom(raw);
+    return {
+        ok: true,
+        spec: read.spec,
+        file: { spec: read.spec, ...(creation ? { creation } : {}), ...(edit ? { edit } : {}) },
+    };
+}
+
+/**
+ * A parsed `table.json` value's edit marker. An unreadable one is dropped
+ * rather than failing the table: it only lets a retry replay, and without it
+ * the version log still can.
+ */
+function editFrom(raw: object): TableEditMarker | undefined {
+    const edit = (raw as Partial<TableFile>).edit;
+    if (
+        !edit || typeof edit !== 'object' ||
+        typeof edit.operation_id !== 'string' ||
+        typeof edit.request_sha256 !== 'string' ||
+        !Number.isInteger(edit.version) || edit.version < 1 ||
+        typeof edit.sha256 !== 'string' ||
+        !edit.meta || typeof edit.meta !== 'object' ||
+        !['agent', 'user', 'system'].includes(edit.meta.actor) ||
+        !Array.isArray(edit.changes)
+    ) {
+        return undefined;
+    }
+    return edit;
+}
+
+/** A parsed `table.json` value's creation marker, checked apart from its spec. */
+function creationFrom(item: Zotero.Item, raw: object): TableCreationState | { error: string } | undefined {
+    const creation = (raw as Partial<TableFile>).creation;
+    if (creation === undefined) return undefined;
+    if (
+        !creation || typeof creation !== 'object' ||
+        typeof creation.operation_id !== 'string' ||
+        typeof creation.request_sha256 !== 'string' ||
+        typeof creation.complete !== 'boolean' ||
+        (creation.changes !== undefined && !Array.isArray(creation.changes))
+    ) {
+        return { error: `Table ${item.key} has an unreadable creation marker.` };
+    }
+    return creation;
+}
+
+/**
+ * The creation marker `table.json` holds, read even when its spec is not, so a
+ * write that replaces an unreadable spec keeps it. Null when the file is
+ * missing, unparseable, or carries no readable marker.
+ */
+export async function readTableFileCreation(item: Zotero.Item): Promise<TableCreationState | null> {
+    const path = tableFilePath(item);
+    if (!path) return null;
+    try {
+        if (!(await IOUtils.exists(path))) return null;
+        const raw: unknown = JSON.parse(await IOUtils.readUTF8(path));
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+        const creation = creationFrom(item, raw);
+        return creation && !('error' in creation) ? creation : null;
+    } catch {
+        return null;
+    }
+}
+
+/** A spec that is readable and says it is this item's. */
+function specFor(item: Zotero.Item, raw: unknown): ReadTableItemResult {
+    const read = readSpec(raw);
+    if (!read.ok) {
+        return read.reason === 'unsupported_version'
+            ? {
+                  ok: false,
+                  code: 'unsupported_version',
+                  specVersion: read.specVersion,
+                  message: `Table ${item.key} was written in another format (spec_version ${read.specVersion}).`,
+              }
+            : { ok: false, code: 'invalid', message: read.detail };
+    }
+    if (read.spec.key !== item.key || !Number.isInteger(read.spec.version) || (read.spec.version ?? 0) < 1)
+        return { ok: false, code: 'invalid', message: 'The table identity does not match its attachment.' };
+    return { ok: true, spec: read.spec, file: { spec: read.spec } };
+}
+
+/**
+ * The stored table, from `table.json`.
+ *
+ * Reading is deliberately not gated on library exclusion: an existing table the
+ * user opens is theirs to look at, and exclusion governs what leaves the
+ * machine, not what the user can see.
+ */
+export async function readTableItemSpec(item: Zotero.Item): Promise<ReadTableItemResult> {
+    await loadTableItemFields([item]);
+    if (!isTableAttachment(item)) {
+        return { ok: false, code: 'not_a_table', message: `Item ${item.key} is not a AsterMargin table.` };
+    }
+    const path = tableFilePath(item);
+    if (!path) {
+        return { ok: false, code: 'no_file', message: `Table ${item.key} has no storage directory.` };
+    }
+    let text: string;
+    try {
+        if (!(await IOUtils.exists(path))) return missingTableFile(item);
+        text = await IOUtils.readUTF8(path);
+    } catch (error) {
+        return { ok: false, code: 'no_file', message: `Table ${item.key} could not be read: ${String(error)}` };
+    }
+    return parseTableFile(item, text);
+}
+
+/**
+ * Why `table.json` is absent: a table whose files have not arrived on this
+ * device yet (`no_file`), a snapshot that carries no table (`no_spec`), or a
+ * table whose file is gone beside a retained history (`corrupt`). The file is
+ * written atomically and syncs with its history, so the last case is damage
+ * from outside; restoring a retained version writes a new `table.json`.
+ */
+async function missingTableFile(item: Zotero.Item): Promise<ReadTableItemResult> {
+    if ((await readTableHistory(item)).versions.length) {
+        return {
+            ok: false,
+            code: 'corrupt',
+            message: `Table ${item.key} has no table.json; recover this device's version or revert to a retained version to repair it.`,
+        };
+    }
+    const snapshot = await item.getFilePathAsync();
+    if (snapshot && (await IOUtils.exists(snapshot))) {
+        return { ok: false, code: 'no_spec', message: `Table ${item.key} carries no table.` };
+    }
+    return { ok: false, code: 'no_file', message: `Table ${item.key} has no file on disk.` };
+}
+
+/**
+ * Whether opening a `no_file` table downloads its files first: file syncing is
+ * on for its library, so the files can still arrive from the server.
+ */
+export function tableFilesDownloadable(item: Zotero.Item): boolean {
+    return Zotero.Sync.Storage.Local.getEnabledForLibrary(item.libraryID);
+}
+
+/** What to show for a `no_file` table: its files are absent or still to come. */
+export function missingTableFileMessage(item: Zotero.Item): string {
+    return tableFilesDownloadable(item)
+        ? 'Table files are not on this device yet. Opening the table downloads them.'
+        : 'Table file is missing on this device.';
+}
+
+// ---------------------------------------------------------------------------
+// The version log
+// ---------------------------------------------------------------------------
+
+/**
+ * Who asked for a write. `tableStore.ts` owns what each value means for
+ * collapsing; the shape lives here because readers on the esbuild side need
+ * to name it without reaching the store.
+ */
+export type TableActor = 'user' | 'agent' | 'system';
+
+/** One entry in the version log. */
+export interface TableVersionEntry {
+    version: number;
+    actor: TableActor;
+    run_id?: string;
+    thread_id?: string;
+    /**
+     * The key consecutive writes collapse under (a fill's job id, a tab
+     * session); see the collapse rule in `tableStore.ts`.
+     */
+    collapse_key?: string;
+    change?: string;
+    /** ISO timestamp of the write. */
+    at: string;
+    /**
+     * SHA-256 of the serialised spec: the bytes of `astermargin/v<N>.json`, or for
+     * the tip, which has no version file, of the spec `table.json` carries.
+     * Not a security claim: it is how a later read notices that a file changed
+     * behind our back (a sync conflict resolved by copying, a hand-edited
+     * sidecar, a write interrupted mid-sequence) rather than silently trusting
+     * it. The store verifies it when opening a table and
+     * refuses to revert to a version that fails it.
+     */
+    sha256: string;
+    /** Size of that file in bytes, for the byte-bounded retention. */
+    bytes?: number;
+    /** `summarize()` of that spec, so listing tables never reads one. */
+    summary: TableSummary;
+    /**
+     * This version may never be overwritten in place — see the collapse rule
+     * in `tableStore.ts`. Set on the version a table was created in, on a
+     * write that asked for it (a model edit, a destructive edit), and on any
+     * version reconstructed from the file rather than written by a known author.
+     */
+    sealed?: true;
+    /** Known creation, unlike a sealed entry reconstructed from lost history. */
+    creation?: true;
+    /** The model edit that committed this version, so a repeat replays it. */
+    operation_id?: string;
+    /** Fingerprint of that edit's request; the same id with another one is refused. */
+    request_sha256?: string;
+    /** The change list that edit answered with, returned again on a replay. */
+    changes?: unknown[];
+}
+
+export interface TableHistory {
+    /** The highest version the log knows about. 0 when there is none. */
+    tip: number;
+    /** Oldest first, capped by the store's retention limit. */
+    versions: TableVersionEntry[];
+}
+
+/** A table with no log at all — a fresh item, or one whose sidecar is gone. */
+export const EMPTY_TABLE_HISTORY: TableHistory = { tip: 0, versions: [] };
+
+/** Defends every reader against a hand-edited or truncated `history.json`. */
+export function normalizeTableHistory(
+    history: TableHistory | null | undefined
+): TableHistory {
+    const versions = Array.isArray(history?.versions)
+        ? history.versions
+              .filter((entry) => typeof entry?.version === 'number')
+              .sort((a, b) => a.version - b.version)
+        : [];
+    const tip = versions.length ? versions[versions.length - 1].version : 0;
+    // A `ledger` written by older builds is dropped here, and so on the next commit.
+    return { tip: Math.max(tip, Number(history?.tip) || 0), versions };
+}
+
+/**
+ * The version log as stored, normalized.
+ *
+ * Read-only and lock-free on purpose: this is what a display surface calls to
+ * learn a table's version and coverage without reading (and parsing) the whole
+ * document. Every write to the log still goes through `tableStore.ts`. An
+ * absent or damaged log reads as an empty one — the document is the state, and
+ * the store rebuilds the log from it on the next open.
+ */
+export async function readTableHistory(
+    item: Zotero.Item
+): Promise<TableHistory> {
+    const path = tableHistoryPath(item);
+    if (!path) return EMPTY_TABLE_HISTORY;
+    try {
+        if (!(await IOUtils.exists(path))) return EMPTY_TABLE_HISTORY;
+        const text = await IOUtils.readUTF8(path);
+        return normalizeTableHistory(JSON.parse(text) as TableHistory);
+    } catch (error) {
+        logger(`readTableHistory: unusable log for ${item.key}: ${String(error)}`, 2);
+        return EMPTY_TABLE_HISTORY;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Addressing
+// ---------------------------------------------------------------------------
+
+/**
+ * A stored table, by the item that holds it.
+ *
+ * Declared here rather than in the store because the esbuild side addresses
+ * tables too — `src/ui/openTable.ts` takes one — and `tableStore.ts` cannot be reached from that bundle. `tableStore.ts`
+ * re-exports it, so nothing that already imports it from there has to change.
+ */
+export interface TableRef {
+    libraryID: number;
+    key: string;
+}
+
+/**
+ * The item behind a ref, or a typed refusal.
+ *
+ * Reading is never gated on library exclusion — an existing table is the user's
+ * to look at. The store's `requireWritable` is where the exclusion boundary is.
+ */
+export async function resolveTableItem(ref: TableRef, allowTrashed = false): Promise<Zotero.Item> {
+    const item = await Zotero.Items.getByLibraryAndKeyAsync(ref.libraryID, ref.key) as
+        | Zotero.Item
+        | false;
+    if (!item || (item.deleted && !allowTrashed)) {
+        throw new TableItemError(
+            item ? `Table ${ref.key} is in the trash.` : `No item ${ref.key} in library ${ref.libraryID}.`,
+            'not_found'
+        );
+    }
+    await loadTableItemFields([item]);
+    if (!isTableAttachment(item)) {
+        throw new TableItemError(
+            `Item ${ref.key} is not a AsterMargin table.`,
+            'not_a_table'
+        );
+    }
+    return item;
+}
+
+/**
+ * Why a table cannot be shown, worded for the person using AsterMargin. A read's
+ * own message names the item key, the file and the parser error; that detail
+ * belongs in the log, agent responses and dev endpoints. Null for a code this
+ * does not describe, so the caller keeps its own message.
+ */
+export function tableReadProblem(
+    code: ReadTableFailureCode | TableItemErrorCode
+): string | null {
+    switch (code) {
+        case 'invalid':
+        case 'invalid_spec':
+        case 'version_corrupt':
+            return "Its saved file is damaged, so AsterMargin can't read it.";
+        case 'corrupt':
+            // On a read, `table.json` is gone while its version history remains.
+            return "Its saved file is missing, so AsterMargin can't read it.";
+        case 'unsupported_version':
+            return "It was saved in a format this version of AsterMargin can't read. Updating AsterMargin may fix this.";
+        case 'no_spec':
+            return 'The item has no table data.';
+        case 'not_a_table':
+            return "The item isn't a AsterMargin table.";
+        case 'no_file':
+        case 'file_missing':
+            return "Its file isn't on this device.";
+        default:
+            return null;
+    }
+}
+
+type ReadTableFailureCode = Extract<ReadTableItemResult, { ok: false }>['code'];
+
+/** Maps a read refusal onto the shared {@link TableItemErrorCode} vocabulary. */
+export function tableReadError(
+    code: 'not_a_table' | 'no_file' | 'no_spec' | 'unsupported_version' | 'invalid' | 'corrupt',
+    message: string
+): TableItemError {
+    switch (code) {
+        case 'no_file':
+            return new TableItemError(message, 'file_missing');
+        case 'invalid':
+            return new TableItemError(message, 'invalid_spec');
+        default:
+            return new TableItemError(message, code);
+    }
+}
+
+/**
+ * The stored spec and the version it claims — the store's read API.
+ *
+ * Lives on this side of the split so that the esbuild bundle can read a table
+ * without reaching `tableStore.ts`, which imports the library-exclusion check
+ * and through it the whole React graph. `tableStore.ts` re-exports it, so
+ * "read a table through the store" stays one function with one implementation.
+ */
+export async function readTable(
+    ref: TableRef
+): Promise<{ spec: TableSpec; version: number }> {
+    const item = await resolveTableItem(ref);
+    const read = await readTableItemSpec(item);
+    if (!read.ok) throw tableReadError(read.code, read.message);
+    return { spec: read.spec, version: read.spec.version ?? 0 };
+}

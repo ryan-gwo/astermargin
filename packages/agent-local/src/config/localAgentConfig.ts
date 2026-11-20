@@ -1,0 +1,128 @@
+/**
+ * Validation of the user's local-agent settings into something the loop can
+ * run, or a specific reason it cannot.
+ *
+ * Pure: callers pass the preference values they already read, so this module
+ * needs no host access and the failure copy is testable directly.
+ */
+
+import { OPENROUTER_API_BASE, type CustomChatModel } from '@astermargin/agent-core/types/customChatModel';
+
+/** Wire formats the in-plugin loop can speak. */
+export const SUPPORTED_FORMATS = ['openai', 'openai_responses', 'anthropic', 'gemini'] as const;
+export type SupportedFormat = (typeof SUPPORTED_FORMATS)[number];
+
+/** Tool-calling rounds allowed in one run before the loop stops. */
+export const DEFAULT_MAX_ROUNDS = 20;
+
+export type LocalConfigError =
+    | 'no_model'
+    | 'no_api_key'
+    | 'unsupported_format'
+    | 'invalid_endpoint';
+
+export interface LocalAgentConfig {
+    /** The selected model, with `format` normalised to a supported value. */
+    model: CustomChatModel;
+    maxRounds: number;
+}
+
+export interface LocalAgentConfigInput {
+    model: CustomChatModel | null;
+    /** User override for the round cap; null or nonsensical falls back. */
+    maxRounds: number | null;
+}
+
+export type LocalConfigResult =
+    | { ok: true; config: LocalAgentConfig }
+    | { ok: false; reason: LocalConfigError; message: string };
+
+const fail = (reason: LocalConfigError, message: string): LocalConfigResult => ({
+    ok: false,
+    reason,
+    message,
+});
+
+/**
+ * Whether an endpoint is callable from this plugin.
+ *
+ * Deliberately more permissive than the hosted path's
+ * `validateCustomProviderApiBase`, which rejects loopback and private hosts
+ * because the AsterMargin backend makes the request and must not be steered at its
+ * own network. Here the request leaves the user's own machine, so a local
+ * server is a first-class endpoint and plain HTTP to it is not a downgrade.
+ */
+const isCallableEndpoint = (apiBase: string): boolean => {
+    let url: URL;
+    try {
+        url = new URL(apiBase);
+    } catch {
+        return false;
+    }
+    return url.protocol === 'https:' || url.protocol === 'http:';
+};
+
+/**
+ * Whether an endpoint is on this machine: `localhost`, `127.0.0.0/8` or `::1`.
+ * A server there (Ollama, llama.cpp) commonly needs no API key, and a request
+ * to it never crosses the network, so plain HTTP is fine.
+ */
+export function isLoopbackEndpoint(apiBase: string | null | undefined): boolean {
+    if (!apiBase) return false;
+    let url: URL;
+    try {
+        url = new URL(apiBase.trim());
+    } catch {
+        return false;
+    }
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    return host === 'localhost' || host === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+export function resolveLocalAgentConfig(input: LocalAgentConfigInput): LocalConfigResult {
+    const { model } = input;
+
+    if (!model) {
+        return fail(
+            'no_model',
+            'Choose a model in AsterMargin Preferences → API Keys before starting a chat.'
+        );
+    }
+    // A server on this machine may run without a key; anything else needs one.
+    const hasApiKey = !!model.api_key && model.api_key.trim().length > 0;
+    if (!hasApiKey && !isLoopbackEndpoint(model.api_base)) {
+        return fail(
+            'no_api_key',
+            `Add an API key for “${model.name}” in AsterMargin Preferences → API Keys.`
+        );
+    }
+
+    const format = (model.format ?? 'openai') as SupportedFormat;
+    if (!SUPPORTED_FORMATS.includes(format)) {
+        return fail(
+            'unsupported_format',
+            `AsterMargin cannot talk to “${format}” endpoints. Choose the OpenAI or Anthropic format for “${model.name}”.`
+        );
+    }
+
+    // A native OpenRouter entry (`provider: "openrouter"`) is valid with no
+    // `api_base` — `isCustomChatModel` allows it and the hosted path treats
+    // OpenRouter's endpoint as the default. Backfill it here so the resolver
+    // does not reject an otherwise-complete OpenRouter model.
+    const isOpenRouter = model.provider?.toLowerCase() === 'openrouter';
+    const rawApiBase = (model.api_base ?? '').trim();
+    const apiBase = rawApiBase || (isOpenRouter ? OPENROUTER_API_BASE : '');
+    if (!apiBase || !isCallableEndpoint(apiBase)) {
+        return fail(
+            'invalid_endpoint',
+            `“${model.name}” needs an endpoint URL, for example https://api.openai.com/v1.`
+        );
+    }
+
+    const maxRounds =
+        input.maxRounds !== null && Number.isInteger(input.maxRounds) && input.maxRounds > 0
+            ? input.maxRounds
+            : DEFAULT_MAX_ROUNDS;
+
+    return { ok: true, config: { model: { ...model, format, api_base: apiBase }, maxRounds } };
+}

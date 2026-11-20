@@ -1,0 +1,259 @@
+import { resolveChatWindow } from './navigation';
+import { restoreReaderSidebarWidthHandler } from './readerWidth';
+/** Window handles are registered only for the lifetime of their renderer. */
+export interface WindowRuntime {
+    readonly id: string;
+    readonly hostWindow: Window;
+    /**
+     * `main`: a Zotero main window. `standalone`: the separate AsterMargin chat
+     * window. `table`: a stored table in its own window, without a chat.
+     * The last two follow the active main window as their context.
+     */
+    readonly kind: "main" | "standalone" | "table";
+    contextWindow: Window | null;
+    readonly events: EventTarget;
+    status: 'attaching' | 'ready' | 'closing';
+}
+
+/**
+ * The chrome window embedding `win`, or undefined when there is none reachable.
+ * Chrome-privileged frames (a reader tab's `reader.html`) expose
+ * `browsingContext`; content frames do not, and end the walk.
+ * `ownerDocument.defaultView` rather than `ownerGlobal`: Firefox 153 renamed
+ * the latter, which then reads as undefined.
+ */
+function embedderWindow(win: Window): Window | undefined {
+    try {
+        return (win as any).browsingContext?.embedderElement?.ownerDocument?.defaultView ?? undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+export class AsterMarginInstance {
+    /** Singleton handle also covers the interval before its renderer attaches. */
+    standaloneWindow?: Window;
+    private windows = new Map<Window, WindowRuntime>();
+    private nextId = 0;
+    private readonly idPrefix = `main-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    private disposed = false;
+    private subscriptions = new Map<WindowRuntime, Set<() => void>>();
+    private notifications = new Map<string, Set<(detail: any) => void>>();
+
+    constructor() {
+        // Release a reader-width wrapper an earlier plugin version left behind.
+        restoreReaderSidebarWidthHandler();
+    }
+
+    attachWindow(
+        win: Window,
+        kind: WindowRuntime["kind"] = "main",
+    ): WindowRuntime {
+        if (this.disposed) throw new Error("AsterMargin instance disposed");
+        const existing = this.windows.get(win);
+        if (existing) return existing;
+        const runtime: WindowRuntime = {
+            id: `${this.idPrefix}-${++this.nextId}`,
+            hostWindow: win,
+            kind,
+            contextWindow: kind === "main" ? win : this.activeMainWindow(),
+            events: new win.EventTarget(),
+            status: "attaching",
+        };
+        this.windows.set(win, runtime);
+        if (kind === "standalone") this.standaloneWindow = win;
+        win.__astermarginRuntime = runtime;
+        win.__astermarginEventBus = runtime.events;
+        if (kind === "main") {
+            const focus = () => this.refreshContext(win);
+            win.addEventListener("activate", focus);
+            this.addWindowCleanup(runtime, () =>
+                win.removeEventListener("activate", focus),
+            );
+            this.refreshContext();
+        }
+        return runtime;
+    }
+
+    private activeMainWindow(): Window | null {
+        const active = Zotero.getMainWindow();
+        if (
+            active &&
+            !active.closed &&
+            this.windows.has(active) &&
+            this.windows.get(active)?.status !== "closing"
+        )
+            return active;
+        return (
+            [...this.windows.values()].find(
+                (r) =>
+                    r.kind === "main" &&
+                    r.status !== "closing" &&
+                    !r.hostWindow.closed,
+            )?.hostWindow ?? null
+        );
+    }
+
+    refreshContext(preferred?: Window): void {
+        const context = preferred ?? this.activeMainWindow();
+        for (const runtime of this.windows.values()) {
+            if (
+                runtime.kind === "main" ||
+                runtime.status === "closing" ||
+                runtime.contextWindow === context
+            )
+                continue;
+            runtime.contextWindow = context;
+            runtime.events.dispatchEvent(
+                new runtime.hostWindow.CustomEvent("contextWindowChanged"),
+            );
+        }
+    }
+
+    async openChat(): Promise<void> {
+        const win = await resolveChatWindow();
+        win.focus();
+        win.__astermarginEventBus?.dispatchEvent(new win.CustomEvent('toggleChat', { detail: { forceOpen: true } }));
+    }
+
+    getWindow(win: Window): WindowRuntime | undefined { return this.windows.get(win); }
+    resolveWindow(id?: string): WindowRuntime | undefined {
+        const runtime =
+            id !== undefined
+                ? [...this.windows.values()].find(value => value.id === id)
+                : (this.windows.get(Zotero.getMainWindow()) ??
+                  [...this.windows.values()].find(
+                      (r) => r.kind === "standalone",
+                  ));
+        return runtime?.status === 'ready' && !runtime.hostWindow.closed ? runtime : undefined;
+    }
+    /**
+     * The ready runtime owning `win`, which may be a frame inside a main window
+     * rather than the main window itself: keyboard shortcuts are installed on
+     * each reader tab's own window, and those have neither `Zotero_Tabs` nor an
+     * event bus. Returns undefined for a window AsterMargin has not attached to,
+     * such as a standalone reader window.
+     */
+    resolveWindowFrom(win: Window | null | undefined): WindowRuntime | undefined {
+        let current = win ?? undefined;
+        // Bounded: a frame chain is short, and a cycle must never hang a keystroke.
+        for (let depth = 0; current && depth < 8; depth++) {
+            const runtime = this.windows.get(current);
+            if (runtime) {
+                return runtime.status === 'ready' && !runtime.hostWindow.closed ? runtime : undefined;
+            }
+            current = embedderWindow(current);
+        }
+        return undefined;
+    }
+
+    getSnapshot(): Array<{
+        id: string;
+        kind: WindowRuntime["kind"];
+        status: WindowRuntime['status']
+    }> {
+        return Array.from(this.windows.values(), ({ id, kind, status }) => ({
+            id,
+            kind,
+            status,
+        }));
+    }
+    markClosing(win: Window): boolean {
+        const runtime = this.windows.get(win);
+        if (!runtime || runtime.status === 'closing') return false;
+        runtime.status = 'closing';
+        this.refreshContext();
+        Zotero.AsterMargin?.presence?.detach(runtime.id);
+        for (const unsubscribe of this.subscriptions.get(runtime) ?? []) unsubscribe();
+        this.subscriptions.delete(runtime);
+        return true;
+    }
+    detachWindow(win: Window): void {
+        const runtime = this.windows.get(win);
+        if (!runtime) return;
+        this.markClosing(win);
+        this.windows.delete(win);
+        if (this.standaloneWindow === win) this.standaloneWindow = undefined;
+        delete win.__astermarginRuntime;
+        delete win.__astermarginJotaiStore;
+        win.__astermarginEventBus = null;
+    }
+
+    addWindowCleanup(runtime: WindowRuntime, cleanup: () => void): void {
+        if (runtime.status === 'closing' || this.windows.get(runtime.hostWindow) !== runtime) { cleanup(); return; }
+        let subscriptions = this.subscriptions.get(runtime);
+        if (!subscriptions) this.subscriptions.set(runtime, subscriptions = new Set());
+        subscriptions.add(cleanup);
+    }
+
+    subscribeWindow(runtime: WindowRuntime, name: string, callback: (detail: any) => void): () => void {
+        const remove = this.subscribe(name, detail => {
+            if (runtime.status !== 'closing') callback(detail);
+        });
+        const unsubscribe = () => { remove(); this.subscriptions.get(runtime)?.delete(unsubscribe); };
+        this.addWindowCleanup(runtime, unsubscribe);
+        return unsubscribe;
+    }
+
+    subscribe(name: string, callback: (detail: any) => void): () => void {
+        if (this.disposed) return () => {};
+        let listeners = this.notifications.get(name);
+        if (!listeners) this.notifications.set(name, listeners = new Set());
+        listeners.add(callback);
+        return () => {
+            listeners.delete(callback);
+            if (!listeners.size) this.notifications.delete(name);
+        };
+    }
+
+    private commands = new Map<WindowRuntime, Record<string, (request: any) => Promise<any>>>();
+
+    registerWindowCommands(runtime: WindowRuntime, handlers: Record<string, (request: any) => Promise<any>>): void {
+        if (runtime.status === 'closing') return;
+        this.commands.set(runtime, handlers);
+        this.addWindowCleanup(runtime, () => {
+            if (this.commands.get(runtime) === handlers) this.commands.delete(runtime);
+        });
+    }
+
+    async dispatchWindowCommand(command: string, request: any): Promise<any> {
+        const runtime = this.resolveWindow(request?.windowId);
+        const handler = runtime && this.commands.get(runtime)?.[command];
+        const unavailable = () => Object.assign(new Error('Target window is unavailable'), { code: 'window_unavailable' });
+        if (!runtime || !handler) throw unavailable();
+        // Resolve once before invoking a renderer; closing never retargets a request.
+        const work = Promise.resolve().then(() => {
+            if (runtime.status !== 'ready' || runtime.hostWindow.closed) throw unavailable();
+            return handler(request);
+        });
+        let release!: () => void;
+        const closed = new Promise<never>((_resolve, reject) => {
+            release = () => reject(unavailable());
+            this.addWindowCleanup(runtime, release);
+        });
+        try {
+            const result = await Promise.race([work, closed]);
+            if (runtime.status !== 'ready' || runtime.hostWindow.closed) throw unavailable();
+            return result;
+        } finally {
+            this.subscriptions.get(runtime)?.delete(release);
+        }
+    }
+
+    publish(name: string, detail: unknown): void {
+        // Retained state and subscribers never receive a caller-owned mutable object.
+        if (this.disposed || Zotero.__astermarginShuttingDown) return;
+        const serialized = JSON.stringify(detail);
+        for (const callback of [...(this.notifications.get(name) ?? [])]) {
+            try { callback(serialized === undefined ? undefined : JSON.parse(serialized)); } catch (error) { Zotero.logError(error as Error); }
+        }
+    }
+
+    disposeInstance(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        for (const win of this.windows.keys()) this.detachWindow(win);
+        this.notifications.clear();
+        restoreReaderSidebarWidthHandler();
+    }
+}

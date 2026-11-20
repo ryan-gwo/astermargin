@@ -1,0 +1,267 @@
+/**
+ * Page label resolution utilities.
+ *
+ * Loads PDF page labels from the attachment file cache and exposes explicit
+ * render-time maps so React/static rendering does not need to read mutable
+ * cache state directly.
+ *
+ * Two conventions coexist in the codebase:
+ * - Citation tag `page` attribute / model-provided page numbers: 1-based page numbers
+ * - `getCitationPages()` return values: 1-based page numbers (page_idx + 1)
+ *
+ * The resolver functions translate physical page numbers to visible page
+ * labels for display and Zotero note export.
+ *
+ * All callers resolve labels up-front (via the `preload*` functions) and pass
+ * an explicit `PageLabelsByAttachmentId` map into the `*FromLabels` resolvers,
+ * so no rendering path reads mutable cache state synchronously.
+ *
+ * Each preload names its label namespace (`documentExtraction/pageLabels`):
+ * the chat shows printed labels; a Zotero note export writes locator labels.
+ */
+
+import { makeRemoteFilePath } from '../../src/services/documentFileIdentity';
+import { getAttachmentFileStatus, isRemoteAccessAvailable } from '../../src/services/agentDataProvider/utils';
+import type { DocumentCacheMetadata, PageLabels } from '../../src/services/documentCache';
+import { loadPageLabelsForMetadata, type PageLabelNamespace } from '../../src/services/documentExtraction/pageLabels';
+import type { Citation } from '@astermargin/agent-core/types/citations';
+import { getBestPDFAttachmentAsync } from '../../src/utils/zoteroItemHelpers';
+import { linkCitationPageLabelNamespace } from '../../src/utils/zoteroLinkCitation';
+import { getParentItemAsync } from '../../src/utils/zoteroDataLoading';
+import { UNRESOLVED_LIBRARY_ID, resolveLibraryRef } from '../../src/utils/libraryIdentity';
+import {
+    getPageLocator,
+    getRequestedRef,
+    getResolvedRef,
+    normalizeCitationTag,
+    parseRawCitationAttributes,
+} from '@astermargin/agent-core/citations/citationGrammar';
+import type { PageLabelsByAttachmentId } from '@astermargin/agent-core/citations/atoms';
+import { hasPageLabels } from '@astermargin/agent-ui/utils/pageLabels';
+
+// Regex for citation tags — matches self-closing and non-self-closing forms
+const CITATION_REGEX = /<citation(?:\s+([^>]*?))?\s*(\/>|>(?:.*?<\/citation>)?)/g;
+
+export type PreloadFilePath =
+    | { item: Zotero.Item; filePath: string; isRemoteOnly: false }
+    | { item: Zotero.Item; filePath: string; isRemoteOnly: true };
+
+async function addPageLabels(
+    target: PageLabelsByAttachmentId,
+    item: Zotero.Item,
+    record: DocumentCacheMetadata | null | undefined,
+    namespace: PageLabelNamespace,
+    filePath: string,
+): Promise<void> {
+    // A link citation that cannot carry its page writes the suffix in declared labels.
+    const effective = namespace === 'locator' ? linkCitationPageLabelNamespace(item) : namespace;
+    const labels = await loadPageLabelsForMetadata(record, effective, filePath);
+    const itemId = item.id;
+    if (!hasPageLabels(labels)) return;
+    target[itemId] = { ...labels };
+}
+
+export async function getCitationPreloadFilePath(item: Zotero.Item): Promise<PreloadFilePath | null> {
+    if (!item.isAttachment()) {
+        const attachment = item.isRegularItem?.() ? await getBestPDFAttachmentAsync(item) : null;
+        if (!attachment) return null;
+        item = attachment;
+    } else {
+        // Resolving the path updates the parent's attachment state, which
+        // Zotero reports as an error when the parent is not loaded yet.
+        await getParentItemAsync(item);
+    }
+
+    const filePath = await item.getFilePathAsync();
+    if (filePath) return { item, filePath, isRemoteOnly: false };
+
+    if (isRemoteAccessAvailable(item)) {
+        return { item, filePath: makeRemoteFilePath(item), isRemoteOnly: true };
+    }
+
+    return null;
+}
+
+/**
+ * Translate a page number string against an explicit page-label map.
+ *
+ * Only translates strings that are purely numeric page references (digits with
+ * optional whitespace/range separators like "-", "–", ","). Non-page locators
+ * such as "§3.2", "fn. 5", or "xii" are returned unchanged.
+ */
+export function translatePageNumberToLabelFromLabels(
+    pageLabels: PageLabels | null | undefined,
+    pageStr: string,
+): string {
+    if (!hasPageLabels(pageLabels)) return pageStr;
+
+    if (!/^\s*\d[\d\s,\-–]*$/.test(pageStr)) return pageStr;
+
+    return pageStr.replace(/\d+/g, (numStr) => {
+        const pageIndex = parseInt(numStr, 10) - 1;
+        if (isNaN(pageIndex) || pageIndex < 0) return numStr;
+        const label = pageLabels[pageIndex];
+        if (label == null || label.trim() === '') return numStr;
+        return label;
+    });
+}
+
+/**
+ * Pre-load attachment page labels of one namespace for all citations in the
+ * given content string. Must be called (and awaited) before synchronous
+ * rendering with `renderToMarkdown` or `renderToHTML`.
+ *
+ * For each referenced attachment:
+ * 1. Try the metadata cache (DB -> memory) via `getMetadata`.
+ * 2. On a local cache miss for locator labels, analyze the PDF via
+ *    `getAttachmentFileStatus` (reads the file: its declared labels and OCR
+ *    needs), which caches the labels it declares. Printed labels come only
+ *    from a full extraction, so a printed-label miss is skipped, and locator
+ *    labels after the analysis are the declared ones until the PDF is fully
+ *    extracted (see `preloadPageLabelsForNewCitations`). A remote-only miss is
+ *    skipped rather than downloading during render.
+ */
+export async function preloadPageLabelsForContent(
+    content: string,
+    namespace: PageLabelNamespace,
+): Promise<PageLabelsByAttachmentId> {
+    const cache = Zotero.AsterMargin?.documentCache;
+    if (!cache) return {};
+
+    const seen = new Set<number>();
+    const labelsByAttachmentId: PageLabelsByAttachmentId = {};
+    const regex = new RegExp(CITATION_REGEX.source, CITATION_REGEX.flags);
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(content)) !== null) {
+        const normalized = normalizeCitationTag(parseRawCitationAttributes(match[1] || ''));
+        if (!normalized.ok || normalized.ref.kind !== 'zotero') continue;
+        // A portable ref whose library isn't on this device can't be looked up
+        // (and would throw); there's nothing to preload for it.
+        if (normalized.ref.library_id === UNRESOLVED_LIBRARY_ID) continue;
+
+        try {
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(normalized.ref.library_id, normalized.ref.zotero_key);
+            if (!item) continue;
+
+            const preloadPath = await getCitationPreloadFilePath(item);
+            if (!preloadPath) continue;
+            const preloadItem = preloadPath.item;
+            if (seen.has(preloadItem.id)) continue;
+            seen.add(preloadItem.id);
+
+            // Cache hit → page_labels already in memory cache
+            const record = await cache.getMetadata({
+                libraryId: preloadItem.libraryID,
+                zoteroKey: preloadItem.key,
+            }, preloadPath.filePath);
+            if (record) {
+                await addPageLabels(labelsByAttachmentId, preloadItem, record, namespace, preloadPath.filePath);
+                continue;
+            }
+
+            // Do not download remote-only PDFs just to preload labels. A later
+            // explicit content request will populate the cache if needed. The
+            // analysis below records no printed labels, so it is skipped for them.
+            if (preloadPath.isRemoteOnly || namespace === 'printed') continue;
+
+            // Local cache miss → analyze the PDF, then read its labels back.
+            await getAttachmentFileStatus(preloadItem, false);
+            const refreshed = await cache.getMetadata({
+                libraryId: preloadItem.libraryID,
+                zoteroKey: preloadItem.key,
+            }, preloadPath.filePath);
+            await addPageLabels(labelsByAttachmentId, preloadItem, refreshed, namespace, preloadPath.filePath);
+        } catch {
+            // Skip items that can't be resolved
+        }
+    }
+
+    return labelsByAttachmentId;
+}
+
+/**
+ * Pre-load page labels of one namespace (printed by default) for the given
+ * citation metadata records, keyed by the attachment each citation resolved
+ * to. Used when citation metadata is available directly (e.g., on run
+ * completion or thread load) so the rendering path can resolve page labels
+ * synchronously. Cache misses are handled as in `preloadPageLabelsForContent`.
+ *
+ * Returns populated page labels keyed by attachment item ID. Empty label maps
+ * are omitted because renderers fall back to raw page numbers.
+ *
+ * Items are looked up asynchronously, which also caches each cited item, its
+ * child list and its attachments. That keeps the synchronous render-time
+ * lookup (`resolvePageLabels`) working for libraries not yet opened in Zotero.
+ */
+export async function preloadPageLabelsForCitations(
+    citations: ReadonlyArray<Partial<Citation>>,
+    namespace: PageLabelNamespace = 'printed',
+): Promise<PageLabelsByAttachmentId> {
+    const cache = Zotero.AsterMargin?.documentCache;
+    if (!cache) return {};
+
+    const seen = new Set<number>();
+    const labelsByAttachmentId: PageLabelsByAttachmentId = {};
+
+    for (const citation of citations) {
+        // Skip citations that don't have any page locators — labels aren't needed.
+        const hasPages =
+            (citation.pages && citation.pages.length > 0) ||
+            (citation.locations || []).some((location) => location.page_idx !== undefined);
+        const requestedRef = getRequestedRef(citation);
+        const resolvedRef = getResolvedRef(citation);
+        const hasPageLocator =
+            !!(requestedRef && getPageLocator(requestedRef)) ||
+            !!(resolvedRef && getPageLocator(resolvedRef));
+        if (!hasPages && !hasPageLocator) continue;
+
+        const zoteroRef = resolvedRef?.kind === 'zotero'
+            ? resolvedRef
+            : requestedRef?.kind === 'zotero'
+                ? requestedRef
+                : null;
+        if (!zoteroRef) continue;
+        // Group citations carry a device-local library_id of
+        // UNRESOLVED_LIBRARY_ID; resolve the portable library_ref to this
+        // device's local library id (null → library not on this device, nothing
+        // to preload) so group citations get printed-page labels too. No
+        // exclusion gate: page labels only enrich the rendering of citations
+        // already persisted in history, which is not gated on library exclusion.
+        const resolvedLibraryId = resolveLibraryRef({ library_ref: zoteroRef.library_ref, library_id: zoteroRef.library_id });
+        if (!resolvedLibraryId) continue;
+
+        try {
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(resolvedLibraryId, zoteroRef.zotero_key);
+            if (!item) continue;
+
+            const preloadPath = await getCitationPreloadFilePath(item);
+            if (!preloadPath) continue;
+            const preloadItem = preloadPath.item;
+            if (seen.has(preloadItem.id)) continue;
+            seen.add(preloadItem.id);
+
+            const record = await cache.getMetadata({
+                libraryId: preloadItem.libraryID,
+                zoteroKey: preloadItem.key,
+            }, preloadPath.filePath);
+            if (record) {
+                await addPageLabels(labelsByAttachmentId, preloadItem, record, namespace, preloadPath.filePath);
+                continue;
+            }
+
+            if (preloadPath.isRemoteOnly || namespace === 'printed') continue;
+
+            await getAttachmentFileStatus(preloadItem, false);
+            const refreshed = await cache.getMetadata({
+                libraryId: preloadItem.libraryID,
+                zoteroKey: preloadItem.key,
+            }, preloadPath.filePath);
+            await addPageLabels(labelsByAttachmentId, preloadItem, refreshed, namespace, preloadPath.filePath);
+        } catch {
+            // Skip items that can't be resolved
+        }
+    }
+
+    return labelsByAttachmentId;
+}

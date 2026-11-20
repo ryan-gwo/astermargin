@@ -1,0 +1,2390 @@
+/**
+ * Agent Service
+ *
+ * This service provides WebSocket communication for agent runs,
+ * enabling bidirectional communication between the Zotero plugin and the backend.
+ *
+ * The AsterMargin agent is the primary agent that handles chat completions and tool execution.
+ */
+
+import { credentials, getCredentialGeneration, assertCredentialGeneration } from './credentials';
+import { getApiBaseUrl } from './config';
+import { assertBackendAccessAllowed } from './backendAccessPolicy';
+import { logger } from '../platform/logger';
+import { AgentRun, type ParkedCardAnswer } from '../agents/types';
+import type { AgentAction } from '../agents/agentActionTypes';
+import { toAgentAction } from '../agents/agentActionTypes';
+import { ApiService } from './apiService';
+import { isApiError } from '../types/apiErrors';
+import {
+    AgentDataProviderMap,
+    resolveDefaultAgentDataProvider,
+    unknownDataRequestErrorResponse,
+    NOOP_KEEPALIVE,
+    REQUEST_KEEPALIVE_INTERVAL_MS,
+    isBackendRequestEvent,
+    isRequestSignal,
+    type AgentDataRequestContext,
+    type RequestKeepalive,
+} from './agentDataDispatch';
+import {
+    AgentRunRequest,
+    ExtractSchemaVersionsWire,
+    ZoteroInstanceWire,
+    askUserQuestionResponse,
+    batchApprovalResponse,
+    deferredApprovalResponse,
+} from '../protocol/agentProtocol';
+import {
+    WSEvent,
+    WSErrorEvent,
+    WSCallbacks,
+    WSAuthMessage,
+    WSPingMessage,
+    WSReadyData,
+    WSRequestAckData,
+    WSRequestKeepalive,
+    WSRequestReceivedAck,
+    WSReattachRequest,
+    WSReattachedEvent,
+    WSReattachUnavailableEvent,
+    AgentConnectRequest,
+    AskUserQuestionAnswer,
+    BatchApprovalMode,
+    ReattachFailureReason,
+    isReattachRequest,
+} from '../protocol/agentProtocol';
+import { REATTACH_CLOSE_CODES, RunLink, RunReply, answeredPromptKey, executedAction, promptKey } from './runLink';
+import type { WSTableCardResponse } from '../protocol/tableCardProtocol';
+import { resolveBusyContext } from './busyContextProvider';
+import {
+    isPreparedJsonMessage,
+    materializePreparedJsonMessage,
+    preparedJsonEnvelope,
+    withPreparedJsonEnvelope,
+    type PreparedJsonMessage,
+} from './preparedJsonMessage';
+import {
+    baselineConnectionEvidence,
+    connectRecoveryAuthFields,
+    ConnectRecoveryAuthFields,
+    ConnectionFailureEvidence,
+    ConnectionFailureStage,
+} from './connectionFailure';
+
+
+// =============================================================================
+// Auth helpers
+// =============================================================================
+
+/**
+ * Get an auth token from the Supabase session for a backend WebSocket handshake.
+ * Includes a defense-in-depth expiry check to catch tokens that were valid
+ * when getSession() ran but became stale due to OS process suspension (e.g.
+ * macOS sleep between getSession()'s internal Date.now() check and here).
+ * Shared by the chat connection (AgentService) and the provider connection.
+ */
+export async function getWSAuthToken(): Promise<string> {
+    // Both backend sockets authenticate through here, so refusing before the
+    // session read keeps either from opening while backend access is blocked.
+    assertBackendAccessAllowed('ws.auth');
+    const generation = getCredentialGeneration();
+    const { data, error } = await credentials.getSession();
+    assertCredentialGeneration(generation);
+
+    if (error) {
+        logger(`AgentService: Error getting session: ${error.message}`, 2);
+        throw new Error('Error getting user session');
+    }
+
+    if (!data.session?.access_token) {
+        throw new Error('User not authenticated');
+    }
+
+    // Proactively refresh if token is expired or expires within 30s.
+    const expiresAt = data.session.expires_at;
+    if (expiresAt && expiresAt - Math.floor(Date.now() / 1000) < 30) {
+        logger('AgentService: Access token expired or near-expiry, refreshing session');
+        const refreshResult = await credentials.refreshSession();
+        assertCredentialGeneration(generation);
+        if (refreshResult.error || !refreshResult.data.session?.access_token) {
+            logger(`AgentService: Session refresh failed: ${refreshResult.error?.message}`, 2);
+            throw new Error('Session expired and refresh failed');
+        }
+        return refreshResult.data.session.access_token;
+    }
+
+    return data.session.access_token;
+}
+
+
+// =============================================================================
+// Agent Service
+// =============================================================================
+
+/** Backstop timeout for a full connect attempt (auth token + handshake + ready). */
+export const CONNECT_TIMEOUT_MS = 20_000;
+
+/**
+ * How long a socket opened to reattach a run may take to open. The run lives on
+ * an instance that is already up, so a socket still closed after this is stuck
+ * (sent into a dead network, or held back by the browser after earlier failures)
+ * and a fresh attempt recovers sooner than waiting out `CONNECT_TIMEOUT_MS`.
+ */
+export const REATTACH_OPEN_TIMEOUT_MS = 5_000;
+
+/** How long a reachability probe (see `probeReachable`) waits for an answer. */
+export const REACHABILITY_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * How long a new run waits for the cancel of a run stopped while it was
+ * reconnecting to reach the server, before replacing it anyway.
+ */
+export const CANCEL_HANDOFF_WAIT_MS = 10_000;
+
+/** Interval between `ping` heartbeats on a ready connection. */
+export const HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
+ * Inbound silence after which a ready connection is treated as lost. The
+ * server answers every ping, so a healthy socket is never quiet this long.
+ */
+export const HEARTBEAT_TIMEOUT_MS = 45_000;
+/**
+ * Longer bound while a message is still being written: its pong queues behind
+ * the upload. Matches how long the server waits on an acknowledged request, so
+ * an upload stalled past it could not have completed the request anyway.
+ */
+export const HEARTBEAT_UPLOAD_TIMEOUT_MS = 180_000;
+
+/** How many run events `recentRunEvents` keeps. */
+const MAX_RUN_EVENTS = 100;
+
+/** A reattach-related event of a run, kept for diagnostics. */
+export interface RunTransportEvent {
+    at: number;
+    runId: string;
+    kind: 'detached' | 'reattached' | 'reattach_failed' | 'reply_from_memory' | 'undelivered_actions';
+    detail?: string;
+}
+
+/** Close reason recorded when the heartbeat, not the browser, detected the loss. */
+export const HEARTBEAT_TIMEOUT_REASON = 'heartbeat_timeout';
+/**
+ * Close code sent when the heartbeat gives up. Scripts may only send 1000 or
+ * 3000-4999, and the server reads 1000/1001 as the user leaving on purpose;
+ * any other code is recorded as a lost connection.
+ */
+export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
+/**
+ * Close code for the socket of a run the user has left after it lost its
+ * connection. The server holds a run whose socket closes with it, as after
+ * any lost connection, instead of ending it as a deliberate close.
+ */
+const LEFT_RUN_CLOSE_CODE = HEARTBEAT_TIMEOUT_CLOSE_CODE;
+
+/** How long `parkRun` waits for the server to settle a parked run. */
+const PARK_SETTLE_WAIT_MS = 1500;
+
+/**
+ * How a `parkRun` ended: the run ended on the server (`ended`), the frame
+ * went out without an answer in time (`sent`), the server refused and the run
+ * was stopped (`refused`), or there was no live run to park (`unavailable`).
+ */
+export type ParkOutcome = 'ended' | 'sent' | 'refused' | 'unavailable';
+
+interface ConnectionAttemptState {
+    stage: ConnectionFailureStage;
+    socketOpened: boolean;
+    readyReceived: boolean;
+    /** When the socket's open event fired (null until then). */
+    openedAt: number | null;
+    /**
+     * When the last WebSocket message arrived (null until the first one).
+     * At failure time this separates idle-kill drops (proxies and load
+     * balancers closing a quiet connection) from mid-stream cuts.
+     */
+    lastMessageAt: number | null;
+}
+
+function attemptEvidence(
+    attempt: ConnectionAttemptState,
+    overrides: Partial<ConnectionFailureEvidence> = {},
+): ConnectionFailureEvidence {
+    const now = Date.now();
+    return baselineConnectionEvidence(attempt.stage, {
+        socketOpened: attempt.socketOpened,
+        readyReceived: attempt.readyReceived,
+        wsUptimeMs: attempt.openedAt !== null ? Math.max(0, now - attempt.openedAt) : null,
+        msSinceLastWsMessageMs:
+            attempt.lastMessageAt !== null ? Math.max(0, now - attempt.lastMessageAt) : null,
+        ...overrides,
+    });
+}
+
+export class AgentConnectionError extends Error {
+    readonly evidence: ConnectionFailureEvidence;
+
+    constructor(message: string, evidence: ConnectionFailureEvidence) {
+        super(message);
+        this.name = 'AgentConnectionError';
+        this.evidence = evidence;
+    }
+}
+
+/**
+ * Thrown when a connect attempt never settles within CONNECT_TIMEOUT_MS.
+ *
+ * The attempt is torn down with a normal close code, so the failure carries no
+ * WebSocket close code of its own. Callers must identify it by type rather than
+ * by close code, otherwise it is indistinguishable from a plain network outage.
+ */
+export class ConnectTimeoutError extends AgentConnectionError {
+    constructor(evidence: ConnectionFailureEvidence, timeoutMs: number = CONNECT_TIMEOUT_MS) {
+        super(`Connection attempt timed out after ${timeoutMs}ms`, {
+            ...evidence,
+            timedOut: true,
+            errorName: 'ConnectTimeoutError',
+        });
+        this.name = 'ConnectTimeoutError';
+    }
+}
+
+export class AgentService {
+    /** Set only when a caller pins this instance to a specific backend. */
+    private overrideBaseUrl?: string;
+    private ws: WebSocket | null = null;
+    private callbacks: WSCallbacks | null = null;
+    private connecting: boolean = false;
+    /**
+     * Settles the promise for the current pre-ready connection attempt.
+     * close() resolves it (an intentional client close is not a failure);
+     * the socket's own close event rejects it.
+     */
+    private activeConnectFinish: ((error?: Error) => void) | null = null;
+    /** Queue to serialize async message processing */
+    private messageQueue: Promise<void> = Promise.resolve();
+    /** Queue to serialize action execution (prevents concurrent edits to the same resource) */
+    private actionExecutionQueue: Promise<void> = Promise.resolve();
+    /** Monotonic counter incremented on close to invalidate stale queued messages */
+    private connectionId: number = 0;
+    /** Resolves the `parkRun` waiting on the server's answer, if one is. */
+    private pendingPark: ((outcome: ParkOutcome) => void) | null = null;
+    /** Whether the connected backend understands `request_received` acks (from the ready event) */
+    private serverSupportsRequestAcks: boolean = false;
+    /** Whether the connected backend understands `request_keepalive` messages (from the ready event) */
+    private serverSupportsRequestKeepalive: boolean = false;
+    /** Whether the connected backend answers `ping` heartbeats (from the ready event) */
+    private serverSupportsHeartbeat: boolean = false;
+    private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    /** Whether the connected backend lets a run outlive its socket (from the ready event) */
+    private serverSupportsRunReattach: boolean = false;
+    /** Heartbeat pings written and pongs read on the current connection. */
+    private pingsSent: number = 0;
+    private pongsReceived: number = 0;
+    /**
+     * The run this service carries. Outlives the socket while the run is being
+     * reattached (see `RunLink`); dropped when the run ends, is closed on
+     * purpose, or cannot be reattached.
+     */
+    private run: RunLink | null = null;
+    /** Whether the connect attempt in progress reattaches a run rather than starting one. */
+    private connectingReattach: boolean = false;
+    /**
+     * Bumped by every deliberate `close()` and `cancel()`. A connect waiting
+     * for a stopped run's cancel gives up if it changes in the meantime.
+     */
+    private connectEpoch: number = 0;
+    /**
+     * Arrival times of inbound messages not yet fully handled: the one being
+     * handled plus those queued behind it. Reported in acks as `queue_depth`
+     * / `queue_oldest_ms` so the backend can tell a blocked message queue from
+     * a frozen main thread.
+     */
+    private queuedMessageArrivals: number[] = [];
+    /**
+     * Keepalive controllers started on receipt of a backend request, keyed by
+     * request id until the dispatcher picks them up, plus every controller
+     * still ticking. Stopped as a group when the connection is reset so a
+     * hung handler cannot keep sending keepalives on a replacement socket.
+     */
+    private pendingKeepalives: Map<string, RequestKeepalive> = new Map();
+    private activeKeepalives: Set<RequestKeepalive> = new Set();
+    /**
+     * Map of backend data-request event -> handler. Injectable so a non-Zotero
+     * host can serve the same requests its own way. Resolved lazily from the
+     * registered default (see `resolveDefaultAgentDataProvider`) on first use,
+     * so this module-level singleton can be constructed before a host has
+     * registered its provider.
+     */
+    private dataProvider: AgentDataProviderMap | null;
+
+    /** The latest reattach-related events of the runs this service carried. */
+    private readonly runEvents: RunTransportEvent[] = [];
+
+    constructor(baseUrl?: string, dataProvider?: AgentDataProviderMap) {
+        this.overrideBaseUrl = baseUrl;
+        this.dataProvider = dataProvider ?? null;
+    }
+
+    /**
+     * Resolved per use rather than captured at construction, so a host can
+     * register its transport config after this module has loaded.
+     */
+    private get baseUrl(): string {
+        return this.overrideBaseUrl ?? getApiBaseUrl();
+    }
+
+    /** Replace the data-request provider map (e.g. a Word add-in injects its own). */
+    setDataProvider(dataProvider: AgentDataProviderMap): void {
+        this.dataProvider = dataProvider;
+    }
+
+    /** Resolve the data-provider map, falling back to the registered default on first use. */
+    private getDataProvider(): AgentDataProviderMap {
+        if (!this.dataProvider) {
+            this.dataProvider = resolveDefaultAgentDataProvider();
+        }
+        return this.dataProvider;
+    }
+
+    /**
+     * Forget everything tied to the current socket.
+     *
+     * `keepRunQueues` keeps the message and action queues for a run that is
+     * about to be reattached: a handler still running for the lost socket must
+     * finish before the replayed events are handled, and actions stay
+     * serialized across the switch.
+     */
+    private resetConnectionState(options: { keepRunQueues?: boolean } = {}): void {
+        this.ws = null;
+        this.callbacks = null;
+        this.connectionId++;
+        if (!options.keepRunQueues) {
+            this.messageQueue = Promise.resolve();
+            this.actionExecutionQueue = Promise.resolve();
+        }
+        this.serverSupportsRequestAcks = false;
+        this.serverSupportsRequestKeepalive = false;
+        this.serverSupportsHeartbeat = false;
+        this.serverSupportsRunReattach = false;
+        this.pingsSent = 0;
+        this.pongsReceived = 0;
+        if (this.heartbeatTimer !== null) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
+        this.queuedMessageArrivals = [];
+        this.stopAllKeepalives();
+    }
+
+    /** Stop carrying the current run; nothing will reattach it. */
+    /**
+     * Stop carrying the current run. `reportUndelivered` is for a run the
+     * server keeps after the client let go of it (a failed reattach): actions
+     * it applied whose results never reached the server are reported to its
+     * owner. A deliberate close (Stop, sign-out, a library exclusion) reports
+     * nothing.
+     */
+    private dropRun(reportUndelivered = false): void {
+        const run = this.run;
+        if (!run) return;
+        run.end();
+        this.run = null;
+        if (reportUndelivered) this.reportUndeliveredActions(run);
+    }
+
+    /**
+     * The server keeps an action pending until it reads the result of
+     * executing it, so an applied action whose result was lost with the run
+     * would stay pending and could be applied again. Hand those results to
+     * the run's owner, which records them.
+     */
+    private reportUndeliveredActions(run: RunLink): void {
+        const report = run.callbacks.onUndeliveredActions;
+        if (!report || !run.hasActionReplies) return;
+        void run.unconfirmedAppliedActions().then((actions) => {
+            if (actions.length === 0) return;
+            logger(`AgentService: Run ${run.runId} ended with ${actions.length} applied action(s) the server may not have received`, 1);
+            this.noteRunEvent(run.runId, 'undelivered_actions', actions.map((action) => action.actionId).join(','));
+            report({ runId: run.runId, actions });
+        });
+    }
+
+    /** The current run, when the backend lets it outlive its socket. */
+    private reattachableRun(): RunLink | null {
+        return this.run?.reattachable ? this.run : null;
+    }
+
+    /**
+     * Whether the backend answers a plain HTTP request, without opening a
+     * socket. Resolves false on a network error, a timeout, or a 5xx (the
+     * server is not serving yet); never rejects.
+     *
+     * A reattach loop waits on this between attempts instead of opening
+     * sockets into a dead network: the browser counts every failed WebSocket
+     * connect and holds back the next one to the same server for longer each
+     * time (up to a minute), so failed attempts during an outage would delay
+     * the first one after it. HTTP requests are not held back.
+     */
+    async probeReachable(timeoutMs: number = REACHABILITY_PROBE_TIMEOUT_MS): Promise<boolean> {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const httpUrl = new URL(this.baseUrl);
+            const response = await fetch(`${httpUrl.protocol}//${httpUrl.host}/health`, {
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            return response.status < 500;
+        } catch {
+            return false;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /**
+     * Get WebSocket URL from HTTP base URL
+     */
+    private getWebSocketUrl(): string {
+        const wsProtocol = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
+        const httpUrl = new URL(this.baseUrl);
+        return `${wsProtocol}://${httpUrl.host}/api/v1/agents/astermargin/run`;
+    }
+
+    /**
+     * Get auth token from Supabase session (see getWSAuthToken).
+     */
+    private async getAuthToken(): Promise<string> {
+        return getWSAuthToken();
+    }
+
+    /**
+     * Check if WebSocket is currently connected
+     */
+    isConnected(): boolean {
+        return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    }
+
+    /**
+     * Connect to the WebSocket endpoint and send an agent run request
+     *
+     * Protocol flow:
+     * 1. Client connects with clean URL (no sensitive data in params)
+     * 2. Client sends WSAuthMessage with token only
+     * 3. Server authenticates and sends "ready" event
+     * 4. Client sends agent run request (with model selection: model_id/api_key or custom_model)
+     * 5. Server validates model and sends "request_ack" event
+     * 6. Server streams delta events and sends complete event
+     *
+     * A `WSReattachRequest` in place of the run request picks up the run this
+     * service is reattaching (see `reattachWithRetry`) instead of starting one.
+     *
+     * @param request The agent run request to send (should include model_id/api_key or custom_model)
+     * @param callbacks Event callbacks
+     * @returns Promise that resolves when connection is established and ready, rejects on error
+     */
+    async connect(
+        request: AgentConnectRequest,
+        callbacks: WSCallbacks,
+        frontendVersion?: string,
+        clientType?: string,
+        clientFeatures?: string[],
+        zoteroInstance?: ZoteroInstanceWire,
+        connectRecovery?: ConnectRecoveryAuthFields,
+        extractSchemaVersions?: ExtractSchemaVersionsWire,
+    ): Promise<void> {
+        // Refuse before touching connection state, so a blocked run is not
+        // reported as a connection failure or retried.
+        assertBackendAccessAllowed('agentService.connect');
+        const connectTelemetry = connectRecovery ?? connectRecoveryAuthFields(1, null);
+        const reattach = isReattachRequest(request);
+        // A run the user stopped while it was reconnecting is still being
+        // reattached to deliver the cancel; replacing it now would leave it
+        // running on the server. Give that a bounded chance to finish.
+        const handoff = reattach ? null : this.cancelHandoff();
+        const stopping = handoff ? this.run : null;
+        if (handoff) {
+            logger(`AgentService: Waiting for the cancel of run ${stopping?.runId} before connecting`, 1);
+            const epoch = this.connectEpoch;
+            await handoff;
+            // Closed or cancelled while waiting: this connection is no longer
+            // wanted. Like any intentional close, that is not a failure.
+            if (this.connectEpoch !== epoch) {
+                logger('AgentService: Connect abandoned while waiting for a cancel', 1);
+                return;
+            }
+        }
+        // Guard: Don't allow overlapping connect attempts. A new run takes
+        // precedence over reattaching one the user has already left.
+        if (this.connecting && (reattach || !this.connectingReattach)) {
+            logger('AgentService: connect() already in progress, ignoring duplicate call', 1);
+            return;
+        }
+
+        // Log if closing an existing connection
+        if (this.ws) {
+            logger(`AgentService: Closing existing connection before new connect (state=${this.ws.readyState})`, 1);
+        }
+
+        // Close existing connection if any. close() clears `connecting`, so
+        // this attempt claims the flag only after the old state is torn down.
+        this.closeSocket(1000, 'Client closing', { notifyClose: false, keepDetachedRun: reattach });
+        if (reattach) {
+            const run = this.run;
+            if (!run || run.runId !== request.run_id || run.state !== 'reattaching') {
+                throw new Error(`Run ${request.run_id} is not waiting to be reattached`);
+            }
+            run.reattachAttempts++;
+        } else {
+            this.run = new RunLink(request.run_id, callbacks);
+            this.run.threadId = (request as AgentRunRequest).thread_id ?? null;
+            // The run this one waited for is gone now, and its stop with it
+            // unless that was settled in time.
+            if (stopping && !stopping.stopSettled) {
+                logger(`AgentService: Run ${request.run_id} replaced run ${stopping.runId} before its stop was confirmed`, 1);
+                callbacks.onPreviousRunNotStopped?.(stopping.runId);
+            }
+        }
+        this.connecting = true;
+        this.connectingReattach = reattach;
+
+        // close() increments connectionId. Capture the new value so an
+        // external close during the async auth-token lookup can abort setup
+        // before it creates a socket.
+        const setupConnectionId = this.connectionId;
+        const attempt: ConnectionAttemptState = {
+            stage: 'auth',
+            socketOpened: false,
+            readyReceived: false,
+            openedAt: null,
+            lastMessageAt: null,
+        };
+
+        this.callbacks = callbacks;
+
+        // Backstop: if neither ready, a server error event, nor a close event
+        // ever settles this attempt (including an auth-token lookup that
+        // hangs), fail it instead of leaving the caller pending forever.
+        // The timer is scoped to this attempt via its connection generation:
+        // a timer that outlives a superseded attempt (e.g. the user cancelled
+        // during the token lookup and a new run has since connected) must not
+        // tear down the newer connection.
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const connectTimeout = new Promise<void>((resolve, reject) => {
+            timeoutId = setTimeout(() => {
+                if (this.connectionId !== setupConnectionId) {
+                    // Superseded while still unsettled: settle quietly,
+                    // mirroring an intentional client close.
+                    resolve();
+                    return;
+                }
+                // Reject before close(): close() resolves the pending
+                // establishConnection promise, so closing first would let the
+                // race settle as a success and mask the timeout.
+                reject(new ConnectTimeoutError(attemptEvidence(attempt), CONNECT_TIMEOUT_MS));
+                // A reattach attempt is retried by its loop; the run it is
+                // for is still going and must not see a close.
+                this.closeSocket(1000, 'Connection attempt timed out', {
+                    notifyClose: !reattach,
+                    keepDetachedRun: reattach,
+                });
+            }, CONNECT_TIMEOUT_MS);
+        });
+
+        try {
+            await Promise.race([
+                this.establishConnection(
+                    request,
+                    callbacks,
+                    setupConnectionId,
+                    attempt,
+                    frontendVersion,
+                    clientType,
+                    clientFeatures,
+                    zoteroInstance,
+                    connectTelemetry,
+                    extractSchemaVersions,
+                ),
+                connectTimeout,
+            ]);
+        } catch (error) {
+            logger(`AgentService: Connection setup error: ${error}`, 1);
+            // Only reset if this attempt still owns the connection state — a
+            // close() or newer connect() during the token await has already
+            // moved on (and may have set `connecting` for its own attempt).
+            if (this.connectionId === setupConnectionId) {
+                this.connecting = false;
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    }
+
+    /**
+     * Fetch the auth token, open the socket, and settle once the server's
+     * `ready` event arrives (or the attempt fails). Split from connect() so
+     * the caller can race it against the attempt-scoped backstop timeout.
+     */
+    private async establishConnection(
+        request: AgentConnectRequest,
+        callbacks: WSCallbacks,
+        setupConnectionId: number,
+        attempt: ConnectionAttemptState,
+        frontendVersion?: string,
+        clientType?: string,
+        clientFeatures?: string[],
+        zoteroInstance?: ZoteroInstanceWire,
+        connectTelemetry?: ConnectRecoveryAuthFields,
+        extractSchemaVersions?: ExtractSchemaVersionsWire,
+    ): Promise<void> {
+        let token: string;
+        try {
+            token = await this.getAuthToken();
+        } catch (error) {
+            if (error instanceof AgentConnectionError) throw error;
+            const message = error instanceof Error ? error.message : String(error);
+            throw new AgentConnectionError(message || 'Could not check user session', attemptEvidence(attempt, {
+                stage: 'auth',
+                errorName: error instanceof Error ? error.name : 'UnknownError',
+            }));
+        }
+
+        // A close() during the token lookup superseded this attempt (and
+        // already cleared `connecting`). An intentional client close is
+        // not a failure, so resolve quietly without creating a socket.
+        if (this.connectionId !== setupConnectionId) {
+            return;
+        }
+
+        // Auth message includes token, frontend version, and — when the
+        // caller supplies them — the client identity, declared features, and
+        // optional connect-recovery telemetry after client-side auto-retry.
+        const resolvedConnectTelemetry = connectTelemetry ?? connectRecoveryAuthFields(1, null);
+        const { connect_started_at_ms: connectStartedAtMs, ...wireTelemetry } = resolvedConnectTelemetry;
+        const authMessageBase: Omit<WSAuthMessage, 'connect_latency_ms'> = {
+            type: 'auth',
+            token,
+            frontend_version: frontendVersion,
+            ...(clientType ? { client_type: clientType } : {}),
+            ...(clientFeatures ? { client_features: clientFeatures } : {}),
+            ...(zoteroInstance ? { zotero_instance: zoteroInstance } : {}),
+            ...(extractSchemaVersions ? { extract_schema_versions: extractSchemaVersions } : {}),
+            ...wireTelemetry,
+        };
+
+        // Connect with clean URL (no sensitive data in params)
+        const wsUrl = this.getWebSocketUrl();
+        attempt.stage = 'opening';
+
+        logger(`AgentService: Connecting to ${wsUrl}`, 1);
+
+        const reattach = isReattachRequest(request);
+
+        return new Promise<void>((resolve, reject) => {
+            let hasResolved = false;
+            let openTimer: ReturnType<typeof setTimeout> | undefined;
+            const finish = (error?: Error) => {
+                if (hasResolved) return;
+                hasResolved = true;
+                clearTimeout(openTimer);
+                this.connecting = false;
+                if (this.activeConnectFinish === finish) {
+                    this.activeConnectFinish = null;
+                }
+                if (error) reject(error);
+                else resolve();
+            };
+            // close() invalidates this socket before its onclose handler
+            // runs, so expose the promise settler explicitly.
+            this.activeConnectFinish = finish;
+
+            // Wrap the onReady callback to send request after ready
+            const wrappedCallbacks: WSCallbacks = {
+                ...callbacks,
+                onReady: (data: WSReadyData) => {
+                    attempt.stage = 'mid_run';
+                    attempt.readyReceived = true;
+                    if (reattach) {
+                        this.onReattachReady(request, wsInstance, attempt, reportClose, finish);
+                        return;
+                    }
+                    if (
+                        request.expected_tail_run_id !== undefined &&
+                        data.thread_admission_version !== 1
+                    ) {
+                        const message =
+                            "This server does not support safe concurrent chats. Update the server before continuing.";
+                        callbacks.onError({
+                            event: "error",
+                            type: "thread_admission_unavailable",
+                            message,
+                            is_retryable: false,
+                        });
+                        finish(new Error(message));
+                        this.closeSocket();
+                        return;
+                    }
+                    logger('AgentService: Server ready, sending agent run request', 1);
+                    // Call the original onReady callback first
+                    callbacks.onReady(data);
+                    // Send the chat request now that server is ready. A socket
+                    // that reports OPEN can still refuse the write (half-open
+                    // channel); failing the connect here is what surfaces that
+                    // instead of leaving the user on an endless thinking state
+                    // for a run the server never received.
+                    if (!this.send(request)) {
+                        // Reject before close(), matching the timeout path:
+                        // close() settles this same promise, so closing first
+                        // would let the failure resolve as a success. The socket
+                        // must still be torn down — `ready` already marked the
+                        // connection live, so nothing else would reclaim it.
+                        finish(new AgentConnectionError(
+                            'Connection closed before the request could be sent',
+                            attemptEvidence(attempt, { requestNeverSent: true }),
+                        ));
+                        this.closeSocket(1000, 'Request could not be sent');
+                        return;
+                    }
+                    this.startConnectionHeartbeat(wsInstance, attempt, reportClose);
+                    // Resolve the connect promise
+                    finish();
+                },
+                onError: (event: WSErrorEvent) => {
+                    // Call the original error callback
+                    callbacks.onError(event);
+                    // If we haven't resolved yet, this is a connection-phase error
+                    finish(new Error(event.message));
+                }
+            };
+
+            this.callbacks = wrappedCallbacks;
+            let wsInstance: WebSocket;
+            try {
+                wsInstance = new WebSocket(wsUrl);
+                this.ws = wsInstance;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                finish(new AgentConnectionError(message || 'Could not create WebSocket', attemptEvidence(attempt, {
+                    errorName: error instanceof Error ? error.name : 'UnknownError',
+                })));
+                return;
+            }
+
+            const connId = this.connectionId;
+            if (reattach) {
+                openTimer = setTimeout(() => {
+                    if (attempt.socketOpened || this.connectionId !== connId) return;
+                    // Reject before close(), as on the connect timeout.
+                    finish(new ConnectTimeoutError(attemptEvidence(attempt), REATTACH_OPEN_TIMEOUT_MS));
+                    this.closeSocket(1000, 'Connection attempt timed out', {
+                        notifyClose: false,
+                        keepDetachedRun: true,
+                    });
+                }, REATTACH_OPEN_TIMEOUT_MS);
+            }
+
+            // Capture the WebSocket instance to avoid race conditions if connect()
+            // is called again before auth completes. The second connect() would call
+            // close() which sets this.ws = null, but we need the original instance.
+            wsInstance.onopen = () => {
+                clearTimeout(openTimer);
+                attempt.stage = 'authenticating';
+                attempt.socketOpened = true;
+                attempt.openedAt = Date.now();
+                logger('AgentService: Connection established, sending auth message', 1);
+                logger(
+                    `AgentService: WebSocket negotiated extensions="${wsInstance.extensions || '(none)'}" protocol="${wsInstance.protocol || '(none)'}"`,
+                    1,
+                );
+                // Small delay to ensure server has completed accept() before we send
+                // This prevents a race condition where messages sent immediately in onopen
+                // may be dropped if the server hasn't finished accepting the connection
+                setTimeout(() => {
+                    // Use captured wsInstance instead of this.ws to handle case where
+                    // connect() is called again during the delay (which would null this.ws)
+                    if (wsInstance.readyState === WebSocket.OPEN) {
+                        const authMessage: WSAuthMessage = {
+                            ...authMessageBase,
+                            connect_latency_ms: Math.max(
+                                0,
+                                Date.now() - connectStartedAtMs,
+                            ),
+                        };
+                        wsInstance.send(JSON.stringify(authMessage));
+                        attempt.stage = 'awaiting_ready';
+                        logger('AgentService: Auth message sent', 1);
+                    } else {
+                        logger(`AgentService: WebSocket not open for auth (state=${wsInstance.readyState}), connection may have been superseded`, 1);
+                    }
+                }, 50); // 50ms delay to allow server to complete accept()
+                callbacks.onOpen?.();
+                // Note: Don't resolve here - wait for ready event
+            };
+
+            wsInstance.onmessage = (event) => {
+                // A frame buffered on a socket that close() has already
+                // replaced must not be acked, counted or queued against the
+                // new connection.
+                if (this.connectionId !== connId || this.ws !== wsInstance) return;
+                const receivedAt = Date.now();
+                attempt.lastMessageAt = receivedAt;
+                const parsed = this.parseMessage(event.data);
+                if (parsed === null) return;
+                // A replayed event this run has already handled. Checked again
+                // when the event's turn comes: one handled on the lost socket
+                // may still be finishing when its replay arrives.
+                // The backend numbers only events that ask for no answer, so a
+                // `seq` on a request would be its payload, never a replay
+                // position.
+                const rawSeq = (parsed as { seq?: unknown }).seq;
+                const seq = typeof rawSeq === 'number' && !isBackendRequestEvent(parsed.event) ? rawSeq : null;
+                const run = seq !== null ? this.reattachableRun() : null;
+                if (run && seq !== null && seq <= run.lastSeq) {
+                    logger(`AgentService: Ignoring "${parsed.event}" seq ${seq}, already handled`, 1);
+                    return;
+                }
+                if (parsed.event === 'pong') {
+                    this.pongsReceived++;
+                    this.reattachableRun()?.forgetConfirmedReplies(this.connectionId, this.pongsReceived);
+                }
+                // Ack and start keepalives here, before the message enters the
+                // queue: the queue awaits UI callbacks (item loads for streamed
+                // parts), so anything sent from inside it would say nothing
+                // about whether the request arrived — only about whether the
+                // queue was moving. Until the dispatcher picks the request up
+                // its keepalives report the `queued` phase.
+                this.maybeAckRequest(parsed, receivedAt);
+                this.maybeStartKeepalive(parsed, receivedAt);
+                // Chain onto the queue so async callbacks are processed in order.
+                // Captured per message: a reset swaps in a fresh array, and a
+                // handler from the old connection that settles afterwards must
+                // shift its own array, not the new connection's.
+                const arrivals = this.queuedMessageArrivals;
+                arrivals.push(receivedAt);
+                this.messageQueue = this.messageQueue.then(() => {
+                    if (this.connectionId !== connId) return;
+                    if (run && seq !== null) {
+                        if (this.run !== run || seq <= run.lastSeq) return;
+                        run.lastSeq = seq;
+                    }
+                    return this.handleMessage(parsed, receivedAt);
+                }).catch((err) => {
+                    logger(`AgentService: Unhandled error in message queue: ${err}`, 1);
+                }).finally(() => {
+                    // Entries stay until their handler settles, so the count
+                    // includes the message currently being handled.
+                    arrivals.shift();
+                });
+            };
+
+            // Note: onerror carries no useful info in browsers. Per the WebSocket
+            // spec, onclose always fires after onerror, so we defer rejection to
+            // onclose to capture the close code (useful for distinguishing proxy
+            // blocks, TLS failures, and server-side rejects).
+            wsInstance.onerror = () => {
+                logger(`AgentService: WebSocket error event (close will follow)`, 1);
+            };
+
+            const reportClose = (code: number, reason: string, wasClean: boolean) => {
+                logger(`AgentService: Connection closed - code=${code}, reason=${reason}, clean=${wasClean}`, 1);
+                const evidence = attemptEvidence(attempt, {
+                    stage: attempt.readyReceived ? 'mid_run' : attempt.stage,
+                    closeCode: code,
+                    closeReason: reason,
+                    wasClean,
+                });
+                const closedBeforeReady = () => {
+                    if (hasResolved) return;
+                    finish(new AgentConnectionError(
+                        reason
+                            ? `Connection closed: ${reason}`
+                            : `Connection closed before ready (code ${code})`,
+                        evidence,
+                    ));
+                };
+                const run = this.run;
+                if (reattach && run?.state === 'reattaching' && !attempt.readyReceived) {
+                    // A failed reattach attempt. The run is still waiting on
+                    // the server, and the reattach loop decides what is next.
+                    this.resetConnectionState({ keepRunQueues: true });
+                    closedBeforeReady();
+                    return;
+                }
+                if (attempt.readyReceived && this.detachRun(code, evidence)) {
+                    return;
+                }
+                if (reattach && run?.state === 'reattaching' && this.run === run) {
+                    // The new socket closed before the server confirmed the
+                    // reattach, in a way that cannot be retried.
+                    this.resetConnectionState();
+                    this.failReattach(run.runId, 'connection_closed');
+                    return;
+                }
+                // The run ends with its socket: requests still queued or
+                // running for it must not go on.
+                if (run && this.run === run) this.dropRun();
+                // Notify before resetConnectionState() so the callback can
+                // still read connection-scoped state.
+                callbacks.onClose?.(code, reason, wasClean, evidence);
+                // The callback may already have started a new connection,
+                // which owns the state now; resetting it would strand that
+                // attempt.
+                if (this.connectionId === connId) {
+                    this.resetConnectionState();
+                }
+                // If we haven't resolved yet, the connection closed before
+                // ready. Close-code details for the error UI travel via the
+                // onClose callback above, not the rejection.
+                closedBeforeReady();
+            };
+
+            wsInstance.onclose = (event) => {
+                if (this.ws !== wsInstance || this.connectionId !== connId) {
+                    logger('AgentService: Ignoring stale close event from superseded connection', 1);
+                    return;
+                }
+                reportClose(event.code, event.reason, event.wasClean);
+            };
+        });
+    }
+
+    /**
+     * Start the heartbeat on a ready connection. A connection the heartbeat
+     * finds silent is reported lost right away instead of waiting for the
+     * browser: a close handshake over a dead connection only ends when its
+     * own timeout fires. Reporting resets this socket's state, so its eventual
+     * native close event is ignored as stale.
+     */
+    private startConnectionHeartbeat(
+        wsInstance: WebSocket,
+        attempt: ConnectionAttemptState,
+        reportClose: (code: number, reason: string, wasClean: boolean) => void,
+    ): void {
+        this.startHeartbeat(wsInstance, attempt, (silentMs) => {
+            logger(`AgentService: No message for ${silentMs}ms, treating the connection as lost`, 1);
+            reportClose(1006, HEARTBEAT_TIMEOUT_REASON, false);
+            try {
+                wsInstance.close(HEARTBEAT_TIMEOUT_CLOSE_CODE, 'Heartbeat timeout');
+            } catch (error) {
+                logger(`AgentService: Error closing lost connection: ${error}`, 1);
+            }
+        });
+    }
+
+    // =========================================================================
+    // Reattaching a run to a new socket
+    // =========================================================================
+
+    /**
+     * `ready` arrived on a socket opened to reattach a run: ask for the run.
+     * Resolves the connect; the outcome arrives as `reattached` or
+     * `reattach_unavailable`.
+     */
+    private onReattachReady(
+        request: WSReattachRequest,
+        wsInstance: WebSocket,
+        attempt: ConnectionAttemptState,
+        reportClose: (code: number, reason: string, wasClean: boolean) => void,
+        finish: (error?: Error) => void,
+    ): void {
+        // Built now rather than taken from `request`, so `last_seq` is current.
+        const message = this.reattachAttempt(request.run_id)?.request;
+        if (!message) {
+            // The run was given up while this socket was connecting.
+            finish();
+            this.closeSocket(1000, 'Run no longer reattaching', { notifyClose: false });
+            return;
+        }
+        if (!this.serverSupportsRunReattach) {
+            finish();
+            this.failReattach(message.run_id, 'unsupported');
+            return;
+        }
+        logger(`AgentService: Server ready, reattaching run ${message.run_id} from seq ${message.last_seq}`, 1);
+        if (!this.send(message)) {
+            finish(new AgentConnectionError(
+                'Connection closed before the reattach could be sent',
+                attemptEvidence(attempt, { requestNeverSent: true }),
+            ));
+            this.closeSocket(1000, 'Reattach could not be sent', { notifyClose: false, keepDetachedRun: true });
+            return;
+        }
+        this.startConnectionHeartbeat(wsInstance, attempt, reportClose);
+        finish();
+    }
+
+    /**
+     * A ready socket was lost. If the run it carried can be picked up on a new
+     * one, keep the run, tell the callbacks it is reattaching and return true;
+     * otherwise return false and let the loss end the run.
+     */
+    private detachRun(code: number, evidence: ConnectionFailureEvidence): boolean {
+        const run = this.run;
+        const graceMs = run?.graceMs ?? null;
+        if (
+            !run ||
+            graceMs === null ||
+            !run.token ||
+            run.terminal ||
+            !run.callbacks.onReattaching ||
+            !REATTACH_CLOSE_CODES.has(code)
+        ) {
+            return false;
+        }
+        const now = Date.now();
+        if (run.state === 'live') {
+            run.state = 'reattaching';
+            run.detachedAt = now;
+            run.dropEvidence = evidence;
+            run.losses = 0;
+            run.reattachAttempts = 0;
+            run.deadline = now + graceMs;
+            run.deadlineTimer = setTimeout(() => {
+                if (this.run === run && run.state === 'reattaching') {
+                    logger(`AgentService: Reattach of run ${run.runId} ran out of time`, 1);
+                    this.failReattach(run.runId, 'gave_up');
+                }
+            }, Math.max(0, run.deadline - now));
+        } else if (run.deadline !== null && now >= run.deadline) {
+            return false;
+        }
+        // Counted for every loss: a socket opened to reattach can reach
+        // `ready` and be lost before the server's confirmation arrives.
+        run.losses++;
+        logger(`AgentService: Run ${run.runId} lost its connection (code ${code}, loss ${run.losses}); reattaching from seq ${run.lastSeq}`, 1);
+        // Reset before notifying: the callback starts the reattach, which must
+        // find this socket's state already gone.
+        this.resetConnectionState({ keepRunQueues: true });
+        this.noteRunEvent(run.runId, 'detached', String(code));
+        run.callbacks.onReattaching?.({
+            runId: run.runId,
+            cancelRequested: run.cancelRequested,
+            detachedAt: run.detachedAt ?? now,
+            graceMs,
+        });
+        return true;
+    }
+
+    /** The latest reattach-related events of the runs this service carried, oldest first. */
+    recentRunEvents(): RunTransportEvent[] {
+        return this.runEvents.map((event) => ({ ...event }));
+    }
+
+    private noteRunEvent(runId: string, kind: RunTransportEvent['kind'], detail?: string): void {
+        this.runEvents.push({ at: Date.now(), runId, kind, ...(detail !== undefined ? { detail } : {}) });
+        if (this.runEvents.length > MAX_RUN_EVENTS) this.runEvents.shift();
+    }
+
+    /** Where the current run stands with respect to reattach, for diagnostics. */
+    runLinkState(): {
+        runId: string;
+        state: 'live' | 'reattaching';
+        reattachable: boolean;
+        hasToken: boolean;
+        lastSeq: number;
+        cancelRequested: boolean;
+    } | null {
+        const run = this.run;
+        if (!run) return null;
+        return {
+            runId: run.runId,
+            state: run.state,
+            reattachable: run.reattachable,
+            hasToken: run.token !== null,
+            lastSeq: run.lastSeq,
+            cancelRequested: run.cancelRequested,
+        };
+    }
+
+    /**
+     * Whether the user's answer to the approval of `actionId` waits for the
+     * run to reconnect, rather than having been sent before the drop.
+     */
+    isApprovalAnswerHeld(actionId: string): boolean {
+        return this.run?.isAnswerUnsent(`deferred_approval_request:${actionId}`) ?? false;
+    }
+
+    /** Whether `runId` lost its socket and is waiting to be reattached. */
+    isReattaching(runId: string): boolean {
+        return this.run?.runId === runId && this.run.state === 'reattaching';
+    }
+
+    /**
+     * Whether `runId` is reconnecting and can be left without stopping it (see
+     * `leaveRun`): it was not stopped, and holds no decision the user made
+     * meanwhile, which leaving would drop.
+     */
+    canLeaveRun(runId: string): boolean {
+        return this.isReattaching(runId) && !this.run!.cancelRequested && !this.run!.hasHeld;
+    }
+
+    /**
+     * Let go of `runId` without cancelling it. The server keeps the run as it
+     * keeps any run whose connection was lost: it finishes and saves it if it
+     * can, or ends it as interrupted once its grace period is over.
+     *
+     * Meant for a run that is reconnecting (`canLeaveRun`). One that has been
+     * picked up again since the user chose to leave is let go the same way.
+     * Returns false, and changes nothing, when the run is not this service's,
+     * was stopped, holds a decision, or cannot be held by the server.
+     */
+    leaveRun(runId: string): boolean {
+        const run = this.run;
+        if (!run || run.runId !== runId || run.cancelRequested || run.hasHeld || run.terminal || !run.token || !run.reattachable) return false;
+        logger(`AgentService: Leaving run ${runId} (${run.state}); the server keeps it`, 1);
+        this.close(LEFT_RUN_CLOSE_CODE, 'Run left after a lost connection', { notifyClose: false });
+        // The server keeps the run, still waiting on results it never got.
+        this.reportUndeliveredActions(run);
+        return true;
+    }
+
+    /**
+     * Ask the server to park `runId`, which is waiting only on cards the user
+     * can answer later, instead of stopping it. Waits briefly for the server
+     * to settle the run; a refusal (the run also waits on something that
+     * cannot park) stops it as `cancel()` would. Either way the socket is
+     * closed without notifying the run's callbacks.
+     *
+     * Once the server has the frame it keeps the park even if the socket
+     * closes before the run has ended, so the wait only bounds how long a
+     * refusal can take to arrive.
+     */
+    async parkRun(runId: string, waitMs: number = PARK_SETTLE_WAIT_MS): Promise<ParkOutcome> {
+        const run = this.run;
+        if (!run || run.runId !== runId || run.terminal || run.cancelRequested || run.state !== 'live') {
+            return 'unavailable';
+        }
+        const connectionId = this.connectionId;
+        const settled = new Promise<ParkOutcome>((resolve) => {
+            this.pendingPark?.('ended');
+            this.pendingPark = resolve;
+        });
+        if (!this.sendPark(runId)) {
+            this.settlePark('unavailable');
+            return 'unavailable';
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const outcome = await Promise.race([
+            settled,
+            new Promise<ParkOutcome>((resolve) => { timer = setTimeout(() => resolve('sent'), waitMs); }),
+        ]).finally(() => clearTimeout(timer));
+        if (this.pendingPark) this.settlePark(outcome);
+        if (outcome === 'refused') {
+            if (connectionId === this.connectionId) await this.cancel();
+            return outcome;
+        }
+        this.closeSocket(1000, 'Run parked', { notifyClose: false, onlyIfConnectionId: connectionId });
+        return outcome;
+    }
+
+    /**
+     * Send the `park` frame for `runId` without waiting for an answer, for a
+     * client that is going away. Returns false when it could not be sent.
+     */
+    sendPark(runId: string): boolean {
+        const run = this.run;
+        if (!run || run.runId !== runId || run.terminal || run.state !== 'live') return false;
+        logger(`AgentService: Parking run ${runId}`, 1);
+        return this.send({ type: 'park', run_id: runId });
+    }
+
+    private settlePark(outcome: ParkOutcome): void {
+        const resolve = this.pendingPark;
+        this.pendingPark = null;
+        resolve?.(outcome);
+    }
+
+    /**
+     * While a run stopped during a reconnect is still being reached to deliver
+     * its cancel, a new run waits for it. Resolves once that run has ended or
+     * `CANCEL_HANDOFF_WAIT_MS` has passed; null when nothing is waited for.
+     * Whether the stop was settled is reported to the run that replaces it
+     * (`onPreviousRunNotStopped`).
+     */
+    cancelHandoff(): Promise<void> | null {
+        const stopping = this.run;
+        if (stopping?.state !== 'reattaching' || !stopping.cancelRequested) return null;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        return Promise.race([
+            stopping.ended,
+            new Promise<void>((resolve) => { timer = setTimeout(resolve, CANCEL_HANDOFF_WAIT_MS); }),
+        ]).finally(() => clearTimeout(timer));
+    }
+
+    /**
+     * What a new socket needs to reattach `runId`: the request it sends and the
+     * callbacks the run was started with. Null when that run is not waiting to
+     * be reattached.
+     */
+    reattachAttempt(runId: string): { request: WSReattachRequest; callbacks: WSCallbacks } | null {
+        const run = this.run;
+        if (!run || run.runId !== runId || run.state !== 'reattaching' || !run.token) return null;
+        return {
+            request: { type: 'reattach', run_id: runId, reattach_token: run.token, last_seq: run.lastSeq },
+            callbacks: run.callbacks,
+        };
+    }
+
+    /**
+     * Give up reattaching `runId`: close any socket opened for it and end the
+     * run through `onReattachFailed`. No-op unless that run is reattaching.
+     */
+    failReattach(runId: string, reason: ReattachFailureReason): void {
+        const run = this.run;
+        if (!run || run.runId !== runId || run.state !== 'reattaching') return;
+        logger(`AgentService: Could not reattach run ${runId}: ${reason}`, 1);
+        this.noteRunEvent(runId, 'reattach_failed', reason);
+        // An expired run was ended by the server, which settles a stop too.
+        if (reason === 'expired') run.stopSettled = true;
+        this.dropRun(true);
+        this.closeSocket(1000, 'Reattach failed', { notifyClose: false });
+        run.callbacks.onReattachFailed?.({
+            runId,
+            reason,
+            evidence: run.dropEvidence ?? baselineConnectionEvidence('mid_run'),
+            gapMs: run.detachedAt !== null ? Math.max(0, Date.now() - run.detachedAt) : 0,
+            attempts: run.reattachAttempts,
+            losses: run.losses,
+        });
+    }
+
+    /** The server picked the run up on this socket: deliver what waited for it. */
+    private onReattached(event: WSReattachedEvent): void {
+        const run = this.run;
+        if (!run || run.runId !== event.run_id || run.state !== 'reattaching') return;
+        const gapMs = run.detachedAt !== null ? Math.max(0, Date.now() - run.detachedAt) : 0;
+        run.state = 'live';
+        run.detachedAt = null;
+        run.deadline = null;
+        run.clearDeadline();
+        logger(`AgentService: Reattached run ${run.runId} after ${gapMs}ms on socket ${run.reattachAttempts} (${run.losses} lost); ${event.replayed} event(s) replayed`, 1);
+        this.noteRunEvent(run.runId, 'reattached', `${event.replayed} replayed`);
+        if (run.cancelRequested) {
+            // Stopped while reconnecting. The user has already left the run,
+            // so nothing else they decided matters any more.
+            run.takeHeld();
+            void this.sendCancel();
+        } else {
+            for (const message of run.takeHeld()) {
+                const key = answeredPromptKey(message);
+                const sent = this.send(message);
+                if (key) run.recordAnswer(key, message, sent ? this.connectionId : null);
+            }
+        }
+        run.callbacks.onReattached?.({
+            runId: run.runId,
+            evidence: run.dropEvidence ?? baselineConnectionEvidence('mid_run'),
+            gapMs,
+            replayed: event.replayed,
+            attempts: run.reattachAttempts,
+            losses: run.losses,
+        });
+    }
+
+    private onReattachUnavailable(event: WSReattachUnavailableEvent): void {
+        if (!this.isReattaching(event.run_id)) return;
+        this.failReattach(event.run_id, event.reason);
+    }
+
+    /**
+     * Send a user decision (an answer to a prompt, or a cancel). While the run
+     * is reattaching it is held and sent once the server confirms the
+     * reattach; it is dropped if the reattach fails, which ends the run anyway.
+     * Returns false only when the decision cannot reach the run.
+     */
+    private sendDecision(message: Record<string, any>): boolean {
+        const run = this.reattachableRun();
+        const key = answeredPromptKey(message);
+        if (run?.state !== 'reattaching' && this.send(message)) {
+            if (run && key) run.recordAnswer(key, message, this.connectionId);
+            return true;
+        }
+        // Reattaching, or the socket refused the write before its close was
+        // noticed. A run that can still be reattached keeps the decision and
+        // delivers it then. Otherwise the caller is told it was not delivered,
+        // and it is not kept: replaying it later could apply an action the
+        // user has since applied locally.
+        if (run?.token && !run.terminal && run.callbacks.onReattaching) {
+            logger(`AgentService: Holding "${message.type}" until run ${run.runId} is reattached`, 1);
+            run.hold(message);
+            if (key) run.recordAnswer(key, message, null);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether a prompt is one this run has already seen. A re-sent prompt is
+     * not shown again; if it was answered, the answer is re-sent unless this
+     * socket already carried it.
+     */
+    private isRepeatedPrompt(key: string | null): boolean {
+        const run = this.reattachableRun();
+        if (!run || !key) return false;
+        const seen = run.notePrompt(key);
+        if (!seen) return false;
+        logger(`AgentService: Prompt ${key} was already received; not showing it again`, 1);
+        if (seen.answer && seen.sentOn !== this.connectionId && run.state === 'live') {
+            const sent = this.send(seen.answer);
+            run.recordAnswer(key, seen.answer, sent ? this.connectionId : null);
+        }
+        return true;
+    }
+
+    /** Write a remembered reply to the current socket, once per socket. */
+    private deliverReply(run: RunLink, reply: RunReply): void {
+        // Before the server confirms a reattach, a reply on the new socket
+        // would reach no run; the server re-sends the request afterwards.
+        if (this.run !== run || run.state !== 'live' || reply.response === null) return;
+        if (reply.sentOn === this.connectionId) return;
+        if (this.send(reply.response)) {
+            reply.sentOn = this.connectionId;
+            reply.pingMark = this.pingsSent;
+        }
+    }
+
+    /**
+     * Ping a ready connection and call `onLost` once no message has arrived
+     * for HEARTBEAT_TIMEOUT_MS. A browser only notices a dropped connection
+     * when a write fails, so a socket the client is not writing to — a run
+     * waiting on an approval card — can look open long after the server has
+     * dropped it. No-op against a backend that does not answer pings.
+     */
+    private startHeartbeat(
+        wsInstance: WebSocket,
+        attempt: ConnectionAttemptState,
+        onLost: (silentMs: number) => void,
+    ): void {
+        if (!this.serverSupportsHeartbeat) return;
+        const connId = this.connectionId;
+        let lastTickAt = Date.now();
+        let aliveAt = lastTickAt;
+        let lastBuffered = wsInstance.bufferedAmount;
+        const timer = setInterval(() => {
+            if (this.connectionId !== connId || this.ws !== wsInstance) {
+                clearInterval(timer);
+                return;
+            }
+            const now = Date.now();
+            // Sampled before this tick's ping, which would otherwise read as
+            // a drain on the next tick. Browsers lower bufferedAmount only
+            // when a whole message has been written, so a drop is the only
+            // visible upload progress; the pong for that window still waits
+            // behind whatever is queued.
+            const buffered = wsInstance.bufferedAmount;
+            // A late tick means timers were starved (busy main thread, system
+            // sleep), so pongs may still be waiting to be dispatched.
+            if (now - lastTickAt > 2 * HEARTBEAT_INTERVAL_MS || buffered < lastBuffered) {
+                aliveAt = now;
+            }
+            lastTickAt = now;
+            lastBuffered = buffered;
+            if (attempt.lastMessageAt !== null) {
+                aliveAt = Math.max(aliveAt, attempt.lastMessageAt);
+            }
+            const silentMs = now - aliveAt;
+            if (silentMs >= (buffered > 0 ? HEARTBEAT_UPLOAD_TIMEOUT_MS : HEARTBEAT_TIMEOUT_MS)) {
+                clearInterval(timer);
+                onLost(silentMs);
+                return;
+            }
+            // The highest event handled lets a backend that reattaches runs
+            // stop holding those events for replay.
+            const run = this.serverSupportsRunReattach ? this.run : null;
+            const ping: WSPingMessage = run ? { type: 'ping', last_seq: run.lastSeq } : { type: 'ping' };
+            try {
+                wsInstance.send(JSON.stringify(ping));
+                this.pingsSent++;
+            } catch (error) {
+                logger(`AgentService: Failed to send ping: ${error}`, 1);
+            }
+        }, HEARTBEAT_INTERVAL_MS);
+        this.heartbeatTimer = timer;
+    }
+
+    /**
+     * Send a message to the server.
+     *
+     * Returns false when the socket is not open, so callers whose message
+     * carries a user decision can recover locally instead of assuming it went
+     * out. Most callers can ignore the result.
+     */
+    send(data: AgentConnectRequest | Record<string, any> | PreparedJsonMessage): boolean {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            logger('AgentService: Cannot send - WebSocket not connected', 1);
+            return false;
+        }
+
+        // Attach a completion-time busy-context snapshot to request responses
+        // (backend response models carry `timing: Dict[str, Any]` and ignore
+        // extra fields, so this is safe against any backend version). Shallow
+        // copy to avoid mutating the caller's object.
+        if (isPreparedJsonMessage(data)) {
+            const envelope = preparedJsonEnvelope(data);
+            if (
+                'request_id' in envelope
+                && 'type' in envelope
+                && !isRequestSignal(envelope.type)
+            ) {
+                try {
+                    data = withPreparedJsonEnvelope(data, (current) => ({
+                        ...current,
+                        timing: { ...current.timing, ...resolveBusyContext() },
+                    }));
+                } catch (error) {
+                    logger(`AgentService: Failed to attach busy context: ${error}`, 1);
+                }
+            }
+        } else if (
+            'request_id' in data
+            && 'type' in data
+            && !isRequestSignal((data as any).type)
+        ) {
+            try {
+                data = {
+                    ...data,
+                    timing: { ...(data as any).timing, ...resolveBusyContext() },
+                };
+            } catch (error) {
+                logger(`AgentService: Failed to attach busy context: ${error}`, 1);
+            }
+        }
+
+        const message = isPreparedJsonMessage(data)
+            ? materializePreparedJsonMessage(data)
+            : JSON.stringify(data);
+
+        // Sanitize sensitive data for logging
+        const sanitizedData: Record<string, any> = isPreparedJsonMessage(data)
+            ? { ...preparedJsonEnvelope(data), result: '[stripped document result for log]' }
+            : { ...data };
+        if ('api_key' in sanitizedData) {
+            sanitizedData.api_key = '[REDACTED]';
+        }
+        if ('reattach_token' in sanitizedData) {
+            sanitizedData.reattach_token = '[REDACTED]';
+        }
+        if ('custom_model' in sanitizedData && typeof sanitizedData.custom_model === 'object') {
+            sanitizedData.custom_model = {
+                ...sanitizedData.custom_model,
+                api_key: sanitizedData.custom_model.api_key ? '[REDACTED]' : undefined
+            };
+        }
+        // Strip large payloads from the LOG copy only. The wire payload at
+        // line :311 uses the original `data`
+        if ('type' in sanitizedData && sanitizedData.type === 'zotero_attachment_page_images' && 'pages' in sanitizedData) {
+            const n = Array.isArray((sanitizedData as any).pages) ? (sanitizedData as any).pages.length : 0;
+            sanitizedData.pages = `[stripped ${n} page image(s) for log]`;
+        }
+        if ('type' in sanitizedData && sanitizedData.type === 'zotero_document' && 'result' in sanitizedData) {
+            sanitizedData.result = '[stripped document result for log]';
+        }
+        // Log the sanitized and stripped data
+        logger(`AgentService: Sending "${sanitizedData.type}"`, sanitizedData, 1);
+
+        try {
+            this.ws.send(message);
+        } catch (error) {
+            logger(`AgentService: Send failed: ${error}`, 1);
+            return false;
+        }
+        return true;
+    }
+
+    /** Busy snapshot plus transport state, shared by acks and keepalives. */
+    private transportBusyContext(receivedAt: number): Record<string, number> {
+        const now = Date.now();
+        const oldest = this.queuedMessageArrivals[0];
+        return {
+            ...resolveBusyContext(),
+            dispatch_lag_ms: Math.max(0, now - receivedAt),
+            queue_depth: this.queuedMessageArrivals.length,
+            queue_oldest_ms: oldest === undefined ? 0 : Math.max(0, now - oldest),
+        };
+    }
+
+    /**
+     * Acknowledge a backend→frontend request as received. Called from the
+     * socket's message handler before the message enters the queue. Gated on
+     * the backend's `supports_request_acks` capability (older backends would
+     * route the ack to the pending request as its response). Best-effort:
+     * never blocks or fails request dispatch.
+     */
+    private maybeAckRequest(event: WSEvent, receivedAt: number): void {
+        if (!this.serverSupportsRequestAcks) return;
+        const requestId = (event as any).request_id;
+        if (typeof requestId !== 'string' || !isBackendRequestEvent(event.event)) return;
+        try {
+            const ack: WSRequestReceivedAck = {
+                type: 'request_received',
+                request_id: requestId,
+                busy: this.transportBusyContext(receivedAt),
+            };
+            this.send(ack);
+        } catch (error) {
+            logger(`AgentService: Failed to send request_received ack: ${error}`, 1);
+        }
+    }
+
+    /**
+     * Start `request_keepalive` for a backend request as soon as it arrives.
+     * The backend keeps waiting on slow work while these arrive and treats
+     * silence after the first one as a frozen client. The controller is parked
+     * under the request id until the dispatcher takes it over (see
+     * `takeKeepalive`); it reports `queued` until then.
+     */
+    private maybeStartKeepalive(event: WSEvent, receivedAt: number): void {
+        if (!this.serverSupportsRequestKeepalive) return;
+        const requestId = (event as any).request_id;
+        if (typeof requestId !== 'string' || !isBackendRequestEvent(event.event)) return;
+        this.pendingKeepalives.set(requestId, this.startKeepalive(requestId, receivedAt, 'queued'));
+    }
+
+    /** Hand a parked keepalive to the dispatcher; a no-op controller when none was started. */
+    private takeKeepalive(requestId: string | null): RequestKeepalive {
+        if (requestId === null) return NOOP_KEEPALIVE;
+        const keepalive = this.pendingKeepalives.get(requestId);
+        if (!keepalive) return NOOP_KEEPALIVE;
+        this.pendingKeepalives.delete(requestId);
+        return keepalive;
+    }
+
+    private startKeepalive(requestId: string, receivedAt: number, initialPhase: string): RequestKeepalive {
+        const connId = this.connectionId;
+        let phase = initialPhase;
+        const controller: RequestKeepalive = {
+            setPhase: (next: string) => { phase = next; },
+            stop: () => {
+                clearInterval(timer);
+                this.activeKeepalives.delete(controller);
+                // A request re-sent after a reattach parks its own controller
+                // under the same id; stopping this one must not remove it.
+                if (this.pendingKeepalives.get(requestId) === controller) {
+                    this.pendingKeepalives.delete(requestId);
+                }
+            },
+        };
+        const tick = () => {
+            // The connection was replaced under a still-running handler:
+            // the new socket must not carry this request's keepalives.
+            if (this.connectionId !== connId) {
+                controller.stop();
+                return;
+            }
+            try {
+                const keepalive: WSRequestKeepalive = {
+                    type: 'request_keepalive',
+                    request_id: requestId,
+                    phase,
+                    elapsed_ms: Math.max(0, Date.now() - receivedAt),
+                    busy: this.transportBusyContext(receivedAt),
+                };
+                this.send(keepalive);
+            } catch (error) {
+                logger(`AgentService: Failed to send request_keepalive: ${error}`, 1);
+            }
+        };
+        const timer = setInterval(tick, REQUEST_KEEPALIVE_INTERVAL_MS);
+        this.activeKeepalives.add(controller);
+        return controller;
+    }
+
+    private stopAllKeepalives(): void {
+        for (const keepalive of Array.from(this.activeKeepalives)) {
+            keepalive.stop();
+        }
+        this.activeKeepalives.clear();
+        this.pendingKeepalives.clear();
+    }
+
+    /** Parse a raw socket frame; null (after reporting) when it is not a usable event. */
+    private parseMessage(rawData: unknown): WSEvent | null {
+        if (!this.callbacks) return null;
+        // Guard against invalid data during close handshake
+        if (typeof rawData !== 'string' || !rawData) {
+            logger('AgentService: Received invalid message data (likely during close)', 1);
+            return null;
+        }
+        try {
+            return JSON.parse(rawData) as WSEvent;
+        } catch (error) {
+            logger(`AgentService: Failed to parse message: ${error}`, 1);
+            this.callbacks.onError({
+                event: 'error',
+                type: 'parse_error',
+                message: 'Failed to parse server message',
+            });
+            return null;
+        }
+    }
+
+    /**
+     * Handle a parsed WebSocket message.
+     * Async to support callbacks that load item data before updating state.
+     * Messages are serialized via messageQueue to preserve processing order;
+     * the request ack has already been sent by the time this runs.
+     */
+    private async handleMessage(event: WSEvent, receivedAt: number = Date.now()): Promise<void> {
+        if (!this.callbacks) return;
+
+        try {
+            // A prompt re-sent after a reattach is not shown again.
+            if (this.isRepeatedPrompt(promptKey(event))) return;
+
+            switch (event.event) {
+                case 'ready': {
+                    this.serverSupportsRequestAcks = event.supports_request_acks === true;
+                    this.serverSupportsRequestKeepalive = event.supports_request_keepalive === true;
+                    this.serverSupportsHeartbeat = event.supports_heartbeat === true;
+                    this.serverSupportsRunReattach = event.supports_run_reattach === true;
+                    // The grace period is the run's: a reattach socket's own
+                    // `ready` does not change what the run was offered.
+                    const run = this.run;
+                    if (run && run.state === 'live') {
+                        const graceS = event.reattach_grace_s;
+                        run.graceMs = this.serverSupportsRunReattach && typeof graceS === 'number' && graceS > 0
+                            ? graceS * 1000
+                            : null;
+                    }
+                    // Convert snake_case backend response to camelCase frontend data
+                    const readyData: WSReadyData = {
+                        thread_admission_version:
+                            event.thread_admission_version,
+                        subscriptionStatus: event.subscription_status,
+                        processingMode: event.processing_mode,
+                        indexingComplete: event.indexing_complete,
+                    };
+                    this.callbacks.onReady(readyData);
+                    break;
+                }
+
+                case 'request_ack': {
+                    if (this.run?.runId === event.run_id && typeof event.reattach_token === 'string') {
+                        this.run.token = event.reattach_token;
+                    }
+                    // Request acknowledged with model info
+                    const ackData: WSRequestAckData = {
+                        runId: event.run_id,
+                        modelId: event.model_id,
+                        modelName: event.model_name,
+                        chargeType: event.charge_type,
+                    };
+                    this.callbacks.onRequestAck?.(ackData);
+                    break;
+                }
+
+                case 'part':
+                    await this.callbacks.onPart(event);
+                    break;
+
+                case 'tool_return':
+                    await this.callbacks.onToolReturn(event);
+                    break;
+
+                case 'tool_call_progress':
+                    this.callbacks.onToolCallProgress(event);
+                    break;
+
+                case 'tool_call_args_stream':
+                    this.callbacks.onToolCallArgsStream(event);
+                    break;
+
+                case 'run_complete':
+                    await this.callbacks.onRunComplete(event);
+                    break;
+
+                case 'run_citations':
+                    await this.callbacks.onRunCitations?.(event);
+                    break;
+
+                case 'streaming_done':
+                    this.callbacks.onStreamingDone?.(event);
+                    break;
+
+                case 'done':
+                    if (this.run) this.run.terminal = true;
+                    this.settlePark('ended');
+                    this.callbacks.onDone();
+                    break;
+
+                case 'pong':
+                    // Its arrival already counted as connection activity.
+                    break;
+
+                case 'reattached':
+                    this.onReattached(event);
+                    break;
+
+                case 'reattach_unavailable':
+                    this.onReattachUnavailable(event);
+                    break;
+
+                case 'thread':
+                    if (this.run) this.run.threadId = event.thread_id;
+                    this.callbacks.onThread(event.thread_id, event.retry_truncation);
+                    break;
+
+                case 'thread_name':
+                    this.callbacks.onThreadName?.(event);
+                    break;
+
+                case 'error': {
+                    if (this.run) {
+                        this.run.terminal = true;
+                        // An error on a socket opened to reattach (an auth
+                        // failure, say) is reported here; nothing is left
+                        // to reattach.
+                        if (this.run.state === 'reattaching') this.dropRun(true);
+                    }
+                    // Call onError callback
+                    this.callbacks.onError(event);
+                    // Backend behavior: some errors close connection (auth, internal),
+                    // others keep it open (LLM errors, rate limits, invalid_request).
+                    // Since each connect() is for a single run (for now), close on any error.
+                    // Use a small delay to avoid race with server-initiated close.
+                    const errorSocket = this.ws;
+                    const errorConnectionId = this.connectionId;
+                    setTimeout(() => {
+                        if (
+                            this.connectionId === errorConnectionId &&
+                            this.ws === errorSocket &&
+                            this.ws &&
+                            this.ws.readyState !== WebSocket.CLOSED
+                        ) {
+                            // Firefox/Zotero only allows code 1000 or 3000-4999 for close()
+                            // 1011 causes InvalidAccessError, so we use 1000 (Normal Closure)
+                            this.closeSocket(1000, `Client closing after error: ${event.type}`);
+                        }
+                    }, 100);
+                    break;
+                }
+
+                case 'warning':
+                    this.callbacks.onWarning(event);
+                    break;
+
+                case 'agent_actions':
+                    await this.callbacks.onAgentActions?.(event);
+                    break;
+
+                case 'retry':
+                    this.callbacks.onRetry?.(event);
+                    break;
+
+                case 'missing_zotero_data':
+                    this.callbacks.onMissingZoteroData?.(event);
+                    break;
+
+                case 'deferred_approval_request':
+                    logger("AgentService: Received deferred_approval_request", event, 1);
+                    // This event is handled by the UI via callback
+                    if (this.callbacks?.onDeferredApprovalRequest) {
+                        this.callbacks.onDeferredApprovalRequest(event);
+                    } else {
+                        // No handler - auto-reject to avoid blocking the agent
+                        logger("AgentService: No deferred approval handler, auto-rejecting", 1);
+                        this.sendDecision({
+                            type: 'deferred_approval_response',
+                            action_id: event.action_id,
+                            approved: false,
+                        });
+                    }
+                    break;
+
+                case 'deferred_approval_stale':
+                    logger("AgentService: Received deferred_approval_stale", event, 1);
+                    this.callbacks?.onDeferredApprovalStale?.(event);
+                    break;
+
+                case 'credit_confirmation_request':
+                    logger("AgentService: Received credit_confirmation_request", event, 1);
+                    // This event is handled by the UI via callback
+                    if (this.callbacks?.onCreditConfirmationRequest) {
+                        this.callbacks.onCreditConfirmationRequest(event);
+                    } else {
+                        // No handler - decline so the run wraps up now instead of
+                        // spending credits or waiting out the confirmation timeout.
+                        logger("AgentService: No credit confirmation handler, auto-declining", 1);
+                        this.sendDecision({
+                            type: 'credit_confirmation_response',
+                            confirmation_id: event.confirmation_id,
+                            approved: false,
+                        });
+                    }
+                    break;
+
+                case 'credit_confirmation_stale':
+                    logger("AgentService: Received credit_confirmation_stale", event, 1);
+                    this.callbacks?.onCreditConfirmationStale?.(event);
+                    break;
+
+                case 'batch_approval_request':
+                    logger("AgentService: Received batch_approval_request", event, 1);
+                    // This event is handled by the UI via callback
+                    if (this.callbacks?.onBatchApprovalRequest) {
+                        this.callbacks.onBatchApprovalRequest(event);
+                    } else {
+                        // No handler - decline. Declining cancels the batch, which
+                        // is the safe outcome for a client that cannot show the
+                        // card: dropping the event would stall the run for the
+                        // whole approval timeout, and approving would grant
+                        // coverage the user was never shown.
+                        logger("AgentService: No batch approval handler, auto-declining", 1);
+                        this.sendDecision({
+                            type: 'batch_approval_response',
+                            approval_id: event.approval_id,
+                            approved: false,
+                            // A response is only well-formed with a mode. Echo the
+                            // mode the card would have preselected.
+                            mode: event.default_mode ?? 'full_access',
+                        });
+                    }
+                    break;
+
+                case 'batch_approval_stale':
+                    logger("AgentService: Received batch_approval_stale", event, 1);
+                    this.callbacks?.onBatchApprovalStale?.(event);
+                    break;
+
+                case 'table_card_request':
+                    logger("AgentService: Received table_card_request", { card_id: event.card_id, sources: event.sources.length }, 1);
+                    if (this.callbacks?.onTableCardRequest) {
+                        this.callbacks.onTableCardRequest(event);
+                    } else {
+                        // A client that cannot show the card declines: nothing
+                        // is created, and the run is not stalled for the card's
+                        // whole timeout.
+                        logger("AgentService: No table card handler, declining", 1);
+                        this.sendDecision({
+                            type: 'table_card_response',
+                            card_id: event.card_id,
+                            approved: false,
+                        });
+                    }
+                    break;
+
+                case 'table_card_stale':
+                    logger("AgentService: Received table_card_stale", event, 1);
+                    this.callbacks?.onTableCardStale?.(event);
+                    break;
+
+                case 'park_refused':
+                    logger(`AgentService: Park of run ${event.run_id ?? '(unknown)'} refused (${event.reason})`, 1);
+                    this.settlePark('refused');
+                    break;
+
+                case 'ask_user_question_request':
+                    logger("AgentService: Received ask_user_question_request", event, 1);
+                    // This event is handled by the UI via callback
+                    if (this.callbacks?.onAskUserQuestionRequest) {
+                        this.callbacks.onAskUserQuestionRequest(event);
+                    } else {
+                        // No handler - auto-cancel so the agent never hangs
+                        logger("AgentService: No ask_user_question handler, auto-cancelling", 1);
+                        this.sendDecision({
+                            type: 'ask_user_question_response',
+                            question_id: event.question_id,
+                            answers: [],
+                            cancelled: true,
+                        });
+                    }
+                    break;
+
+                default: {
+                    // Data-request events are dispatched through the injectable
+                    // data-provider map rather than hardcoded cases. The handler
+                    // resolves with the response to send; on failure — or when
+                    // the map has no entry — an error reply is sent so the
+                    // backend doesn't time out.
+                    const eventName = (event as any).event;
+                    const dataEvent = event as any;
+                    const requestId = typeof dataEvent.request_id === 'string' ? dataEvent.request_id : null;
+                    // Started on receipt (see onmessage), so time spent in the
+                    // message queue or behind other executes is reported as
+                    // `queued` rather than as silence.
+                    const keepalive = this.takeKeepalive(requestId);
+                    const entry = this.getDataProvider()[eventName];
+                    if (!entry) {
+                        keepalive.stop();
+                        logger(`AgentService: Unknown event type: ${eventName}`, 1);
+                        const errorResponse = unknownDataRequestErrorResponse(event);
+                        if (errorResponse) {
+                            this.send(errorResponse);
+                        }
+                        break;
+                    }
+                    // A request belongs to the run when the run can outlive
+                    // this socket: it keeps going while the run is reattached,
+                    // and its reply goes to whichever socket carries the run.
+                    const run = requestId !== null ? this.reattachableRun() : null;
+                    const earlier = run && requestId !== null ? run.reply(requestId) : undefined;
+                    if (run && earlier) {
+                        // Re-sent after a reattach: its reply was lost with the
+                        // socket, or it is still running. Never run it again.
+                        logger(`AgentService: ${eventName} ${requestId} was already received; answering from memory`, 1);
+                        this.noteRunEvent(run.runId, 'reply_from_memory', eventName);
+                        keepalive.setPhase('running');
+                        void earlier.settled.then(() => {
+                            keepalive.stop();
+                            this.deliverReply(run, earlier);
+                        });
+                        break;
+                    }
+                    logger(`AgentService: Received ${eventName}`, dataEvent, 1);
+                    const requestConnectionId = this.connectionId;
+                    // A run the user stopped while it was reattaching only
+                    // waits to deliver the cancel; nothing queued for it runs.
+                    const isCurrent = (): boolean =>
+                        run
+                            ? this.run === run && !run.cancelRequested
+                            : this.connectionId === requestConnectionId;
+                    const owner = this.run;
+                    const context: AgentDataRequestContext = {
+                        assertCurrent: () => {
+                            if (!isCurrent()) {
+                                throw Object.assign(new Error('Request connection closed'), { code: 'operation_cancelled' });
+                            }
+                        },
+                        receivedAt,
+                        reportPhase: (phase) => keepalive.setPhase(phase),
+                        ...(owner ? {
+                            run: { runId: owner.runId, threadId: owner.threadId },
+                            runStopped: owner.stopSignal,
+                        } : {}),
+                    };
+                    const tracked = run && requestId !== null
+                        ? run.trackReply(requestId, executedAction(eventName, dataEvent))
+                        : null;
+                    const respond = (response: Record<string, any> | PreparedJsonMessage) => {
+                        keepalive.stop();
+                        if (run && tracked) {
+                            tracked.settle(response);
+                            this.deliverReply(run, tracked.reply);
+                        } else {
+                            this.send(response);
+                        }
+                    };
+                    const runRequest = (): Promise<void> => {
+                        keepalive.setPhase('running');
+                        return entry.handle(dataEvent, context)
+                            .then((res) => respond(res))
+                            .catch((err) => {
+                                logger(`AgentService: ${eventName} failed: ${err}`, 1);
+                                respond(entry.errorResponse(dataEvent, err));
+                            });
+                    };
+                    if (entry.serialize) {
+                        // Chain onto actionExecutionQueue to serialize mutating
+                        // actions. Stale queued actions are skipped once the
+                        // request is no longer current (same guard as
+                        // messageQueue).
+                        this.actionExecutionQueue = this.actionExecutionQueue.then(() => {
+                            if (!isCurrent()) {
+                                keepalive.stop();
+                                // Never run, so there is no reply to wait for.
+                                tracked?.settle(null);
+                                return;
+                            }
+                            return runRequest();
+                        });
+                    } else {
+                        runRequest();
+                    }
+                    break;
+                }
+            }
+        } catch (error) {
+            logger(`AgentService: Error handling event: ${error}`, 1);
+            // Only report handling errors if we're still actively listening
+            if (this.callbacks) {
+                this.callbacks.onError({
+                    event: 'error',
+                    type: 'event_handling_error',
+                    message: 'Failed to handle server event',
+                    details: String(error),
+                });
+            }
+        }
+    }
+
+    /**
+     * Close the WebSocket connection
+     * @param code Optional close code (default: 1000 for normal closure)
+     * @param reason Optional close reason
+     */
+    close(
+        code: number = 1000,
+        reason: string = 'Client closing',
+        options: { notifyClose?: boolean; onlyIfConnectionId?: number; keepDetachedRun?: boolean } = {},
+    ): void {
+        // A deliberate close also abandons a connect still waiting to start;
+        // only the reattach machinery's own teardown leaves one alone.
+        if (!options.keepDetachedRun) this.connectEpoch++;
+        this.closeSocket(code, reason, options);
+    }
+
+    /** `close()` without abandoning a connect that is waiting to start. */
+    private closeSocket(
+        code: number = 1000,
+        reason: string = 'Client closing',
+        options: { notifyClose?: boolean; onlyIfConnectionId?: number; keepDetachedRun?: boolean } = {},
+    ): void {
+        const { notifyClose = true, onlyIfConnectionId, keepDetachedRun = false } = options;
+
+        // A caller that captured its connection generation up front (e.g. a
+        // deferred close inside cancel()) must not tear down a newer
+        // connection that superseded it in the meantime.
+        if (onlyIfConnectionId !== undefined && onlyIfConnectionId !== this.connectionId) {
+            logger('AgentService: Skipping close for superseded connection', 1);
+            return;
+        }
+
+        const wsToClose = this.ws;
+        const callbacks = this.callbacks;
+        const finishConnect = this.activeConnectFinish;
+
+        if (wsToClose) {
+            // Only attempt to close if not already closing/closed
+            // CLOSING = 2, CLOSED = 3
+            if (wsToClose.readyState === WebSocket.OPEN || wsToClose.readyState === WebSocket.CONNECTING) {
+                logger(`AgentService: Closing connection - code=${code}, reason=${reason}`, 1);
+                try {
+                    wsToClose.close(code, reason);
+                } catch (error) {
+                    // Log but don't throw - the connection may already be closing from server side
+                    logger(`AgentService: Error closing WebSocket (state=${wsToClose.readyState}): ${error}`, 1);
+                }
+            } else {
+                logger(`AgentService: WebSocket already closing/closed (state=${wsToClose.readyState})`, 1);
+            }
+        }
+        // A deliberate close ends the run. Only the reattach machinery keeps a
+        // run that is waiting to be picked up on a new socket.
+        const keepRun = keepDetachedRun && this.run?.state === 'reattaching';
+        if (!keepRun) this.dropRun();
+        this.resetConnectionState({ keepRunQueues: keepRun });
+        // Clear the in-progress flag even when the attempt has not created
+        // its settle handle yet (i.e. it is still awaiting the auth token),
+        // so a new connect() is not silently swallowed by the overlap guard.
+        this.connecting = false;
+        if (notifyClose) {
+            callbacks?.onClose?.(code, reason, true);
+        }
+        // Resolve (not reject) a pending connect: an intentional client close
+        // is not a transport failure, and the closing caller has already
+        // updated any run/UI state itself.
+        finishConnect?.();
+    }
+
+    /**
+     * Cancel the current run and close the connection.
+     * Sends a cancel message to the backend before closing to ensure proper cleanup.
+     *
+     * A run that is reattaching is cancelled once the server confirms the
+     * reattach; without that it would keep going on the server for the grace
+     * period. If the reattach fails the run ends anyway.
+     * @param waitMs Time to wait after sending cancel before closing (default: 250ms)
+     */
+    async cancel(waitMs: number = 250): Promise<void> {
+        this.connectEpoch++;
+        return this.sendCancel(waitMs);
+    }
+
+    /** `cancel()` without abandoning a connect that is waiting to start. */
+    private async sendCancel(waitMs: number = 250): Promise<void> {
+        if (this.run?.state === 'reattaching') {
+            logger(`AgentService: Run ${this.run.runId} is reattaching; cancelling it once reattached`, 1);
+            this.run.cancelRequested = true;
+            this.run.markStopped();
+            return;
+        }
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            logger('AgentService: Cannot cancel - WebSocket not connected', 1);
+            this.closeSocket();
+            return;
+        }
+
+        // Nothing queued for the run starts while the cancel is flushed, and
+        // work its requests started stops.
+        if (this.run) {
+            this.run.cancelRequested = true;
+            this.run.markStopped();
+        }
+
+        // Capture the generation being cancelled: if a new run connects
+        // during the flush wait below, the deferred close must not tear it down.
+        const connectionIdToCancel = this.connectionId;
+
+        // Send cancel message to backend
+        logger('AgentService: Sending cancel message', 1);
+        this.ws.send(JSON.stringify({ type: 'cancel' }));
+        if (this.run) this.run.stopSettled = true;
+
+        // Wait briefly to allow the message to be flushed
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+        // Close the connection (no-op if a newer connection superseded it)
+        this.closeSocket(1000, 'User cancelled', { onlyIfConnectionId: connectionIdToCancel });
+    }
+
+    /**
+     * Send a response to a deferred approval request.
+     * Called by the UI when the user approves or rejects an action.
+     * @param actionId The action ID from the approval request
+     * @param approved Whether the user approved the action
+     * @param userInstructions Optional additional instructions from the user
+     * @returns false if the socket was not open, so the decision never left the
+     *   client. The caller must recover the card rather than wait for a reply
+     *   that cannot come.
+     */
+    sendApprovalResponse(actionId: string, approved: boolean, userInstructions?: string | null, actionChanges?: import('../protocol/duplicates').MergeItemsChoices): boolean {
+        logger(`AgentService: Sending approval response for ${actionId}: ${approved}${userInstructions ? ' (with instructions)' : ''}`, 1);
+        return this.sendDecision(deferredApprovalResponse(actionId, approved, userInstructions, actionChanges));
+    }
+
+    /**
+     * Send a response to a run-level credit confirmation request.
+     * Called by the UI when the user lets the run continue or declines.
+     * @param confirmationId The confirmation ID from the request
+     * @param approved Whether the user let the run continue
+     * @param userInstructions Optional additional instructions from the user
+     * @returns false if the socket was not open, so the decision never left the
+     *   client. The caller must recover the card rather than wait for a reply
+     *   that cannot come.
+     */
+    sendCreditConfirmationResponse(
+        confirmationId: string,
+        approved: boolean,
+        userInstructions?: string | null,
+    ): boolean {
+        logger(`AgentService: Sending credit confirmation response for ${confirmationId}: ${approved}${userInstructions ? ' (with instructions)' : ''}`, 1);
+        return this.sendDecision({
+            type: 'credit_confirmation_response',
+            confirmation_id: confirmationId,
+            approved,
+            user_instructions: userInstructions,
+        });
+    }
+
+    /**
+     * Send a response to a batch approval request.
+     * Called by the UI when the user approves or declines the batch.
+     * @param approvalId The approval ID from the request
+     * @param approved Whether the user approved the batch
+     * @param mode Coverage the decision grants for the life of the batch
+     * @param userInstructions Optional instructions from the user. Meaningful on
+     *   both paths: they constrain an approved batch and say what to do instead
+     *   when the batch is declined.
+     * @returns false if the socket was not open, so the decision never left the
+     *   client. The caller must recover the card rather than wait for a reply
+     *   that cannot come.
+     */
+    sendBatchApprovalResponse(
+        approvalId: string,
+        approved: boolean,
+        mode: BatchApprovalMode,
+        userInstructions?: string | null,
+    ): boolean {
+        logger(`AgentService: Sending batch approval response for ${approvalId}: ${approved} (${mode})${userInstructions ? ' (with instructions)' : ''}`, 1);
+        return this.sendDecision(batchApprovalResponse(approvalId, approved, mode, userInstructions));
+    }
+
+    /**
+     * Send the answer to a table card: the edited input on an approval, or a
+     * decline with optional instructions. Correlated by `card_id`.
+     * @returns false if the socket was not open, so the answer never left the
+     *   client.
+     */
+    sendTableCardResponse(response: WSTableCardResponse): boolean {
+        logger(`AgentService: Sending table card response for ${response.card_id}: ${response.approved ? response.choice ?? 'create' : 'declined'}`, 1);
+        return this.sendDecision(response);
+    }
+
+    /**
+     * Send an answer built for a parked card as the live response it is:
+     * the card was shown again by the run on this socket.
+     */
+    sendCardAnswer(answer: ParkedCardAnswer): boolean {
+        logger(`AgentService: Sending "${answer.type}" to a card shown again`, 1);
+        return this.sendDecision(answer as unknown as Record<string, any>);
+    }
+
+    /**
+     * Send a response to an ask_user_question request.
+     * Called by the UI when the user submits their answers or skips the card.
+     * Note: like deferred_approval_response, this carries no request_id — the
+     * backend correlates by question_id.
+     * @param questionId The question ID from the request
+     * @param answers The user's answers (empty when cancelled)
+     * @param cancelled Whether the user skipped the question(s)
+     * @returns false if the socket was not open, so the response never left the
+     *   client. The caller must recover the card rather than wait for a reply
+     *   that cannot come.
+     */
+    sendAskUserQuestionResponse(
+        questionId: string,
+        answers: AskUserQuestionAnswer[],
+        cancelled: boolean = false,
+    ): boolean {
+        logger(`AgentService: Sending ask_user_question response for ${questionId}: ${cancelled ? 'cancelled' : `${answers.length} answer(s)`}`, 1);
+        return this.sendDecision(askUserQuestionResponse(questionId, answers, cancelled));
+    }
+
+}
+
+// =============================================================================
+// Agent Run REST API Types
+// =============================================================================
+
+/** Reservation activity is independent of the persisted run's display status. */
+export interface ThreadActivity {
+    state: "active" | "expired" | "idle";
+    run_id: string | null;
+}
+
+/** Response for getting thread runs with optional actions */
+export interface ThreadRunsResponse {
+    tail_run_id?: string | null;
+    activity?: ThreadActivity;
+    runs: AgentRun[];
+    agent_actions: AgentAction[] | null;
+}
+
+/** A thread's last persisted run and reservation activity, without history. */
+export interface ThreadActivityResponse {
+    tail_run_id?: string | null;
+    activity?: ThreadActivity;
+}
+
+/** Response for getting a single run with optional actions */
+export interface AgentRunWithActionsResponse {
+    run: AgentRun;
+    agent_actions: AgentAction[] | null;
+}
+
+/** Response for paginated runs list */
+export interface PaginatedRunsResponse {
+    data: AgentRun[];
+    next_cursor: string | null;
+    has_more: boolean;
+}
+
+// =============================================================================
+// Agent Run REST API Service
+// =============================================================================
+
+/**
+ * Service for managing agent runs via REST API.
+ * Handles fetching runs, run details, and associated actions.
+ */
+export class AgentRunService extends ApiService {
+    /** Set once the server answers the thread activity endpoint with 404. */
+    private activityEndpointMissing = false;
+
+    constructor(baseUrl?: string) {
+        super(baseUrl);
+    }
+
+    /**
+     * Gets all runs for a thread with optional agent actions.
+     * @param threadId The thread ID to fetch runs for
+     * @param includeActions Whether to include agent actions in the response
+     * @returns Promise with runs and optionally actions
+     */
+    async getThreadRuns(
+        threadId: string,
+        includeActions: boolean = false
+    ): Promise<ThreadRunsResponse> {
+        let endpoint = `/api/v1/agents/astermargin/threads/${threadId}/runs`;
+        if (includeActions) {
+            endpoint += '?include_actions=true';
+        }
+
+        const response = await this.get<{ runs: AgentRun[]; agent_actions?: Record<string, any>[] | null
+            tail_run_id?: string | null;
+            activity?: ThreadActivity;
+        }>(endpoint, { timeoutMs: 15000 });
+
+        return {
+            runs: response.runs,
+            tail_run_id: response.tail_run_id,
+            activity: response.activity,
+            agent_actions: response.agent_actions?.map(toAgentAction) ?? null
+        };
+    }
+
+    /**
+     * Gets a thread's tail run and reservation activity without its history,
+     * e.g. to poll a run that is still settling on the server. Servers without
+     * this endpoint answer 404; from then on this reads the same fields from
+     * the history endpoint instead.
+     */
+    async getThreadActivity(threadId: string, timeoutMs: number = 15000): Promise<ThreadActivityResponse> {
+        if (!this.activityEndpointMissing) {
+            try {
+                return await this.get<ThreadActivityResponse>(
+                    `/api/v1/agents/astermargin/threads/${threadId}/activity`,
+                    { timeoutMs },
+                );
+            } catch (error) {
+                // The endpoint answers a missing thread as empty, never 404.
+                if (!isApiError(error) || error.status !== 404) throw error;
+                this.activityEndpointMissing = true;
+                logger('AgentRunService: Server has no thread activity endpoint; reading history instead', 1);
+            }
+        }
+        const history = await this.getThreadRuns(threadId, false);
+        return { tail_run_id: history.tail_run_id, activity: history.activity };
+    }
+
+    /**
+     * Gets a single run by ID with optional agent actions.
+     * @param runId The run ID to fetch
+     * @param includeActions Whether to include agent actions in the response
+     * @returns Promise with the run and optionally actions
+     */
+    async getRun(
+        runId: string,
+        includeActions: boolean = false
+    ): Promise<AgentRunWithActionsResponse> {
+        let endpoint = `/api/v1/agents/astermargin/runs/${runId}`;
+        if (includeActions) {
+            endpoint += '?include_actions=true';
+        }
+
+        const response = await this.get<{ run: AgentRun; agent_actions?: Record<string, any>[] | null }>(endpoint);
+
+        return {
+            run: response.run,
+            agent_actions: response.agent_actions?.map(toAgentAction) ?? null
+        };
+    }
+
+    /**
+     * Gets paginated list of all runs for the current user.
+     * @param limit Maximum number of runs to return (default: 20)
+     * @param after Cursor for pagination (run ID of the last item from previous page)
+     * @returns Promise with paginated runs data
+     */
+    async getRuns(
+        limit: number = 20,
+        after: string | null = null
+    ): Promise<PaginatedRunsResponse> {
+        let endpoint = `/api/v1/agents/astermargin/runs?limit=${limit}`;
+        if (after) {
+            endpoint += `&after=${after}`;
+        }
+
+        return this.get<PaginatedRunsResponse>(endpoint);
+    }
+}
+
+// =============================================================================
+// Singleton Exports
+// =============================================================================
+
+export const agentService = new AgentService();
+export const agentRunService = new AgentRunService();

@@ -1,0 +1,128 @@
+import { DuplicateError } from '../duplicates/discovery';
+import { validateMergeItemsAction } from '../duplicates/merge';
+import { CollectionResolutionError } from '../collections/collectionIdentity';
+import { waitForDeferredCommits } from '../committedTransaction';
+import { SNAPSHOT_TRANSACTION_WAIT_MS, waitForOpenTransaction } from '../openTransaction';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    WSAgentActionValidateResponse
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import { validateCreateCollectionAction } from './actions/createCollection';
+import { validateCreateHighlightAnnotationsAction } from './actions/createHighlightAnnotations';
+import { validateCreateItemAction } from './actions/createItems';
+import { validateImportItemsAction } from './actions/importItems';
+import { validateCreateNoteAction } from './actions/createNote';
+import { validateCreateNoteAnnotationsAction } from './actions/createNoteAnnotations';
+import { validateEditAnnotationsAction } from './actions/editAnnotations';
+import { validateEditMetadataAction } from './actions/editMetadata';
+import { validateEditNoteAction } from './actions/editNote';
+import { validateEditNoteBatchAction } from './actions/editNoteBatch';
+import { validateManageCollectionsAction } from './actions/manageCollections';
+import { validateManageTagsAction } from './actions/manageTags';
+import { validateOrganizeItemsAction } from './actions/organizeItems';
+import type { ActionValidateRequest } from './operationContext';
+
+
+/**
+ * Handle agent_action_validate request from backend.
+ * Validates that an action can be performed and returns the current value
+ * for before/after tracking, plus the user's preference.
+ */
+export async function handleAgentActionValidateRequest(
+    request: ActionValidateRequest
+): Promise<WSAgentActionValidateResponse> {
+    logger(`handleAgentActionValidateRequest: Validating ${request.action_type}`, 1);
+
+    try {
+        // Other plugins' observers may still be writing to items AsterMargin just
+        // saved, and any other write (Zotero, another plugin, a bulk edit) may
+        // hold an open transaction whose changes land when it commits.
+        // Snapshot existing items after those writes land, or the
+        // execute-time staleness check refuses the action. Imports snapshot no
+        // existing item, so they don't wait.
+        if (request.action_type !== 'import_item') {
+            if (!(await waitForDeferredCommits())) {
+                logger(`handleAgentActionValidateRequest: validating ${request.action_type} while earlier writes are still delivering Notifier events`, 1);
+            }
+            if (!(await waitForOpenTransaction(SNAPSHOT_TRANSACTION_WAIT_MS))) {
+                logger(`handleAgentActionValidateRequest: validating ${request.action_type} while another Zotero transaction is still open`, 1);
+            }
+        }
+
+        if (request.action_type === 'edit_metadata') {
+            return await validateEditMetadataAction(request);
+        }
+
+        if (request.action_type === 'create_collection') {
+            return await validateCreateCollectionAction(request);
+        }
+
+        if (request.action_type === 'organize_items') {
+            return await validateOrganizeItemsAction(request);
+        }
+
+        if (request.action_type === 'create_item') {
+            return await validateCreateItemAction(request);
+        }
+
+        if (request.action_type === 'import_item') {
+            return await validateImportItemsAction(request);
+        }
+
+        if (request.action_type === 'edit_note') {
+            return await validateEditNoteAction(request);
+        }
+
+        if (request.action_type === 'edit_note_batch') {
+            return await validateEditNoteBatchAction(request);
+        }
+
+        if (request.action_type === 'create_note') {
+            return await validateCreateNoteAction(request);
+        }
+
+        if (request.action_type === 'create_highlight_annotations') {
+            return await validateCreateHighlightAnnotationsAction(request);
+        }
+
+        if (request.action_type === 'create_note_annotations') {
+            return await validateCreateNoteAnnotationsAction(request);
+        }
+
+        if (request.action_type === 'edit_annotations') {
+            return await validateEditAnnotationsAction(request);
+        }
+
+        if (request.action_type === 'merge_items') return await validateMergeItemsAction(request);
+
+        if (request.action_type === 'manage_tags') {
+            return await validateManageTagsAction(request);
+        }
+
+        if (request.action_type === 'manage_collections') {
+            return await validateManageCollectionsAction(request);
+        }
+
+        // Unsupported action type.
+        // Note: confirm_extraction approvals are backend-managed and intentionally
+        // not validated through this local deferred-tool preference flow.
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Unsupported action type: ${request.action_type}`,
+            error_code: 'unsupported_action_type',
+            preference: 'always_ask',
+        };
+    } catch (error) {
+        logger(`handleAgentActionValidateRequest: Error: ${error}`, 1);
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: error instanceof Error ? error.message : String(error),
+            error_code: error instanceof CollectionResolutionError || error instanceof DuplicateError ? error.code : 'validation_failed',
+            preference: 'always_ask',
+        };
+    }
+}

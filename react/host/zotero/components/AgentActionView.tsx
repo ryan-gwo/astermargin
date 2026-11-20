@@ -1,0 +1,1005 @@
+import { useSurfaceWindow } from '../../../runtime/SurfaceWindowContext';
+import { getMergedItemReference } from '../../../atoms/mergeItemsChoices';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { useAtomValue, useSetAtom, useStore } from 'jotai';
+import { AgentRunStatus } from '@astermargin/agent-core/agents/types';
+import { toolResultAtom } from '@astermargin/agent-core/run-state/atoms';
+import {
+    AgentAction,
+    agentActionsForToolcallAtom,
+    noPendingApprovalsCoveredCountAtom,
+    pendingApprovalsCoveredByFullAccessCountAtom,
+    removePendingApprovalAtom,
+} from '../../../agents/agentActions';
+import type { PendingApproval } from '@astermargin/agent-ui/host';
+import {
+    setRunPermissionModeAtom,
+    approvalResponseIntentsAtom,
+    isRunReconnectingAtom,
+    isWSChatPendingAtom,
+    removeApprovalResponseIntentAtom,
+    sendApprovalResponseAtom,
+} from '../../../atoms/agentRunAtoms';
+import { pendingParkedAnswerIdsAtom } from '../../../atoms/parkedRuns';
+import {
+    agentActionItemTitleAtom,
+    getAgentActionItemTitleKey,
+    setAgentActionItemTitleAtom,
+    toolExpandedAtom,
+    setToolExpandedAtom,
+} from '../../../atoms/messageUIState';
+import {
+    applyAgentActionsAtom,
+    refreshMergeProposalsAtom,
+    rejectAgentActionsAtom,
+    undoAgentActionsAtom,
+} from '../agentActionExecution';
+import { shortItemTitle } from '../../../../src/utils/zoteroUtils';
+import { RECONNECT_HELD_CAPTION, RECONNECT_SENDING_CAPTION, RECONNECT_UNAVAILABLE_TOOLTIP, RESOLVING_UNAVAILABLE_TOOLTIP } from '@astermargin/agent-core/transport/connectionFailure';
+import { useRunReconnectShown } from '../../../hooks/useVisibleReconnect';
+import { useReattachResolutionView } from '../../../components/agentRuns/RunResolutionNotices';
+import { hasLibraryIdentity, resolveItemReference, resolveLibraryRef } from '../../../../src/utils/libraryIdentity';
+import { notifyReferenceUnavailable } from '../sourceActions';
+import {
+    TickIcon,
+    CancelIcon,
+    Spinner,
+    Icon,
+    RepeatIcon,
+    ArrowDownIcon,
+    ArrowRightIcon,
+    ArrowUpRightIcon,
+} from '../../../components/icons/icons';
+import { revealSource, openNoteByKey, getCurrentCollectionKeyForItem } from '../../../utils/sourceUtils';
+import Button from '@astermargin/agent-ui/primitives/Button';
+import IconButton from '@astermargin/agent-ui/primitives/IconButton';
+import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
+import MenuButton from '@astermargin/agent-ui/primitives/MenuButton';
+import { DownloadIcon } from '@astermargin/agent-ui/icons';
+import type { FileExportFormat } from '@astermargin/agent-ui/host/types';
+import { exportNoteToFile, openExportedFile, revealExportedFile } from '../fileExport';
+import { exportWithFeedback, fileExportFormatMenuItems } from '../../../utils/fileExportFeedback';
+import { addPopupMessageAtom } from '../../../utils/popupMessageUtils';
+import { getCreatedNoteExportTarget } from './reviewChangeRows';
+import { countPendingNoteEdits } from './reviewChanges/useRunActionRows';
+import { getCreateAnnotationsOpenLink } from './createAnnotationsNavigation';
+import { useOverflowCollapse } from '@astermargin/agent-ui/utils/useOverflowCollapse';
+import DeferredToolPreferenceButton from '../../../components/ui/buttons/DeferredToolPreferenceButton';
+import RunPermissionButton, { RunPermissionMode } from '../../../components/ui/buttons/RunPermissionButton';
+import {
+    ActionStatus,
+    NEVER_AUTO_COLLAPSE_TOOLS,
+    getOverallStatus,
+    getActionLabel,
+    getActionTitle,
+    buildPreviewData,
+    PreviewData,
+    getCreateAnnotationsDisplayStatus,
+    getAgentActionToolIcon,
+    actionCardProgressMessage,
+    createdItemsFullText,
+    createItemsFullTextSummary,
+    hasFailedUndo,
+    getStatusConfig,
+    STALE_APPLY_ANYWAY_TOOLTIP,
+    staleProposalDetail,
+    wasRefusedAsStale,
+    unconfirmedCaption,
+} from './agentActionViewHelpers';
+import { StaleProposalNote } from './StaleProposalNote';
+import { isStaleMergeProposal } from './mergeItemsErrors';
+import { ActionPreview } from './ActionPreview';
+import { useApprovalRecovery } from './useApprovalRecovery';
+import {
+    isCoveredByFullAccess,
+    isFullAccessGrantedForRun,
+    runApprovalPolicyAtom,
+} from '../../../atoms/runApprovalPolicy';
+import { dismissActiveEditNotePreview } from '../editNotePreviewLifecycle';
+import { agentService } from '@astermargin/agent-core/transport/agentService';
+
+export { STATUS_CONFIGS, getOverallStatus } from './agentActionViewHelpers';
+export type { ActionStatus } from './agentActionViewHelpers';
+
+interface AgentActionViewProps {
+    toolcallId: string;
+    toolName: string;
+    runId: string;
+    responseIndex: number;
+    pendingApproval: PendingApproval | null;
+    hasToolReturn?: boolean;
+    streamingArgs?: Record<string, any> | null;
+    runStatus?: AgentRunStatus;
+    /** Progress note posted on the tool call while the backend waits on Zotero. */
+    progress?: string;
+}
+
+type HeaderLinkAction = {
+    tooltip: string;
+    onClick: () => void | Promise<void>;
+};
+
+export const AgentActionView: React.FC<AgentActionViewProps> = ({
+    toolcallId,
+    toolName,
+    runId,
+    responseIndex,
+    pendingApproval: pendingApprovalProp,
+    hasToolReturn = false,
+    streamingArgs,
+    runStatus,
+    progress,
+}) => {
+    const [isHovered, setIsHovered] = useState(false);
+
+    const toolcallActions = useAtomValue(useMemo(() => agentActionsForToolcallAtom(toolcallId), [toolcallId]));
+    const actions = useMemo(
+        () => toolcallActions.filter((a) => a.run_id === runId),
+        [toolcallActions, runId],
+    );
+    const action = actions.length > 0 ? actions[0] : null;
+
+    const actionInFinalState = action && action.status !== 'pending';
+    const pendingApproval = actionInFinalState ? null : pendingApprovalProp;
+    const isAwaitingApproval = pendingApproval !== null;
+    // An answer to the run waits while its connection is being recovered.
+    const isRunReconnecting = useAtomValue(isRunReconnectingAtom);
+    const isAnswerHeld = isAwaitingApproval && isRunReconnecting;
+    const reconnectShown = useRunReconnectShown();
+    // A run whose reattach failed may still be waiting on the server for this
+    // answer; acting on it locally waits until the server says how it ended.
+    const isRunResolving = useReattachResolutionView(runId, true) !== null;
+    const isDecisionHeld = isAnswerHeld || isRunResolving;
+    const heldTooltip = isAnswerHeld
+        ? RECONNECT_UNAVAILABLE_TOOLTIP
+        : isRunResolving ? RESOLVING_UNAVAILABLE_TOOLTIP : null;
+
+    const runIsStreamable = runStatus === undefined || runStatus === 'in_progress';
+    const isStreaming = !action
+        && !pendingApproval
+        && !!streamingArgs
+        && Object.keys(streamingArgs).length > 0
+        && runIsStreamable;
+
+    const expansionKey = `${runId}:${responseIndex}:${toolcallId}`;
+    const storedExpanded = useAtomValue(useMemo(() => toolExpandedAtom(expansionKey), [expansionKey]));
+    const setExpanded = useSetAtom(setToolExpandedAtom);
+    const hasExistingState = storedExpanded !== undefined;
+    const neverAutoCollapse = NEVER_AUTO_COLLAPSE_TOOLS.has(toolName);
+    const isExpanded = storedExpanded ?? (isAwaitingApproval || neverAutoCollapse);
+
+    // The footer's buttons never wrap; when the row is too narrow for them,
+    // the permission trigger drops to its icon.
+    const footer = useOverflowCollapse(1);
+    const permissionIconOnly = footer.level >= 1;
+
+    const prevAwaitingRef = useRef(isAwaitingApproval);
+    const hasInitializedRef = useRef(false);
+    useEffect(() => {
+        if (!hasInitializedRef.current) {
+            hasInitializedRef.current = true;
+            if (!hasExistingState) {
+                setExpanded({ key: expansionKey, expanded: isAwaitingApproval || neverAutoCollapse });
+            }
+            return;
+        }
+
+        if (prevAwaitingRef.current !== isAwaitingApproval) {
+            setExpanded({
+                key: expansionKey,
+                expanded: neverAutoCollapse ? true : isAwaitingApproval,
+            });
+        }
+        prevAwaitingRef.current = isAwaitingApproval;
+    }, [isAwaitingApproval, expansionKey, hasExistingState, neverAutoCollapse, setExpanded]);
+
+    const [isProcessingApproval, setIsProcessingApproval] = useState(false);
+    const [isProcessingAction, setIsProcessingAction] = useState(false);
+    const [isUndoError, setIsUndoError] = useState(false);
+    const [isExternallyProcessing, setIsExternallyProcessing] = useState(false);
+    const [clickedButton, setClickedButton] = useState<'approve' | 'applyAnyway' | 'reject' | 'undo' | 'refresh' | null>(null);
+    const prevPendingApprovalRef = useRef<PendingApproval | null>(pendingApproval);
+
+    const isRunPending = useAtomValue(isWSChatPendingAtom);
+    const isMultiAction = (toolName === 'create_items' || toolName === 'create_item') && actions.length > 1;
+
+    const sendApprovalResponse = useSetAtom(sendApprovalResponseAtom);
+    const setRunPermissionMode = useSetAtom(setRunPermissionModeAtom);
+    const runApprovalPolicy = useAtomValue(runApprovalPolicyAtom);
+    // How many cards a switch to full access would answer at once, so the menu
+    // row can say so before the user reaches for it. The row shows only while
+    // this card awaits approval, so only then does the count need following.
+    const pendingCoveredCount = useAtomValue(
+        isAwaitingApproval ? pendingApprovalsCoveredByFullAccessCountAtom : noPendingApprovalsCoveredCountAtom,
+    );
+    const removeApprovalResponseIntent = useSetAtom(removeApprovalResponseIntentAtom);
+    const removePendingApproval = useSetAtom(removePendingApprovalAtom);
+    const applyAgentActions = useSetAtom(applyAgentActionsAtom);
+    const refreshMergeProposals = useSetAtom(refreshMergeProposalsAtom);
+    const rejectAgentActions = useSetAtom(rejectAgentActionsAtom);
+    const surfaceWindow = useSurfaceWindow();
+    const undoAgentActions = useSetAtom(undoAgentActionsAtom);
+
+    // Shared with the terminal review row for this tool call. The run belongs
+    // in the identity because continuation runs may reuse tool-call ids.
+    const itemTitleKey = getAgentActionItemTitleKey(runId, toolcallId);
+    const itemTitle = useAtomValue(useMemo(() => agentActionItemTitleAtom(itemTitleKey), [itemTitleKey]));
+    const setItemTitle = useSetAtom(setAgentActionItemTitleAtom);
+
+    const hasAssociatedItem =
+        toolName === 'edit_metadata' ||
+        toolName === 'edit_item' ||
+        toolName === 'create_highlight_annotations' ||
+        toolName === 'create_note_annotations';
+
+    useEffect(() => {
+        if (!hasAssociatedItem || itemTitle) return;
+
+        const fetchTitle = async () => {
+            const libraryId: number | undefined =
+                action?.proposed_data?.resolved_ref?.library_id ??
+                action?.proposed_data?.library_id ??
+                pendingApproval?.actionData?.library_id;
+            const libraryRef: string | undefined =
+                action?.proposed_data?.resolved_ref?.library_ref ??
+                action?.proposed_data?.library_ref ??
+                pendingApproval?.actionData?.library_ref;
+            const zoteroKey: string | undefined =
+                action?.proposed_data?.resolved_ref?.zotero_key ??
+                action?.proposed_data?.zotero_key ??
+                pendingApproval?.actionData?.zotero_key;
+
+            // A portable `library_ref` is a complete identity: the numeric id may
+            // be absent or the unresolved sentinel, and `resolveItemReference`
+            // prefers the ref anyway.
+            if (!hasLibraryIdentity({ library_ref: libraryRef, library_id: libraryId }) || !zoteroKey) return;
+
+            const resolved = await resolveItemReference({ library_ref: libraryRef, library_id: libraryId, zotero_key: zoteroKey });
+            if (resolved.status === 'found') {
+                const title = await shortItemTitle(resolved.item);
+                setItemTitle({ key: itemTitleKey, title });
+            }
+        };
+
+        fetchTitle();
+    }, [action, pendingApproval, itemTitle, itemTitleKey, hasAssociatedItem, setItemTitle]);
+
+    // A created note exports as it is now in Zotero, with later edits by the
+    // agent or the user, from the same header as its Open link.
+    const noteExportTarget = toolName === 'create_note' && action ? getCreatedNoteExportTarget(action) : null;
+    const [isExportingNote, setIsExportingNote] = useState(false);
+    const addPopupMessage = useSetAtom(addPopupMessageAtom);
+    const jotaiStore = useStore();
+    const handleExportNote = useCallback(async (format: FileExportFormat) => {
+        if (isExportingNote || !noteExportTarget) return;
+        setIsExportingNote(true);
+        try {
+            const pendingChanges = countPendingNoteEdits(jotaiStore, noteExportTarget);
+            await exportWithFeedback(
+                format,
+                () => exportNoteToFile({
+                    format,
+                    surface: 'note_card',
+                    note: noteExportTarget,
+                    createdBy: { runId, toolCallId: toolcallId },
+                    pendingChanges,
+                }),
+                addPopupMessage,
+                { reveal: revealExportedFile, open: openExportedFile },
+            );
+        } finally {
+            setIsExportingNote(false);
+        }
+    }, [isExportingNote, noteExportTarget, runId, toolcallId, addPopupMessage, jotaiStore]);
+
+    const handleApprovalRecovered = useCallback(() => {
+        setIsProcessingApproval(false);
+        setIsExternallyProcessing(false);
+        setClickedButton(null);
+    }, []);
+    const { setProcessingApproval } = useApprovalRecovery({
+        isAwaitingDecision: isProcessingApproval || isExternallyProcessing,
+        hasToolReturn,
+        actionStatus: action?.status,
+        onRecover: handleApprovalRecovered,
+        label: `AgentActionView(${toolName})`,
+    });
+
+    useEffect(() => {
+        const previousPendingApproval = prevPendingApprovalRef.current;
+        const wasAwaiting = previousPendingApproval !== null;
+        const isNoLongerAwaiting = pendingApproval === null;
+
+        // Waiting on a decision again: a parked card whose answer did not
+        // reach a run (the resume failed) is answerable once more.
+        if (!wasAwaiting && !isNoLongerAwaiting && (isProcessingApproval || isExternallyProcessing)) {
+            setIsProcessingApproval(false);
+            setIsExternallyProcessing(false);
+            setProcessingApproval(null);
+            setClickedButton(null);
+        }
+
+        if (wasAwaiting && isNoLongerAwaiting) {
+            const previousActionId = previousPendingApproval.actionId;
+            // Read when the approval resolves rather than subscribed to: only
+            // this transition consults it, and a subscription would re-render
+            // every card in the thread whenever any approval is answered.
+            const previousIntent = jotaiStore.get(approvalResponseIntentsAtom).get(previousActionId);
+
+            if (!isProcessingApproval && isRunPending && !hasToolReturn) {
+                setIsExternallyProcessing(true);
+                setClickedButton(previousIntent === false ? 'reject' : 'approve');
+                // Record it for recovery too: a decision made from another
+                // surface (Approve All, the composer, the diff-preview banner)
+                // can miss its window exactly like one made here.
+                setProcessingApproval({
+                    actionId: previousActionId,
+                    kind: previousIntent === false ? 'reject' : 'approve',
+                });
+            }
+
+            if (previousIntent !== undefined) {
+                removeApprovalResponseIntent(previousActionId);
+            }
+        }
+
+        prevPendingApprovalRef.current = pendingApproval;
+    }, [
+        pendingApproval,
+        isProcessingApproval,
+        isExternallyProcessing,
+        isRunPending,
+        hasToolReturn,
+        jotaiStore,
+        removeApprovalResponseIntent,
+        setProcessingApproval,
+    ]);
+
+    useEffect(() => {
+        if ((isProcessingApproval || isExternallyProcessing) && action && action.status !== 'pending') {
+            setIsProcessingApproval(false);
+            setProcessingApproval(null);
+            setIsExternallyProcessing(false);
+            setClickedButton(null);
+        }
+        if (isExternallyProcessing && (hasToolReturn || !isRunPending)) {
+            setIsExternallyProcessing(false);
+            setProcessingApproval(null);
+            setClickedButton(null);
+        }
+    }, [isProcessingApproval, isExternallyProcessing, action?.status, hasToolReturn, isRunPending, action, setProcessingApproval]);
+
+    // An answer to this parked card is on its way to the run that resumes it.
+    const isParkedAnswerPending = useAtomValue(pendingParkedAnswerIdsAtom).has(toolcallId);
+    const isProcessing = isProcessingApproval || isProcessingAction || isExternallyProcessing || isParkedAnswerPending;
+    const actionDisplayStatus = action ? getCreateAnnotationsDisplayStatus(action) : null;
+    const status: ActionStatus | 'awaiting' = (isAwaitingApproval || isProcessing)
+        ? 'awaiting'
+        : isMultiAction
+            ? getOverallStatus(actions)
+            : (actionDisplayStatus ?? action?.status ?? 'pending');
+    const isConfirmExtraction = toolName === 'confirm_extraction';
+    const isConfirmExternalSearch = toolName === 'confirm_external_search';
+    const isConfirmAction = isConfirmExtraction || isConfirmExternalSearch;
+    const hasNoActionData = !action && !pendingApproval && !isStreaming;
+    const baseConfig = getStatusConfig(status, actions);
+    // A stale merge fails the same way on every retry; Refresh proposes it
+    // again for review instead.
+    const isStaleMerge = actions.some(isStaleMergeProposal);
+    const config = (isConfirmAction && status !== 'awaiting')
+        ? { ...baseConfig, showApply: false, showReject: false, showUndo: false, showRetry: false }
+        : isStaleMerge
+            ? { ...baseConfig, showRetry: false }
+            : baseConfig;
+    const showRefresh = isStaleMerge && !isConfirmAction && status === 'error';
+    // Read off the records, like the Library changes row, so the choice between
+    // re-applying and retrying undo survives a remount.
+    const isUndoRetry = isUndoError || hasFailedUndo(actions);
+
+    // Every action on this card has settled, but the tool call has not returned:
+    // the backend is still working on it (`create_items` holds its result while
+    // background PDF fetches finish). The run-level status line is suppressed
+    // for as long as any tool call is outstanding — see `shouldShowRunStatus` —
+    // on the assumption that the call's own card reports the wait, so without a
+    // spinner here the pane looks frozen. Excludes `pending`, where the card is
+    // waiting on the reader rather than on the backend.
+    const isAwaitingToolReturn =
+        runStatus === 'in_progress' &&
+        !hasToolReturn &&
+        status !== 'awaiting' &&
+        status !== 'pending';
+
+    // The wait this reports is the backend's, not the user's: an approved edit
+    // whose save is taking Zotero a long time, or the items and PDF fetches of
+    // `create_items`. See `actionCardProgressMessage`.
+    const progressMessage = actionCardProgressMessage(toolName, progress, {
+        isCallOpen: runStatus === 'in_progress' && !hasToolReturn,
+        isAwaitingApproval,
+        status,
+    });
+
+    // `create_items`: what full text each created item got, as the call's
+    // return reports it. Fixed once returned; a PDF that lands later is not
+    // followed.
+    const toolResult = useAtomValue(useMemo(() => toolResultAtom(toolcallId), [toolcallId]));
+    const createdFullText = useMemo(
+        () => (toolName === 'create_items' && hasToolReturn ? createdItemsFullText(toolResult) : null),
+        [toolName, hasToolReturn, toolResult],
+    );
+    const fullTextSummary = createItemsFullTextSummary(createdFullText, actions.length === 1);
+    const fullTextByKey = useMemo(() => {
+        const byKey = new Map<string, string | null>();
+        for (const item of createdFullText ?? []) {
+            if (item.zoteroKey && item.kind !== undefined) byKey.set(item.zoteroKey, item.kind);
+        }
+        return byKey;
+    }, [createdFullText]);
+
+    // While the run reconnects, a card awaiting a decision says when it can be
+    // answered, and one already answered says its answer has yet to be sent.
+    // An answer sent before the connection dropped is not waiting: the
+    // action may already be applied, its result on the way.
+    const answeredActionId = pendingApprovalProp?.actionId ?? action?.id ?? null;
+    const isReplyHeld = isRunReconnecting && !actionInFinalState
+        && (isProcessingApproval || isExternallyProcessing)
+        && answeredActionId !== null
+        && agentService.isApprovalAnswerHeld(answeredActionId);
+    // Shown only once the reconnect has outlasted a blip.
+    const reconnectCaption = !reconnectShown
+        ? null
+        : isAnswerHeld
+            ? RECONNECT_HELD_CAPTION
+            : isReplyHeld ? RECONNECT_SENDING_CAPTION : null;
+    // A reconnect caption says more than a progress note from before the drop.
+    const headerProgress = reconnectCaption ? null : progressMessage;
+    // An unconfirmed action offers nothing to click; this says what to do.
+    const unconfirmedNote = !isProcessing && !isConfirmAction ? unconfirmedCaption(actions) : null;
+    // An apply refused because the library changed: what changed, once expanded.
+    const staleDetail = !isProcessing && !isConfirmAction ? staleProposalDetail(actions) : null;
+
+    const handleApprove = useCallback(() => {
+        if (!pendingApproval) return;
+        setIsProcessingApproval(true);
+        setProcessingApproval({ actionId: pendingApproval.actionId, kind: 'approve' });
+        setClickedButton('approve');
+        sendApprovalResponse({ actionId: pendingApproval.actionId, approved: true });
+        removePendingApproval(pendingApproval.actionId);
+    }, [pendingApproval, sendApprovalResponse, removePendingApproval]);
+
+    const handleReject = useCallback(() => {
+        if (!pendingApproval) return;
+        setIsProcessingApproval(true);
+        setProcessingApproval({ actionId: pendingApproval.actionId, kind: 'reject' });
+        setClickedButton('reject');
+        sendApprovalResponse({ actionId: pendingApproval.actionId, approved: false });
+        removePendingApproval(pendingApproval.actionId);
+    }, [pendingApproval, sendApprovalResponse, removePendingApproval]);
+
+    // Switching to full access answers every covered card in the run, this one
+    // included, so the click is tracked as an approval of it — the card stays in
+    // its "sending" state until the run comes back, exactly as a direct Apply
+    // would. A card the grant does not cover keeps its own controls instead.
+    const handleRunPermissionChange = useCallback(async (mode: RunPermissionMode) => {
+        const fullAccess = mode === 'full_access';
+        if (!fullAccess) {
+            setRunPermissionMode({ runId, fullAccess: false });
+            return;
+        }
+        const answersThisCard = pendingApproval !== null
+            && isCoveredByFullAccess(pendingApproval.actionType, pendingApproval.actionData);
+        if (answersThisCard) {
+            setIsProcessingApproval(true);
+            setProcessingApproval({ actionId: pendingApproval.actionId, kind: 'approve' });
+            setClickedButton('approve');
+        }
+        // The sweep can answer a note edit whose diff preview is live in the
+        // editor, even from a card of another tool, so tear it down first — as
+        // every other surface that applies or rejects an action does. The grant
+        // is applied either way: a teardown that fails must not strand the card
+        // on a decision the user has already made.
+        let approvedCount = 0;
+        try {
+            await dismissActiveEditNotePreview();
+        } finally {
+            approvedCount = setRunPermissionMode({ runId, fullAccess: true });
+        }
+        // Refused when the run ended while the preview was being torn down.
+        // Nothing was sent, so release the card rather than leaving it waiting
+        // for a reply that cannot come.
+        if (answersThisCard && approvedCount === 0) {
+            setIsProcessingApproval(false);
+            setProcessingApproval(null);
+            setClickedButton(null);
+        }
+    }, [pendingApproval, setRunPermissionMode, runId, setProcessingApproval]);
+
+    // `skipStaleCheck` is "Apply anyway": write a proposal the library has
+    // moved away from, after the user saw what changed.
+    const applyActions = useCallback(async (skipStaleCheck: boolean) => {
+        if (actions.length === 0 || isProcessing) return;
+
+        setIsUndoError(false);
+        setIsProcessingAction(true);
+        setClickedButton(skipStaleCheck ? 'applyAnyway' : 'approve');
+        try {
+            const result = await applyAgentActions({ actions, runId, skipStaleCheck });
+            // Refused because the library changed: open the card on what changed.
+            if (wasRefusedAsStale(result)) {
+                setExpanded({ key: expansionKey, expanded: true });
+            }
+        } finally {
+            setIsProcessingAction(false);
+            setClickedButton(null);
+        }
+    }, [actions, isProcessing, runId, applyAgentActions, setExpanded, expansionKey]);
+    const handleApplyPending = useCallback(() => applyActions(false), [applyActions]);
+    const handleApplyAnyway = useCallback(() => applyActions(true), [applyActions]);
+
+    const handleRejectPending = useCallback(() => {
+        if (actions.length === 0 || isProcessing) return;
+
+        setClickedButton('reject');
+        rejectAgentActions({ actions: isMultiAction ? actions : [action!] });
+        setTimeout(() => setClickedButton(null), 100);
+    }, [action, actions, isProcessing, isMultiAction, rejectAgentActions]);
+
+    const handleUndo = useCallback(async () => {
+        if (!action || isProcessing) return;
+
+        setIsProcessingAction(true);
+        setClickedButton('undo');
+        try {
+            const result = await undoAgentActions({ actions, window: surfaceWindow });
+            if (result.fatalError) setIsUndoError(true);
+        } finally {
+            setIsProcessingAction(false);
+            setClickedButton(null);
+        }
+    }, [action, actions, isProcessing, undoAgentActions]);
+
+    const handleRefresh = useCallback(async () => {
+        if (actions.length === 0 || isProcessing) return;
+
+        setIsProcessingAction(true);
+        setClickedButton('refresh');
+        try {
+            await refreshMergeProposals({ actions });
+        } finally {
+            setIsProcessingAction(false);
+            setClickedButton(null);
+        }
+    }, [actions, isProcessing, refreshMergeProposals]);
+
+    const handleRetry = useCallback(async () => {
+        if (isUndoRetry) {
+            setIsUndoError(false);
+            await handleUndo();
+        } else {
+            await handleApplyPending();
+        }
+    }, [isUndoRetry, handleUndo, handleApplyPending]);
+
+    const handleRevealNote = useCallback(async () => {
+        const libraryId = action?.result_data?.library_id;
+        const zoteroKey = action?.result_data?.zotero_key;
+        const libraryRef = action?.result_data?.library_ref;
+        if (!zoteroKey || !hasLibraryIdentity({ library_id: libraryId, library_ref: libraryRef })) return;
+        // The collection lookup is a local query, so it needs this device's
+        // rowid; `revealSource` resolves the reference itself.
+        const resolvedLibraryId = resolveLibraryRef({ library_ref: libraryRef, library_id: libraryId });
+        // Reveal within the current collection when the note belongs to it,
+        // instead of switching to the library root.
+        const collectionKey = resolvedLibraryId
+            ? await getCurrentCollectionKeyForItem(resolvedLibraryId, zoteroKey)
+            : undefined;
+        revealSource({ library_id: libraryId, zotero_key: zoteroKey, library_ref: libraryRef }, collectionKey);
+    }, [action]);
+
+    const toggleExpanded = () => setExpanded({ key: expansionKey, expanded: !isExpanded });
+    // While the action awaits a decision, a collapsed card carries Apply /
+    // Reject in its header. Expanded, the footer's labeled buttons decide and
+    // the header keeps the open link, so the item can be checked first.
+    const isDecisionState = isAwaitingApproval || status === 'pending';
+    // A refused stale proposal awaits the same decision; its ✓ applies anyway.
+    const isStaleDecision = !isDecisionState && config.showApplyAnyway === true;
+    const showDecisionButtons = (isDecisionState || isStaleDecision) && !isExpanded && !isProcessing && !isConfirmAction && !hasNoActionData;
+    const previewData = buildPreviewData(toolName, pendingApproval, action);
+    const runPermissionMode: RunPermissionMode =
+        isFullAccessGrantedForRun(runApprovalPolicy, runId) ? 'full_access' : 'ask';
+
+    const getHeaderIcon = () => {
+        if (isAwaitingApproval) return getAgentActionToolIcon(toolName);
+        if (isAwaitingToolReturn) return Spinner;
+        if (isHovered && isExpanded) return ArrowDownIcon;
+        if (isHovered && !isExpanded) return ArrowRightIcon;
+        if (config.icon === null) return getAgentActionToolIcon(toolName);
+        return config.icon;
+    };
+
+    const shouldShowStatusIcon = () => {
+        if (isHovered) return false;
+        // A spinner stands in for the status icon while the tool call is open,
+        // and the status icon's own colour and scale are not its to wear.
+        if (isAwaitingToolReturn) return false;
+        return config.icon !== null || !isAwaitingApproval;
+    };
+
+    const actionTitle = getActionTitle(toolName, action?.proposed_data, itemTitle, actions);
+    const mergedItemReference = action ? getMergedItemReference(action) : null;
+    const annotationKind = toolName === 'create_highlight_annotations'
+        ? 'highlight'
+        : toolName === 'create_note_annotations' ? 'note' : null;
+    // The header's open link (↗) goes to the action's result, where it is
+    // viewed: a note opens in the note editor, annotations in the reader, and
+    // an item-level change shows the item in the library. Each card type has
+    // one destination; a card with nothing to open yet shows no link.
+    const headerLinkAction: HeaderLinkAction | null = (() => {
+        if (mergedItemReference) {
+            return {
+                tooltip: 'Reveal in library',
+                onClick: async () => {
+                    // The collection lookup is a local query, so it needs this
+                    // device's rowid; `revealSource` resolves the reference itself.
+                    const libraryId = resolveLibraryRef(mergedItemReference);
+                    const collectionKey = libraryId
+                        ? await getCurrentCollectionKeyForItem(libraryId, mergedItemReference.zotero_key)
+                        : undefined;
+                    revealSource(mergedItemReference, collectionKey);
+                },
+            };
+        }
+
+        if (toolName === 'create_note') {
+            const created = action?.status === 'applied' ? action.result_data : undefined;
+            // The click handler resolves through `library_ref`, so gate on
+            // library identity rather than a rowid the result may not carry.
+            if (!created?.zotero_key || !hasLibraryIdentity({
+                library_id: created.library_id,
+                library_ref: created.library_ref,
+            })) return null;
+            return {
+                tooltip: 'Open note',
+                onClick: () => {
+                    // Resolve through the device-portable library_ref so a note created
+                    // in a group library on another computer opens the right local item.
+                    const libraryId = resolveLibraryRef({
+                        library_ref: created.library_ref,
+                        library_id: created.library_id,
+                    });
+                    if (libraryId) void openNoteByKey(libraryId, created.zotero_key);
+                    else notifyReferenceUnavailable('item', 'library_unavailable');
+                },
+            };
+        }
+
+        if (annotationKind) {
+            return getCreateAnnotationsOpenLink(
+                annotationKind,
+                previewData?.actionData ?? action?.proposed_data,
+                action?.result_data,
+                action?.status === 'applied',
+            );
+        }
+
+        const revealRef = {
+            library_id: action?.proposed_data?.library_id,
+            zotero_key: action?.proposed_data?.zotero_key,
+            library_ref: action?.proposed_data?.library_ref,
+        };
+        if (!hasLibraryIdentity(revealRef) || !revealRef.zotero_key) return null;
+        return {
+            tooltip: 'Reveal in library',
+            onClick: () => {
+                revealSource({
+                    library_id: revealRef.library_id,
+                    zotero_key: revealRef.zotero_key,
+                    library_ref: revealRef.library_ref,
+                });
+            },
+        };
+    })();
+
+    if (isStreaming) {
+        const effectiveArgs = streamingArgs ?? {};
+        const streamingTitle = getActionTitle(toolName, effectiveArgs, itemTitle, undefined);
+        const streamingPreviewData: PreviewData = {
+            actionType: toolName,
+            actionData: effectiveArgs,
+        };
+
+        return (
+            <div className="agent-action-view rounded-card flex flex-col min-w-0 border-card mb-2">
+                <div className="display-flex flex-row py-15 bg-senary border-bottom-quinary">
+                    <div
+                        className="variant-ghost-secondary display-flex flex-row py-15 gap-2 text-left mt-015"
+                        style={{ background: 'transparent', border: 0, padding: 0 }}
+                    >
+                        <div className="display-flex flex-row px-3 gap-2">
+                            <div className="flex-1 display-flex mt-010">
+                                <Icon icon={Spinner} />
+                            </div>
+                            <div className="two-line-header shimmer-text">
+                                <span className="font-color-primary font-medium" style={{ fontWeight: '500' }}>{getActionLabel(toolName, effectiveArgs)}</span>
+                                {streamingTitle && <span className="font-color-secondary ml-15" style={{ fontWeight: '400' }}>{streamingTitle}</span>}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <ActionPreview
+                    toolName={toolName}
+                    previewData={streamingPreviewData}
+                    status="pending"
+                    isStreaming={true}
+                />
+            </div>
+        );
+    }
+
+    return (
+        <div className="agent-action-view rounded-card flex flex-col min-w-0 border-card mb-2">
+            <div
+                className={`
+                    display-flex flex-row py-15 bg-senary items-start
+                    ${isExpanded ? 'border-bottom-quinary' : ''}
+                `}
+            >
+                <button
+                    type="button"
+                    className={`
+                        variant-ghost-secondary display-flex flex-row py-15 gap-2 text-left mt-015
+                        ${isProcessing ? 'opacity-80' : ''}
+                    `}
+                    style={{ fontSize: '0.95rem', background: 'transparent', border: 0, padding: 0 }}
+                    aria-expanded={isExpanded}
+                    onClick={isProcessing ? () => {} : toggleExpanded}
+                    disabled={isProcessing}
+                    onMouseEnter={() => setIsHovered(true)}
+                    onMouseLeave={() => setIsHovered(false)}
+                >
+                    <div className="display-flex flex-row ml-3 gap-2">
+                        <div className="flex-1 display-flex mt-010 font-color-primary">
+                            <Icon icon={getHeaderIcon()} className={shouldShowStatusIcon() ? config.iconClassName : undefined} />
+                        </div>
+                        <div className="display-flex flex-col min-w-0 gap-1">
+                            <div className={`two-line-header${isAwaitingToolReturn ? ' shimmer-text' : ''}`}>
+                                {/* Label off the same data the preview renders: a
+                                    count-carrying label would otherwise read as
+                                    singular while an approval is still pending and
+                                    no action row exists yet. */}
+                                <span className="font-color-primary font-medium">
+                                    {getActionLabel(toolName, previewData?.actionData ?? action?.proposed_data)}
+                                    {headerProgress ? ':' : ''}
+                                </span>
+                                {/* Progress takes the title's place, as in a passive
+                                    tool row ("Label: progress"), so it stays on the
+                                    header line however long the title is. */}
+                                {headerProgress ? (
+                                    <span className={`font-color-secondary ml-15${isAwaitingToolReturn ? '' : ' shimmer-text'}`}>{headerProgress}</span>
+                                ) : actionTitle && (
+                                    <span className="font-color-secondary ml-15">
+                                        {fullTextSummary ? `${actionTitle} (${fullTextSummary})` : actionTitle}
+                                    </span>
+                                )}
+                            </div>
+                            {reconnectCaption ? (
+                                <span className="font-color-secondary text-sm" role="status">{reconnectCaption}</span>
+                            ) : unconfirmedNote && (
+                                <span className="font-color-secondary text-sm" role="status">{unconfirmedNote}</span>
+                            )}
+                        </div>
+                    </div>
+                </button>
+
+                <div className="flex-1" />
+
+                {/* Header actions, right-aligned: Apply / Reject alone while a
+                    collapsed card awaits a decision; otherwise at most one
+                    tool-specific action, then the open / reveal link as the
+                    rightmost icon. Folding is the header button itself. */}
+                <div className="display-flex flex-row items-center gap-25 mr-2 mt-015">
+                    {showDecisionButtons && (
+                        <>
+                            <Tooltip content={heldTooltip ?? 'Reject'} showArrow singleLine>
+                                <IconButton
+                                    icon={CancelIcon}
+                                    variant="ghost-secondary"
+                                    iconClassName="font-color-red"
+                                    onClick={isAwaitingApproval ? handleReject : handleRejectPending}
+                                    ariaLabel="Reject"
+                                    disabled={isDecisionHeld}
+                                />
+                            </Tooltip>
+                            <Tooltip content={heldTooltip ?? (isStaleDecision ? STALE_APPLY_ANYWAY_TOOLTIP : 'Apply')} showArrow singleLine>
+                                <IconButton
+                                    icon={TickIcon}
+                                    variant="ghost-secondary"
+                                    iconClassName="font-color-green scale-14"
+                                    onClick={isAwaitingApproval ? handleApprove : isStaleDecision ? handleApplyAnyway : handleApplyPending}
+                                    ariaLabel={isStaleDecision ? 'Apply anyway' : 'Apply'}
+                                    disabled={isDecisionHeld}
+                                />
+                            </Tooltip>
+                        </>
+                    )}
+                    {!isDecisionState && noteExportTarget && !isProcessing && (isExportingNote ? (
+                        <IconButton
+                            icon={DownloadIcon}
+                            variant="ghost-secondary"
+                            iconClassName="font-color-secondary scale-10"
+                            onClick={() => {}}
+                            loading
+                            ariaLabel="Exporting"
+                        />
+                    ) : (
+                        <MenuButton
+                            icon={DownloadIcon}
+                            variant="ghost-secondary"
+                            iconClassName="font-color-secondary scale-10"
+                            menuItems={fileExportFormatMenuItems(handleExportNote)}
+                            tooltipContent="Export"
+                            ariaLabel="Export"
+                        />
+                    ))}
+                    {headerLinkAction && !showDecisionButtons && (
+                        <Tooltip content={headerLinkAction.tooltip} showArrow singleLine>
+                            <IconButton
+                                icon={ArrowUpRightIcon}
+                                variant="ghost-secondary"
+                                iconClassName="font-color-secondary scale-10"
+                                onClick={() => void headerLinkAction.onClick()}
+                                ariaLabel={headerLinkAction.tooltip}
+                            />
+                        </Tooltip>
+                    )}
+                </div>
+            </div>
+
+            {isExpanded && (
+                <div className="display-flex flex-col">
+                    {staleDetail && <StaleProposalNote detail={staleDetail} />}
+                    {previewData ? (
+                        <ActionPreview
+                            toolName={toolName}
+                            previewData={previewData}
+                            disabled={isProcessing}
+                            status={status}
+                            actions={actions}
+                            isCallOpen={runStatus === 'in_progress' && !hasToolReturn}
+                            fullTextByKey={fullTextByKey}
+                        />
+                    ) : (
+                        <div className="text-sm font-color-secondary">
+                            No preview available
+                        </div>
+                    )}
+
+                    <div ref={footer.ref} className="display-flex flex-row items-center gap-2 px-2 py-2">
+                        {/* A cost confirmation has no permission control to offer:
+                            what a request may spend is set once by the credit
+                            limit. While the run is waiting on this card the
+                            control is about this run; once it is not, there is
+                            no run left to grant, so it goes back to being the
+                            standing per-tool preference. */}
+                        {isAwaitingApproval && runStatus !== 'parked' && !hasNoActionData && !isConfirmAction && (
+                            <div className="flex-none">
+                                <RunPermissionButton
+                                    mode={runPermissionMode}
+                                    onChange={handleRunPermissionChange}
+                                    disabled={isProcessing}
+                                    pendingCoveredCount={pendingCoveredCount}
+                                    iconOnly={permissionIconOnly}
+                                />
+                            </div>
+                        )}
+                        {/* The same slot held the run-scoped menu a moment ago,
+                            so this one says which scope it is. */}
+                        {!isAwaitingApproval && status === 'pending' && !hasNoActionData && !isConfirmAction && (
+                            <div className="flex-none">
+                                <DeferredToolPreferenceButton
+                                    toolName={toolName}
+                                    disabled={toolName === 'delete_annotations'}
+                                    tooltipContent={
+                                        toolName === 'delete_annotations'
+                                            ? 'The approval preference cannot be changed for annotation deletion'
+                                            : 'Default for this kind of change in future responses'
+                                    }
+                                />
+                            </div>
+                        )}
+                        <div className="flex-1" />
+
+                        {config.showReject && (!isProcessing || clickedButton === 'reject') && (
+                            <Button
+                                variant="outline"
+                                onClick={isAwaitingApproval ? handleReject : handleRejectPending}
+                                loading={isProcessing && clickedButton === 'reject'}
+                                disabled={isProcessing || isDecisionHeld}
+                                title={heldTooltip ?? undefined}
+                                className="flex-none whitespace-nowrap"
+                            >
+                                Reject
+                            </Button>
+                        )}
+
+                        {toolName === 'create_note' && action?.status === 'applied' && hasLibraryIdentity({ library_id: action?.result_data?.library_id, library_ref: action?.result_data?.library_ref }) && action?.result_data?.zotero_key && (
+                            <Button
+                                variant="outline"
+                                onClick={handleRevealNote}
+                                disabled={isProcessing}
+                                className="flex-none whitespace-nowrap"
+                            >
+                                Reveal
+                            </Button>
+                        )}
+
+                        {(config.showUndo || (isProcessing && clickedButton === 'undo')) && (
+                            <Button
+                                variant="outline"
+                                onClick={handleUndo}
+                                loading={isProcessing && clickedButton === 'undo'}
+                                disabled={isProcessing}
+                                className="flex-none whitespace-nowrap"
+                            >
+                                {toolName === 'create_note' ? 'Delete' : 'Undo'}
+                            </Button>
+                        )}
+
+                        {config.showRetry && (
+                            <Button
+                                variant="outline"
+                                icon={RepeatIcon}
+                                onClick={handleRetry}
+                                loading={isProcessing}
+                                className="flex-none whitespace-nowrap"
+                            >
+                                {isUndoRetry ? 'Retry Undo' : 'Try Again'}
+                            </Button>
+                        )}
+
+                        {showRefresh && (
+                            <Button
+                                variant="outline"
+                                icon={RepeatIcon}
+                                onClick={handleRefresh}
+                                loading={isProcessing && clickedButton === 'refresh'}
+                                disabled={isProcessing}
+                                title="Check the records again and show the current merge for review"
+                                className="flex-none whitespace-nowrap"
+                            >
+                                Refresh
+                            </Button>
+                        )}
+
+                        {((config.showApplyAnyway && !isProcessing) || (isProcessing && clickedButton === 'applyAnyway')) && (
+                            <Button
+                                variant="solid"
+                                onClick={handleApplyAnyway}
+                                loading={isProcessing && clickedButton === 'applyAnyway'}
+                                disabled={isProcessing}
+                                title="Make the change even though the library changed since it was proposed"
+                                className="flex-none whitespace-nowrap"
+                            >
+                                Apply anyway
+                            </Button>
+                        )}
+
+                        {config.showApply && (!isProcessing || clickedButton === 'approve') && (
+                            <Button
+                                variant="solid"
+                                onClick={isAwaitingApproval ? handleApprove : handleApplyPending}
+                                loading={isProcessing && clickedButton === 'approve'}
+                                disabled={isProcessing || isDecisionHeld}
+                                title={heldTooltip ?? undefined}
+                                className="flex-none whitespace-nowrap"
+                            >
+                                <span>{isConfirmAction ? 'Confirm' : 'Apply'}</span>
+                            </Button>
+                        )}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default AgentActionView;

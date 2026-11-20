@@ -1,0 +1,860 @@
+import type { MutableRefObject, ReactNode } from 'react';
+import type { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import type { CitationRef } from '@astermargin/agent-core/citations/citationGrammar';
+import type { Citation, PartLocation } from '@astermargin/agent-core/types/citations';
+import type { PageLabelsByAttachmentId } from '@astermargin/agent-core/citations/atoms';
+import type { ExternalReference } from '@astermargin/agent-core/types/externalReferences';
+import type { ToolCallPart, AgentRun, AgentRunStatus, MessageSearchFilters } from '@astermargin/agent-core/agents/types';
+import type { MessageAttachment, ViewAttachment } from '@astermargin/agent-core/types/attachments/apiTypes';
+import type { MenuPosition, SearchMenuCloseReason } from '../primitives/SearchMenu';
+import type { MenuItem } from '../primitives/ContextMenu';
+import type { AddSourcesMenuHandle, AddSourcesQuerySource } from '../composer/useAddSourcesMenu';
+import type { AgentActionType } from '@astermargin/agent-core/protocol/agentProtocol';
+import type { BatchOutcomeTarget } from '@astermargin/agent-core/run-state/batchProgress';
+import type { TableFillViewRequest } from '@astermargin/agent-core/protocol/tableFillProtocol';
+
+/**
+ * What a citation click should act on.
+ *
+ * - `passage` — navigate to the cited location: open the reader at the page and
+ *   highlight the quoted text, open the note, launch the external file, ... This
+ *   is the default.
+ * - `item` — reveal the cited work itself where the user keeps it, ignoring the
+ *   locator. Selected by holding the platform accelerator (Cmd / Ctrl).
+ */
+export type CitationActivationIntent = 'passage' | 'item';
+
+/**
+ * Where a citation opens the document it cites: `tab` in the client's main
+ * view (switching to it), `window` in a separate reader window, leaving the
+ * main view where it is.
+ */
+export type CitationReaderTarget = 'tab' | 'window';
+
+/**
+ * Everything the host needs to activate (navigate to / open) a cited location.
+ *
+ * The render layer derives this from the client-agnostic citation view model and
+ * hands it to the host; the host performs the client-specific side effects
+ * (open reader at a locator, open a note, launch a file, show an external
+ * reference, ...). Only ever passed for a "ready" citation, so `metadata` is
+ * always present.
+ */
+export interface CitationActivation {
+    /** Self-contained citation metadata (content kind, locations, pages, preview, ...). */
+    metadata: Citation;
+    /**
+     * What the click should act on. Optional: a host that does not distinguish
+     * the two treats every click as `passage`, which is the behavior it had
+     * before the alternate activation existed.
+     */
+    intent?: CitationActivationIntent;
+    /** Where to open the cited document. Omitted: the host's default (for Zotero, its "Open PDFs in a new window" setting). */
+    readerTarget?: CitationReaderTarget;
+    isExternal: boolean;
+    isExternalFile: boolean;
+    externalFileKey: string | null;
+    externalSourceId?: string;
+    /** Whether an external reference has been mapped to a library item. */
+    hasMappedItem: boolean;
+    /** Effective library identity, accounting for mapped external references. */
+    effectiveLibraryID: number;
+    effectiveItemKey: string;
+    effectiveLibraryRef?: string;
+    /** Stripped preview text (used as the temporary-annotation label). */
+    previewText: string;
+    /** Document the click originated from (targets the right reader window). */
+    ownerDocument: Document;
+}
+
+/**
+ * Client host capability slices.
+ *
+ * The chat-history render surface (citations, cited-sources, toolcall results,
+ * notes, ...) is presentational and client-agnostic. The handful of operations
+ * that *are* client-specific — navigating to items, opening files, and a few
+ * legacy data lookups — are injected through the slices below so the UI can be
+ * reused across clients.
+ *
+ * Each slice on {@link ClientHost} is optional and namespaced; a client supplies
+ * only the capabilities it has, and renderers degrade gracefully when a slice is
+ * absent.
+ */
+
+/**
+ * One find_in_attachments match to navigate to in the reader. Assembled by the
+ * render layer from an attachment-search row and match.
+ */
+export interface AttachmentMatchNavigation {
+    library_id: number;
+    zotero_key: string;
+    library_ref?: string;
+    content_kind: 'pdf' | 'epub' | 'text' | 'snapshot';
+    /** 1-based page number (EPUB: 1-based section ordinal). */
+    page_number?: number | null;
+    /** Printed page label for the matched page, when known. */
+    page_label?: string | null;
+    /** Compact part location used for reader navigation. */
+    target?: PartLocation | null;
+    /** Match preview text, used for temporary-annotation comments and EPUB search. */
+    snippet?: string;
+    /** Owning document of the clicked row, so the host targets the right window. */
+    ownerDocument?: Document;
+}
+
+/**
+ * Navigation actions a rendered chat surface can trigger on the host.
+ *
+ * These are inherently client-specific: where "reveal in library" or "open the
+ * file" means something different per client. This subsumes the verbs the
+ * citation click handler needs today; future toolcall-result and source-list
+ * components consume the same slice.
+ */
+export interface NavigationHost {
+    /**
+     * Opens a stored table in the client's table view. `origin` is the window
+     * the interaction happened in — derive it from the clicked element's
+     * `ownerDocument` — so the table opens beside the surface the user is
+     * looking at rather than in whichever window is newest. `onDownload`
+     * fires when the table's files must be downloaded before it can open.
+     * `focus` brings a row (and a cell, with a column) into view; the result's
+     * `focus` is `missing` when the table no longer has it. `request` asks the
+     * table's view to show a fill's failed rows. The host tells the user when
+     * the table cannot be opened, so the `error` is not for display.
+     */
+    openTable?(
+        key: string,
+        origin?: Window | null,
+        options?: {
+            onDownload?: () => void;
+            focus?: { rowId: string; columnId?: string };
+            request?: TableFillViewRequest;
+        },
+    ): Promise<{ ok: true; warning?: string; focus?: 'found' | 'missing' } | { error: string }>;
+    /**
+     * Takes back one model edit of a stored table (the `edit_table` tool
+     * display's Undo): restores the version before it, only while the table
+     * is exactly as that edit left it. `version` is the version the edit
+     * committed, `runId` the run that made it.
+     */
+    undoTableEdit?(
+        key: string,
+        edit: { version: number; runId: string },
+        origin?: Window | null,
+    ): Promise<{ ok: true } | { error: string }>;
+    /** Reveal/select the referenced item in the library view. */
+    revealInLibrary(ref: ZoteroItemReference): void;
+    /** Reveal/select the referenced library in the library view. */
+    revealLibrary(libraryId: number): void | Promise<void>;
+    /**
+     * Reveal/select the referenced collection in the library view. The ref's
+     * `zotero_key` is the collection key (not an item key).
+     */
+    revealCollection(ref: ZoteroItemReference): void;
+    /**
+     * Reveal/select an attached saved search or built-in view (Unfiled Items,
+     * …) in the library view. Optional — clients without such views leave the
+     * chip inert.
+     */
+    revealView?(view: ViewAttachment): void | Promise<void>;
+    /**
+     * Reveal whatever `zotero_key` names in the referenced library: a regular
+     * item, attachment, or note is selected in the library view, an annotation
+     * is opened in the reader, and a collection is selected. Used by the object
+     * links the model writes in prose (`[Smith 2004](u-KEY)`), which carry a
+     * key but not the object type. Optional — clients without it leave such
+     * links inert.
+     */
+    revealObject?(ref: ZoteroItemReference): void | Promise<void>;
+    /** Open a local file (e.g. a PDF/text attachment) in the host's default handler. */
+    launchFile(filePath: string): void;
+    /** Open an external URL. */
+    openExternalUrl(url: string): void;
+    /**
+     * Activate a cited location: open the reader at the locator, open a note,
+     * launch an external file, reveal an external reference, etc. Encapsulates
+     * all client-specific citation-click behavior so the render layer stays
+     * client-agnostic. Only called for "ready" citations.
+     */
+    activateCitation(activation: CitationActivation): void | Promise<void>;
+    /** Open a library item's best attachment (PDF/etc.) or note in the host viewer. */
+    openSource(ref: ZoteroItemReference): void | Promise<void>;
+    /** Open the referenced annotation in the reader, scrolled to its location. */
+    openAnnotation(ref: ZoteroItemReference): void | Promise<void>;
+    /** Open the reader at a find_in_attachments match and highlight it. */
+    navigateToAttachmentMatch(match: AttachmentMatchNavigation): void | Promise<void>;
+    /** Open a locally stored external-file copy by its ext key (no-op if no local copy). */
+    launchExternalFile(extKey: string): void | Promise<void>;
+    /**
+     * Open the client's settings surface for editing a saved action (for
+     * Zotero, the Actions tab of the preferences window with `actionId`
+     * revealed in edit mode). Optional — clients without an action editor
+     * omit it, and action pills degrade to hover-only.
+     */
+    openActionSettings?(actionId: string): void;
+    /**
+     * Navigate to what a batch outcome row names (collection filed into, tag
+     * applied). The target has no library — the host resolves the name or key
+     * against the libraries it can see.
+     */
+    revealBatchOutcome?(target: BatchOutcomeTarget): void | Promise<void>;
+    /**
+     * Right-click menu entries for a library item: reveal it, open it (or its
+     * best attachment), show its file. Interaction-time, so the host may load the
+     * item live. Resolves to an empty list when the item is unavailable.
+     * Optional — clients without it leave item rows with no custom menu.
+     */
+    itemMenuItems?(ref: ZoteroItemReference): Promise<MenuItem[]>;
+}
+
+/**
+ * Display metadata for a library item, resolved by the host for source/result
+ * lists. Currently minimal; grows as more list surfaces are decoupled.
+ */
+export interface ResolvedItemDisplay {
+    /** Zotero item type, for icon rendering. */
+    itemType?: string;
+    /**
+     * Whether the item has a readable attachment (enables an "open" action).
+     * Absent when the caller asked `resolveItemDisplay` not to find out.
+     */
+    hasReadableAttachment?: boolean;
+    /**
+     * Bibliographic display name for the referenced item, used by tool-call
+     * header labels (e.g. "Smith 2005"; a note's title for note references).
+     * For attachments this is the parent item's display name. Absent when it
+     * can't be resolved.
+     */
+    displayName?: string;
+    /**
+     * Attachments only: the broad content kind ("pdf", "epub", "snapshot", …),
+     * so the row's icon matches the one a stamped record would give it.
+     * Absent for other items and when the client cannot say.
+     */
+    contentKind?: string;
+    /**
+     * The item's title, for lists that need more than the display name to
+     * tell items apart. For attachments this is the parent item's title.
+     * Absent when it can't be resolved.
+     */
+    title?: string;
+    /**
+     * The first creator's name, when the item has one. Absent for an item
+     * without creators (a web page, a report), whose display name is then a
+     * placeholder — a list may prefer to lead with the title instead.
+     */
+    creator?: string;
+    /**
+     * The item type in the client's words ("Report", "Web Page"), for a row
+     * that has no creator to show. Absent when the client cannot say.
+     */
+    itemTypeLabel?: string;
+}
+
+/**
+ * Fallback data lookups for legacy (pre-v2) rendering data.
+ *
+ * Citation v2 metadata is self-contained, so this slice is deliberately minimal
+ * and shrinking: it only covers data that older stored rows did not persist.
+ */
+export interface ItemDataHost {
+    resolveTableDisplay?(key: string): Promise<TableDisplay>;
+    subscribeTableChanges?(key: string, changed: () => void): () => void;
+    /**
+     * Resolve printed page labels for a citation when the metadata does not
+     * already carry them. Returns a sparse 0-based page index -> printed label
+     * map, or null when unavailable (renderer then falls back to raw page
+     * numbers).
+     *
+     * The label map is passed in from the active render store (rather than read
+     * from a module-global store) so this works under the isolated store that
+     * `renderToHTML` populates during note export.
+     */
+    resolvePageLabels(
+        ref: CitationRef,
+        pageLabelsByAttachmentId: PageLabelsByAttachmentId,
+    ): Record<number, string> | null;
+    /**
+     * Resolve display metadata (icon type + attachment availability + display
+     * name) for a library item in a source/result list. Async because it may
+     * load the item; returns null when the item can't be resolved.
+     *
+     * `options.attachment` (default true) asks for `hasReadableAttachment`,
+     * which costs a child-item load and a best-attachment search per item. A
+     * list that only names items passes false so a page of rows does not
+     * pay for a flag it never draws. A host that ignores the option answers
+     * as before.
+     */
+    resolveItemDisplay(
+        ref: ZoteroItemReference,
+        options?: { attachment?: boolean },
+    ): Promise<ResolvedItemDisplay | null>;
+    /**
+     * Resolve a library's display name for a tool-call header label. Accepts the
+     * raw `library` arg (numeric id or name). Returns null when unavailable.
+     */
+    resolveLibraryName(libraryParam: number | string): Promise<string | null>;
+    /**
+     * Resolve a collection's display name for a tool-call header label. Accepts
+     * the raw collection key/id/name arg and an optional scoping library id.
+     * Returns null when unavailable.
+     */
+    resolveCollectionName(keyOrName: string | number, libraryId?: number): Promise<string | null>;
+}
+
+/**
+ * What the host needs to render a citation as host-native formatted output for
+ * document export (e.g. a Zotero note). Derived from the citation view model.
+ */
+export interface CitationExportRequest {
+    effectiveLibraryID: number;
+    effectiveItemKey: string;
+    /**
+     * Portable library ref (`"u"` / `"g<groupID>"`). For group citations the
+     * device-local `effectiveLibraryID` is 0 (identity lives here), so the host
+     * must resolve this to a local libraryID before looking the item up.
+     */
+    effectiveLibraryRef?: string | null;
+    /** Identity as cited by the model, for page-locator fallback. */
+    requestedRef: CitationRef | null;
+    /** 1-based cited page numbers. */
+    pages: number[];
+    /** Self-contained metadata, for the page-label fallback. */
+    metadata?: Citation;
+    /**
+     * Page-label map from the active render store. Passed in (rather than read
+     * from a module-global store) so note export uses the isolated store that
+     * `renderToHTML` populates with preloaded labels.
+     */
+    pageLabelsByAttachmentId: PageLabelsByAttachmentId;
+}
+
+/**
+ * Host-native rendered citation for export. `html` is inserted via
+ * `dangerouslySetInnerHTML`; the `citation` variant also carries the serialized
+ * citation payload for the editor's `data-citation` attribute.
+ */
+export type CitationExportRender =
+    | { kind: 'html'; html: string }
+    | { kind: 'citation'; html: string; citationData: string };
+
+/**
+ * What the host needs to render an external-file citation (a user-attached,
+ * non-Zotero file) as host-native output for document export.
+ */
+export interface ExternalFileCitationExportRequest {
+    /** Ext key of the cited external file, or null when unknown. */
+    externalFileKey: string | null;
+    /** Display label (filename / cited name). */
+    displayName: string;
+    /** Cited page/section locator suffix (e.g. ", p.3"), already formatted; empty when none. */
+    locatorSuffix: string;
+    /**
+     * Absolute local paths for external files present on this computer, keyed by
+     * ext key. Passed in from the active render store (rather than read from a
+     * module-global store) so note export uses the isolated store that
+     * `renderToHTML` populates.
+     */
+    localPathsByExtKey: Record<string, string>;
+}
+
+/**
+ * What the host needs to render a citation of an external work (found by
+ * search, not in the user's library) as a host-native citation.
+ */
+export interface ExternalReferenceCitationExportRequest {
+    /** External reference id the model cited. */
+    externalId: string;
+    /** The work's metadata from the thread's external reference cache. */
+    reference: ExternalReference;
+    /** Identity as cited by the model, for its locator. */
+    requestedRef: CitationRef | null;
+}
+
+/** File formats a response can be exported to. */
+export type FileExportFormat = 'docx' | 'pdf' | 'markdown' | 'latex';
+
+/** The final answer only, or the full response with the agent's tool activity. */
+export type FileExportContent = 'final' | 'full';
+
+/** Outcome of exporting to a file. `warnings` are user-facing sentences. */
+export type FileExportResult =
+    | {
+        status: 'saved';
+        /** The exported document. */
+        path: string;
+        /** Its file name. */
+        fileName: string;
+        /** The folder it was saved in, as shown to the user. */
+        folderName: string;
+        /** Names of files written beside it (a LaTeX export's .bib file). */
+        companionFileNames: string[];
+        warnings: string[];
+    }
+    | { status: 'canceled' };
+
+/**
+ * Render content into the host's native document format. For Zotero this is a
+ * note (CSL-formatted HTML); other clients format
+ * differently. Clients that don't support document export omit this slice.
+ */
+export interface DocumentExportHost {
+    /** Render a Zotero/library citation for export. Returns null when the item is unavailable. */
+    renderCitation(request: CitationExportRequest): CitationExportRender | null;
+    /**
+     * Render an external-file citation as host-native output. Returns null when
+     * the host has no richer representation than plain text (e.g. no local copy
+     * of the file on this computer), in which case the render layer falls back to
+     * its client-agnostic plain-text form. Optional — clients without local
+     * external-file storage omit it.
+     */
+    renderExternalFileCitation?(request: ExternalFileCitationExportRequest): CitationExportRender | null;
+    /**
+     * Render a citation of an external work as a host-native citation. Returns
+     * null when the host cannot, in which case the render layer falls back to
+     * a link. Optional.
+     */
+    renderExternalReferenceCitation?(request: ExternalReferenceCitationExportRequest): CitationExportRender | null;
+    /**
+     * Export a response — the runs of its resume chain, in order — to a file
+     * the user chooses, with citations formatted by the host. Interaction-time:
+     * may read the client's global state. Optional; clients without file export
+     * omit it and the action is not offered.
+     */
+    exportResponseToFile?(request: { runs: AgentRun[]; format: FileExportFormat; content: FileExportContent }): Promise<FileExportResult>;
+    /**
+     * Export a whole thread — every run in order, with the user's prompts and
+     * the agent's tool activity — to a file the user chooses. Same contract as
+     * `exportResponseToFile`.
+     */
+    exportThreadToFile?(request: { runs: AgentRun[]; format: FileExportFormat }): Promise<FileExportResult>;
+    /** Show an exported file in the system file manager. Rejects when it is gone. */
+    revealExportedFile?(path: string): Promise<void>;
+    /** Open an exported file in the system's default application. Rejects when it is gone. */
+    openExportedFile?(path: string): Promise<void>;
+}
+
+export type NoteSaveFormat =
+    | {
+        kind: 'agent-run';
+        /** 1-based message index used in the generated Zotero note title. */
+        responseIndex?: number;
+        /** Thread/run identity for the AsterMargin provenance link. */
+        threadId?: string | null;
+        runId?: string;
+    }
+    | {
+        kind: 'streaming-note';
+        /** Thread/run identity for the AsterMargin provenance link. */
+        threadId?: string | null;
+        runId?: string;
+    };
+
+export interface SaveNoteRequest {
+    /**
+     * Inner note HTML already rendered by the shared citation/markdown renderer.
+     * The host owns Zotero-note wrappers, provenance chrome, persistence, and
+     * navigation.
+     */
+    contentHtml: string;
+    /** Human-readable title for clients that expose one in their native note model. */
+    title?: string;
+    /**
+     * When true, save under the current parent item when one exists. If
+     * `requireParent` is also true, the host returns null when no parent exists.
+     */
+    asChild: boolean;
+    /** Require a parent item instead of falling back to a standalone note. */
+    requireParent?: boolean;
+    /** Existing AsterMargin/Zotero note format to preserve for this save surface. */
+    format: NoteSaveFormat;
+}
+
+export interface SavedNoteReference extends ZoteroItemReference {
+    parent_key?: string;
+}
+
+/**
+ * Host-native note writes. The render layer supplies already-rendered content;
+ * the host resolves Zotero/library targets and performs the mutation.
+ */
+export interface NoteWriterHost {
+    /** Render-time: whether the current target library can accept new notes. */
+    isCurrentLibraryEditable(): boolean;
+    /** Render-time: whether the current Zotero context has a parent item target. */
+    canSaveAsChildNote(): boolean;
+    /**
+     * Render-time: display title of the item a child note would be saved
+     * under, or null when there is none or it cannot be named.
+     */
+    childNoteParentTitle?(): string | null;
+    /** Interaction-time: create a note in the host library and optionally reveal it. */
+    saveNote(request: SaveNoteRequest): Promise<SavedNoteReference | null>;
+}
+
+/**
+ * Display configuration the render layer needs. Typed, named accessors (rather
+ * than a generic `getPref`) so the render layer never couples to a client's
+ * preference system. Read on each render — no reactivity is implied.
+ */
+export interface ConfigHost {
+    /** Citation display format. */
+    citationFormat(): 'author-year' | 'numeric';
+    /** Whether to render printed page labels instead of raw page numbers. */
+    usePageLabels(): boolean;
+    /** Whether to expose development-only UI affordances. */
+    isDevelopment(): boolean;
+    /**
+     * Absolute URL for a documentation page, from a path relative to the docs
+     * site root (e.g. `'credits#credit-overview'`). The docs site is a separate
+     * deployment whose base URL each client learns its own way — one substitutes
+     * it at build time, another derives it from the runtime origin — so the join
+     * belongs to the host. Optional: a host that omits it gets no documentation
+     * links (the link degrades to plain text).
+     */
+    docsUrl?(path: string): string;
+    /**
+     * Whether the composer applies the Windows composition-order workaround for
+     * input methods (see the composer's composition-end deferral).
+     *
+     * A kill-switch, not a feature flag: the workaround fixes lost text with
+     * Windows IMEs and is only ever turned off when a particular IME interacts
+     * badly with it. Optional — a host that omits it (or omits this whole slice)
+     * leaves the workaround **enabled**.
+     */
+    isImeCompositionOrderFixEnabled?(): boolean;
+    /**
+     * Whether the composer stops Lexical from inserting its composition start
+     * character in Gecko on Windows, which sends some IMEs' candidate window to
+     * the top-left corner of the screen.
+     *
+     * Opt-in, because commits then rely more often on the composer's
+     * composition-end recovery: a host that omits it (or omits this whole
+     * slice) leaves the suppression **disabled**.
+     */
+    isImeCompositionStartCharSuppressionEnabled?(): boolean;
+    /**
+     * Whether the composer emits compact IME event traces to the log, for
+     * diagnosing composition issues without a local reproduction. Diagnostic
+     * only; a host that omits it (or omits this whole slice) gets **no** tracing.
+     */
+    isImeTracingEnabled?(): boolean;
+}
+
+/**
+ * Display mode for a single host-rendered action button.
+ *
+ * - `full`     — icon + label.
+ * - `icon-only`— compact icon button.
+ * - `none`     — button is omitted.
+ */
+export type ExternalReferenceActionMode = 'full' | 'icon-only' | 'none';
+
+/**
+ * Visual variant the render layer can request for host-rendered buttons.
+ */
+export type HostButtonVariant =
+    | 'solid'
+    | 'surface'
+    | 'outline'
+    | 'subtle'
+    | 'ghost'
+    | 'surface-light'
+    | 'ghost-secondary'
+    | 'ghost-tertiary'
+    | 'error';
+
+/**
+ * Render inputs for the external-reference action buttons (details / web / PDF /
+ * reveal / import). The shared render layer assembles these from a client-agnostic
+ * {@link ExternalReference}; the host owns the actual buttons and their
+ * client-specific behavior (importing into the library, revealing, opening PDFs).
+ */
+export interface ExternalReferenceActionsProps {
+    /** The external reference whose actions are rendered. */
+    item: ExternalReference;
+    /** Visual variant for the rendered buttons. */
+    buttonVariant?: HostButtonVariant;
+    /** Extra class names applied to each button. */
+    className?: string;
+    /** Display mode for the Reveal button (shown when the item exists in the library). */
+    revealButtonMode?: ExternalReferenceActionMode;
+    /** Display mode for the Import button (shown when the item is not in the library). */
+    importButtonMode?: ExternalReferenceActionMode;
+    /** Display mode for the Details button. */
+    detailsButtonMode?: ExternalReferenceActionMode;
+    /** Display mode for the Web button. */
+    webButtonMode?: ExternalReferenceActionMode;
+    /** Display mode for the PDF button. */
+    pdfButtonMode?: ExternalReferenceActionMode;
+    /** Whether to show the citation count. */
+    showCitationCount?: boolean;
+    /**
+     * The link the Web button opens. Defaults to the record's primary link
+     * from its identifiers; a results view passes the link for its source.
+     */
+    webUrl?: string;
+}
+
+/**
+ * A write the backend has deferred for user approval, as carried by the
+ * `deferred_approval_request` wire event. Client-neutral by construction: the
+ * shape is that event's payload, and `actionData` stays opaque — only the client
+ * that renders and applies the action interprets it.
+ *
+ * Declared here because the shared render layer hands it to the host's in-stream
+ * action UI below; each client's approval store imports this declaration rather
+ * than restating it.
+ */
+export interface PendingApproval {
+    actionId: string;
+    toolcallId: string;
+    actionType: AgentActionType;
+    actionData: Record<string, any>;
+    /** Prior value of the edited object, when the backend sent one (for diffs). */
+    currentValue?: any;
+}
+
+/**
+ * The object an `edit_note` group writes to, resolved from the tool-call args.
+ *
+ * Zotero-shaped by name because notes are — the render layer only groups the
+ * parts and forwards the target, and the host resolves it to a real note.
+ */
+export interface EditNoteResolvedTarget {
+    /** Device-local library rowid, or `0` when the library is not on this device. */
+    libraryId: number;
+    zoteroKey: string;
+    /**
+     * Device-portable library identity ("u" / "g<groupID>") when the target was
+     * named portably. Zotero keys are unique only within a library, so this is
+     * what tells two unavailable libraries apart — their rowids are both `0`.
+     */
+    libraryRef?: string;
+}
+
+/**
+ * Inputs for the in-stream agent-action UI, discriminated by `kind` to cover the
+ * three render situations: a single action tool-call (`tool-action`), a bulk
+ * annotation tool-call (`annotation`), and a grouped edit_note run
+ * (`edit-note-group`). The shared dispatchers classify and pass these; the host
+ * owns the rich apply/undo rendering. Mirrors the props the Zotero components
+ * (`AgentActionView` / `AnnotationToolCallView` / `EditNoteGroupView`) take today.
+ */
+export type AgentActionInStreamProps =
+    | {
+        kind: 'tool-action';
+        part: ToolCallPart;
+        runId: string;
+        responseIndex: number;
+        runStatus: AgentRunStatus;
+        toolName: string;
+        pendingApproval: PendingApproval | null;
+        hasToolReturn: boolean;
+        streamingArgs?: Record<string, unknown> | null;
+    }
+    | { kind: 'annotation'; part: ToolCallPart; runId: string; runStatus: AgentRunStatus }
+    | {
+        kind: 'edit-note-group';
+        parts: ToolCallPart[];
+        target: EditNoteResolvedTarget | null;
+        runId: string;
+        responseIndex: number;
+        runStatus: AgentRunStatus;
+    };
+
+/**
+ * Host-rendered "+" picker for a user message being edited.
+ *
+ * Library search, collection/tag browse, and file pick are client-specific, so
+ * the shared overlay owns only the attachment/filter data and hands the picker
+ * to the host. Chip removal stays on the shared chip row.
+ */
+export interface RequestSourcesMenuProps {
+    attachments: MessageAttachment[];
+    filters: MessageSearchFilters | null;
+    /**
+     * Identifies the edit session these props belong to. Opaque: the picker
+     * captures it when it starts staging a pick and hands it back on
+     * completion, so the caller can tell a pick that belongs to the session on
+     * screen from one that outlived the session that started it.
+     */
+    editSessionId: number;
+    /**
+     * Attach what the user picked; the caller dedupes against `attachments`.
+     * The id is the one that was current when staging began.
+     */
+    onAddAttachments(attachments: MessageAttachment[], editSessionId: number): void;
+    /** Detach one attachment, keyed by `messageAttachmentIdentity`. */
+    onRemoveAttachment(attachmentKey: string): void;
+    /** Replace the search filters (see `onAddAttachments` for the id). */
+    onFiltersChange(filters: MessageSearchFilters, editSessionId: number): void;
+    /**
+     * True while a pick is still being staged (file copy, item load, filter
+     * serialize). The overlay holds sending so a submit in that window cannot
+     * regenerate without what the user just picked.
+     */
+    onPendingChange?(isPending: boolean): void;
+
+    // Menu state, owned by the caller so a typed `@` can open the picker with
+    // the editor as its search box (same as the composer). Produced by
+    // `useAddSourcesMenu`; only the picker itself is client-specific.
+    isMenuOpen: boolean;
+    menuPosition: MenuPosition;
+    searchQuery: string;
+    /** Whether the query comes from the editor (typed `@`) or the menu's field. */
+    querySource: AddSourcesQuerySource;
+    onQueryChange(query: string): void;
+    onOpen(position: MenuPosition): void;
+    /** Close without consuming the typed `@query` (Escape, click outside). */
+    onDismiss(reason: SearchMenuCloseReason): void;
+    /** Close because something was picked — the typed `@query` is consumed. */
+    onCommit(): void;
+    /** Clear the typed query but leave the menu open (entering a submenu). */
+    onResetQuery(): void;
+    /** Receives the open menu so the caller can step back out of a submenu. */
+    menuRef: MutableRefObject<AddSourcesMenuHandle | null>;
+
+    menuPortalContainer?: HTMLElement | null;
+    disabled?: boolean;
+    verticalPosition?: 'above' | 'below';
+}
+
+/**
+ * Host-provided, client-specific UI components.
+ *
+ * Unlike the other slices (which inject *behavior*), this slice injects *UI* for
+ * surfaces that are inherently client-specific — chiefly the agent-action
+ * approve/apply/undo controls and item-mutation buttons that only make sense for
+ * a Zotero library. Shared dispatchers ask the host for these renderers instead
+ * of importing the client components directly, so the dependency arrow stays
+ * shared → host-interface, never shared → client UI.
+ *
+ * Each method returns a {@link ReactNode}, or `null` when the client has no UI
+ * for that surface (the shared caller then renders nothing). The slice grows as
+ * more action UIs move behind the host seam.
+ */
+export interface ComponentsHost {
+    /**
+     * Render the action buttons for an external (non-library) reference —
+     * details / web / open-PDF plus reveal-in-library / import-to-library. The
+     * import and reveal actions write to / navigate the Zotero library, so the
+     * whole control is client-specific. Returns null when the host has no such UI.
+     */
+    externalReferenceActions(props: ExternalReferenceActionsProps): ReactNode;
+    /**
+     * Render the rich in-stream agent-action / mutation UI for one tool-call part
+     * or edit-note group (approve/apply/undo controls, bulk-annotation panel, the
+     * edit_note group). Return null to fall back to the shared generic summary.
+     */
+    agentActionInStream(props: AgentActionInStreamProps): ReactNode;
+    /**
+     * Render the post-run review block for the client's library changes
+     * (create-item / note / annotation mutation summaries), pending or settled.
+     * A continued answer arrives as its complete run chain so the host can
+     * present one coherent review. Return null when there is nothing to show.
+     */
+    pendingActionsReview(props: { runs: AgentRun[] }): ReactNode;
+    /**
+     * Render the icon that stands for a bibliographic item of the given type.
+     *
+     * `itemType` is the client-agnostic icon name produced by
+     * `itemTypeToIconName` (`@astermargin/agent-core/types/citations`) — an item type
+     * such as `journalArticle` or `book`, or an attachment kind such as
+     * `attachmentPDF` — so the shared layer describes *what the item is* and the
+     * host decides what that looks like. Hosts with a full item-type icon set
+     * (Zotero) render the matching glyph; returning null falls back to the
+     * package's generic document icon.
+     */
+    itemTypeIcon(props: { itemType: string; className?: string }): ReactNode;
+    /**
+     * Render the icon for the reveal-in-library action, i.e. the glyph for
+     * {@link NavigationHost.revealInLibrary}. Split from the shared icon set
+     * because "show this item where the user keeps it" is a client's own
+     * affordance and each one has its own established glyph for it. Returning
+     * null falls back to the package's generic library icon.
+     */
+    revealInLibraryIcon(props: { className?: string }): ReactNode;
+    /**
+     * Render the "+" picker for a user message being edited. Optional — a
+     * client with no library to pick from omits it, and the overlay then only
+     * lets the user remove what is already attached.
+     */
+    requestSourcesMenu?(props: RequestSourcesMenuProps): ReactNode;
+}
+
+/**
+ * What the host can report about the user's current selection in the document it
+ * is embedded in.
+ *
+ * Deliberately minimal: the only thing every document host can produce is the
+ * selected text, plus something it can later use to find that range again.
+ * `location` is opaque — the render layer stores it and hands it back to the same
+ * host unchanged, never parsing it — so each client picks its own encoding (a
+ * Word bookmark id, an OOXML range, …) without the shared layer growing a case
+ * per client. It is a string so a staged context chip can be serialized into a
+ * run payload like any other attachment reference.
+ */
+export interface DocumentSelection {
+    /** Selected text as plain text. Empty when the selection is a collapsed cursor. */
+    text: string;
+    /** Opaque, host-owned handle for the selected range. Absent when the host cannot address it. */
+    location?: string;
+}
+
+/**
+ * Reading from and writing to the document the client is embedded in (Word,
+ * later Google Docs).
+ *
+ * Inherently client-specific, and absent for clients that are not hosted inside
+ * a document: the Zotero plugin has a library, not a cursor, and omits this
+ * slice entirely. Shared components must therefore treat it as optional — an
+ * "insert citation" affordance is only offered when the slice is present.
+ */
+export interface DocumentActionsHost {
+    /** Insert citations for the given references at the cursor, host-native. */
+    insertCitation(refs: CitationRef[]): Promise<void>;
+    /** Insert already-rendered markdown content at the cursor. */
+    insertText(markdown: string): Promise<void>;
+    /** The user's current selection, or null when there is none to report. */
+    getSelection(): Promise<DocumentSelection | null>;
+    /** Display name of the open document, or null when unavailable. */
+    documentName(): string | null;
+}
+
+export interface DialogsHost {
+    /**
+     * Show a blocking two-button confirm dialog and return whether the user
+     * confirmed. Synchronous by design — callers gate irreversible transitions
+     * (interrupting a run, opening a thread from another Zotero instance) on
+     * the answer before mutating any state.
+     */
+    confirm(opts: { title: string; text: string; confirmLabel: string; window?: Window }): boolean;
+}
+
+/**
+ * Aggregate client host. Registered once per client at bundle init via
+ * {@link setHost}. Slices are optional — check before use.
+ */
+export type TableDisplay =
+    | {
+          status: 'available';
+          title: string;
+          rows: number;
+          /** Every column in the spec, system ones included. */
+          columns: number;
+          /** Content columns: every column except system metadata (year, DOI, row type). */
+          contentColumns?: number;
+      }
+    | { status: 'unavailable'; reason: string };
+
+export interface ClientHost {
+    navigation?: NavigationHost;
+    itemData?: ItemDataHost;
+    documentExport?: DocumentExportHost;
+    noteWriter?: NoteWriterHost;
+    config?: ConfigHost;
+    components?: ComponentsHost;
+    documentActions?: DocumentActionsHost;
+    dialogs?: DialogsHost;
+}

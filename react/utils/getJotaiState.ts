@@ -1,0 +1,105 @@
+import { citationsAtom, citationMapAtom, citationsByRunIdAtom } from "@astermargin/agent-core/citations/atoms"
+import { userAtom, isAuthenticatedAtom, isWaitingForProfileAtom, authLoadingAtom, sessionRestoreAtom } from "../atoms/auth"
+import { readerTextSelectionAtom, currentMessageContentAtom, currentReaderAttachmentAtom, currentReaderAttachmentKeyAtom, currentNoteTabItemKeyAtom } from "../atoms/messageComposition"
+import { supportedModelsAtom, selectedModelAtom, availableModelsAtom } from "../atoms/models"
+import { profileWithPlanAtom, isProfileLoadedAtom, updateRequiredAtom, minimumFrontendVersionAtom, processingModeAtom, profileBalanceAtom, hasAuthorizedAccessAtom, hasAuthorizedFreeAccessAtom, syncWithZoteroAtom } from "../atoms/profile"
+import { recentThreadsAtom, currentThreadIdAtom } from "../atoms/threads"
+import { isSidebarVisibleAtom, isLibraryTabAtom, isPreferencePageVisibleAtom, userScrolledAtom, popupMessagesAtom } from "../atoms/ui"
+import { store } from "../store"
+import { flushPendingPartEvents } from "./streamingPartQueue"
+
+// Agent-related atoms
+import { threadRunsAtom, activeRunAtom, allRunsAtom, isStreamingAtom as isAgentStreamingAtom, toolResultsMapAtom } from "@astermargin/agent-core/run-state/atoms"
+import { threadAgentActionsAtom, agentActionsByToolcallAtom, agentActionsByRunAtom } from "../agents/agentActions"
+import { isWSChatPendingAtom, isWSConnectedAtom, isWSReadyAtom, wsReadyDataAtom, wsRequestAckDataAtom, wsErrorAtom, wsWarningAtom } from "../atoms/agentRunAtoms"
+
+export const atomRegistry = {
+    // Auth
+    isAuthenticated: isAuthenticatedAtom,
+    isWaitingForProfile: isWaitingForProfileAtom,
+    user: userAtom,
+    authLoading: authLoadingAtom,
+    sessionRestore: sessionRestoreAtom,
+
+    // Agent Runs
+    threadRuns: threadRunsAtom,
+    activeRun: activeRunAtom,
+    allRuns: allRunsAtom,
+    isAgentStreaming: isAgentStreamingAtom,
+    toolResultsMap: toolResultsMapAtom,
+
+    // Agent Actions
+    threadAgentActions: threadAgentActionsAtom,
+    agentActionsByToolcall: agentActionsByToolcallAtom,
+    agentActionsByRun: agentActionsByRunAtom,
+
+    // WebSocket State
+    isWSChatPending: isWSChatPendingAtom,
+    isWSConnected: isWSConnectedAtom,
+    isWSReady: isWSReadyAtom,
+    wsReadyData: wsReadyDataAtom,
+    wsRequestAckData: wsRequestAckDataAtom,
+    wsError: wsErrorAtom,
+    wsWarning: wsWarningAtom,
+
+    // Citations
+    citationMetadata: citationsAtom,
+    citationMetadataView: citationMapAtom,
+    citationsByRunId: citationsByRunIdAtom,
+
+    // Input
+    currentMessageContent: currentMessageContentAtom,
+    currentReaderAttachment: currentReaderAttachmentAtom,
+    currentReaderAttachmentKey: currentReaderAttachmentKeyAtom,
+    currentNoteTabItemKey: currentNoteTabItemKeyAtom,
+    readerTextSelection: readerTextSelectionAtom,
+
+    // Models
+    supportedModels: supportedModelsAtom,
+    selectedModel: selectedModelAtom,
+    availableModels: availableModelsAtom,
+
+    // Profile
+    isProfileLoaded: isProfileLoadedAtom,
+    profileWithPlan: profileWithPlanAtom,
+    processingModeAtom: processingModeAtom,
+    updateRequired: updateRequiredAtom,
+    minimumFrontendVersion: minimumFrontendVersionAtom,
+    profileBalance: profileBalanceAtom,
+    hasAuthorizedAccess: hasAuthorizedAccessAtom,
+    hasAuthorizedFreeAccess: hasAuthorizedFreeAccessAtom,
+    syncWithZotero: syncWithZoteroAtom,
+
+    // Threads
+    recentThreads: recentThreadsAtom,
+    currentThreadId: currentThreadIdAtom,
+
+    // UI
+    isSidebarVisible: isSidebarVisibleAtom,
+    isLibraryTab: isLibraryTabAtom,
+    isPreferencePageVisible: isPreferencePageVisibleAtom,
+    userScrolled: userScrolledAtom,
+    popupMessages: popupMessagesAtom,
+}
+
+export const getJotaiState = () => {
+    // Streamed parts are applied a frame after they arrive, so a snapshot taken
+    // mid-response would otherwise trail the stream by a frame.
+    flushPendingPartEvents()
+
+    const state: Record<string, unknown> = {}
+    
+    Object.entries(atomRegistry).forEach(([key, atom]) => {
+        try {
+            state[key] = store.get(atom as any)
+        } catch (error: any) {
+            state[key] = `Error reading atom: ${error.message}`
+        }
+    })
+
+    // Plugin version is a plain string, not a Jotai atom, so it is read
+    // directly rather than through store.get() (which requires an atom object).
+    state.currentAsterMarginVersion = Zotero.AsterMargin?.pluginVersion
+
+    return state;
+}

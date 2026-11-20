@@ -1,0 +1,22 @@
+import { agentRunService } from "@astermargin/agent-core/transport/agentService";
+
+export const RESPONSE_FINISH_MESSAGE = "Available when this response finishes.";
+
+export function hasThreadWriter(threadId: string): boolean {
+    return !!Zotero.AsterMargin?.presence
+        ?.getSnapshot()
+        .claims.some((claim) => claim.threadId === threadId);
+}
+
+/** A persisted terminal run alone does not establish reservation settlement. */
+export async function isFinishedChat(threadId: string): Promise<boolean> {
+    if (!threadId || hasThreadWriter(threadId)) return false;
+    try {
+        const snapshot = Zotero.AsterMargin?.localMode
+            ? await Zotero.AsterMargin.db.localHistory.getHistory(threadId)
+            : await agentRunService.getThreadActivity(threadId);
+        return snapshot.activity?.state === "idle" && !hasThreadWriter(threadId);
+    } catch {
+        return false;
+    }
+}

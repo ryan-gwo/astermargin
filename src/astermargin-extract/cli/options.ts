@@ -1,0 +1,162 @@
+/**
+ * Shared option parsers for CLI commands.
+ *
+ * Commander hands us strings for every flag value; these helpers turn
+ * `--pages 0,1,2`, `--page-range 5:12`, and `--settings settings.json`
+ * into the structured shapes the Node API expects, with strict
+ * validation so an agent typo surfaces as a clear error rather than
+ * silently extracting page 0.
+ */
+import { readFile } from "node:fs/promises";
+import type {
+    ExtractionSettings,
+    GraphicsLayerMode,
+} from "@astermargin/agent-core/extract/types";
+import {
+    CURRENT_PDF_EXTRACTION_PRESET,
+    OVERRIDABLE_PRESET_SWITCHES,
+    applyPresetOverrides,
+    pdfExtractionPreset,
+    type PresetOverrides,
+} from "../schema/presets";
+
+export function parsePagesList(value: string): number[] {
+    const parts = value.split(",").map((s) => s.trim()).filter(Boolean);
+    const out: number[] = [];
+    const seen = new Set<number>();
+    for (const p of parts) {
+        const n = Number(p);
+        if (!Number.isInteger(n) || n < 0) {
+            throw new Error(`--pages: invalid page index "${p}"`);
+        }
+        if (seen.has(n)) {
+            throw new Error(`--pages: duplicate page index "${n}"`);
+        }
+        seen.add(n);
+        out.push(n);
+    }
+    if (out.length === 0) throw new Error("--pages must list at least one index");
+    return out;
+}
+
+export function parsePageInt(value: string): number {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0) {
+        throw new Error(`--page must be a non-negative integer, got "${value}"`);
+    }
+    return n;
+}
+
+export interface PageRangeOpt {
+    startIndex: number;
+    endIndex?: number;
+    maxPages?: number;
+}
+
+export function parsePageRange(value: string): PageRangeOpt {
+    // Format: "start:end" or "start:" with `--max-pages` separate.
+    // Accept "start" alone for "from this page to the end".
+    const m = /^(\d+)(?::(\d+)?)?$/.exec(value);
+    if (!m) {
+        throw new Error(
+            `--page-range must look like "<start>" or "<start>:<end>", got "${value}"`,
+        );
+    }
+    const startIndex = Number(m[1]);
+    if (!Number.isInteger(startIndex) || startIndex < 0) {
+        throw new Error(`--page-range start must be a non-negative integer`);
+    }
+    const range: PageRangeOpt = { startIndex };
+    if (m[2] != null) {
+        const endIndex = Number(m[2]);
+        if (!Number.isInteger(endIndex) || endIndex < startIndex) {
+            throw new Error(
+                `--page-range end must be a non-negative integer >= start`,
+            );
+        }
+        range.endIndex = endIndex;
+    }
+    return range;
+}
+
+export function parseAnalysisWindow(value: string): number {
+    // Accept the literal "Infinity" / "inf" as a special case so
+    // `Number(value)` produces +Infinity rather than NaN. The downstream
+    // op layer (`resolveAnalysisPages`) explicitly handles Infinity.
+    const lower = value.trim().toLowerCase();
+    const n =
+        lower === "infinity" || lower === "inf" ? Number.POSITIVE_INFINITY : Number(value);
+    if (Number.isNaN(n) || n < 0) {
+        throw new Error(
+            `--analysis-window must be a non-negative number (or "Infinity"), got "${value}"`,
+        );
+    }
+    // Finite values must also be integers (the op rejects fractional windows).
+    if (Number.isFinite(n) && !Number.isInteger(n)) {
+        throw new Error(
+            `--analysis-window must be a non-negative integer (or "Infinity"), got "${value}"`,
+        );
+    }
+    return n;
+}
+
+export async function loadJsonFile<T = unknown>(path: string): Promise<T> {
+    const txt = await readFile(path, "utf8");
+    try {
+        return JSON.parse(txt) as T;
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`failed to parse JSON in ${path}: ${msg}`);
+    }
+}
+
+/** `--schema-version`: a PDF schema version with an extraction preset. */
+export function parseSchemaVersion(value: string): string {
+    if (!pdfExtractionPreset(value)) {
+        throw new Error(`--schema-version: no extraction preset for PDF schema "${value}"`);
+    }
+    return value;
+}
+
+/** Help text of `--preset`. */
+export const PRESET_OPTION_HELP =
+    `development only: override preset switches, comma-separated name[=true|false] (${OVERRIDABLE_PRESET_SWITCHES.join(", ")})`;
+
+/**
+ * `--preset`: preset switches to override, comma-separated `name` or
+ * `name=true|false` (e.g. `learnedBoundaries=false`).
+ */
+export function parsePresetOverrides(value: string): PresetOverrides {
+    const overrides: Record<string, boolean> = {};
+    for (const part of value.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const [name, raw = "true", ...rest] = part.split("=");
+        if (rest.length > 0 || (raw !== "true" && raw !== "false")) {
+            throw new Error(`--preset: "${part}" is not name or name=true|false`);
+        }
+        overrides[name] = raw === "true";
+    }
+    try {
+        applyPresetOverrides(CURRENT_PDF_EXTRACTION_PRESET, overrides);
+    } catch (e) {
+        throw new Error(`--preset: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return overrides;
+}
+
+export function parseGraphicsLayerMode(value: string): GraphicsLayerMode {
+    if (value === "off" || value === "auto" || value === "on") return value;
+    throw new Error(
+        `--graphics-layer-mode must be one of off | auto | on, got "${value}"`,
+    );
+}
+
+export function applyGraphicsLayerMode(
+    settings: ExtractionSettings | undefined,
+    mode: string | undefined,
+): ExtractionSettings | undefined {
+    if (mode == null) return settings;
+    return {
+        ...(settings ?? {}),
+        graphicsLayerMode: parseGraphicsLayerMode(mode),
+    };
+}

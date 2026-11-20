@@ -1,0 +1,198 @@
+import { atom } from 'jotai';
+import { selectAtom } from 'jotai/utils';
+import { Session } from '@supabase/supabase-js';
+import { credentials } from '@astermargin/agent-core/transport/credentials';
+import { isProfileLoadedAtom, profileWithPlanAtom } from './profile';
+import {
+    firstRunNextStepsDismissedAtom,
+    firstRunReturnRequestedAtom,
+    firstRunSuggestionsAtom,
+    firstRunSuggestionsErrorAtom,
+    firstRunSuggestionsModeAtom,
+} from './firstRun';
+import { whereToStartVisibleAtom } from './whereToStart';
+import { getPref, setPref } from '../../src/utils/prefs';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import type { SessionRestoreState } from '../../src/services/instanceAccount';
+import { LOCAL_USER_ID, localModeEnabledAtom } from './localMode';
+
+/**
+ * Atom representing the current authentication session
+ * Null when no active session exists
+ */
+export const sessionAtom = atom<Session | null>(null);
+
+// =============================================================================
+// Login Form State Atoms
+// These atoms manage shared state for the login form across all windows
+// =============================================================================
+
+export type AuthMethod = 'initial' | 'code' | 'password';
+export type LoginStep = 'method-selection' | 'otp' | 'forgot-password';
+
+/**
+ * Determines the authentication method shown in the login form
+ * Synced with preferences for persistence. 
+ * Note: 'code' is a transient state and defaults to 'initial' on restart.
+ */
+const getInitialAuthMethod = (): AuthMethod => {
+    const stored = getPref("authMethod");
+    return (stored === 'password') ? stored : 'initial';
+};
+
+export const authMethodAtom = atom<AuthMethod>(getInitialAuthMethod());
+
+/**
+ * Write atom to update authMethod and persist to preferences
+ */
+export const setAuthMethodAtom = atom(
+    null,
+    (get, set, method: AuthMethod) => {
+        set(authMethodAtom, method);
+        setPref("authMethod", method);
+    }
+);
+
+/**
+ * Current step in the login flow
+ */
+export const loginStepAtom = atom<LoginStep>('method-selection');
+
+/**
+ * Email input value for login form (shared across windows)
+ */
+const getInitialEmail = (): string => {
+    return getPref("userEmail") || '';
+};
+
+export const loginEmailAtom = atom<string>(getInitialEmail());
+
+/**
+ * Password input value for login form
+ */
+export const loginPasswordAtom = atom<string>('');
+
+/**
+ * Error message for authentication forms
+ */
+export const loginErrorAtom = atom<string | null>(null);
+
+/**
+ * Loading state for authentication operations
+ */
+export const loginLoadingAtom = atom<boolean>(false);
+
+/**
+ * Countdown timer for OTP resend (in seconds)
+ */
+export const otpResendCountdownAtom = atom<number>(0);
+
+/**
+ * Whether we're waiting for profile to load after successful auth
+ */
+export const isWaitingForProfileAtom = atom<boolean>(false);
+
+/**
+ * Reset transient login form state (loading, errors, step, password, etc.).
+ * Does NOT touch authMethod — that is a user preference, not transient state,
+ * and should only change via explicit user action (setAuthMethodAtom).
+ *
+ * Accepts any setter with the signature (atom, value) => void,
+ * so it works with both Jotai atom write `set` and `store.set`.
+ */
+export function resetLoginFormState(set: (atom: any, value: any) => void): void {
+    logger('resetLoginFormState: resetting login form state');
+    set(loginStepAtom, 'method-selection');
+    set(loginLoadingAtom, false);
+    set(loginPasswordAtom, '');
+    set(loginErrorAtom, null);
+    set(otpResendCountdownAtom, 0);
+    set(isWaitingForProfileAtom, false);
+}
+
+/**
+ * Reset login form to initial state.
+ * Resets the authMethod atom to 'initial' for the UI (to show method selection)
+ * but does NOT persist the change — the user's stored preference is preserved.
+ */
+export const resetLoginFormAtom = atom(
+    null,
+    (_get, set) => {
+        resetLoginFormState(set);
+        set(authMethodAtom, 'initial');
+    }
+);
+
+/**
+ * Derived atom that determines if the user is authenticated
+ * Uses the session's access token to verify authentication status
+ */
+export const isAuthenticatedAtom = atom(
+    (get) => {
+        const session = get(sessionAtom);
+        return !!session?.access_token;
+    }
+);
+
+/**
+ * User information extracted from the authentication session
+ */
+export type AuthUser = {
+    id: string;
+    email?: string;
+    last_sign_in_at?: string;
+}
+
+/**
+ * Atom containing the current user's information.
+ * Derived from sessionAtom so it can never drift out of sync with the
+ * session (and therefore with isAuthenticatedAtom). Null when no user is
+ * authenticated.
+ *
+ * The equality function keeps a stable reference across token refreshes and
+ * focus/visibility events — those change the session's access token but not
+ * the user's identity, so consumers should not re-render.
+ */
+export const userAtom = selectAtom(
+    sessionAtom,
+    (session): AuthUser | null => {
+        if (!session?.user) return null;
+        const { id, email, last_sign_in_at } = session.user;
+        return { id, email, last_sign_in_at };
+    },
+    (a, b) => {
+        if (a === b) return true;
+        if (!a || !b) return false;
+        return a.id === b.id && a.email === b.email && a.last_sign_in_at === b.last_sign_in_at;
+    }
+);
+export const userIdAtom = atom<string | null>((get) => get(userAtom)?.id || null);
+
+/**
+ * The user id a new run is stamped with: the signed-in user's, or
+ * `LOCAL_USER_ID` in local mode, where runs never reach an account.
+ */
+export const runUserIdAtom = atom<string | null>((get) =>
+    get(localModeEnabledAtom) ? LOCAL_USER_ID : get(userIdAtom)
+);
+
+/**
+ * Loading state atom to track auth initialization status
+ */
+export const authLoadingAtom = atom<boolean>(true);
+
+/**
+ * Progress restoring the saved session while auth is still loading: null until
+ * the first restore attempt fails or runs long. Projected from the instance
+ * account; see `AccountSnapshot.restore`.
+ */
+export const sessionRestoreAtom = atom<SessionRestoreState | null>(null);
+
+/**
+ * Atom setter for logging out, setting session and user atoms to null
+ * Also resets all login form state (except email for convenience)
+ */
+export const logoutAtom = atom(null, () => credentials.signOut());
+
+const localHistoryUser = {id:LOCAL_USER_ID,email:'',last_sign_in_at:''};
+export const historyUserAtom = atom(get => get(localModeEnabledAtom) ? localHistoryUser : get(userAtom));

@@ -1,0 +1,19 @@
+{
+    "name": "an empty table counts nothing",
+    "spec": {
+        "id": "t0",
+        "spec_version": 2,
+        "title": "Empty",
+        "columns": [],
+        "rows": []
+    },
+    "summary": {
+        "rows": 0,
+        "columns": 0,
+        "sources": 0,
+        "in_scope_rows": 0,
+        "failed_rows": 0,
+        "user_edits": 0,
+        "columns_detail": {}
+    }
+}

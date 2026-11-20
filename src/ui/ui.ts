@@ -1,0 +1,729 @@
+import { isFinishedChat, RESPONSE_FINISH_MESSAGE } from "../services/threads/finishedChat";
+import { getLocaleID, getString } from "../utils/locale";
+import { triggerToggleChat, triggerToggleQuickPrompt } from "./toggleChat";
+import { KeyboardManager } from "../utils/keyboardManager";
+import { isQuickPromptShortcut } from "../utils/shortcuts";
+import { getPref } from "../utils/prefs";
+import { PreferencePageTab } from "../../react/atoms/ui";
+import { ActionCategoryFilter } from "@astermargin/agent-core/types/actions";
+
+import { contextMainWindow, resolveChatWindow } from "../runtime/navigation";
+import { attachViewRowDrag, detachViewRowDrag } from "../modules/viewRowDrag";
+import { loadRendererBundle } from "./rendererBundle";
+import { SIDEBAR_MOUNT_ID, SIDEBAR_ROOT_ID } from "./libraryPane";
+
+let keyboardManager: KeyboardManager | null = null;
+
+/**
+ * The main window a keyboard shortcut acts on. Shortcut listeners are installed
+ * on every reader tab's own window as well as on main windows, so the event's
+ * own window is frequently a frame that is not a main window at all. Resolve it
+ * through the window registry and fall back to the active main window.
+ */
+function resolveShortcutWindow(ev: KeyboardEvent): Window | null {
+    const origin = (ev.target as HTMLElement | null)?.ownerDocument?.defaultView;
+    const runtime = Zotero.AsterMargin?.runtime.resolveWindowFrom(origin);
+    // A table window has no chat to toggle.
+    return (runtime?.kind !== 'table' ? runtime?.hostWindow : null) ?? Zotero.getMainWindow() ?? null;
+}
+
+function getKeyboardManager(): KeyboardManager {
+    if (!keyboardManager) {
+        keyboardManager = new KeyboardManager();
+    }
+    return keyboardManager;
+}
+
+interface AsterMarginWindow extends Window {
+    AsterMarginReact?: {
+        initializeRuntime: (runtime: import("../runtime/instance").WindowRuntime) => void;
+        disposeRuntime: () => void;
+        renderSidebar: () => any;
+        renderGlobalInitializer: (container: Element) => any;
+        renderWindowSidebar: (container: Element) => any;
+        renderTableTab?: import("./tableTabTypes").RenderTableTab;
+        renderFloatingPopup: (container: Element) => any;
+        renderPreferencesWindow: (container: Element, initialTab?: PreferencePageTab | null, initialActionsCategoryFilter?: ActionCategoryFilter | null) => any;
+        unmountFromElement: (container: Element) => boolean;
+    };
+}
+
+// Window name for the separate AsterMargin window
+const ASTERMARGIN_WINDOW_NAME = 'astermargin-separate-window';
+
+// Window name for the separate AsterMargin preferences window
+const ASTERMARGIN_PREFERENCES_WINDOW_NAME = 'astermargin-preferences-window';
+
+export class AsterMarginUIFactory {
+    // Store root references per window
+    private static windowRoots = new WeakMap<Window, Set<any>>();
+    private static toolbarFocusHandlers = new WeakMap<Window, EventListener>();
+
+    static registerChatPanel(win: AsterMarginWindow) {
+        const windowHref = win.location?.href ?? 'unknown';
+        ztoolkit.log(`registerChatPanel: start for window ${windowHref}`);
+        // Remove existing panel if present
+        this.removeChatPanel(win);
+        const standalone = win.__astermarginRuntime?.kind === "standalone";
+        ztoolkit.log("registerChatPanel: previous panel removed");
+
+        // Add toggle button to toolbar
+        if (!standalone) {
+            this.addToolbarButton(win);
+            attachViewRowDrag(win);
+        }
+        ztoolkit.log("registerChatPanel: toolbar button setup finished");
+
+        // Load React bundle
+        const runtime = win.__astermarginRuntime;
+        loadRendererBundle(win, runtime, () => {
+            ztoolkit.log("registerChatPanel: reactBundle.js loaded");
+            if (win.AsterMarginReact &&
+                typeof win.AsterMarginReact.renderSidebar === 'function' &&
+                typeof win.AsterMarginReact.renderGlobalInitializer === 'function' &&
+                typeof win.AsterMarginReact.unmountFromElement === 'function') {
+
+                ztoolkit.log("registerChatPanel: AsterMarginReact API verified");
+            } else {
+                throw new Error("AsterMargin renderer API incomplete");
+            }
+
+
+            // Initialize roots tracking for this window
+            if (!this.windowRoots.has(win)) {
+                this.windowRoots.set(win, new Set());
+            }
+            const roots = this.windowRoots.get(win)!;
+
+            // Create and render global initializer once
+            let globalInitializerRoot = win.document.getElementById("astermargin-global-initializer-root");
+            if (!globalInitializerRoot) {
+                globalInitializerRoot = win.document.createElement("div");
+                globalInitializerRoot.id = "astermargin-global-initializer-root";
+                globalInitializerRoot.style.display = "none";
+                win.document.documentElement.appendChild(globalInitializerRoot);
+                ztoolkit.log("registerChatPanel: created global initializer root element");
+
+                if (typeof win.AsterMarginReact?.renderGlobalInitializer === 'function') {
+                    const root = win.AsterMarginReact.renderGlobalInitializer(globalInitializerRoot);
+                    if (root) roots.add(root);
+                    ztoolkit.log("registerChatPanel: renderGlobalInitializer mounted");
+                } else {
+                    ztoolkit.log("AsterMargin Error: renderGlobalInitializer function not found on window object.");
+                }
+            } else {
+                ztoolkit.log("registerChatPanel: global initializer root already existed");
+            }
+
+            // Create and render floating popup overlay
+            let floatingPopupRoot = win.document.getElementById("astermargin-pane-floating-popup");
+            if (!floatingPopupRoot) {
+                floatingPopupRoot = win.document.createElement("div");
+                floatingPopupRoot.id = "astermargin-pane-floating-popup";
+                // Scoping root for the shared agent-ui sheets, as above.
+                floatingPopupRoot.className = "astermargin-root";
+                win.document.documentElement.appendChild(floatingPopupRoot);
+                ztoolkit.log("registerChatPanel: created floating popup root element");
+
+                if (typeof win.AsterMarginReact?.renderFloatingPopup === 'function') {
+                    const root = win.AsterMarginReact.renderFloatingPopup(floatingPopupRoot);
+                    if (root) roots.add(root);
+                    ztoolkit.log("registerChatPanel: renderFloatingPopup mounted");
+                } else {
+                    ztoolkit.log("AsterMargin Error: renderFloatingPopup function not found on window object.");
+                }
+            } else {
+                ztoolkit.log("registerChatPanel: floating popup root already existed");
+            }
+
+            if (standalone) {
+                const container =
+                    win.document.getElementById("astermargin-pane-window");
+                if (container)
+                    roots.add(
+                        win.AsterMarginReact.renderWindowSidebar(container),
+                    );
+            }
+
+            // The main window's sidebar: one React tree that the renderer
+            // moves between the item pane and the context pane with the
+            // selected tab (`react/ui/sidebarMount.tsx`).
+            if (!standalone) {
+                const root = win.AsterMarginReact.renderSidebar();
+                if (root) roots.add(root);
+                ztoolkit.log("registerChatPanel: sidebar mounted");
+            }
+            // The renderer marks readiness after its command subscriptions mount.
+        }, (error) => {
+            if (win.__astermarginRuntime === runtime) {
+                this.removeChatPanel(win);
+                Zotero.AsterMargin.runtime.detachWindow(win);
+            }
+            if (error) Zotero.logError(error as Error);
+            else ztoolkit.log("AsterMargin renderer failed to load");
+        });
+    }
+
+    private static addToolbarButton(win: AsterMarginWindow) {
+        const toolbar = win.document.querySelector("#zotero-tabs-toolbar");
+        if (!toolbar) return;
+
+        const key = getPref("keyboardShortcut").toUpperCase() || "Y";
+        const shortcut = Zotero.isMac ? `⌘${key}` : `Ctrl+${key}`;
+        const chatToggleBtn = win.document.createXULElement("toolbarbutton");
+        chatToggleBtn.setAttribute("id", "zotero-astermargin-tb-chat-toggle");
+        chatToggleBtn.setAttribute("tooltiptext", `Toggle AsterMargin (${shortcut})`);
+        chatToggleBtn.setAttribute("aria-label", "Toggle AsterMargin");
+        chatToggleBtn.setAttribute("aria-pressed", "false");
+        chatToggleBtn.setAttribute("tabindex", "0");
+        chatToggleBtn.setAttribute("style", "-moz-user-focus: normal;");
+        chatToggleBtn.addEventListener("command", () => triggerToggleChat(win));
+
+        const syncButton = toolbar.querySelector("#zotero-tb-sync");
+        const separator = toolbar.querySelector("div.zotero-tb-separator");
+
+        if (syncButton) {
+            toolbar.insertBefore(chatToggleBtn, syncButton);
+            if (separator) {
+                const clonedSeparator = separator.cloneNode(true) as HTMLElement;
+                clonedSeparator.setAttribute("id", "astermargin-tb-separator");
+                toolbar.insertBefore(clonedSeparator, syncButton);
+            }
+        } else {
+            toolbar.appendChild(chatToggleBtn);
+        }
+
+        this.installToolbarFocusHandler(win);
+    }
+
+    /**
+     * Include the AsterMargin toggle in Zotero's title-bar keyboard path.
+     */
+    private static installToolbarFocusHandler(win: AsterMarginWindow) {
+        this.removeToolbarFocusHandler(win);
+
+        const titleBar = win.document.getElementById("zotero-title-bar");
+        if (!titleBar) {
+            return;
+        }
+
+        const isHidden = (element: Element | null): boolean => {
+            if (!element) {
+                return true;
+            }
+            const htmlElement = element as HTMLElement & { disabled?: boolean; hidden?: boolean };
+            const parent = htmlElement.parentNode as (HTMLElement & { hidden?: boolean }) | null;
+            const style = win.getComputedStyle(htmlElement);
+            return Boolean(
+                htmlElement.disabled
+                || htmlElement.hidden
+                || parent?.hidden
+                || style?.display === "none"
+            );
+        };
+
+        const focusIfVisible = (selector: string): boolean => {
+            const target = win.document.querySelector(selector) as HTMLElement | null;
+            if (isHidden(target)) {
+                return false;
+            }
+            target?.focus();
+            return true;
+        };
+
+        const getFocusDirection = (event: KeyboardEvent): "forward" | "backward" | null => {
+            if (event.altKey || event.ctrlKey || event.metaKey) {
+                return null;
+            }
+            if (event.key === "Tab") {
+                return event.shiftKey ? "backward" : "forward";
+            }
+            if (event.shiftKey) {
+                return null;
+            }
+            // Zotero's title bar treats vertical arrows like Tab/Shift+Tab.
+            if (event.key === "ArrowDown") {
+                return "forward";
+            }
+            if (event.key === "ArrowUp") {
+                return "backward";
+            }
+            return null;
+        };
+
+        const handler = ((event: KeyboardEvent) => {
+            const focusDirection = getFocusDirection(event);
+            if (!focusDirection) {
+                return;
+            }
+
+            const target = event.target as Element | null;
+            const targetId = target?.id;
+            let handled = false;
+
+            if (focusDirection === "forward" && targetId === "zotero-tb-sync-error") {
+                handled = focusIfVisible("#zotero-astermargin-tb-chat-toggle");
+            } else if (focusDirection === "forward" && targetId === "zotero-astermargin-tb-chat-toggle") {
+                handled = focusIfVisible("#zotero-tb-sync");
+            } else if (focusDirection === "backward" && targetId === "zotero-tb-sync") {
+                handled = focusIfVisible("#zotero-astermargin-tb-chat-toggle");
+            } else if (focusDirection === "backward" && targetId === "zotero-astermargin-tb-chat-toggle") {
+                handled = focusIfVisible("#zotero-tb-sync-error")
+                    || focusIfVisible("#zotero-tb-tabs-menu");
+            }
+
+            if (handled) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }) as EventListener;
+
+        titleBar.addEventListener("keydown", handler, true);
+        this.toolbarFocusHandlers.set(win, handler);
+    }
+
+    private static removeToolbarFocusHandler(win: AsterMarginWindow) {
+        const handler = this.toolbarFocusHandlers.get(win);
+        if (!handler) {
+            return;
+        }
+
+        const titleBar = win.document?.getElementById("zotero-title-bar");
+        titleBar?.removeEventListener("keydown", handler, true);
+        this.toolbarFocusHandlers.delete(win);
+    }
+
+    /**
+     * Remove the chat panel and unmount React components.
+     *
+     * IMPORTANT: This must always attempt to unmount React components even if
+     * win.closed is true, because React cleanup effects need to run to unregister
+     * Zotero.Notifier observers. Skipping this causes SIGSEGV during shutdown.
+     */
+    static removeChatPanel(win: AsterMarginWindow) {
+        ztoolkit.log("AsterMarginUIFactory.removeChatPanel called.");
+
+        try {
+            if (!win) {
+                return;
+            }
+
+            // The window's AsterMargin tabs are rendered by its bundle, which is
+            // about to go away; close them (unmounting their roots) first.
+            try {
+                Zotero.__astermarginTabs?.closeForWindow(win);
+            } catch (e) {
+                ztoolkit.log(`removeChatPanel: closing AsterMargin tabs failed: ${e}`);
+            }
+
+            // Dismiss any active diff preview in note editors.
+            // This must happen BEFORE React unmount because the preview module
+            // state (activePreview, poll timer) lives in the webpack bundle.
+            // After unmount, the bundle is gone and the preview artifacts
+            // (banner, frozen editor, _disableSaving) would be stranded.
+            //
+            // NOTE: This duplicates cleanup logic from dismissDiffPreview() in
+            // react/utils/noteEditorDiffPreview.ts. If the cleanup steps change
+            // (e.g., new artifacts to remove), update both locations.
+            //
+            // Backstop for a window whose bundle held no agent connection:
+            // when it did, the shutdown close dismisses the preview first.
+            try {
+                const instances: any[] = (Zotero as any).Notes?._editorInstances ?? [];
+                for (const inst of instances) {
+                    try {
+                        const doc = inst?._iframeWindow?.wrappedJSObject?.document
+                            ?? inst?._iframeWindow?.document;
+                        if (!doc) continue;
+                        const banner = doc.getElementById('astermargin-preview-banner');
+                        if (!banner) continue;
+                        // This instance has an active preview — clean it up
+                        banner.remove();
+                        doc.getElementById('astermargin-diff-preview-style')?.remove();
+                        // Unfreeze editor
+                        const view = inst._iframeWindow?.wrappedJSObject
+                            ?._currentEditorInstance?._editorCore?.view;
+                        if (view?.dom) view.dom.contentEditable = 'true';
+                        // Restore the editor from the saved note via Zotero's
+                        // own reinit(). Do NOT re-enable saving manually: the
+                        // editor still shows the diff HTML at this point (the
+                        // restore is asynchronous and this bundle is being
+                        // torn down), and a single autosave would persist the
+                        // presentation-only markup into the note. reinit()
+                        // reloads item.note and resets _disableSaving itself;
+                        // saveSync() inside uninit() is a no-op while saving
+                        // is still disabled.
+                        const itemId = inst.itemID ?? inst._item?.id;
+                        try {
+                            // reinit() drops the tab association; restore it
+                            // (best effort) so tab-based behavior survives.
+                            const tabID = inst.tabID;
+                            const restoreTabId = () => {
+                                try { if (tabID && !inst._tabID) inst._tabID = tabID; } catch (e) { /* ignore */ }
+                            };
+                            const p = inst.reinit?.();
+                            if (p?.then) p.then(restoreTabId, restoreTabId);
+                            else restoreTabId();
+                        } catch (e) {
+                            // Best effort — leave saving disabled rather than
+                            // risk persisting the diff markup.
+                        }
+                        ztoolkit.log(`removeChatPanel: cleaned up diff preview for editor ${itemId}`);
+                    } catch (e) {
+                        // Best effort — don't let preview cleanup block React unmount
+                    }
+                }
+            } catch (e) {
+                // Best effort
+            }
+
+            // Unmount React components - CRITICAL for triggering cleanup effects
+            if (win.AsterMarginReact && typeof win.AsterMarginReact.unmountFromElement === 'function') {
+                const elementIds = [SIDEBAR_ROOT_ID, "astermargin-global-initializer-root", "astermargin-pane-floating-popup"];
+                elementIds.forEach(id => {
+                    try {
+                        const element = win.document?.getElementById?.(id);
+                        if (element) {
+                            const unmounted = win.AsterMarginReact!.unmountFromElement(element);
+                            if (unmounted) {
+                                ztoolkit.log(`Unmounted React component from #${id}`);
+                            } else {
+                                ztoolkit.log(`No React root found for #${id}`);
+                            }
+                        }
+                    } catch (e: any) {
+                        ztoolkit.log(`Error unmounting React component from #${id}: ${e.message}`);
+                    }
+                });
+            }
+
+            win.AsterMarginReact?.disposeRuntime?.();
+
+            // Fallback: try to unmount using stored roots
+            const roots = this.windowRoots.get(win);
+            if (roots && roots.size > 0) {
+                roots.forEach(root => {
+                    try {
+                        root.unmount();
+                        ztoolkit.log("Unmounted React root using fallback method");
+                    } catch (e: any) {
+                        ztoolkit.log(`Error unmounting React root: ${e.message}`);
+                    }
+                });
+                roots.clear();
+            }
+
+            this.windowRoots.delete(win);
+            delete win.AsterMarginReact;
+
+            // Only try to remove DOM elements if document is still accessible
+            if (win.document) {
+                try {
+                    this.removeToolbarFocusHandler(win);
+                    detachViewRowDrag(win);
+
+                    const elementIds = [
+                        SIDEBAR_MOUNT_ID,
+                        "zotero-astermargin-tb-chat-toggle",
+                        "astermargin-tb-separator",
+                        "astermargin-global-initializer-root",
+                        "astermargin-pane-floating-popup"
+                    ];
+                    elementIds.forEach(id => {
+                        try {
+                            const element = win.document.getElementById(id);
+                            if (element) {
+                                element.remove();
+                                ztoolkit.log(`Removed element #${id}`);
+                            }
+                        } catch (e) {
+                            // Ignore errors during shutdown
+                        }
+                    });
+
+                    try {
+                        const scriptTag = win.document.querySelector('script[src="chrome://astermargin/content/reactBundle.js"]');
+                        if (scriptTag) {
+                            scriptTag.remove();
+                            ztoolkit.log("Removed React bundle script tag.");
+                        }
+                    } catch (e) {
+                        // Ignore errors during shutdown
+                    }
+                } catch (e) {
+                    // Document access failed, ignore
+                }
+            }
+        } catch (error: any) {
+            ztoolkit.log(`Error in removeChatPanel: ${error.message}`);
+        }
+    }
+
+    static registerShortcuts() {
+        const manager = getKeyboardManager();
+
+        // Always unregister all existing shortcuts first to prevent duplicates
+        manager.unregisterAll();
+
+        if (typeof ztoolkit !== 'undefined') {
+            ztoolkit.log("Registering keyboard shortcuts...");
+        }
+
+        const keyboardShortcut = getPref("keyboardShortcut").toLowerCase() || "y";
+
+        // Debounce variables for toggle shortcut
+        let lastToggleTime = 0;
+        const TOGGLE_DEBOUNCE_MS = 200; // 200ms debounce to prevent rapid repeated toggles
+
+        // Register keyboard shortcut for toggling chat panel
+        manager.register(
+            (ev, keyOptions) => {
+                const isMacToggle = Zotero.isMac && ev.key.toLowerCase() === keyboardShortcut && ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey;
+                const isWindowsToggle = !Zotero.isMac && ev.key.toLowerCase() === keyboardShortcut && ev.ctrlKey && !ev.altKey && !ev.shiftKey && !ev.metaKey;
+
+                if (isMacToggle || isWindowsToggle) {
+                    const now = Date.now();
+                    const timeSinceLastToggle = now - lastToggleTime;
+
+                    const timestamp = new Date().toISOString();
+                    if (typeof ztoolkit !== 'undefined') {
+                        ztoolkit.log(`keyboardManager [${timestamp}]: Keyboard shortcut detected - key: ${ev.key}, metaKey: ${ev.metaKey}, ctrlKey: ${ev.ctrlKey}, shiftKey: ${ev.shiftKey}, altKey: ${ev.altKey}, timeSinceLastToggle: ${timeSinceLastToggle}ms`);
+                    }
+
+                    // Debounce: ignore if called too soon after last toggle
+                    if (timeSinceLastToggle < TOGGLE_DEBOUNCE_MS) {
+                        if (typeof ztoolkit !== 'undefined') {
+                            ztoolkit.log(`keyboardManager [${timestamp}]: Toggle ignored (debounced), only ${timeSinceLastToggle}ms since last toggle`);
+                        }
+                        ev.preventDefault();
+                        return;
+                    }
+
+                    ev.preventDefault();
+                    lastToggleTime = now;
+
+                    const win = resolveShortcutWindow(ev);
+                    if (win) triggerToggleChat(win);
+                }
+            }
+        );
+
+        // Register keyboard shortcut for opening separate window
+        // Mac: Cmd+Shift+J, Windows/Linux: Ctrl+Shift+J
+        manager.register(
+            (ev, keyOptions) => {
+                const isMacShortcut = Zotero.isMac && ev.key.toLowerCase() === keyboardShortcut && ev.metaKey && ev.shiftKey && !ev.ctrlKey && !ev.altKey;
+                const isWindowsShortcut = !Zotero.isMac && ev.key.toLowerCase() === keyboardShortcut && ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey;
+
+                if (isMacShortcut || isWindowsShortcut) {
+                    ev.preventDefault();
+                    const origin = (ev.target as HTMLElement)?.ownerDocument?.defaultView;
+                    void resolveChatWindow(origin).then(win => this.openAsterMarginWindow(win)).catch(Zotero.logError);
+                }
+            }
+        );
+
+        // Register keyboard shortcut for the quick prompt (composer in the
+        // corner while the sidebar is closed).
+        // Mac: Cmd+Option+J, Windows/Linux: Ctrl+Alt+J
+        manager.register(
+            (ev, keyOptions) => {
+                // Keyup can still carry the full chord when the letter is
+                // released first. Only the initial keydown toggles the popup.
+                if (keyOptions.type !== 'keydown') return;
+                if (isQuickPromptShortcut(ev, keyboardShortcut, Zotero.isMac)) {
+                    ev.preventDefault();
+                    if (ev.repeat) return;
+                    const win = resolveShortcutWindow(ev);
+                    if (win) triggerToggleQuickPrompt(win);
+                }
+            }
+        );
+    }
+
+    /** AsterMargin's shortcuts in a table window, as in main windows and readers. */
+    static attachShortcuts(win: Window) {
+        keyboardManager?.attachWindow(win);
+    }
+
+    /**
+     * Unregister all keyboard shortcuts.
+     *
+     * CRITICAL: This must be called during shutdown to:
+     * 1. Clear the interval in KeyboardManager
+     * 2. Unregister Zotero.Reader event listeners
+     */
+    static unregisterShortcuts() {
+        if (keyboardManager) {
+            keyboardManager.unregisterAll();
+            keyboardManager = null;
+        }
+    }
+
+    /**
+     * Find an existing AsterMargin separate window
+     */
+    static findAsterMarginWindow(): Window | undefined {
+        const pending = Zotero.AsterMargin?.runtime?.standaloneWindow;
+        if (pending && !pending.closed) return pending;
+        try {
+            const wm = Services.wm;
+            const enumerator = wm.getEnumerator('astermargin:window');
+            while (enumerator.hasMoreElements()) {
+                const win = enumerator.getNext() as Window;
+                if (!win.closed && win.name === ASTERMARGIN_WINDOW_NAME) {
+                    return win;
+                }
+            }
+        } catch (e) {
+            // Silently handle errors
+        }
+        return undefined;
+    }
+
+    /** Open AsterMargin in a separate window, or focus the one already open. */
+    static openAsterMarginWindow(origin?: Window, skipInitialSelection = false): Window {
+        const existingWindow = this.findAsterMarginWindow();
+        if (existingWindow) {
+            if (skipInitialSelection) existingWindow.__astermarginSkipInitialSelection = true;
+            existingWindow.focus();
+            Zotero.debug("AsterMargin: Focusing existing separate window");
+            return existingWindow;
+        }
+
+        const mainWindow = origin ?? Zotero.getMainWindow();
+        const opened = Services.ww.openWindow(
+            (mainWindow ?? null) as any,
+            'chrome://astermargin/content/astermarginWindow.xhtml',
+            ASTERMARGIN_WINDOW_NAME,
+            'chrome,resizable,centerscreen,dialog=false',
+            null as any,
+        ) as unknown as Window;
+        opened.__astermarginSkipInitialSelection = skipInitialSelection;
+        if (Zotero.AsterMargin?.runtime) Zotero.AsterMargin.runtime.standaloneWindow = opened;
+        Zotero.debug("AsterMargin: Opened separate window");
+        return opened;
+    }
+
+    /** Send plain data to the independent renderer, pinning it before waiting. */
+    static async commandAsterMarginWindow(
+        command: string,
+        payload: Record<string, unknown> = {},
+    ): Promise<any> {
+        const generation = Zotero.AsterMargin.account?.getSnapshot().generation;
+        const allowed = async () => command !== "open-chat" || (
+            await isFinishedChat(String(payload.threadId ?? "")) &&
+            generation === Zotero.AsterMargin.account?.getSnapshot().generation
+        );
+        if (!await allowed()) return { ok: false, reason: "thread_active", message: RESPONSE_FINISH_MESSAGE };
+        const win = this.openAsterMarginWindow(undefined, command === "open-chat");
+        if (!win)
+            throw Object.assign(new Error("AsterMargin window unavailable"), {
+                code: "window_unavailable",
+            });
+        const deadline = Date.now() + 15000;
+        while (
+            !win.closed &&
+            win.__astermarginRuntime?.status !== "ready" &&
+            Date.now() < deadline
+        ) {
+            await Zotero.Promise.delay(25);
+        }
+        if (win.closed || win.__astermarginRuntime?.status !== "ready") {
+            throw Object.assign(new Error("AsterMargin window unavailable"), {
+                code: "window_unavailable",
+            });
+        }
+        if (!await allowed()) return { ok: false, reason: "thread_active", message: RESPONSE_FINISH_MESSAGE };
+        return Zotero.AsterMargin.runtime.dispatchWindowCommand(command, {
+            ...JSON.parse(JSON.stringify(payload)),
+            windowId: win.__astermarginRuntime.id,
+        });
+    }
+
+    /**
+     * Close the AsterMargin separate window if it exists
+     */
+    static closeAsterMarginWindow(): void {
+        const existingWindow = this.findAsterMarginWindow();
+        if (existingWindow) {
+            existingWindow.close();
+            Zotero.debug("AsterMargin: Closed separate window");
+        }
+    }
+
+    /** Close preferences before disposing the renderer that owns them. */
+    static closeWindowsRenderedBy(win: Window, closeUnowned = false): void {
+        const auxiliaryWindows = [this.findPreferencesWindow()];
+        for (const auxiliaryWindow of auxiliaryWindows) {
+            if (!auxiliaryWindow || auxiliaryWindow.closed) continue;
+            const owner = auxiliaryWindow.__astermarginOwnerWindowRef?.deref();
+            if (owner === win || (closeUnowned && !owner)) {
+                auxiliaryWindow.close();
+                Zotero.debug("AsterMargin: Closed auxiliary window whose React owner is going away");
+            }
+        }
+    }
+
+    /**
+     * Find an existing AsterMargin preferences window
+     */
+    static findPreferencesWindow(): Window | undefined {
+        try {
+            const wm = Services.wm;
+            const enumerator = wm.getEnumerator('astermargin:preferences');
+            if (enumerator.hasMoreElements()) {
+                return enumerator.getNext() as Window;
+            }
+        } catch (e) {
+            // Silently handle errors
+        }
+        return undefined;
+    }
+
+    /**
+     * Open AsterMargin preferences in a separate window. `actionsCategoryFilter` requests
+     * that the Actions tab pre-filter its list to that category (or "uncategorized").
+     * `actionId` requests that the Actions tab reveal that action in edit mode.
+     */
+    static openPreferencesWindow(tab?: PreferencePageTab, actionsCategoryFilter?: ActionCategoryFilter, actionId?: string, window?: Window): void {
+        const existingWindow = this.findPreferencesWindow();
+        if (existingWindow) {
+            // Switch tab (and apply the category filter / action-edit request)
+            // if requested via the global function
+            if (tab && (Zotero as any).__astermarginOpenPreferencesTab) {
+                (Zotero as any).__astermarginOpenPreferencesTab(tab, actionsCategoryFilter, actionId);
+            }
+            existingWindow.focus();
+            Zotero.debug("AsterMargin: Focusing existing preferences window");
+            return;
+        }
+
+        const mainWindow = window?.__astermarginRuntime
+            ? window
+            : (contextMainWindow(window ?? Zotero.getMainWindow()) ??
+              this.findAsterMarginWindow());
+        if (!mainWindow) return;
+        const ownerWindowRef = new WeakRef(mainWindow);
+        const opened = mainWindow.openDialog(
+            'chrome://astermargin/content/astermarginPreferences.xhtml',
+            ASTERMARGIN_PREFERENCES_WINDOW_NAME,
+            'chrome,resizable,centerscreen,dialog=false',
+            // `??` so the uncategorized filter (`""`) is not dropped as falsy.
+            { tab: tab || null, actionsCategoryFilter: actionsCategoryFilter ?? null, actionId: actionId || null, ownerWindowRef }
+        );
+        if (opened) opened.__astermarginOwnerWindowRef = ownerWindowRef;
+        Zotero.debug("AsterMargin: Opened preferences window");
+    }
+
+    /**
+     * Close the AsterMargin preferences window if it exists
+     */
+    static closePreferencesWindow(): void {
+        const existingWindow = this.findPreferencesWindow();
+        if (existingWindow) {
+            existingWindow.close();
+            Zotero.debug("AsterMargin: Closed preferences window");
+        }
+    }
+}

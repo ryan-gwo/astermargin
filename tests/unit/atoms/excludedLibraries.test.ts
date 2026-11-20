@@ -1,0 +1,308 @@
+import { createStore } from 'jotai';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { SafeProfileWithPlan } from '@astermargin/agent-core/types/profile';
+import { ZoteroLibrary } from '@astermargin/agent-core/types/zotero';
+
+const { updateExcludedLibrariesMock, popupMessages } = vi.hoisted(() => ({
+    updateExcludedLibrariesMock: vi.fn(),
+    popupMessages: [] as any[],
+}));
+const localPrefs = vi.hoisted(() => ({ value: undefined as string | undefined }));
+
+vi.mock('@astermargin/agent-core/transport/clients/accountService', () => ({
+    accountService: {
+        updateExcludedLibraries: updateExcludedLibrariesMock,
+    },
+}));
+
+vi.mock('../../../src/utils/prefs', () => ({
+    getPref: () => localPrefs.value,
+    setPref: (_key: string, value: string) => {
+        localPrefs.value = value;
+    },
+}));
+
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test-local' })),
+}));
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({ logger: vi.fn() }));
+
+vi.mock('../../../react/utils/popupMessageUtils', async () => {
+    const { atom } = await vi.importActual<typeof import('jotai')>('jotai');
+    return {
+        addPopupMessageAtom: atom(null, (_get, _set, message: any) => {
+            popupMessages.push(message);
+        }),
+    };
+});
+
+import {
+    allLibrariesExcludedAtom,
+    isLibraryAccessReadyAtom,
+    isProfileLoadedAtom,
+    libraryScopeInitializedAtom,
+    localZoteroLibrariesAtom,
+    localZoteroLibrariesInitializedAtom,
+    profileProjectionAtom as profileWithPlanAtom,
+    searchableLibraryIdsAtom,
+} from '../../../react/atoms/profile';
+import { toggleExcludedLibraryAtom, isUpdatingExcludedLibrariesAtom, nextExcludedLibraries } from '../../../react/atoms/excludedLibraries';
+
+function library(overrides: Partial<ZoteroLibrary>): ZoteroLibrary {
+    return {
+        library_id: 1,
+        group_id: null,
+        name: 'My Library',
+        is_group: false,
+        type: 'user',
+        type_id: 1,
+        read_only: false,
+        ...overrides,
+    };
+}
+
+function profile(overrides: Partial<SafeProfileWithPlan> = {}): SafeProfileWithPlan {
+    return {
+        user_id: 'user-1',
+        current_plan_id: 'plan-1',
+        credit_plan: null,
+        credit_plan_status: 'none',
+        credit_plan_monthly_credits: 0,
+        credit_period_start: null,
+        credit_period_end: null,
+        credit_monthly_reset_at: null,
+        credit_cancel_at_period_end: false,
+        credit_pending_downgrade: false,
+        rolled_over_credits: 0,
+        purchased_credits_expires_at: null,
+        zotero_user_id: null,
+        zotero_local_ids: ['test-local'],
+        use_zotero_sync: false,
+        has_authorized_access: false,
+        has_completed_onboarding: true,
+        has_authorized_free_access: true,
+        pending_upgrade_consent: false,
+        pending_downgrade_ack: false,
+        consent_to_share: false,
+        email_notifications: false,
+        libraries: [],
+        excluded_libraries: [],
+        first_run_completed_at: null,
+        first_run_completion_kind: null,
+        standard_page_balance: 0,
+        purchased_standard_page_balance: 0,
+        chat_credits_used: 0,
+        purchased_chat_credits: 0,
+        indexing_complete: false,
+        data_version: 0,
+        data_migrated_at: null,
+        ...overrides,
+    };
+}
+
+describe('searchableLibraryIdsAtom', () => {
+    it('initializes library scope only after both profile and local libraries load', () => {
+        const store = createStore();
+
+        expect(store.get(libraryScopeInitializedAtom)).toBe(false);
+
+        store.set(localZoteroLibrariesInitializedAtom, true);
+        expect(store.get(libraryScopeInitializedAtom)).toBe(false);
+
+        store.set(isProfileLoadedAtom, true);
+        expect(store.get(libraryScopeInitializedAtom)).toBe(true);
+
+        store.set(isProfileLoadedAtom, false);
+        expect(store.get(libraryScopeInitializedAtom)).toBe(false);
+    });
+
+    it('keeps access decisions pending until profile and local libraries are loaded', () => {
+        const store = createStore();
+
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([]);
+        expect(store.get(isLibraryAccessReadyAtom)).toBe(false);
+
+        store.set(profileWithPlanAtom, profile());
+        store.set(localZoteroLibrariesAtom, [library({ library_id: 1 })]);
+
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([]);
+        expect(store.get(isLibraryAccessReadyAtom)).toBe(false);
+
+        store.set(isProfileLoadedAtom, true);
+
+        expect(store.get(isLibraryAccessReadyAtom)).toBe(true);
+    });
+
+    it('returns all local library IDs when nothing is excluded', () => {
+        const store = createStore();
+        store.set(isProfileLoadedAtom, true);
+        store.set(profileWithPlanAtom, profile());
+        store.set(localZoteroLibrariesAtom, [
+            library({ library_id: 1 }),
+            library({ library_id: 42, group_id: 123, name: 'Group', is_group: true, type: 'group' }),
+        ]);
+
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([1, 42]);
+    });
+
+    it('removes the personal library for the global user exclusion entry', () => {
+        const store = createStore();
+        store.set(isProfileLoadedAtom, true);
+        store.set(profileWithPlanAtom, profile({ excluded_libraries: [{ type: 'user' }] }));
+        store.set(localZoteroLibrariesAtom, [
+            library({ library_id: 1 }),
+            library({ library_id: 42, group_id: 123, name: 'Group', is_group: true, type: 'group' }),
+        ]);
+
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([42]);
+    });
+
+    it('removes group libraries by global group ID', () => {
+        const store = createStore();
+        store.set(isProfileLoadedAtom, true);
+        store.set(profileWithPlanAtom, profile({ excluded_libraries: [{ type: 'group', group_id: 123 }] }));
+        store.set(localZoteroLibrariesAtom, [
+            library({ library_id: 1 }),
+            library({ library_id: 42, group_id: 123, name: 'Group', is_group: true, type: 'group' }),
+        ]);
+
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([1]);
+    });
+
+    it('reports all libraries excluded only after local libraries are loaded', () => {
+        const store = createStore();
+        store.set(profileWithPlanAtom, profile({ excluded_libraries: [{ type: 'user' }] }));
+
+        expect(store.get(allLibrariesExcludedAtom)).toBe(false);
+
+        store.set(localZoteroLibrariesAtom, [library({ library_id: 1 })]);
+
+        expect(store.get(allLibrariesExcludedAtom)).toBe(false);
+
+        store.set(isProfileLoadedAtom, true);
+
+        expect(store.get(allLibrariesExcludedAtom)).toBe(true);
+    });
+
+    it('keeps its identity when an account publish re-sends the same scope', () => {
+        // The account service hands every subscriber a deep clone of its
+        // snapshot on every revision, and a token refresh is a revision. Without
+        // an equality guard each of those gives this atom a new array, and every
+        // effect holding it in a dependency list re-runs — which is what turned
+        // one failing request into a refetch loop.
+        const store = createStore();
+        const publish = () => {
+            store.set(profileWithPlanAtom, structuredClone(profile({
+                excluded_libraries: [{ type: 'group', group_id: 77 }],
+            })));
+            store.set(localZoteroLibrariesAtom, structuredClone([
+                library({ library_id: 1 }),
+                library({ library_id: 2, is_group: true, group_id: 77, type: 'group' }),
+            ]));
+        };
+
+        store.set(isProfileLoadedAtom, true);
+        publish();
+        const first = store.get(searchableLibraryIdsAtom);
+        expect(first).toEqual([1]);
+
+        let notifications = 0;
+        const unsubscribe = store.sub(searchableLibraryIdsAtom, () => { notifications++; });
+        for (let i = 0; i < 5; i++) publish();
+
+        expect(store.get(searchableLibraryIdsAtom)).toBe(first);
+        expect(notifications).toBe(0);
+        unsubscribe();
+    });
+
+    it('still reports a scope change when an exclusion is actually added', () => {
+        const store = createStore();
+        store.set(isProfileLoadedAtom, true);
+        store.set(localZoteroLibrariesAtom, [
+            library({ library_id: 1 }),
+            library({ library_id: 2, is_group: true, group_id: 77, type: 'group' }),
+        ]);
+        store.set(profileWithPlanAtom, profile());
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([1, 2]);
+
+        store.set(profileWithPlanAtom, profile({ excluded_libraries: [{ type: 'group', group_id: 77 }] }));
+        expect(store.get(searchableLibraryIdsAtom)).toEqual([1]);
+    });
+});
+
+describe('toggleExcludedLibraryAtom', () => {
+    beforeEach(() => {
+        updateExcludedLibrariesMock.mockReset();
+        updateExcludedLibrariesMock.mockResolvedValue(undefined);
+        Zotero.AsterMargin ??= {} as any;
+        Zotero.AsterMargin.account = { updateExcludedLibraries: updateExcludedLibrariesMock } as any;
+        popupMessages.length = 0;
+    });
+
+    it('delegates addition while preserving exclusions absent from this device', async () => {
+        const store = createStore();
+        const absent = { type: 'group' as const, group_id: 999 };
+        store.set(profileWithPlanAtom, profile({ excluded_libraries: [absent] }));
+        await store.set(toggleExcludedLibraryAtom, library({library_id: 42, group_id: 123, is_group: true, type: 'group'}));
+        expect(updateExcludedLibrariesMock).toHaveBeenCalledWith([absent, {type: 'group', group_id: 123}]);
+    });
+
+    it('delegates removal without overwriting the authoritative projection', async () => {
+        const store = createStore();
+        const entries = [{type: 'user' as const}, {type: 'group' as const, group_id: 999}];
+        store.set(profileWithPlanAtom, profile({excluded_libraries: entries}));
+        await store.set(toggleExcludedLibraryAtom, library({library_id: 1}));
+        expect(updateExcludedLibrariesMock).toHaveBeenCalledWith([entries[1]]);
+        expect(store.get(profileWithPlanAtom)?.excluded_libraries).toEqual(entries);
+    });
+
+    it('waits for the instance command and surfaces save failures', async () => {
+        const store = createStore();
+        store.set(profileWithPlanAtom, profile());
+        let reject!: (error: Error) => void;
+        updateExcludedLibrariesMock.mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
+        const pending = store.set(toggleExcludedLibraryAtom, library({library_id: 1}));
+        expect(store.get(isUpdatingExcludedLibrariesAtom)).toBe(true);
+        reject(new Error('offline'));
+        await pending;
+        expect(store.get(isUpdatingExcludedLibrariesAtom)).toBe(false);
+        expect(popupMessages).toEqual([expect.objectContaining({type: 'error'})]);
+    });
+});
+
+describe('nextExcludedLibraries', () => {
+    it('adds a library not already excluded', () => {
+        expect(nextExcludedLibraries([], library({ library_id: 1 }))).toEqual([{ type: 'user' }]);
+    });
+
+    it('removes a library already excluded, preserving entries absent from this device', () => {
+        const absent = { type: 'group' as const, group_id: 999 };
+        expect(nextExcludedLibraries([{ type: 'user' }, absent], library({ library_id: 1 }))).toEqual([absent]);
+    });
+});
+
+describe('toggleExcludedLibraryAtom in local mode', () => {
+    beforeEach(() => {
+        Zotero.AsterMargin = { ...(Zotero.AsterMargin as any), localMode: true } as any;
+        localPrefs.value = undefined;
+        popupMessages.length = 0;
+        updateExcludedLibrariesMock.mockReset();
+    });
+
+    it('writes the toggled library to the local exclusion preference instead of calling the account', async () => {
+        const store = createStore();
+        await store.set(toggleExcludedLibraryAtom, library({ library_id: 42, group_id: 123, is_group: true, type: 'group' }));
+
+        expect(localPrefs.value).toBe(JSON.stringify([{ type: 'group', group_id: 123 }]));
+        expect(updateExcludedLibrariesMock).not.toHaveBeenCalled();
+    });
+
+    it('toggles a library back off, preserving other pending entries', async () => {
+        localPrefs.value = JSON.stringify([{ type: 'user' }, { type: 'group', group_id: 999 }]);
+        const store = createStore();
+        await store.set(toggleExcludedLibraryAtom, library({ library_id: 1 }));
+
+        expect(localPrefs.value).toBe(JSON.stringify([{ type: 'group', group_id: 999 }]));
+    });
+});

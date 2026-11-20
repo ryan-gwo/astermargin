@@ -1,0 +1,108 @@
+/**
+ * Encrypted auth-session storage for the plugin-owned Supabase client.
+ *
+ * Kept outside the shared transport layer so other hosts can supply their own storage.
+ */
+
+import { EncryptedStorage } from './EncryptedStorage';
+import { recordAuthDiagnostic, summarizeStack } from './authDiagnostics';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    SupabaseStorageAdapter,
+    setSupabaseStorageAdapter,
+} from '@astermargin/agent-core/transport/supabaseClient';
+
+/**
+ * The Zotero plugin's storage adapter: an AES-encrypted, profile-bound store
+ * (see EncryptedStorage).
+ *
+ * The store is constructed here, during registration at bundle init, so
+ * `EncryptedStorage` must not touch the `Zotero` global from its constructor
+ * or field initializers — a throw there would abort the whole bundle before
+ * any UI mounts. Its per-key work is already async and happens on first use.
+ */
+function createEncryptedStorageAdapter(): SupabaseStorageAdapter {
+    // Create encrypted storage instance
+    const encryptedStorage = new EncryptedStorage({
+        onFailure: (operation, error) => recordAuthDiagnostic(`storage_${operation}_failed`, String(error)),
+    });
+
+    // Adapter to make EncryptedStorage compatible with Supabase's expected storage interface
+    return {
+    getItem: async (key: string) => {
+        try {
+            const data = await encryptedStorage.getItem(key);
+            if (!data) {
+                logger(`zoteroStorage: getItem("${key}") returned null (no stored session)`);
+                if (isSessionKey(key)) recordAuthDiagnostic('storage_read_empty');
+                return null;
+            }
+
+            // Migrate double-encoded tokens from old format
+            // Old format: JSON.stringify('{"access_token":"..."}') → "\"{\\"access_token\\"...\""
+            // New format: '{"access_token":"..."}'
+            if (data.startsWith('"') && data.endsWith('"')) {
+                try {
+                    const migrated = JSON.parse(data);
+                    await encryptedStorage.setItem(key, migrated);
+                    return migrated;
+                } catch {
+                    // If parse fails, it's not double-encoded, return as-is
+                }
+            }
+
+            return data;
+        } catch (error) {
+            logger(`zoteroStorage: Error getting auth from encrypted storage: ${error}`, 2);
+            recordAuthDiagnostic('storage_read_failed', String(error));
+            return null;
+        }
+    },
+    setItem: async (key: string, value: string) => {
+        // Retry once on failure — if the new token isn't persisted, the old
+        // (now server-invalidated) refresh token will cause a logout on restart.
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                await encryptedStorage.setItem(key, value);
+                return;
+            } catch (error) {
+                logger(`zoteroStorage: Failed to persist auth token (attempt ${attempt + 1}/2): ${error}`, 2);
+            }
+        }
+        logger('zoteroStorage: Auth token could NOT be persisted after 2 attempts. '
+            + 'Session will work in memory but a restart will require re-login.', 2);
+        recordAuthDiagnostic('storage_write_abandoned', key);
+    },
+    removeItem: async (key: string) => {
+        const stack = new Error().stack;
+        logger(`zoteroStorage: removeItem("${key}") called — session being cleared`, stack);
+        if (isSessionKey(key)) recordAuthDiagnostic('storage_removed', summarizeStack(stack));
+        try {
+            await encryptedStorage.removeItem(key);
+        } catch (error) {
+            logger(`zoteroStorage: Error removing auth from encrypted storage: ${error}`, 2);
+        }
+    }
+    };
+}
+
+/**
+ * Whether `key` holds the session itself, not one of the SDK's companion
+ * entries (`-code-verifier`, `-user`), which are routinely empty or removed
+ * alongside it and would only add noise to the diagnostics.
+ */
+function isSessionKey(key: string): boolean {
+    return key.endsWith('-auth-token');
+}
+
+/**
+ * Register the Zotero encrypted-storage adapter the Supabase auth session
+ * persists into. Required, not a fallback: the client throws when nothing is
+ * registered. Call once during instance startup,
+ * before the Supabase client is first used — the client is created lazily on
+ * first access to the exported `supabase` proxy, so this only needs to land
+ * before that point, not before module load.
+ */
+export function registerZoteroSupabaseStorage(): void {
+    setSupabaseStorageAdapter(createEncryptedStorageAdapter());
+}

@@ -1,0 +1,385 @@
+import { atom } from 'jotai';
+import { createElement } from 'react';
+import { PopupMessage } from '../types/popupMessage';
+import { popupMessagesAtom } from '../atoms/ui';
+import { localZoteroLibrariesAtom } from '../atoms/profile';
+import { v4 as uuidv4 } from 'uuid';
+import { CSSItemTypeIcon } from '../components/icons/icons';
+import { RegularItemsSummaryContent } from '../components/ui/popup/RegularItemsSummaryContent';
+import { truncateText } from '@astermargin/agent-ui/utils/stringUtils';
+import { getDisplayNameFromItem } from '../utils/sourceUtils';
+import type { ItemValidationState } from '../atoms/itemValidation';
+import {
+    toReadabilityInfo,
+    summarizeRegularItemReadability,
+    summarizeUnsupportedAttachments,
+    type AttachmentReadabilityInfo,
+} from './attachmentReadabilityCopy';
+
+/**
+ * Adds a new popup message to the list.
+ * @param message Partial message object. ID will be generated if not provided.
+ */
+export const addPopupMessageAtom = atom(
+    null,
+    (get, set, newMessage: Omit<PopupMessage, 'id'> & { id?: string }) => {
+        const id = newMessage.id ?? uuidv4();
+        const messageWithDefaults: PopupMessage = {
+            id,
+            expire: true, // Default expire to true
+            ...newMessage,
+        };
+        // Add to the beginning to show on top
+        set(popupMessagesAtom, (prevMessages) => {
+            // Keep IDs unique so UI keys stay stable
+            const withoutDuplicate = prevMessages.filter((msg) => msg.id !== id);
+            // if (prevMessages.length > 0 && prevMessages.some((msg) => msg.text === messageWithDefaults.text && msg.title === messageWithDefaults.title)) {
+            //     return prevMessages;
+            // }
+            return [messageWithDefaults, ...withoutDuplicate];
+        });
+    }
+);
+
+export type PopupMessageUpdates = Partial<Omit<PopupMessage, 'id'>>;
+
+/**
+ * Updates a popup message by its ID.
+ * @param messageId ID of the message to update.
+ * @param updates Partial message object with fields to update.
+ */
+export const updatePopupMessageAtom = atom(
+    null,
+    (
+        get,
+        set,
+        {
+            messageId,
+            updates,
+        }: {
+            messageId: string;
+            updates: PopupMessageUpdates;
+        },
+    ) => {
+        set(popupMessagesAtom, (prevMessages) =>
+            prevMessages.map((msg) =>
+                msg.id === messageId ? { ...msg, ...updates } : msg,
+            ),
+        );
+    },
+);
+
+/**
+ * Removes a popup message by its ID.
+ * @param messageId ID of the message to remove.
+ */
+export const removePopupMessageAtom = atom(
+    null,
+    (get, set, messageId: string) => {
+        set(popupMessagesAtom, (prevMessages) =>
+            prevMessages.filter((msg) => msg.id !== messageId)
+        );
+    }
+);
+
+/**
+ * Stable ids for the excluded-library notices, one per context funnel.
+ */
+export const EXCLUDED_LIBRARY_READER_POPUP_ID = 'library-excluded-reader';
+export const EXCLUDED_LIBRARY_SELECTION_POPUP_ID = 'library-excluded-selection';
+
+/**
+ * User-facing copy naming the excluded libraries behind skipped context.
+ */
+function excludedLibraryText(names: string[]): string {
+    const unique = [...new Set(names)].map((name) => `"${name}"`);
+
+    const subject = unique.length === 0
+        ? 'This library is'
+        : unique.length === 1
+            ? `The library ${unique[0]} is`
+            : `The libraries ${unique.join(', ')} are`;
+
+    return `${subject} excluded from AsterMargin. You can change excluded libraries in AsterMargin Preferences.`;
+}
+
+/**
+ * Notify the user that context was skipped because its library is excluded
+ * from AsterMargin.
+ *
+ * Context funnels drop excluded libraries before item validation runs, so the
+ * "Item Removed" popup that explains every other rejection never fires for
+ * them. Without this the item simply never shows up, with no explanation.
+ */
+export const addExcludedLibraryPopupAtom = atom(
+    null,
+    (get, set, params: { id: string; libraryIDs: number[]; title: string; expire?: boolean }) => {
+        const { id, libraryIDs, title, expire = true } = params;
+        // Names come from the same library snapshot that decided the exclusion,
+        // so the notice cannot disagree with the decision behind it and no
+        // second lookup is needed.
+        const libraries = get(localZoteroLibrariesAtom);
+        const names = libraryIDs
+            .map((libraryID) => libraries.find((library) => library.library_id === libraryID)?.name)
+            .filter((name): name is string => !!name);
+        set(removePopupMessageAtom, id);
+        set(addPopupMessageAtom, {
+            id,
+            type: 'error',
+            title,
+            text: excludedLibraryText(names),
+            expire,
+            duration: 5000,
+        });
+    }
+);
+
+const parseProvidersFromTitle = (title: string): string[] => {
+    const match = title.match(/^(.+?) API Keys? Added$/);
+    if (!match) {
+        return [];
+    }
+
+    const normalized = match[1]
+        .replace(/,\s+and\s+/g, ', ')
+        .replace(/\s+and\s+/g, ', ');
+
+    const providerList = normalized
+        .split(',')
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0);
+
+    return Array.from(new Set(providerList));
+};
+
+/**
+ * Adds or updates an API key popup message.
+ * If an API key message already exists, updates it with the new provider.
+ * Otherwise, creates a new message.
+ * 
+ * @param provider The provider type (google, openai, anthropic)
+ * @param providerDisplayName The display name (e.g., "Google Gemini", "OpenAI")
+ * @param hasStreamingIssue Whether OpenAI requires verification
+ * @param currentModelUsesAppKey Whether the current model uses AsterMargin's key
+ * @param currentModelName The name of the current model (if using app key)
+ */
+export const addAPIKeyMessageAtom = atom(
+    null,
+    (get, set, {
+        provider,
+        providerDisplayName,
+        hasStreamingIssue,
+        currentModelUsesAppKey,
+        currentModelName
+    }: {
+        provider: string;
+        providerDisplayName: string;
+        hasStreamingIssue: boolean;
+        currentModelUsesAppKey: boolean;
+        currentModelName?: string;
+    }) => {
+        const messages = get(popupMessagesAtom);
+        const existingMessage = messages.find((msg) => msg.title?.includes('API Key'));
+
+        let streamingNote = '';
+        let appKeyNote = '';
+        let existingMessageId: string | undefined;
+        const providerSet = new Set<string>();
+
+        if (existingMessage) {
+            existingMessageId = existingMessage.id;
+
+            if (existingMessage.title) {
+                parseProvidersFromTitle(existingMessage.title).forEach((name) => providerSet.add(name));
+            }
+
+            // Keep existing streaming note if present
+            if (existingMessage.text?.includes('Verification required:')) {
+                streamingNote = '\n\nVerification required: Visit OpenAI Organization Settings to verify your organization before using OpenAI key.';
+            }
+
+            // Keep existing app key note if present
+            const appKeyMatch = existingMessage.text?.match(/The current model \((.+?)\) uses AsterMargin's key/);
+            if (appKeyMatch) {
+                appKeyNote = `\n\nThe current model (${appKeyMatch[1]}) uses AsterMargin credits. To use your own, pick a model under 'Your API Keys'.`;
+            }
+        }
+
+        // Add new provider if not already in list
+        if (!providerSet.has(providerDisplayName)) {
+            providerSet.add(providerDisplayName);
+        }
+        const providers = Array.from(providerSet);
+
+        // Update streaming note if this is OpenAI with issues
+        if (provider === 'openai' && hasStreamingIssue) {
+            streamingNote = '\n\nVerification required: Visit OpenAI Organization Settings to verify your organization before using this key.';
+        }
+
+        // Update app key note with current state
+        if (currentModelUsesAppKey && currentModelName) {
+            appKeyNote = `\n\nThe current model (${currentModelName}) uses AsterMargin credits. To use your own, pick a model under 'Your API Keys'.`;
+        } else {
+            appKeyNote = '';
+        }
+
+        // Format provider list for display
+        const formatProviderList = (providers: string[]): string => {
+            if (providers.length === 1) return providers[0];
+            if (providers.length === 2) return providers.join(' and ');
+            const last = providers[providers.length - 1];
+            const rest = providers.slice(0, -1);
+            return `${rest.join(', ')}, and ${last}`;
+        };
+
+        const formattedProviders = formatProviderList(providers);
+        const isPlural = providers.length > 1;
+        
+        // Build title and text
+        const title = `${formattedProviders} API Key${isPlural ? 's' : ''} Added`;
+        let messageText = `You can now select ${formattedProviders} models from the model selector.`;
+        messageText += streamingNote;
+        messageText += appKeyNote;
+
+        if (existingMessage && existingMessageId) {
+            // Update existing message
+            set(updatePopupMessageAtom, {
+                messageId: existingMessageId,
+                updates: {
+                    title: title,
+                    text: messageText
+                }
+            });
+        } else {
+            // Create new message
+            set(addPopupMessageAtom, {
+                type: 'info',
+                title: title,
+                text: messageText,
+                expire: false
+            });
+        }
+    }
+);
+
+export function safeChildAttachments(item: Zotero.Item): Zotero.Item[] {
+    try {
+        if (!item.isRegularItem()) return [];
+        return item
+            .getAttachments()
+            .map((id: number) => {
+                try {
+                    return Zotero.Items.get(id) || null;
+                } catch {
+                    return null;
+                }
+            })
+            .filter((attachment): attachment is Zotero.Item => Boolean(attachment));
+    } catch {
+        return [];
+    }
+}
+
+function buildRegularItemPopupSummary(
+    item: Zotero.Item,
+    getValidation: (item: Zotero.Item) => ItemValidationState | undefined,
+) {
+    const attachments = safeChildAttachments(item);
+    const infos = attachments.map((attachment) => toReadabilityInfo(getValidation(attachment)));
+    const summary = summarizeRegularItemReadability(infos);
+
+    return {
+        item,
+        label: summary.label,
+    };
+}
+
+function readabilityInfosForItem(
+    item: Zotero.Item,
+    getValidation: (item: Zotero.Item) => ItemValidationState | undefined,
+): AttachmentReadabilityInfo[] {
+    return safeChildAttachments(item).map((attachment) => toReadabilityInfo(getValidation(attachment)));
+}
+
+/**
+ * Adds a popup message warning that a regular item's attachments aren't readable.
+ * Shown when at least one completed attachment has an issue; the header carries
+ * the item, the body the attachment-scoped reason.
+ *
+ * @param item The regular Zotero item
+ * @param getValidation Function to get validation results for items
+ */
+export const addRegularItemPopupAtom = atom(
+    null,
+    (get, set, {
+        item,
+        getValidation
+    }: {
+        item: Zotero.Item;
+        getValidation: (item: Zotero.Item) => ItemValidationState | undefined;
+    }) => {
+        const itemSummary = buildRegularItemPopupSummary(item, getValidation);
+
+        set(addPopupMessageAtom, {
+            id: item.key,
+            type: 'items_summary',
+            icon: createElement(CSSItemTypeIcon, { itemType: item.getItemTypeIconName() }),
+            title: truncateText(getDisplayNameFromItem(item), 68),
+            // Header already shows the item's icon + title, so the body renders the
+            // readability reason only (showItemTitles: false) to avoid duplicating them.
+            customContent: createElement(RegularItemsSummaryContent, { items: [itemSummary], showItemTitles: false }),
+            expire: true,
+            duration: 3400
+        });
+    }
+);
+
+/**
+ * Adds a summary popup warning that several regular items have unsupported
+ * attachments. The body aggregates unsupported attachment kinds across every
+ * listed item.
+ *
+ * @param items Array of regular Zotero items
+ * @param getValidation Function to get validation results for items
+ */
+export const addRegularItemsSummaryPopupAtom = atom(
+    null,
+    (get, set, {
+        items,
+        getValidation
+    }: {
+        items: Zotero.Item[];
+        getValidation: (item: Zotero.Item) => ItemValidationState | undefined;
+    }) => {
+        if (items.length === 0) return;
+
+        const perItemInfos = items.map((item) => ({
+            item,
+            infos: readabilityInfosForItem(item, getValidation),
+        }));
+        const unsupportedItemCount = perItemInfos
+            .filter(({ infos }) => summarizeUnsupportedAttachments(infos))
+            .length;
+        const allInfos = perItemInfos.flatMap(({ infos }) => infos);
+        const unsupportedLabel = summarizeUnsupportedAttachments(allInfos);
+        const hasUnsupportedAttachments = Boolean(unsupportedLabel);
+        const label = unsupportedLabel
+            || summarizeRegularItemReadability(allInfos).label
+            || "Some attachments can't be read";
+        const affectedItemCount = hasUnsupportedAttachments ? unsupportedItemCount : items.length;
+
+        set(addPopupMessageAtom, {
+            type: 'items_summary',
+            title: hasUnsupportedAttachments
+                ? `${affectedItemCount} ${affectedItemCount === 1 ? 'item has' : 'items have'} unsupported attachments`
+                : `${affectedItemCount} ${affectedItemCount === 1 ? 'item has' : 'items have'} attachment issues`,
+            customContent: createElement(RegularItemsSummaryContent, {
+                items: [{ item: items[0], label }],
+                showItemTitles: false,
+                showStatusIcon: false,
+            }),
+            expire: true,
+            duration: 3400
+        });
+    }
+);

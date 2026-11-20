@@ -1,0 +1,119 @@
+import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
+import { useEffect, useState } from 'react';
+import { getActiveZoteroLibraryId } from '../../../../utils/zoteroTargetContext';
+import { CollectionMenuItemContext, createCollectionMenuItem } from '../utils/menuItemFactories';
+
+interface UseCollectionsMenuOptions {
+    isActive: boolean;
+    searchQuery: string;
+    searchableLibraryIds: number[];
+    collectionMenuItemContext: CollectionMenuItemContext;
+    verticalPosition?: 'above' | 'below';
+}
+
+interface UseCollectionsMenuResult {
+    menuItems: SearchMenuItem[];
+}
+
+export const useCollectionsMenu = ({
+    isActive,
+    searchQuery,
+    searchableLibraryIds,
+    collectionMenuItemContext,
+    verticalPosition = 'above'
+}: UseCollectionsMenuOptions): UseCollectionsMenuResult => {
+    const [menuItems, setMenuItems] = useState<SearchMenuItem[]>([]);
+    const [collections, setCollections] = useState<Zotero.Collection[]>([]);
+    const [activeLibraryId, setActiveLibraryId] = useState<number | null>(null);
+
+    const getEffectiveLibraryId = (libraryId: number | null): number | null => {
+        if (libraryId && searchableLibraryIds.includes(libraryId)) {
+            return libraryId;
+        }
+        if (searchableLibraryIds.includes(1)) {
+            return 1;
+        }
+        return null;
+    };
+
+    useEffect(() => {
+        if (!isActive) {
+            setCollections([]);
+            setMenuItems([]);
+            setActiveLibraryId(null);
+            return;
+        }
+
+        let isCancelled = false;
+
+        const fetchCollections = async () => {
+            const libraryIdActive = getActiveZoteroLibraryId();
+            const libraryId = getEffectiveLibraryId(libraryIdActive);
+            setActiveLibraryId(libraryId);
+
+            if (!libraryId) {
+                if (!isCancelled) {
+                    setCollections([]);
+                }
+                return;
+            }
+
+            try {
+                const collectionIds = await Zotero.Collections.getAllIDs(libraryId);
+                const availableCollections = collectionIds
+                    .map((id) => {
+                        try {
+                            return Zotero.Collections.get(id);
+                        } catch {
+                            return null;
+                        }
+                    })
+                    .filter((collection): collection is Zotero.Collection => Boolean(collection))
+                    .filter((collection) => !collection.deleted)
+                    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+
+                if (!isCancelled) {
+                    setCollections(availableCollections);
+                }
+            } catch (error) {
+                console.error('Error fetching collections:', error);
+                if (!isCancelled) {
+                    setCollections([]);
+                }
+            }
+        };
+
+        fetchCollections();
+
+        return () => {
+            isCancelled = true;
+        };
+    }, [isActive, searchableLibraryIds]);
+
+    useEffect(() => {
+        if (!isActive) {
+            return;
+        }
+
+        const lowerCaseQuery = searchQuery.toLowerCase();
+        const filteredCollections = collections.filter((collection) =>
+            collection.name.toLowerCase().includes(lowerCaseQuery)
+        );
+        const items = filteredCollections.map((collection) =>
+            createCollectionMenuItem(collection, collectionMenuItemContext, searchQuery)
+        );
+        let headerLabel = 'Select Collections';
+        if (activeLibraryId) {
+            const library = Zotero.Libraries.get(activeLibraryId);
+            headerLabel = library ? `Collections in ${library.name}` : headerLabel;
+        }
+        const header: SearchMenuItem = { label: headerLabel, isGroupHeader: true, onClick: () => {} };
+        if (verticalPosition === 'above') {
+            setMenuItems([...items.reverse(), header]);
+        } else {
+            setMenuItems([header, ...items]);
+        }
+    }, [isActive, searchQuery, collections, collectionMenuItemContext, activeLibraryId, verticalPosition]);
+
+    return { menuItems };
+};

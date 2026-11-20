@@ -1,0 +1,1477 @@
+/**
+ * Paragraph-scoped sentence → bbox resolver.
+ *
+ * This is the second feasibility step that builds on `SentenceMapper.ts`.
+ * Where `SentenceMapper` runs its splitter on the entire flattened page text,
+ * this module scopes the splitter to **one paragraph at a time**. That gives
+ * better sentence boundaries (no stitching across column gutters or
+ * heading/body transitions) and makes sentence text match the reading order
+ * the existing `ParagraphDetector` already computes.
+ *
+ * Design notes:
+ *
+ * - It **coexists** with the page-wide `SentenceMapper` path. Neither module
+ *   replaces the other. Callers pick based on performance vs. accuracy:
+ *     * `SentenceMapper` — single walk, single splitter call, no paragraph
+ *       detection. Cheaper.
+ *     * `ParagraphSentenceMapper` — full column + line + paragraph pipeline
+ *       on top of the detailed walk. More expensive, but sentence bounds
+ *       respect paragraph structure.
+ *
+ * - It does not duplicate paragraph-detection logic. Instead it asks
+ *   `detectParagraphs` for its per-item line groups via the new
+ *   `trackItemLines: true` option, then maps each paragraph's lines back to
+ *   the source `RawLineDetailed` entries by bbox identity.
+ *
+ * - The text/chars lockstep invariant is preserved per-paragraph in exactly
+ *   the same way as `SentenceMapper.flattenPageText` preserves it per-page.
+ */
+
+import type {
+    BoundingBox,
+    CaptionItem,
+    DegradationNote,
+    DegradationSummary,
+    DocItem,
+    FootnoteItem,
+    ItemLine,
+    MarginItem,
+    RawChar,
+    RawLineDetailed,
+    RawPageDataDetailed,
+    ReferenceItem,
+    SectionHeaderItem,
+    SentenceItem,
+    TextBearingItem,
+    TextItem,
+} from "@astermargin/agent-core/extract/types";
+import { bboxHeight, mergeBoxes } from "@astermargin/agent-core/extract/types";
+import type { PageLine } from "./LineDetector";
+import type { ParagraphDetectionSettings } from "./ParagraphDetector";
+import { detectParagraphs } from "./ParagraphDetector";
+import {
+    draftItemsFromParagraphs,
+    publicItemText,
+    type DraftItem,
+} from "./pipeline/draftItems";
+import { detectColumns } from "./ColumnDetector";
+import { detectLinesOnPage } from "./LineDetector";
+import { decideLineJoin, joinsWithoutSpace, SOFT_HYPHEN, type LineJoin } from "./lineJoins";
+import { MATH_OPERATORS } from "./mathOperators";
+import {
+    charCodeUnits,
+    hasSentenceFinalTerminator,
+    lineTextMatchesChars,
+    simpleRegexSentenceSplit,
+    sentenceToBoxes,
+    type PageText,
+    type SentenceRange,
+    type SentenceSplitter,
+} from "./SentenceMapper";
+import {
+    inverseRotateBBox,
+    rotateRawPageDetailed,
+    type RotationAngle,
+} from "./PageRotationNormalizer";
+import { carriesSentences, type SentenceBearingItem } from "./schema/itemKinds";
+import { CURRENT_PDF_EXTRACTION_PRESET } from "./schema/presets";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Plain-text rendering of a single paragraph with a source map pointing back
+ * to the detailed chars that produced it.
+ *
+ * Mirrors `SentenceMapper.PageText` but scoped to a single paragraph. The
+ * `lines` field is the paragraph's own line array (each entry from the
+ * detailed walk), and `source[i]` refers to indices into that array — not
+ * page-global line indices.
+ */
+export interface ParagraphText {
+    /** Concatenated paragraph text, with single-space fillers between lines. */
+    text: string;
+    /**
+     * Parallel source map. `text.length === source.length`. Real entries
+     * point back to `(lineIndex, charIndex)` into `lines`; `null` marks
+     * boundary filler (the inter-line space) that should be skipped when
+     * resolving sentences. A non-BMP char (surrogate pair) repeats its
+     * entry for each of its two code units.
+     */
+    source: Array<{ lineIndex: number; charIndex: number } | null>;
+    /**
+     * Detailed lines for this paragraph, in reading order.
+     * `lines[source[i].lineIndex].chars[source[i].charIndex]` is the char
+     * that contributed `text[i]`.
+     */
+    lines: RawLineDetailed[];
+}
+
+/** Result of running the full paragraph-scoped sentence pipeline on a page. */
+export interface PageSentenceResult {
+    pageIndex: number;
+    width: number;
+    height: number;
+    items: DocItem[];
+    sentences: SentenceItem[];
+    degradation?: DegradationSummary;
+}
+
+/** Cap on diagnostic notes to avoid unbounded memory on pathological PDFs. */
+const MAX_DEGRADATION_NOTES = 50;
+
+// ---------------------------------------------------------------------------
+// Detailed-line lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a lookup from raw-line bbox to `RawLineDetailed`.
+ *
+ * The existing line/paragraph detectors keep `RawLine.bbox` verbatim on every
+ * `DetectedSpan`, so spans can be traced back to the raw line they came from
+ * by comparing bbox coordinates. Keys are rounded to avoid spurious
+ * float-equality misses; the rounding granularity (3 decimals) is far below
+ * any real bbox-distinct-enough-to-matter threshold.
+ */
+function bboxKey(b: BoundingBox): string {
+    return `${b.l.toFixed(3)}|${b.t.toFixed(3)}|${b.r.toFixed(3)}|${b.b.toFixed(3)}|${b.origin}`;
+}
+
+export function buildDetailedLineLookup(
+    page: RawPageDataDetailed,
+): Map<string, RawLineDetailed> {
+    const map = new Map<string, RawLineDetailed>();
+    for (const block of page.blocks) {
+        if (block.type !== "text" || !block.lines) continue;
+        for (const line of block.lines) {
+            map.set(bboxKey(line.bbox), line);
+        }
+    }
+    return map;
+}
+
+// ---------------------------------------------------------------------------
+// Paragraph → ParagraphText
+// ---------------------------------------------------------------------------
+
+/**
+ * Collect the detailed lines that make up a single `PageLine[]` paragraph
+ * group, in reading order.
+ *
+ * Each `PageLine.spans` has a `bbox` that was copied verbatim from the raw
+ * line it was built from. We look that bbox up in `detailedLookup` to
+ * recover the corresponding `RawLineDetailed`. Missing lookups are skipped
+ * (and surfaced to the caller through `result.degradation`), which keeps the
+ * pipeline resilient when a single span drifts.
+ *
+ * Span-level ordering: within a single `PageLine`, spans are sorted left-to
+ * -right by the line detector. Across lines, the detector sorts top-to-
+ * bottom. Concatenating in this order yields reading order.
+ */
+function collectDetailedLinesForParagraph(
+    lineGroup: PageLine[],
+    detailedLookup: Map<string, RawLineDetailed>,
+): RawLineDetailed[] {
+    const out: RawLineDetailed[] = [];
+    const seen = new Set<string>();
+    for (const pageLine of lineGroup) {
+        for (const span of pageLine.spans) {
+            const key = bboxKey(span.bbox);
+            if (seen.has(key)) continue;
+            const detailed = detailedLookup.get(key);
+            if (!detailed) continue; // unmapped — counted downstream
+            seen.add(key);
+            out.push(detailed);
+        }
+    }
+    return out;
+}
+
+/**
+ * Canonical footnote-marker glyphs. A superscript run consisting of these
+ * characters and following a sentence-ending punctuation is collapsed to a
+ * single space so the splitter sees the underlying boundary.
+ *
+ * Restricted to digits and traditional footnote symbols on purpose — keeps
+ * the transformation away from inline math, trademark glyphs, and raised
+ * letters in ordinals like "1st".
+ */
+const FOOTNOTE_MARKER_CHARS = new Set([
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "*", "†", "‡", "§", "¶", "#",
+]);
+
+/**
+ * Sentence-ending punctuation that, when immediately followed by a
+ * superscript footnote marker, hides what would otherwise be a clean
+ * sentence boundary (e.g. "factor.11 The").
+ */
+const SENTENCE_END_PUNCT = new Set([".", "!", "?"]);
+
+/**
+ * A char whose bbox height is below this fraction of the line's median
+ * char height is treated as a superscript candidate. 0.85 is generous
+ * enough to catch ~0.65× footnote glyphs without flagging punctuation
+ * whose ink box happens to be slightly shorter than the median.
+ */
+const SUPERSCRIPT_HEIGHT_RATIO = 0.85;
+
+function lineMedianCharHeight(line: RawLineDetailed): number {
+    const heights = new Float64Array(line.chars.length);
+    let n = 0;
+    for (const c of line.chars) {
+        const height = bboxHeight(c.bbox);
+        if (height > 0) heights[n++] = height;
+    }
+    if (n === 0) return 0;
+    // A typed array sorts numerically without a comparator.
+    return heights.subarray(0, n).sort()[Math.floor(n / 2)];
+}
+
+// ---------------------------------------------------------------------------
+// Line-break hyphenation
+// ---------------------------------------------------------------------------
+
+/**
+ * Matches a genuine in-text hyphenated run: two or more letter groups joined by
+ * ASCII hyphen-minus (U+002D), with no surrounding whitespace. A word split
+ * across a line break never matches, because the hyphen ends one line's text
+ * while the continuation starts the next line's text, so the two letters are
+ * never adjacent to the hyphen within a single line string.
+ */
+const MIDLINE_COMPOUND_RE = /\p{L}+(?:-\p{L}+)+/gu;
+
+/**
+ * Collect the document's genuine hyphenated compounds (e.g. "broken-windows",
+ * "neighborhood-level") from raw line text. This is the signal for whether a
+ * word split across a line break is a real compound (keep the hyphen) or a soft
+ * hyphen inserted for justification (join the halves).
+ *
+ * The line-break lookup only ever probes a two-part `<prevWord>-<nextWord>`
+ * key, so a multi-hyphen run is recorded as each of its **consecutive** pairs:
+ * "difference-in-differences" yields "difference-in" and "in-differences", so a
+ * break at either hyphen is recognized as a genuine compound. Compounds are
+ * stored lowercased so the lookup is case-insensitive. Pass an existing set as
+ * `into` to accumulate across pages.
+ */
+export function collectHyphenatedCompounds(
+    lineTexts: Iterable<string>,
+    into: Set<string> = new Set(),
+): Set<string> {
+    for (const text of lineTexts) {
+        if (!text.includes("-")) continue;
+        for (const match of text.matchAll(MIDLINE_COMPOUND_RE)) {
+            const parts = match[0].toLowerCase().split("-");
+            for (let i = 0; i + 1 < parts.length; i++) {
+                into.add(`${parts[i]}-${parts[i + 1]}`);
+            }
+        }
+    }
+    return into;
+}
+
+/** Trailing `<letters>-` of a line (ASCII hyphen-minus only). */
+const TRAILING_HYPHEN_RE = /(\p{L}+)-$/u;
+/** Leading letters of the next line. */
+const LEADING_WORD_RE = /^(\p{L}+)/u;
+/** Host with a known TLD (`forbes.com`, `broken-windows.org`, `bbc.co.uk`). */
+const URL_HOST_RE =
+    /[a-z0-9-]+\.(?:com|org|net|edu|gov|mil|int|io|co|info|biz|us|uk|ca|eu|de|fr|au|nl|jp|cn|in|ru|br|gov\.uk|ac\.uk)\b/i;
+/** Filename with a known extension (`report-final.pdf`). */
+const FILE_EXT_RE =
+    /\.(?:pdf|html?|php|aspx?|jsp|xml|json|csv|tsv|txt|docx?|xlsx?|pptx?|zip|tar|gz|png|jpe?g|gif|svg)\b/i;
+
+/**
+ * True when a whitespace-delimited token is a URL / email / DOI / filesystem
+ * path, where hyphens are literal and a line break must not fuse them
+ * (`https://x.com/some-article`, `10.1234/abc-def`, `a-b@x.com`,
+ * `www.broken-windows.org`, `/usr/some-bin`, `report-final.pdf`).
+ *
+ * Deliberately tight: a **bare `/` between two letters is a conjunction**
+ * ("inequality/stratification", "and/or"), NOT a path — fusing must still apply
+ * there. The host / extension tests use closed allowlists rather than a generic
+ * `word.word` pattern, so a run-together `sentence.Next` (seen on PDFs that drop
+ * inter-word spaces) is not mistaken for a host. A token qualifies only on a
+ * real URL/path signal: a `://` scheme, a `mailto:` / `@host.tld` email, a
+ * `www.` label, a known `host.tld`, a known `file.ext`, a `10.NNNN/` DOI prefix,
+ * a leading `/ ./ ../` path, or a backslash. Digit-adjacent hyphens (COVID-19,
+ * 15-trillion, year ranges) need no handling here — they are already excluded
+ * by the letter-anchored `TRAILING_HYPHEN_RE` / `LEADING_WORD_RE`.
+ */
+function isUrlishToken(token: string): boolean {
+    return (
+        /:\/\//.test(token) ||                     // scheme:// (http, https, ftp, …)
+        /^mailto:/i.test(token) ||                 // mailto:
+        /@[a-z0-9.-]+\.[a-z]{2,}/i.test(token) ||  // email local@host.tld
+        /\bwww\./i.test(token) ||                  // www. host label
+        URL_HOST_RE.test(token) ||                 // host.tld (com, org, edu, …)
+        FILE_EXT_RE.test(token) ||                 // filename.ext
+        /\b10\.\d{4,}\//.test(token) ||            // DOI 10.NNNN/…
+        /^\.{0,2}\//.test(token) ||                // absolute / relative path: / ./ ../
+        /\\/.test(token)                           // Windows path backslash
+    );
+}
+
+export type LineBreakHyphenDecision = "none" | "join" | "keep";
+
+/** `decideLineJoin`'s answer in `decideLineBreakHyphen`'s terms: "glue" keeps the last character. */
+const LINE_JOIN_AS_HYPHEN_DECISION: Record<LineJoin, LineBreakHyphenDecision> = {
+    space: "none",
+    join: "join",
+    glue: "keep",
+};
+
+/**
+ * Decide how to treat a hyphen that falls at a physical line break.
+ *
+ *  - `"none"` — the previous line does not end in `<letter>-`, or the next line
+ *    does not start with a letter; leave the text untouched.
+ *  - `"keep"` — the hyphen is genuine (keep it) but the inter-line space is a
+ *    line-break artifact (drop it). Either the joined compound is attested
+ *    elsewhere in the document (`vocabulary`, e.g. "neighborhood-level"), or the
+ *    hyphen sits inside a URL / email / DOI / path token where it is always
+ *    literal (e.g. ".../ai-will-add" wrapped at "ai-"). Reconstructs as
+ *    "neighborhood-level" / ".../ai-will-add".
+ *  - `"join"` — default. A soft hyphen inserted for justification (e.g. "con-"
+ *    / "sequences"). Drop the hyphen and the inter-line space.
+ *
+ * Only ASCII hyphen-minus (U+002D) is considered, matching the markdown path's
+ * `joinLines` in `ParagraphDetector`. En/em dashes and double hyphens never
+ * join. With no `vocabulary`, every line-break hyphen joins.
+ */
+export function decideLineBreakHyphen(
+    prevLineText: string,
+    nextLineText: string,
+    vocabulary?: ReadonlySet<string>,
+): LineBreakHyphenDecision {
+    // Most lines don't end in a hyphen: rule them out before the regexes.
+    let end = prevLineText.length;
+    while (end > 0 && /\s/u.test(prevLineText[end - 1])) end--;
+    if (end === 0 || prevLineText.charCodeAt(end - 1) !== 0x2d) return "none";
+    const prev = prevLineText.slice(0, end);
+    const prevMatch = TRAILING_HYPHEN_RE.exec(prev);
+    if (!prevMatch) return "none";
+    const next = nextLineText.replace(/^\s+/u, "");
+    const nextMatch = LEADING_WORD_RE.exec(next);
+    if (!nextMatch) return "none";
+    // A hyphen inside a URL / email / DOI / path token is literal: keep it (and
+    // drop the line-break space) so the link reconstructs intact instead of
+    // being fused. Checked on the two tokens adjacent to the break only, so a
+    // URL elsewhere on the line does not affect an ordinary hyphenation.
+    const prevToken = /\S+$/.exec(prev)?.[0] ?? "";
+    const nextToken = /^\S+/.exec(next)?.[0] ?? "";
+    if (isUrlishToken(prevToken) || isUrlishToken(nextToken)) {
+        return "keep";
+    }
+    const compound = `${prevMatch[1]}-${nextMatch[1]}`.toLowerCase();
+    return vocabulary?.has(compound) ? "keep" : "join";
+}
+
+/**
+ * `next` continues `prev`'s row: they overlap vertically by at least half the
+ * shorter line and `next` starts to the right of `prev`.
+ */
+function onSameRow(prev: RawLineDetailed, next: RawLineDetailed): boolean {
+    const minH = Math.min(bboxHeight(prev.bbox), bboxHeight(next.bbox));
+    if (!(minH > 0)) return false;
+    const overlap = Math.min(prev.bbox.b, next.bbox.b) - Math.max(prev.bbox.t, next.bbox.t);
+    return overlap >= 0.5 * minH && next.bbox.l >= prev.bbox.r - 0.25 * minH;
+}
+
+/**
+ * `next` continues `prev`'s word on their row: set in the same size (a raised
+ * marker or a subscript keeps its space, as before), no whitespace at the
+ * boundary, and a gap of at most a tenth of an em, narrower than any word
+ * space.
+ */
+function touches(prev: RawLineDetailed, next: RawLineDetailed): boolean {
+    if (/\s$/u.test(prev.text) || /^\s/u.test(next.text)) return false;
+    const a = prev.font?.size ?? 0;
+    const b = next.font?.size ?? 0;
+    if (!(a > 0 && b > 0) || Math.max(a, b) > 1.15 * Math.min(a, b)) return false;
+    return next.bbox.l - prev.bbox.r <= 0.1 * a;
+}
+
+/** Switches of `buildParagraphText`, from the PDF schema preset. */
+export interface ParagraphTextOptions {
+    /** Join line breaks with `decideLineJoin` (`ParagraphDetectionSettings.lineJoins`). */
+    lineJoins?: boolean;
+    /**
+     * Footnote markers glued to text (`ParagraphDetectionSettings.noteMarkers`):
+     * a raised marker after a word is dropped, as one after sentence-ending
+     * punctuation already is, and, with `leadMarker`, the paragraph's raised
+     * lead marker is set off from the text after it.
+     */
+    noteMarkers?: boolean;
+    /** The paragraph is a footnote, whose first line may open with its marker. */
+    leadMarker?: boolean;
+}
+
+/** Unit names a decimal prefix goes before ("mrad", "µmol", "kohm"). */
+const PREFIXED_UNITS = ["rad", "bar", "mol", "ohm", "sec", "cal", "lux"];
+const UNIT_PREFIXES = ["", "q", "r", "y", "z", "a", "f", "p", "n", "µ", "μ", "m", "c", "d", "da", "h", "k"];
+/** Words a prefix and a unit spell, which keep dropping a glued marker ("flux12"). */
+const PREFIXED_UNIT_WORDS = new Set(["flux", "arad"]);
+
+/**
+ * Units of three or more letters a raised digit after is a power of
+ * ("4 rad²", "2 mbar³", "ohm²"), not a note marker.
+ */
+const UNIT_WORDS = new Set([
+    ...PREFIXED_UNITS.flatMap((unit) => UNIT_PREFIXES.map((prefix) => prefix + unit))
+        .filter((word) => !PREFIXED_UNIT_WORDS.has(word)),
+    "ohms", "ppm", "ppb", "ppt", "rpm", "mph", "kph", "atm", "torr", "dyn", "erg", "gal", "lbs",
+    "arcsec", "arcmin", "mas",
+]);
+
+/** Spelled-out metric units, which take a spelled-out prefix ("kilometres", "milliseconds"). */
+const SPELLED_METRIC_UNITS = [
+    "meter", "metre", "gram", "liter", "litre", "second", "newton", "joule", "watt", "pascal", "ampere", "volt",
+    "coulomb", "tesla", "hertz", "mole", "radian", "steradian",
+];
+const SPELLED_UNIT_PREFIXES = ["", "kilo", "hecto", "deca", "deci", "centi", "milli", "micro", "nano", "pico", "femto", "mega", "giga"];
+/** Plural of a spelled-out unit ("seconds", "inches", "feet"); "hertz" has none. */
+function unitPlural(unit: string): string {
+    if (unit.endsWith("hertz")) return unit;
+    if (unit === "foot") return "feet";
+    return unit.endsWith("inch") ? `${unit}es` : `${unit}s`;
+}
+
+/**
+ * Spelled-out units and their plurals, a single raised 2, 3 or 4 after which
+ * is a power ("metres per second²", "variance in seconds²"), not a note
+ * marker. A longer marker after them ("seconds12") is still dropped.
+ */
+const SPELLED_UNIT_WORDS = new Set(
+    [
+        ...SPELLED_METRIC_UNITS.flatMap((unit) => SPELLED_UNIT_PREFIXES.map((prefix) => prefix + unit)),
+        "minute", "hour", "kelvin", "ohm", "inch", "foot", "yard", "mile",
+    ].flatMap((unit) => [unit, unitPlural(unit)]),
+);
+
+/** Marker characters a footnote opens with: numbers, note symbols, lettered notes. */
+const LEAD_MARKER_RE = /^[0-9*†‡§¶#a-z]$/u;
+
+/** A raised glyph sits at least this share of its neighbour's height above the neighbour's bottom. */
+const RAISED_RATIO = 0.15;
+
+function isRaisedAgainst(ch: RawChar, neighbour: RawChar): boolean {
+    return ch.bbox.b <= neighbour.bbox.b - RAISED_RATIO * bboxHeight(neighbour.bbox);
+}
+
+/**
+ * Index just past a footnote's lead marker that runs into its text ("1AI is
+ * a collection…"): one to four small, raised marker characters at the start
+ * of the line, directly followed by a full-size character. `-1` when there
+ * is none (no marker, or a space already follows it).
+ */
+function gluedLeadMarkerEnd(line: RawLineDetailed, superscriptThreshold: number): number {
+    const chars = line.chars;
+    let start = 0;
+    while (start < chars.length && /\s/u.test(chars[start].c)) start++;
+    let end = start;
+    const isSmall = (ch: RawChar) => bboxHeight(ch.bbox) > 0 && bboxHeight(ch.bbox) < superscriptThreshold;
+    while (end < chars.length && end - start < 4 && LEAD_MARKER_RE.test(chars[end].c) && isSmall(chars[end])) end++;
+    if (end === start || end >= chars.length) return -1;
+    const next = chars[end];
+    if (/\s/u.test(next.c) || isSmall(next)) return -1;
+    return chars.slice(start, end).every((ch) => isRaisedAgainst(ch, next)) ? end : -1;
+}
+
+/**
+ * Indices of footnote markers glued to the word before them
+ * ("programmes52", "context53", "alleles105,106"): small, raised digits
+ * (numbers of up to three digits, with commas and dashes between) right
+ * after a lowercase word of three or more letters, followed by a space,
+ * punctuation or the end of the line. The word length and case keep
+ * exponents of units and variables ("mm3", "cm2", "R2") out, and lists of
+ * longer unit names and function names those of units and mathematics
+ * ("rad²", "cos² x", "log² n"); a spelled-out unit keeps a single-digit
+ * power ("seconds²").
+ */
+function gluedNoteMarkerChars(line: RawLineDetailed, superscriptThreshold: number): Set<number> {
+    const out = new Set<number>();
+    const chars = line.chars;
+    const isSmall = (ch: RawChar) => bboxHeight(ch.bbox) > 0 && bboxHeight(ch.bbox) < superscriptThreshold;
+    for (let i = 3; i < chars.length; i++) {
+        const code = chars[i].c.charCodeAt(0);
+        if (code < 48 || code > 57 || chars[i].c.length !== 1 || !isSmall(chars[i])) continue;
+        const prev = chars[i - 1];
+        if (!/\p{Ll}/u.test(prev.c) || isSmall(prev) || !isRaisedAgainst(chars[i], prev)) continue;
+        let w = i - 1;
+        while (w >= 0 && /\p{L}/u.test(chars[w].c)) w--;
+        const word = chars.slice(w + 1, i).map((ch) => ch.c).join("");
+        if (word.length < 3 || !/^\p{Ll}+$/u.test(word) || MATH_OPERATORS.has(word) || UNIT_WORDS.has(word)) continue;
+        // The marker, or a list or range of them ("105,106", "14–16"), set
+        // small and raised; it ends on a digit.
+        let end = i;
+        while (
+            end < chars.length && end - i < 12 && isSmall(chars[end]) &&
+            (/[0-9]/u.test(chars[end].c) || (/[,\u2013-]/u.test(chars[end].c) && isRaisedAgainst(chars[end], prev)))
+        ) end++;
+        while (end > i && !/[0-9]/u.test(chars[end - 1].c)) end--;
+        const run = chars.slice(i, end).map((ch) => ch.c).join("");
+        if (/[0-9]{4}/u.test(run)) continue;
+        if (SPELLED_UNIT_WORDS.has(word) && /^[2-4]$/u.test(run)) continue;
+        if (end < chars.length && !/[\s.,;:!?)\]”’"']/u.test(chars[end].c)) continue;
+        for (let k = i; k < end; k++) out.add(k);
+        i = end - 1;
+    }
+    return out;
+}
+
+/**
+ * Build a `ParagraphText` (text + source map + lines) from a list of
+ * detailed raw lines belonging to a single paragraph.
+ *
+ * Exactly mirrors `SentenceMapper.flattenPageText` but scoped to a single
+ * paragraph:
+ * - Every real char contributes to `text` and gets a `source` entry.
+ * - A single `" "` filler (with a `null` source entry) separates adjacent
+ *   lines so the splitter sees word boundaries.
+ * - The invariant that `line.text` has as many UTF-16 code units as its
+ *   chars contribute is checked loudly; a violation throws. A non-BMP char
+ *   (e.g. the math-italic 𝛼 common in Word / Unicode-math equations) is one
+ *   char but two code units, and gets one source entry per unit.
+ *
+ * Superscript footnote markers following a sentence-ending punctuation
+ * (e.g. the "11" in "factor.11 The") are replaced with a single
+ * inter-word space. Without this the splitter sees `.1` and keeps both
+ * clauses in one sentence; with it the splitter sees `. ` and recovers
+ * the boundary. The footnote chars contribute no source entry, so they
+ * drop out of bbox mapping cleanly.
+ *
+ * Words split across a line break are de-hyphenated: when a line ends in
+ * `<letter>-` and the next line starts with a letter, the inter-line space is
+ * suppressed and — unless the joined compound is in `vocabulary` (a genuine
+ * compound like "neighborhood-level") — the trailing hyphen is dropped, so
+ * "con-" / "sequences" becomes "consequences". The dropped hyphen and any
+ * trailing whitespace contribute no source entry, preserving the text/source
+ * lockstep; the rejoined word's bboxes simply span both source lines. See
+ * `decideLineBreakHyphen`. With no `vocabulary`, every line-break hyphen joins.
+ *
+ * With `lineJoins`, each line break (not a boundary between two raw lines
+ * side by side on one row) follows `decideLineJoin` instead (shared
+ * with the markdown text, see `lineJoins.ts`): hyphens are decided from the
+ * document's spelling and the word's shape, URLs, DOIs, number ranges and
+ * CJK text join without a space, a soft hyphen at a line end joins the word,
+ * and soft hyphens inside a line are dropped.
+ *
+ * With `noteMarkers`, a footnote marker glued to the word before it is
+ * dropped ("programmes52 (which" → "programmes (which"), and with
+ * `leadMarker` a footnote's own glued lead marker gets a space after it
+ * ("1AI is…" → "1 AI is…"), keeping the marker.
+ */
+export function buildParagraphText(
+    lines: RawLineDetailed[],
+    vocabulary?: ReadonlySet<string>,
+    options: ParagraphTextOptions = {},
+): ParagraphText {
+    const lineJoins = options.lineJoins ?? false;
+    const textParts: string[] = [];
+    const source: ParagraphText["source"] = [];
+    let lastEmittedNonWhitespaceRealChar: string | null = null;
+    let inFootnoteRun = false;
+
+    // Per-line plan for the boundary AFTER each line. When the line ends in
+    // `<letter>-` and the next line starts with a letter, `lastRealIdx` is the
+    // char index of that trailing hyphen and `dropHyphen` distinguishes join
+    // (drop the hyphen) from keep (retain it). In both cases the hyphen's
+    // line and the inter-line filler are de-spaced; chars after `lastRealIdx`
+    // are trailing whitespace and are dropped so no stray space survives.
+    const dehyphenate: Array<
+        { lastRealIdx: number; dropHyphen: boolean } | null
+    > = new Array(lines.length).fill(null);
+    for (let li = 0; li < lines.length - 1; li++) {
+        // `decideLineJoin` reads line breaks. Two raw lines side by side on
+        // one row are not a line break: a hyphen between them is literal, and
+        // they join directly only when they touch (MuPDF split a word) or
+        // meet in Chinese or Japanese text, with a word space otherwise.
+        const decision = !lineJoins
+            ? decideLineBreakHyphen(lines[li].text, lines[li + 1].text, vocabulary)
+            : onSameRow(lines[li], lines[li + 1])
+                ? (touches(lines[li], lines[li + 1]) || joinsWithoutSpace(lines[li].text, lines[li + 1].text) ? "keep" : "none")
+                : LINE_JOIN_AS_HYPHEN_DECISION[decideLineJoin(lines[li].text, lines[li + 1].text, vocabulary)];
+        if (decision === "none") continue;
+        const chars = lines[li].chars;
+        let lastRealIdx = -1;
+        for (let ci = chars.length - 1; ci >= 0; ci--) {
+            if (!/\s/.test(chars[ci].c)) {
+                lastRealIdx = ci;
+                break;
+            }
+        }
+        if (lastRealIdx < 0) continue;
+        dehyphenate[li] = { lastRealIdx, dropHyphen: decision === "join" };
+    }
+
+    for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        if (!lineTextMatchesChars(line)) {
+            throw new Error(
+                `[ParagraphSentenceMapper] text/chars length mismatch on line ${li}: ` +
+                `text.length=${line.text.length}, chars code units=${charCodeUnits(line)}`,
+            );
+        }
+        const cut = dehyphenate[li];
+        // After a de-hyphenated break, drop this continuation line's leading
+        // whitespace too. `decideLineBreakHyphen` ignored it when forming the
+        // compound, so emitting it here would reintroduce the space
+        // ("con" + " sequences" → "con sequences" instead of "consequences").
+        let leadingWhitespace = li > 0 && dehyphenate[li - 1] !== null;
+        const median = lineMedianCharHeight(line);
+        const superscriptThreshold =
+            median > 0 ? median * SUPERSCRIPT_HEIGHT_RATIO : 0;
+        const leadEnd = options.noteMarkers && options.leadMarker && li === 0 && superscriptThreshold > 0
+            ? gluedLeadMarkerEnd(line, superscriptThreshold)
+            : -1;
+        const gluedMarkers = options.noteMarkers && superscriptThreshold > 0
+            ? gluedNoteMarkerChars(line, superscriptThreshold)
+            : null;
+        for (let ci = 0; ci < line.chars.length; ci++) {
+            const ch = line.chars[ci];
+            if (ci === leadEnd) {
+                textParts.push(" ");
+                source.push(null);
+            }
+            // Line-break de-hyphenation: drop the trailing whitespace after the
+            // last real char, and (join only) the trailing hyphen itself.
+            if (
+                cut &&
+                (ci > cut.lastRealIdx ||
+                    (cut.dropHyphen && ci === cut.lastRealIdx))
+            ) {
+                continue;
+            }
+            if (leadingWhitespace) {
+                if (/\s/.test(ch.c)) continue;
+                leadingWhitespace = false;
+            }
+            if (lineJoins && ch.c === SOFT_HYPHEN) continue;
+            const isSmall =
+                superscriptThreshold > 0 &&
+                bboxHeight(ch.bbox) > 0 &&
+                bboxHeight(ch.bbox) < superscriptThreshold;
+            const isFootnoteMarker =
+                isSmall && FOOTNOTE_MARKER_CHARS.has(ch.c);
+            // A marker glued to a word is dropped; the space or punctuation
+            // after it follows the word directly.
+            if (gluedMarkers?.has(ci)) continue;
+            if (
+                isFootnoteMarker &&
+                (inFootnoteRun ||
+                    (lastEmittedNonWhitespaceRealChar !== null &&
+                        SENTENCE_END_PUNCT.has(lastEmittedNonWhitespaceRealChar)))
+            ) {
+                if (!inFootnoteRun) {
+                    textParts.push(" ");
+                    source.push(null);
+                    inFootnoteRun = true;
+                }
+                continue;
+            }
+            inFootnoteRun = false;
+            if (!/\s/.test(ch.c)) {
+                lastEmittedNonWhitespaceRealChar = ch.c;
+            }
+            textParts.push(ch.c);
+            for (let u = 0; u < ch.c.length; u++) {
+                source.push({ lineIndex: li, charIndex: ci });
+            }
+        }
+        // Inter-line filler. Suppressed across a de-hyphenated break so the two
+        // halves of the split word are concatenated directly.
+        if (li < lines.length - 1 && !cut) {
+            textParts.push(" ");
+            source.push(null);
+        }
+    }
+    return { text: textParts.join(""), source, lines };
+}
+
+/**
+ * Safe wrapper around `buildParagraphText` that catches invariant
+ * violations and returns them as `{ error }` instead of throwing.
+ * Used by the pipeline for graceful degradation — a single malformed
+ * line on one paragraph should not nuke the whole page.
+ */
+export function tryBuildParagraphText(
+    lines: RawLineDetailed[],
+    vocabulary?: ReadonlySet<string>,
+    options: ParagraphTextOptions = {},
+):
+    | { ok: true; paragraphText: ParagraphText }
+    | { ok: false; error: string } {
+    try {
+        return { ok: true, paragraphText: buildParagraphText(lines, vocabulary, options) };
+    } catch (err) {
+        return {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+        };
+    }
+}
+
+function itemLinesFromDetailed(lines: RawLineDetailed[]): ItemLine[] {
+    return lines.map((line) => ({
+        text: line.text,
+        bbox: line.bbox,
+        fontSize: line.font?.size,
+    }));
+}
+
+function itemFromDraft(
+    item: DraftItem,
+    pageIndex: number,
+    index: number,
+    lines: ItemLine[],
+): TextItem | SectionHeaderItem | CaptionItem | ReferenceItem | FootnoteItem | MarginItem {
+    const text = publicItemText(item);
+    const base: Omit<TextBearingItem, "kind"> = {
+        id: `p${pageIndex}:i${index}`,
+        pageIndex,
+        index,
+        bbox: item.bbox,
+        columnIndex: item.columnIndex,
+        text,
+        lines: lines.length > 0 ? lines : [{ text, bbox: item.bbox }],
+    };
+    switch (item.kind) {
+        case "reference":
+            return { ...base, kind: "reference" };
+        case "section_header":
+            return { ...base, kind: "section_header", level: 1 };
+        case "text":
+            return { ...base, kind: "text" };
+        case "caption":
+            return { ...base, kind: "caption" };
+        case "footnote":
+            return { ...base, kind: "footnote" };
+        case "margin":
+            return { ...base, kind: "margin" };
+    }
+}
+
+function fallbackSentenceFromItem(item: SentenceBearingItem): SentenceItem {
+    return {
+        parentId: item.id,
+        index: 0,
+        text: item.text,
+        bboxes: [item.bbox],
+        fragments: [
+            {
+                lineIndex: 0,
+                text: item.text,
+                bbox: item.bbox,
+            },
+        ],
+    };
+}
+
+/**
+ * Resolve sentence ranges within a `ParagraphText` to `SentenceItem[]`.
+ *
+ * Uses the same `sentenceToBoxes` core that `SentenceMapper` uses page-wide,
+ * but with a paragraph-local line array so the `lineIndex` values refer to
+ * the paragraph's lines.
+ */
+function resolveSentencesInParagraph(
+    paragraphText: ParagraphText,
+    parentId: string,
+    splitter: SentenceSplitter,
+): SentenceItem[] {
+    // Reuse the page-wide sentenceToBoxes by repackaging as a PageText view
+    // of the paragraph. The line array is identical; the source indices are
+    // already paragraph-local.
+    const pageTextView: PageText = {
+        text: paragraphText.text,
+        source: paragraphText.source,
+        lines: paragraphText.lines,
+    };
+    const ranges: SentenceRange[] = splitter(paragraphText.text, {
+        source: paragraphText.source,
+    });
+    const out: SentenceItem[] = [];
+    for (const range of ranges) {
+        const s = sentenceToBoxes(
+            pageTextView,
+            range,
+            0,
+            out.length,
+        );
+        if (!s) continue;
+        out.push({
+            parentId,
+            index: out.length,
+            text: s.text,
+            bboxes: s.bboxes,
+            fragments: s.fragments,
+        });
+    }
+    return out;
+}
+
+function inverseRotateItem(
+    item: DocItem,
+    pageRotation: RotationAngle,
+    sourceWidth: number,
+    sourceHeight: number,
+): void {
+    item.bbox = inverseRotateBBox(item.bbox, pageRotation, sourceWidth, sourceHeight);
+    if ("lines" in item) {
+        for (const line of item.lines) {
+            line.bbox = inverseRotateBBox(line.bbox, pageRotation, sourceWidth, sourceHeight);
+        }
+    }
+    if (carriesSentences(item) && item.sentences) {
+        for (const sentence of item.sentences) {
+            for (let i = 0; i < sentence.bboxes.length; i++) {
+                sentence.bboxes[i] = inverseRotateBBox(
+                    sentence.bboxes[i],
+                    pageRotation,
+                    sourceWidth,
+                    sourceHeight,
+                );
+            }
+            for (const fragment of sentence.fragments ?? []) {
+                fragment.bbox = inverseRotateBBox(
+                    fragment.bbox,
+                    pageRotation,
+                    sourceWidth,
+                    sourceHeight,
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level: page → paragraph-scoped sentences
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for `extractPageSentences`.
+ */
+export interface PageSentenceOptions {
+    /**
+     * Splitter callback. Defaults to `simpleRegexSentenceSplit` at this
+     * layer. Worker callers resolve a sentencex-backed splitter from a
+     * serializable config before invoking the mapper; tests and fixture
+     * replay can still pass function-valued splitters directly. The
+     * default is kept regex-only so the mapper module has no implicit WASM
+     * dependency and stays trivially testable.
+     */
+    splitter?: SentenceSplitter;
+    /**
+     * BCP-47 / ISO 639-1 language code, used by callers higher up the
+     * stack (e.g. `AsterMarginExtractor.extract({ mode: "structured" })`) to
+     * construct a language-tuned splitter. This field is informational
+     * at the mapper layer — if `splitter` is set it takes precedence
+     * and `language` is ignored.
+     */
+    language?: string;
+    /** Forwarded to `detectParagraphs`. */
+    paragraphSettings?: ParagraphDetectionSettings;
+    /**
+     * If provided, skip running columns + lines + paragraphs and map these
+     * draft items (`draftItemsFromParagraphs`, edited by any item passes).
+     * Useful when the caller already ran the line / paragraph pipeline and
+     * wants to add sentence bboxes without re-doing detection.
+     *
+     * Rotation handshake: when `pageRotation !== 0`, the supplied
+     * `items` are in the **upright working frame** (the
+     * upstream `FilteredParagraphPipeline` rotated the raw page before
+     * column/paragraph detection). The mapper normalizes the
+     * `detailedPage` argument with the same rotation before
+     * `buildDetailedLineLookup` so the bbox-key invariant holds, then
+     * inverse-rotates every emitted bbox back to MuPDF frame using
+     * `sourceWidth` / `sourceHeight`. Omitting these (or leaving
+     * `pageRotation = 0`) preserves the existing un-rotated path.
+     */
+    precomputed?: {
+        items: readonly DraftItem[];
+        pageRotation?: RotationAngle;
+        sourceWidth?: number;
+        sourceHeight?: number;
+    };
+    /**
+     * Cross-page analysis window for smart-removal and document-wide
+     * style profiling. Currently informational at this layer (the
+     * worker resolves the analysis page set upstream); kept here for
+     * documentation parity with `AsterMarginExtractor.extract({ mode:
+     * "structured" })`.
+     *   - 0 (default) = analyze only the target page
+     *   - positive N  = ±N pages around the target page
+     *   - Infinity    = whole document
+     */
+    analysisWindow?: number;
+    /**
+     * Document-wide vocabulary of genuine hyphenated compounds (lowercased,
+     * e.g. "broken-windows"). When a word is split across a line break, the
+     * mapper keeps the hyphen if the joined compound is in this set and
+     * otherwise joins the halves (the default for the dominant soft-hyphen
+     * case). Built once per document by the worker from the analysis-window
+     * line text; absent ⇒ every line-break hyphen joins. See
+     * `collectHyphenatedCompounds` / `decideLineBreakHyphen`.
+     */
+    compoundVocabulary?: ReadonlySet<string>;
+}
+
+/**
+ * Full pipeline: take a detailed page, run column + line + paragraph
+ * detection, then produce paragraph-scoped sentence bboxes.
+ *
+ * This is the paragraph-scoped counterpart to
+ * `SentenceMapper.extractPageWideSentences`. Either may be used; they do not
+ * interfere with one another.
+ */
+export function extractPageSentences(
+    detailedPageInput: RawPageDataDetailed,
+    options: PageSentenceOptions = {},
+): PageSentenceResult {
+    const splitter = options.splitter ?? simpleRegexSentenceSplit;
+
+    // Rotation handshake. When the caller pre-rotated their raw page
+    // for column/paragraph detection, mirror the same rotation here so
+    // the detailed lines used by `buildDetailedLineLookup` live in the
+    // same frame as the precomputed paragraph lines they need to match
+    // against. `sourceWidth` / `sourceHeight` are the original MuPDF
+    // dims used to inverse-rotate every output bbox at the end.
+    const pageRotation: RotationAngle = options.precomputed?.pageRotation ?? 0;
+    const sourceWidth =
+        options.precomputed?.sourceWidth ?? detailedPageInput.width;
+    const sourceHeight =
+        options.precomputed?.sourceHeight ?? detailedPageInput.height;
+    const detailedPage =
+        pageRotation === 0
+            ? detailedPageInput
+            : rotateRawPageDetailed(detailedPageInput, pageRotation).page;
+
+    // 1. Column + line detection.
+    //    `RawPageDataDetailed` is structurally a `RawPageData`, so the
+    //    existing detectors accept it unchanged — they just ignore the
+    //    extra `chars` field on each line.
+    let draftItems: readonly DraftItem[];
+    if (options.precomputed) {
+        draftItems = options.precomputed.items;
+    } else {
+        const columnResult = detectColumns(detailedPage);
+        const lineResult = detectLinesOnPage(detailedPage, columnResult.columns, {
+            exclusiveColumns: options.paragraphSettings?.exclusiveColumnLines ?? CURRENT_PDF_EXTRACTION_PRESET.exclusiveColumnLines,
+        });
+        draftItems = draftItemsFromParagraphs(detectParagraphs(
+            lineResult,
+            null,
+            options.paragraphSettings ?? {},
+            { paragraph: 0, header: 0 },
+            { trackItemLines: true },
+        ));
+    }
+
+    const detailedLookup = buildDetailedLineLookup(detailedPage);
+
+    const items: DocItem[] = [];
+    const flatSentences: SentenceItem[] = [];
+    let degradedCount = 0;
+    const degradationNotes: DegradationNote[] = [];
+    // Uncapped — `degradationNotes` itself is bounded by MAX_DEGRADATION_NOTES,
+    // but the column-continuation pass needs to skip every degraded paragraph,
+    // not just the first 50.
+    const degradedItems = new Set<string>();
+    const addNote = (note: DegradationNote) => {
+        if (degradationNotes.length < MAX_DEGRADATION_NOTES) {
+            degradationNotes.push(note);
+        }
+    };
+
+    for (let i = 0; i < draftItems.length; i++) {
+        const item = draftItems[i];
+        const detailedLines = collectDetailedLinesForParagraph(
+            item.lines,
+            detailedLookup,
+        );
+
+        // Degradation path 1: paragraph could not be mapped back to any
+        // detailed line. We still want a usable SentenceItem for the
+        // caller, so we emit a fallback covering the whole paragraph.
+        if (detailedLines.length === 0) {
+            const docItem = itemFromDraft(item, detailedPage.pageIndex, i, []);
+            degradedCount++;
+            degradedItems.add(docItem.id);
+            addNote({ itemId: docItem.id, itemKind: docItem.kind, reason: "unmapped" });
+            if (carriesSentences(docItem)) {
+                const fallback = fallbackSentenceFromItem(docItem);
+                docItem.sentences = [fallback];
+                flatSentences.push(fallback);
+            }
+            items.push(docItem);
+            continue;
+        }
+
+        // Degradation path 2: text/chars invariant failed on this paragraph.
+        // Caught here so one malformed line doesn't crash the whole page.
+        const built = tryBuildParagraphText(
+            detailedLines,
+            options.compoundVocabulary,
+            {
+                lineJoins: options.paragraphSettings?.lineJoins ?? CURRENT_PDF_EXTRACTION_PRESET.lineJoins,
+                noteMarkers: options.paragraphSettings?.noteMarkers ?? CURRENT_PDF_EXTRACTION_PRESET.noteMarkers,
+                leadMarker: item.kind === "footnote",
+            },
+        );
+        if (!built.ok) {
+            const docItem = itemFromDraft(item, detailedPage.pageIndex, i, []);
+            degradedCount++;
+            degradedItems.add(docItem.id);
+            addNote({
+                itemId: docItem.id,
+                itemKind: docItem.kind,
+                reason: "invariant_violation",
+                message: built.error,
+            });
+            if (carriesSentences(docItem)) {
+                const fallback = fallbackSentenceFromItem(docItem);
+                docItem.sentences = [fallback];
+                flatSentences.push(fallback);
+            }
+            items.push(docItem);
+            continue;
+        }
+
+        const paragraphText = built.paragraphText;
+        const docItem = itemFromDraft(
+            item,
+            detailedPage.pageIndex,
+            i,
+            itemLinesFromDetailed(detailedLines),
+        );
+
+        // Headings, references and margin items: never split into
+        // sentences, and excluded from the flattened sentence view.
+        if (!carriesSentences(docItem)) {
+            if (docItem.kind === "reference") {
+                // A reference has no sentences to carry the repaired text, so
+                // its own text takes it: line-break hyphens are resolved per
+                // the compound vocabulary and URLs ("…/research-" + "article.pdf"
+                // keeps its hyphen), unlike the detector's naive join.
+                const repaired = paragraphText.text.replace(/ +/g, " ").trim();
+                if (repaired) docItem.text = repaired;
+            }
+            items.push(docItem);
+            continue;
+        }
+
+        // Happy path (body paragraph).
+        const sentences = resolveSentencesInParagraph(
+            paragraphText,
+            docItem.id,
+            splitter,
+        );
+
+        // Degradation path 3: splitter returned no sentences for a paragraph
+        // with real content. Emit one fallback so the paragraph is still
+        // addressable, but mark it degraded so the caller can tell.
+        if (sentences.length === 0 && paragraphText.text.trim().length > 0) {
+            degradedCount++;
+            degradedItems.add(docItem.id);
+            addNote({ itemId: docItem.id, itemKind: docItem.kind, reason: "empty_split" });
+            const fallback = fallbackSentenceFromItem(docItem);
+            docItem.sentences = [fallback];
+            flatSentences.push(fallback);
+            items.push(docItem);
+            continue;
+        }
+
+        docItem.sentences = sentences;
+        flatSentences.push(...sentences);
+        items.push(docItem);
+    }
+
+    // Mutates `joinWithNext` on last sentences of text items whose successor
+    // is the start of a sentence that crosses a column boundary. `items`
+    // and `flatSentences` share SentenceItem object identity, so the flag is
+    // visible through both.
+    //
+    // Runs BEFORE the inverse-rotation step so the LTR geometric gate
+    // in `nextStartsStrictlyRightOfPrev` (and similar geometric
+    // heuristics) operates on upright bboxes — that's the frame those
+    // gates were tuned for.
+    annotateColumnContinuations(
+        items,
+        splitter,
+        degradedItems,
+        {
+            endColumns: draftItems.map((item) => item.endColumnIndex ?? item.columnIndex),
+            skipInserts: options.paragraphSettings?.noteMarkers ?? CURRENT_PDF_EXTRACTION_PRESET.noteMarkers,
+        },
+    );
+
+    // Inverse-rotate every emitted bbox back to MuPDF frame so
+    // downstream consumers see the same coord system regardless of whether
+    // the pipeline normalized internally.
+    if (pageRotation !== 0) {
+        for (const item of items) {
+            inverseRotateItem(item, pageRotation, sourceWidth, sourceHeight);
+        }
+    }
+
+    return {
+        pageIndex: detailedPage.pageIndex,
+        // Report MuPDF-frame dims so downstream consumers (e.g. the
+        // annotation layer's `applyRotationToBoundingBox`) get the
+        // pre-normalization page geometry.
+        width: sourceWidth,
+        height: sourceHeight,
+        items,
+        sentences: flatSentences,
+        degradation:
+            degradedCount > 0
+                ? { count: degradedCount, notes: degradationNotes }
+                : undefined,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Column-continuation annotator (sets SentenceItem.joinWithNext)
+// ---------------------------------------------------------------------------
+
+function startsWithLowercase(text: string): boolean {
+    const trimmed = text.replace(/^\s+/u, "");
+    if (!trimmed) return false;
+    return /^\p{Ll}/u.test(trimmed);
+}
+
+/**
+ * Returns true when `text` has more `(` than `)` — i.e. it ends inside an
+ * unclosed parenthetical. Used as a structural continuation marker so the
+ * column-boundary heuristic accepts mid-parenthetical splits whose right side
+ * begins with a capitalized proper noun (e.g. "(for research on" / "NYC, see
+ * Durán-Narucki 2008).") instead of being blocked by the lowercase-start gate.
+ *
+ * Square brackets and braces are intentionally not counted — the only
+ * structurally common cross-column split shape we observe is round-paren
+ * citations, and broadening the rule would invite false positives without
+ * concrete fixture evidence.
+ */
+function hasUnclosedParen(text: string): boolean {
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === "(") depth++;
+        else if (c === ")" && depth > 0) depth--;
+    }
+    return depth > 0;
+}
+
+/**
+ * Geometric gate: in an LTR multi-column layout, a continuation paragraph in
+ * column N+1 sits **entirely to the right** of column N's rightmost extent.
+ * If `next`'s leftmost bbox starts to the left of (or overlaps with) `prev`'s
+ * rightmost bbox edge, the two are not in a clean column-to-column relation
+ * — typical false-positive shape is a full-width figure-caption / banner
+ * paragraph (bbox spans both columns) followed by a left-column body
+ * paragraph that resumes the previous page's text.
+ *
+ * Uses MAX(x+w) over `prev.bboxes` and MIN(x) over `next.bboxes` so multi-
+ * fragment sentences (wrapped across several lines) are evaluated at their
+ * widest extent, not just the last fragment.
+ *
+ * **LTR only.** The producer's other gates (lowercase-start in particular)
+ * are already LTR-biased — RTL layouts and scripts without case never reach
+ * here today. Documented as out of scope; revisit alongside RTL paragraph
+ * detection.
+ */
+function nextStartsStrictlyRightOfPrev(
+    prev: SentenceItem,
+    next: SentenceItem,
+): boolean {
+    if (prev.bboxes.length === 0 || next.bboxes.length === 0) return false;
+    let prevMaxRight = -Infinity;
+    for (const b of prev.bboxes) {
+        if (b.r > prevMaxRight) prevMaxRight = b.r;
+    }
+    let nextMinLeft = Infinity;
+    for (const b of next.bboxes) {
+        if (b.l < nextMinLeft) nextMinLeft = b.l;
+    }
+    return nextMinLeft >= prevMaxRight;
+}
+
+/**
+ * Decide whether a (last sentence, first sentence) pair across consecutive
+ * columns should be joined. Pure heuristic — no I/O.
+ */
+function shouldJoinAcrossColumns(
+    prev: SentenceItem,
+    next: SentenceItem,
+    splitter: SentenceSplitter,
+): boolean {
+    const lastText = prev.text;
+    const firstText = next.text;
+
+    // A trailing hyphen ("ge-" / "nomes") is a strong continuation indicator,
+    // not a reason to skip — word-level rejoining is a downstream consumer
+    // concern, not the producer's. Only sentence-final terminators block.
+    if (hasSentenceFinalTerminator(lastText)) return false;
+    // Gate 7: next must look like a continuation. Default test is "starts with
+    // a lowercase letter". The unclosed-paren bypass covers the cross-column
+    // parenthetical-citation case (see `hasUnclosedParen`); the splitter check
+    // below still adjudicates either way.
+    if (
+        !startsWithLowercase(firstText) &&
+        !hasUnclosedParen(lastText)
+    ) {
+        return false;
+    }
+    // Geometric gate: next paragraph must start strictly to the right of
+    // prev's rightmost extent (LTR-only — see `nextStartsStrictlyRightOfPrev`).
+    // Catches full-width figure-caption → left-column-body false positives.
+    if (!nextStartsStrictlyRightOfPrev(prev, next)) return false;
+
+    const left = lastText.replace(/\s+$/u, "");
+    const right = firstText.replace(/^\s+/u, "");
+    if (!left || !right) return false;
+    const combined = `${left} ${right}`;
+
+    const ranges = splitter(combined);
+    if (ranges.length !== 1) return false;
+
+    const r = ranges[0];
+    // Splitter must cover the whole combined string (allowing trailing
+    // whitespace, which `simpleRegexSentenceSplit` strips and sentencex may
+    // also exclude). We accept a single range that starts at 0 and reaches
+    // the trimmed end.
+    if (r.start !== 0) return false;
+    let end = combined.length;
+    while (end > 0 && /\s/.test(combined[end - 1])) end--;
+    return r.end >= end;
+}
+
+/** Options of `annotateColumnContinuations`. */
+export interface ColumnContinuationOptions {
+    /**
+     * Column index each item ends in, aligned with `items`; defaults to each
+     * item's `columnIndex`. An item the detector joined across stacked blocks
+     * ends in a later block than it starts in (`ContentItem.endColumnIndex`).
+     */
+    endColumns?: readonly number[];
+    /**
+     * The item that continues a text item is the next one that is not an
+     * insert: a footnote, caption, table or figure
+     * (`ParagraphDetectionSettings.noteMarkers`).
+     */
+    skipInserts?: boolean;
+}
+
+/**
+ * Items printed apart from the running text: a sentence goes on past them to
+ * its continuation (`SentenceItem.joinWithNext`).
+ */
+const INSERT_KINDS: ReadonlySet<DocItem["kind"]> = new Set(["footnote", "caption", "table", "picture"]);
+
+/**
+ * A text item too short to be the running text a figure interrupts: an axis
+ * label, table cell, legend entry or margin line number left as `text`.
+ */
+function isTextFragment(item: DocItem): boolean {
+    const text = item.text.trim();
+    return text.length < 40 && text.split(/\s+/).length < 5;
+}
+
+/**
+ * Set `SentenceItem.joinWithNext = true` on the last sentence of each text
+ * item whose successor (in reading order) begins a sentence that continues
+ * the previous one across a column boundary.
+ *
+ * Conservative: requires strictly consecutive columns (`col` → `col + 1`,
+ * from the column the item ends in: `endColumns`; columns that only skipped
+ * inserts take up don't count),
+ * both sides text items, last sentence non-terminated, first sentence
+ * lowercase-starting, and the splitter must agree the combined text is one
+ * sentence. Only sets the flag — never writes `false` (omitted ≡ false per
+ * `SentenceItem.joinWithNext` contract). Stale `true` values from prior calls
+ * on the same array are cleared at evaluation time so the helper is
+ * idempotent under repeated invocation.
+ *
+ * Mutates `items[i].sentences[last].joinWithNext` in place. Because the
+ * caller's flat view shares SentenceItem object identity with
+ * `items[i].sentences`, the flag is observable through both.
+ *
+ * With `skipInserts`, the item that continues a text item is the next one
+ * that is not a footnote, caption, table or figure: on a two-column page with
+ * notes or a captioned figure under the first column, the column's last
+ * paragraph goes on in the second column after them. Past a caption, table or
+ * figure, the item must be more than a fragment of a few words: figure and
+ * table text left as `text` sits just before the caption.
+ *
+ * @internal Public surface is `extractPageSentences`; this helper is
+ * exported for direct unit testing.
+ */
+export function annotateColumnContinuations(
+    items: DocItem[],
+    splitter: SentenceSplitter,
+    degradedItems: ReadonlySet<string>,
+    { endColumns, skipInserts = false }: ColumnContinuationOptions = {},
+): void {
+    const endColumn = (k: number) => endColumns?.[k] ?? items[k].columnIndex;
+    for (let i = 0; i < items.length - 1; i++) {
+        const cur = items[i];
+        let j = i + 1;
+        // Inserts set apart from the columns of text (a caption under a
+        // figure, a column's notes) can be blocks of their own.
+        const insertColumns = new Set<number>();
+        let skipsFigure = false;
+        while (skipInserts && j < items.length - 1 && INSERT_KINDS.has(items[j].kind)) {
+            for (let c = items[j].columnIndex; c <= endColumn(j); c++) insertColumns.add(c);
+            if (items[j].kind !== "footnote") skipsFigure = true;
+            j++;
+        }
+        const next = items[j];
+        const curSentences = cur.kind === "text" ? cur.sentences ?? [] : [];
+        const nextSentences = next.kind === "text" ? next.sentences ?? [] : [];
+        const lastSentence = curSentences[curSentences.length - 1];
+
+        // Always clear any stale flag before re-evaluating; only set on
+        // success below. Prevents leftover `true` from a prior call on a
+        // mutated test array.
+        if (lastSentence) delete lastSentence.joinWithNext;
+
+        if (!lastSentence) continue;
+        if (cur.kind !== "text" || next.kind !== "text") {
+            continue;
+        }
+        // The next column, or the first after the ones its inserts take up.
+        let column = endColumn(i) + 1;
+        while (column < next.columnIndex && insertColumns.has(column)) column++;
+        if (column !== next.columnIndex) continue;
+        if (degradedItems.has(cur.id) || degradedItems.has(next.id)) continue;
+        // Text left over from a figure or table sits just before its caption;
+        // the sentence the figure interrupts is a paragraph of running text.
+        if (skipsFigure && isTextFragment(cur)) continue;
+        const firstSentence = nextSentences[0];
+        if (!firstSentence) continue;
+
+        if (shouldJoinAcrossColumns(lastSentence, firstSentence, splitter)) {
+            lastSentence.joinWithNext = true;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feasibility report — mirrors SentenceMapper.buildFeasibilityReport
+// ---------------------------------------------------------------------------
+
+export interface PageSentenceFeasibilityReport {
+    pageIndex: number;
+    itemCount: number;
+    itemsByKind: Partial<Record<DocItem["kind"], number>>;
+    /**
+     * Degradation summary copied from `extractPageSentences`. Omitted
+     * when no items degraded.
+     */
+    degradation?: DegradationSummary;
+    totalSentences: number;
+    multiFragmentSentences: number;
+    invariantHolds: boolean;
+    allBBoxesInPage: boolean;
+    /** First N items with their sentence summaries, for inspection. */
+    items: Array<{
+        index: number;
+        itemKind: DocItem["kind"];
+        numLines: number;
+        text: string;
+        numSentences: number;
+        sentences: Array<{
+            text: string;
+            numBBoxes: number;
+            unionBBox: BoundingBox;
+        }>;
+    }>;
+}
+
+function unionBBoxes(bboxes: BoundingBox[]): BoundingBox {
+    return mergeBoxes(bboxes);
+}
+
+export function buildPageSentenceFeasibilityReport(
+    detailedPage: RawPageDataDetailed,
+    options: PageSentenceOptions = {},
+    maxParagraphs = 10,
+    maxSentencesPerParagraph = 5,
+): PageSentenceFeasibilityReport {
+    let invariantHolds = true;
+    try {
+        // Proactively validate text/chars lockstep — buildParagraphText will
+        // throw if broken, but we also want a clean boolean for the report.
+        for (const block of detailedPage.blocks) {
+            if (block.type !== "text" || !block.lines) continue;
+            for (const line of block.lines) {
+                if (!lineTextMatchesChars(line)) {
+                    invariantHolds = false;
+                    break;
+                }
+            }
+            if (!invariantHolds) break;
+        }
+    } catch {
+        invariantHolds = false;
+    }
+
+    const result = extractPageSentences(detailedPage, options);
+
+    let multi = 0;
+    let allBBoxesInPage = true;
+    const tolerance = 1.0;
+    for (const s of result.sentences) {
+        if (s.bboxes.length > 1) multi++;
+        for (const b of s.bboxes) {
+            if (
+                b.l < -tolerance ||
+                b.t < -tolerance ||
+                b.r > detailedPage.width + tolerance ||
+                b.b > detailedPage.height + tolerance
+            ) {
+                allBBoxesInPage = false;
+                break;
+            }
+        }
+        if (!allBBoxesInPage) break;
+    }
+
+    const itemsByKind: Partial<Record<DocItem["kind"], number>> = {};
+    for (const item of result.items) {
+        itemsByKind[item.kind] = (itemsByKind[item.kind] ?? 0) + 1;
+    }
+
+    const previews = result.items.slice(0, maxParagraphs).map((item, idx) => {
+        const sentences = carriesSentences(item) ? item.sentences ?? [] : [];
+        return {
+            index: idx,
+            itemKind: item.kind,
+            numLines: "lines" in item ? item.lines.length : 0,
+            text:
+                "text" in item && item.text.length > 120
+                    ? item.text.slice(0, 120) + "…"
+                    : "text" in item ? item.text : "",
+            numSentences: sentences.length,
+            sentences: sentences.slice(0, maxSentencesPerParagraph).map((s) => ({
+                text: s.text.length > 80 ? s.text.slice(0, 80) + "…" : s.text,
+                numBBoxes: s.bboxes.length,
+                unionBBox: unionBBoxes(s.bboxes),
+            })),
+        };
+    });
+
+    return {
+        pageIndex: detailedPage.pageIndex,
+        itemCount: result.items.length,
+        itemsByKind,
+        degradation: result.degradation,
+        totalSentences: result.sentences.length,
+        multiFragmentSentences: multi,
+        invariantHolds,
+        allBBoxesInPage,
+        items: previews,
+    };
+}

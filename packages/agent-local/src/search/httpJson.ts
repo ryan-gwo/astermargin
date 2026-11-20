@@ -1,0 +1,195 @@
+/**
+ * JSON fetch with the manners a free-tier API expects.
+ *
+ * Returns a result rather than throwing: a caller merging two sources needs to
+ * report one failure alongside the other's results, and an exception would
+ * discard both.
+ *
+ * Retries what retrying can fix — 429, 5xx, and a thrown network error (e.g. a
+ * dropped connection) — up to `maxAttempts`. A 4xx other than 429 means the
+ * query itself was wrong and will be wrong again, so those fail immediately.
+ * A 429 that reports an exhausted daily budget (see `isExhaustedBudget`) also
+ * fails immediately, on the first attempt — no amount of retrying resolves it
+ * before the source's own reset.
+ *
+ * `sleep` and `now` are injected so tests are deterministic and fast. `sleep`
+ * takes the caller's `AbortSignal` so a backoff wait is interruptible — Stop
+ * must not have to wait out an 8-second retry delay.
+ */
+
+export const DEFAULT_TIMEOUT_MS = 10_000;
+export const DEFAULT_MAX_ATTEMPTS = 3;
+const BASE_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 8_000;
+
+export interface HttpJsonOptions {
+    url: string;
+    headers?: Record<string, string>;
+    signal: AbortSignal;
+    timeoutMs?: number;
+    maxAttempts?: number;
+    sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+export type HttpJsonResult<T> =
+    | { ok: true; data: T }
+    | { ok: false; error: string; status: number | null };
+
+/**
+ * Waits `ms`, or returns as soon as `signal` aborts — whichever comes first —
+ * always clearing its timer and removing its listener so neither outlives the
+ * call. Exported for direct testing; `fetchJson` and `HostGate` use it as
+ * their default.
+ */
+export function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+        if (signal.aborted) {
+            resolve();
+            return;
+        }
+        const onAbort = () => {
+            clearTimeout(timer);
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+        };
+        const timer = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        signal.addEventListener('abort', onAbort);
+    });
+}
+
+const isRetryable = (status: number): boolean => status === 429 || status >= 500;
+
+/** Prefer the server's own advice over our backoff schedule. */
+const retryAfterMs = (value: string | null): number | null => {
+    if (!value) return null;
+    const seconds = Number(value);
+    return Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, MAX_BACKOFF_MS) : null;
+};
+
+/**
+ * A `Retry-After` this much longer than our own backoff schedule signals a
+ * quota reset, not a moment to wait out — retrying would just burn another
+ * attempt for the same answer.
+ */
+const RETRY_AFTER_GIVE_UP_SECONDS = 60;
+
+/**
+ * A 429 whose daily budget is spent will not succeed no matter how soon it is
+ * retried, unlike a transient per-second rate limit — retrying either wastes
+ * an attempt (a source like OpenAlex counts failed requests for free, so no
+ * quota is lost, but the caller still burns a round) or, for a caller that
+ * does count failures, makes the situation worse. OpenAlex documents
+ * `X-RateLimit-Remaining: 0` as exactly this signal; a `Retry-After` far
+ * longer than any transient limit would ever ask for is the same signal from
+ * a source that expresses it in seconds instead.
+ */
+const isExhaustedBudget = (headers: { get(name: string): string | null }): boolean => {
+    if (headers.get('X-RateLimit-Remaining') === '0') return true;
+    const retryAfterSeconds = Number(headers.get('Retry-After'));
+    return Number.isFinite(retryAfterSeconds) && retryAfterSeconds > RETRY_AFTER_GIVE_UP_SECONDS;
+};
+
+export async function fetchJson<T>(options: HttpJsonOptions): Promise<HttpJsonResult<T>> {
+    const {
+        url,
+        headers,
+        signal,
+        timeoutMs = DEFAULT_TIMEOUT_MS,
+        maxAttempts = DEFAULT_MAX_ATTEMPTS,
+        sleep = defaultSleep,
+    } = options;
+
+    let lastStatus: number | null = null;
+    let lastError = 'The request failed.';
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (signal.aborted) return { ok: false, error: 'Cancelled.', status: null };
+
+        // A per-attempt timeout that also respects the caller's cancellation.
+        const timer = new AbortController();
+        const onAbort = () => timer.abort();
+        signal.addEventListener('abort', onAbort);
+        const timeout = setTimeout(() => timer.abort(), timeoutMs);
+
+        try {
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: { Accept: 'application/json', ...headers },
+                signal: timer.signal,
+            });
+
+            if (response.ok) {
+                return { ok: true, data: (await response.json()) as T };
+            }
+
+            lastStatus = response.status;
+            lastError = `${response.status} ${response.statusText}`;
+
+            const givesUpNow =
+                !isRetryable(response.status) ||
+                attempt === maxAttempts - 1 ||
+                (response.status === 429 && isExhaustedBudget(response.headers));
+
+            if (givesUpNow) {
+                return { ok: false, error: lastError, status: lastStatus };
+            }
+
+            const advised = retryAfterMs(response.headers.get('Retry-After'));
+            await sleep(advised ?? Math.min(BASE_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS), signal);
+        } catch (error) {
+            if (signal.aborted) return { ok: false, error: 'Cancelled.', status: null };
+            lastStatus = null;
+            lastError = error instanceof Error ? error.message : String(error);
+            if (attempt === maxAttempts - 1) {
+                return { ok: false, error: lastError, status: null };
+            }
+            await sleep(Math.min(BASE_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS), signal);
+        } finally {
+            clearTimeout(timeout);
+            signal.removeEventListener('abort', onAbort);
+        }
+    }
+
+    return { ok: false, error: lastError, status: lastStatus };
+}
+
+export interface HostGateDeps {
+    sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+    now?: () => number;
+}
+
+/**
+ * Spaces requests to one host, so a burst of tool calls does not earn a ban.
+ *
+ * Deliberately simple: serialised waiters, no token bucket. Local mode makes a
+ * handful of requests per run, not a stream. Callers keep one instance per
+ * host at module scope, so pacing holds across repeated catalog rebuilds
+ * within the same process rather than resetting on every call site.
+ */
+export class HostGate {
+    private nextAllowedAt = 0;
+    private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+    private readonly now: () => number;
+
+    constructor(
+        private readonly minIntervalMs: number,
+        deps: HostGateDeps = {}
+    ) {
+        this.sleep = deps.sleep ?? defaultSleep;
+        this.now = deps.now ?? (() => performance.now());
+    }
+
+    async wait(signal: AbortSignal): Promise<void> {
+        if (signal.aborted) return;
+        const delay = this.nextAllowedAt - this.now();
+        if (delay > 0) await this.sleep(delay, signal);
+        // An aborted wait never happened as far as pacing is concerned — the
+        // request it was gating won't be made, so it must not consume this
+        // host's slot and delay the next, real request.
+        if (signal.aborted) return;
+        this.nextAllowedAt = this.now() + this.minIntervalMs;
+    }
+}

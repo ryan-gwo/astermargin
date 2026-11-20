@@ -1,0 +1,392 @@
+/**
+ * Reader toolbar dropdown menu: adds a AsterMargin button to the PDF reader toolbar.
+ *
+ * On click the button opens a XUL menupopup with:
+ *   1. "Ask AsterMargin"          — opens sidebar & focuses input
+ *   2. Attachment actions     — same customisable list as the library context menu
+ *   3. "Add custom action…"  — opens Preferences → Actions tab
+ *
+ * Lives in the esbuild bundle — must NOT import from react/store or Jotai.
+ */
+
+import { captureReaderActionLocation } from '../runtime/readerActionLocation';
+import { resolveChatWindow } from '../runtime/navigation';
+
+import { getMergedActions } from './zoteroContextMenu';
+import {
+    activeAgentPageViewSchema,
+    disposeAllAgentPageViews,
+    hideAgentPageView,
+    showAgentPageView,
+} from './agentPageView';
+import { openPreferencesWindow } from '../ui/openPreferencesWindow';
+import { ActionCategory, KnownActionCategory } from '@astermargin/agent-core/types/actions';
+
+// Module-level handler reference for cleanup
+let toolbarHandler: ((event: any) => void) | null = null;
+
+// Cached SVG strings fetched at init time
+let cachedIconSvg: string | null = null;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const ICON_URL = 'chrome://astermargin/content/icons/toolbar-16.svg';
+
+// Inline SVG dropmarker matching the reader's IconChevronDown8 (8x8, currentColor)
+const BUTTON_CLASS = 'astermargin-reader-toolbar-button';
+
+// "Visualize (Schema N)" (what the agent sees on each page) is a development
+// tool, present only in development and staging builds.
+const SHOW_AGENT_PAGE_VIEW =
+    process.env.NODE_ENV === 'development' || process.env.BUILD_ENV === 'staging';
+
+/** PDF schema versions the agent-view visualizer offers, newest first. */
+const AGENT_PAGE_VIEW_SCHEMAS = ['5', '4'];
+
+const DROPMARKER_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" fill="none"><path fill="currentColor" d="m0 2.707 4 4 4-4L7.293 2 4 5.293.707 2z"/></svg>`;
+
+// ---------------------------------------------------------------------------
+// Category icons — match the React UI (homepage launcher, Actions preferences,
+// slash menu). Inline data-URI SVGs because native XUL menuitems can't render
+// React icons. Zap for missing/unknown categories.
+// ---------------------------------------------------------------------------
+
+const CATEGORY_ICON_PATH_ENTRIES = {
+    write: '<path d="M5.07579 17C4.08939 4.54502 12.9123 1.0121 19.9734 2.22417C20.2585 6.35185 18.2389 7.89748 14.3926 8.61125C15.1353 9.38731 16.4477 10.3639 16.3061 11.5847C16.2054 12.4534 15.6154 12.8797 14.4355 13.7322C11.8497 15.6004 8.85421 16.7785 5.07579 17Z"/><path d="M4 22C4 15.5 7.84848 12.1818 10.5 10"/>',
+    research: '<path d="M18.5 17.5L21 20M19 15C19 16.6569 17.6569 18 16 18C14.3431 18 13 16.6569 13 15C13 13.3431 14.3431 12 16 12C17.6569 12 19 13.3431 19 15Z"/><path d="M17 22H5C3.89543 22 3 21.1046 3 20M10 18H5C3.89543 18 3 18.8954 3 20M3 20V8C3 5.17157 3 3.75736 3.87868 2.87868C4.75736 2 6.17157 2 9 2H15C16.8856 2 17.8284 2 18.4142 2.58579C19 3.17157 19 4.11438 19 6V9"/>',
+    organize: '<path d="M8.64298 3.14559L6.93816 3.93362C4.31272 5.14719 3 5.75397 3 6.75C3 7.74603 4.31272 8.35281 6.93817 9.56638L8.64298 10.3544C10.2952 11.1181 11.1214 11.5 12 11.5C12.8786 11.5 13.7048 11.1181 15.357 10.3544L17.0618 9.56638C19.6873 8.35281 21 7.74603 21 6.75C21 5.75397 19.6873 5.14719 17.0618 3.93362L15.357 3.14559C13.7048 2.38186 12.8786 2 12 2C11.1214 2 10.2952 2.38186 8.64298 3.14559Z"/><path d="M20.788 11.0972C20.9293 11.2959 21 11.5031 21 11.7309C21 12.7127 19.6873 13.3109 17.0618 14.5072L15.357 15.284C13.7048 16.0368 12.8786 16.4133 12 16.4133C11.1214 16.4133 10.2952 16.0368 8.64298 15.284L6.93817 14.5072C4.31272 13.3109 3 12.7127 3 11.7309C3 11.5031 3.07067 11.2959 3.212 11.0972"/><path d="M20.3767 16.2661C20.7922 16.5971 21 16.927 21 17.3176C21 18.2995 19.6873 18.8976 17.0618 20.0939L15.357 20.8707C13.7048 21.6236 12.8786 22 12 22C11.1214 22 10.2952 21.6236 8.64298 20.8707L6.93817 20.0939C4.31272 18.8976 3 18.2995 3 17.3176C3 16.927 3.20778 16.5971 3.62334 16.2661"/>',
+    annotate: '<path d="M6.6777 16.2071L8.79289 18.3223M6.6777 16.2071L2.5 20.5H6.5L8.79289 18.3223M6.6777 16.2071C6.28717 15.8166 6.29534 15.1872 6.63537 14.752C7.42742 13.7383 7.71531 12.8216 7.79924 12.1382C7.89158 11.3863 8.07366 10.5734 8.60933 10.0377L9.50122 9.14828M8.79289 18.3223C9.18342 18.7128 9.81278 18.7047 10.248 18.3646C11.2617 17.5726 12.1784 17.2847 12.8618 17.2008C13.6137 17.1084 14.4266 16.9263 14.9623 16.3907L15.8517 15.4988M15.8517 15.4988L9.50122 9.14828M15.8517 15.4988C16.2422 15.8893 16.8754 15.8893 17.2659 15.4988L21.5 11.2647M9.50122 9.14828C9.1107 8.75776 9.1107 8.12459 9.50122 7.73407L13.7353 3.5"/>',
+} satisfies Record<KnownActionCategory, string>;
+
+/** Map so Object.prototype names (`constructor`, …) don't inherit a function. */
+const CATEGORY_ICON_PATHS = new Map<string, string>(Object.entries(CATEGORY_ICON_PATH_ENTRIES));
+
+const FALLBACK_ICON_PATH = '<path d="M8.62814 12.6736H8.16918C6.68545 12.6736 5.94358 12.6736 5.62736 12.1844C5.31114 11.6953 5.61244 11.0138 6.21504 9.65083L8.02668 5.55323C8.57457 4.314 8.84852 3.69438 9.37997 3.34719C9.91142 3 10.5859 3 11.935 3H14.0244C15.6632 3 16.4826 3 16.7916 3.53535C17.1007 4.0707 16.6942 4.78588 15.8811 6.21623L14.8092 8.10188C14.405 8.81295 14.2029 9.16849 14.2057 9.45952C14.2094 9.83775 14.4105 10.1862 14.7354 10.377C14.9854 10.5239 15.3927 10.5239 16.2074 10.5239C17.2373 10.5239 17.7523 10.5239 18.0205 10.7022C18.3689 10.9338 18.5513 11.3482 18.4874 11.7632C18.4382 12.0826 18.0918 12.4656 17.399 13.2317L11.8639 19.3523C10.7767 20.5545 10.2331 21.1556 9.86807 20.9654C9.50303 20.7751 9.67833 19.9822 10.0289 18.3962L10.7157 15.2896C10.9826 14.082 11.1161 13.4782 10.7951 13.0759C10.4741 12.6736 9.85877 12.6736 8.62814 12.6736Z"/>';
+
+/** Build a themed data-URI SVG icon for an action's skill category (Zap for uncategorized). */
+function categoryIconDataUri(category: ActionCategory | undefined, win: Window): string {
+    const isDark = win.matchMedia?.('(prefers-color-scheme: dark)')?.matches ?? false;
+    const stroke = isDark ? '%23ffffff8c' : '%230000008c';
+    const paths = (category && CATEGORY_ICON_PATHS.get(category)) || FALLBACK_ICON_PATH;
+    return `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="${stroke}" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+}
+
+// ---------------------------------------------------------------------------
+// Icon helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Give a menuitem its icon. Firefox 153 (Zotero 11) renders menu icons as an
+ * `<html:img class="menu-icon">` that shows `--menuitem-icon`, in native macOS
+ * menus too, unless `image` is set: that maps to the img's `srcset`, which
+ * suppresses the variable and does not render a data: URI there. Earlier
+ * versions map `image` to the icon's `src` and need the attribute.
+ */
+function setMenuItemIcon(menuitem: Element, uri: string): void {
+    let usesSrcset = false;
+    try {
+        const mapping = (menuitem.constructor as any).inheritedAttributes?.['.menu-icon'];
+        usesSrcset = typeof mapping === 'string' && /(^|,)srcset=image(,|$)/.test(mapping);
+    } catch { /* unknown menuitem implementation: use the attribute */ }
+    if (usesSrcset) {
+        (menuitem as HTMLElement).style.setProperty('--menuitem-icon', `url("${uri.replace(/"/g, '%22')}")`);
+    } else {
+        menuitem.setAttribute('image', uri);
+    }
+}
+
+async function cacheIcon(): Promise<void> {
+    if (cachedIconSvg) return;
+    const response = await Zotero.HTTP.request('GET', ICON_URL, {responseType:'text'});
+    cachedIconSvg = String(response.responseText);
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar handler
+// ---------------------------------------------------------------------------
+
+/** Create the toolbar button element in the given document. */
+function createToolbarButton(reader: any, doc: Document): HTMLElement {
+    const button = doc.createElement('button');
+    button.className = `toolbar-button toolbar-dropdown-button ${BUTTON_CLASS}`;
+    button.title = 'AsterMargin';
+    button.tabIndex = -1;
+    button.innerHTML = `${cachedIconSvg || ''}${DROPMARKER_SVG}`;
+    button.addEventListener('click', () => {
+        openAsterMarginMenu(reader, button);
+    });
+    return button;
+}
+
+function onRenderToolbar(event: any): void {
+    const { reader, doc, append } = event;
+    append(createToolbarButton(reader, doc));
+}
+
+/** Inject the button into an already-open reader that missed the renderToolbar event. */
+function injectIntoExistingReader(reader: any): void {
+    try {
+        const iframeDoc = reader?._iframeWindow?.document;
+        if (!iframeDoc) return;
+
+        // Skip if already injected
+        if (iframeDoc.querySelector(`.${BUTTON_CLASS}`)) return;
+
+        // Find the custom-sections container inside the toolbar's .end section
+        const toolbar = iframeDoc.querySelector('.toolbar .end .custom-sections');
+        if (!toolbar) return;
+
+        const button = createToolbarButton(reader, iframeDoc);
+        // Wrap in a .section div to match what CustomSections does
+        const section = iframeDoc.createElement('div');
+        section.className = 'section';
+        section.appendChild(button);
+        toolbar.appendChild(section);
+    } catch (_e) {
+        // Best-effort — reader may not be fully initialized
+    }
+}
+
+// Dev-only: dispatch an extraction-visualizer action so the React layer
+// (which owns the visualizer code in the webpack bundle) can run it.
+async function dispatchVisualizerAction(
+    action:
+        | 'items'
+        | 'sentences'
+        | 'clear'
+        | 'copy-extract-fixture-command'
+        | 'copy-ocr-fixture-command',
+    reader: any,
+): Promise<void> {
+    const win = await resolveChatWindow(reader._window);
+    const eventBus = win?.__astermarginEventBus;
+    if (!eventBus) return;
+
+    eventBus.dispatchEvent(new win.CustomEvent('readerVisualizerAction', {
+        detail: { action, readerInstanceID: reader._instanceID },
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Menu builder
+// ---------------------------------------------------------------------------
+
+function openAsterMarginMenu(reader: any, anchorButton: HTMLElement): void {
+    const win = reader._window;
+    const popupset = reader._popupset;
+    const iframe = reader._iframe;
+    if (!win || !popupset || !iframe) return;
+
+    const xulDoc = win.document;
+    const popup = xulDoc.createXULElement('menupopup');
+    popupset.appendChild(popup);
+    const appendSeparator = () => {
+        popup.appendChild(xulDoc.createXULElement('menuseparator'));
+    };
+    const appendVisualizerItem = (
+        label: string,
+        action: Parameters<typeof dispatchVisualizerAction>[0],
+    ) => {
+        const menuitem = xulDoc.createXULElement('menuitem');
+        menuitem.setAttribute('label', label);
+        menuitem.addEventListener('command', () => {
+            void dispatchVisualizerAction(action, reader).catch(Zotero.logError);
+        });
+        popup.appendChild(menuitem);
+    };
+
+    // Auto-cleanup
+    popup.addEventListener('popuphidden', () => popup.remove());
+
+    // ---- Ask AsterMargin ----
+    const askItem = xulDoc.createXULElement('menuitem');
+    askItem.setAttribute('label', 'Ask AsterMargin');
+    askItem.addEventListener('command', async () => {
+        const readerLocation = captureReaderActionLocation(reader);
+        const mainWin = await resolveChatWindow(win);
+        const eventBus = mainWin?.__astermarginEventBus;
+        if (!eventBus) return;
+        eventBus.dispatchEvent(new mainWin.CustomEvent('readerSelectionAction', {
+            detail: { action: 'ask', text: '', readerItemID: reader.itemID, readerLocation },
+        }));
+        setTimeout(() => {
+            eventBus.dispatchEvent(new mainWin.CustomEvent('focusInput', {
+                detail: {},
+            }));
+        }, 100);
+    });
+    popup.appendChild(askItem);
+
+    // ---- Actions section (attachment actions, PDF and EPUB readers) ----
+    const isPdf = reader.type === 'pdf';
+    const isEpub = reader.type === 'epub';
+    const readerItemID: number | undefined = reader.itemID;
+
+    if (isPdf || isEpub) {
+        const actions = getMergedActions().filter(a => a.targets.includes('attachment'));
+
+        if (actions.length > 0) {
+            appendSeparator();
+
+            // Disabled header
+            const header = xulDoc.createXULElement('menuitem');
+            header.setAttribute('label', 'Actions');
+            // Keep the literal 'true': Gecko 115 (Zotero 7-10) disables a
+            // menuitem only on disabled="true", while Zotero 11 (Firefox 153)
+            // treats the attribute as boolean and accepts any value. Writing
+            // "true" is the one form that disables under both.
+            header.setAttribute('disabled', 'true');
+            popup.appendChild(header);
+
+            for (const action of actions) {
+                const menuitem = xulDoc.createXULElement('menuitem');
+                menuitem.setAttribute('label', action.title);
+                menuitem.classList.add('menuitem-iconic');
+                setMenuItemIcon(menuitem, categoryIconDataUri(action.category, win));
+                menuitem.addEventListener('command', async () => {
+                    const mainWin = await resolveChatWindow(win);
+                    const eventBus = mainWin?.__astermarginEventBus;
+                    if (!eventBus) return;
+                    eventBus.dispatchEvent(new mainWin.CustomEvent('contextMenuAction', {
+                        detail: {
+                            actionId: action.id,
+                            actionTitle: action.title,
+                            targetType: 'attachment',
+                            itemIds: readerItemID ? [readerItemID] : [],
+                            collections: [],
+                            views: [],
+                        },
+                    }));
+                });
+                popup.appendChild(menuitem);
+            }
+        }
+    }
+
+    // ---- Add custom action… ----
+    appendSeparator();
+
+    const addItem = xulDoc.createXULElement('menuitem');
+    addItem.setAttribute('label', 'Add custom action\u2026');
+    addItem.addEventListener('command', () => {
+        void resolveChatWindow(reader._window).then(mainWin =>
+            openPreferencesWindow('actions', undefined, undefined, mainWin)).catch(Zotero.logError);
+    });
+    popup.appendChild(addItem);
+
+    // ---- Visualize what the agent sees (PDF only) ----
+    // Checkbox items: choosing the checked one hides the view, the other
+    // switches to that schema. The view's panel switches between columns,
+    // lines and items. The dev-only section below opens with its own
+    // separator, which closes this group.
+    if (SHOW_AGENT_PAGE_VIEW && isPdf) {
+        appendSeparator();
+        const activeSchema = activeAgentPageViewSchema(reader);
+        for (const schemaVersion of AGENT_PAGE_VIEW_SCHEMAS) {
+            const menuitem = xulDoc.createXULElement('menuitem');
+            menuitem.setAttribute('label', `Visualize (Schema ${schemaVersion})`);
+            menuitem.setAttribute('type', 'checkbox');
+            if (activeSchema === schemaVersion) menuitem.setAttribute('checked', 'true');
+            menuitem.addEventListener('command', () => {
+                if (activeSchema === schemaVersion) hideAgentPageView(reader);
+                else void showAgentPageView(reader, schemaVersion).catch(Zotero.logError);
+            });
+            popup.appendChild(menuitem);
+        }
+    }
+
+    // ---- Dev-only: EPUB extraction visualizer, PDF fixture commands ----
+    // Dropped from production builds at compile time.
+    if (process.env.NODE_ENV === 'development' && (isPdf || isEpub)) {
+        appendSeparator();
+        if (isEpub) {
+            appendVisualizerItem('Visualize Items', 'items');
+            appendVisualizerItem('Visualize Sentences', 'sentences');
+            appendVisualizerItem('Clear Visualization', 'clear');
+        } else {
+            appendVisualizerItem('Copy Extract Fixture Command', 'copy-extract-fixture-command');
+            appendVisualizerItem('Copy OCR Fixture Command', 'copy-ocr-fixture-command');
+        }
+    }
+
+    // ---- Position & open ----
+    const btnRect = anchorButton.getBoundingClientRect();
+    const iframeRect = iframe.getBoundingClientRect();
+    const screenRect = win.windowUtils.toScreenRectInCSSUnits(
+        iframeRect.x + btnRect.left,
+        iframeRect.y + btnRect.bottom,
+        0,
+        0,
+    );
+    setTimeout(() => popup.openPopupAtScreen(screenRect.x, screenRect.y, true));
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup helper
+// ---------------------------------------------------------------------------
+
+function removeListenerSafely(type: string, handler: (event: unknown) => void): boolean {
+    const reader = Zotero?.Reader as any;
+    const listeners = reader?._registeredListeners;
+    if (!Array.isArray(listeners)) return false;
+    reader._registeredListeners = listeners.filter(
+        (l: any) => !(l?.type === type && l?.handler === handler),
+    );
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export async function initReaderToolbarMenu(): Promise<void> {
+    if (typeof Zotero?.Reader?.registerEventListener !== 'function') {
+        ztoolkit.log('readerToolbarMenu: Reader API not available, skipping');
+        return;
+    }
+
+    // Clean up any previous listener (e.g. plugin reload)
+    cleanupReaderToolbarMenu();
+
+    // Cache the icon before registering so it's available synchronously in the handler
+    await cacheIcon();
+
+    toolbarHandler = onRenderToolbar;
+    Zotero.Reader.registerEventListener('renderToolbar', toolbarHandler, addon.data.config.addonID);
+
+    // Inject into already-open readers (e.g. plugin re-enable while reader tabs are open)
+    const readers = (Zotero.Reader as any)?._readers;
+    if (Array.isArray(readers)) {
+        for (const reader of readers) {
+            injectIntoExistingReader(reader);
+        }
+    }
+
+    ztoolkit.log('readerToolbarMenu: Registered renderToolbar listener');
+}
+
+export function cleanupReaderToolbarMenu(): void {
+    disposeAllAgentPageViews();
+
+    if (toolbarHandler) {
+        removeListenerSafely('renderToolbar', toolbarHandler);
+        toolbarHandler = null;
+    }
+
+    // Remove buttons already injected into open reader iframes
+    try {
+        const readers = (Zotero?.Reader as any)?._readers;
+        if (Array.isArray(readers)) {
+            for (const reader of readers) {
+                const iframeDoc = reader?._iframeWindow?.document;
+                if (!iframeDoc) continue;
+                const buttons = iframeDoc.querySelectorAll(`.${BUTTON_CLASS}`);
+                buttons.forEach((btn: Element) => btn.closest('.section')?.remove() ?? btn.remove());
+            }
+        }
+    } catch (_e) {
+        // Best-effort cleanup
+    }
+}

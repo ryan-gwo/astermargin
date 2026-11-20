@@ -1,0 +1,23 @@
+import { notifyWorkerStartFailure } from '../utils/workerUnavailableNotice';
+import { useEffect } from 'react';
+import { useSetAtom } from 'jotai';
+import { isBackgroundWorkerRunningAtom } from '../atoms/backgroundExtraction';
+import { tryGetWindowRuntime } from '../runtime/windowRuntime';
+
+/**
+ * Mirror the esbuild-side background extractor activity into Jotai state.
+ */
+export function useBackgroundWorkerStatus() {
+    const setIsRunning = useSetAtom(isBackgroundWorkerRunningAtom);
+
+    useEffect(() => {
+        const runtime = tryGetWindowRuntime();
+        if (!runtime) return;
+        const unsubscribe = Zotero.AsterMargin.runtime.subscribeWindow(
+            runtime, 'background-worker:status', detail => setIsRunning(detail.running),
+        );
+        const unsubscribeFailures = Zotero.AsterMargin.runtime.subscribeWindow(runtime, 'document-worker:failure', notifyWorkerStartFailure);
+        setIsRunning(Zotero.AsterMargin?.backgroundExtractor?.getStatus?.().running ?? false);
+        return () => { unsubscribe(); unsubscribeFailures(); };
+    }, [setIsRunning]);
+}

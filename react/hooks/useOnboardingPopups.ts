@@ -1,0 +1,173 @@
+import { getContextWindow } from '../runtime/windowRuntime';
+import { useEffect } from 'react';
+import { useAtomValue, useSetAtom } from 'jotai';
+import { getPref, setPref } from '../../src/utils/prefs';
+import { isAsterMarginUIVisibleAtom, isLibraryTabAtom } from '../atoms/ui';
+import { addFloatingPopupMessageAtom, floatingPopupMessagesAtom } from '../atoms/floatingPopup';
+import { currentNoteItemAtom } from '../atoms/zoteroContext';
+import { getCurrentReader } from '../utils/readerUtils';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { INTERRUPTED_THREAD_POPUP_ID } from './useInterruptedThreadPopup';
+
+const WELCOME_POPUP_ID = 'onboarding-welcome';
+const READER_TIP_POPUP_ID = 'onboarding-reader-tip';
+const NOTE_TIP_POPUP_ID = 'onboarding-note-tip';
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const READER_TIP_DELAY_MS = 500;
+const NOTE_TIP_DELAY_MS = 500;
+
+/**
+ * Manages onboarding popups for first-time user engagement:
+ * 1. Welcome popup on first install (not shown to upgrading users)
+ * 2. Reader tip popup on first PDF reader open (shown to all users once; re-shown
+ *    once after the tip was revised, and suppressed while a version-update popup is up)
+ * 3. Note tip popup on first note tab open (shown to all users once)
+ */
+export function useOnboardingPopups() {
+    // Covers both surfaces: no tip when the sidebar OR the separate window is open
+    const isAsterMarginUIVisible = useAtomValue(isAsterMarginUIVisibleAtom);
+    const isLibraryTab = useAtomValue(isLibraryTabAtom);
+    const noteItem = useAtomValue(currentNoteItemAtom);
+    const floatingPopupMessages = useAtomValue(floatingPopupMessagesAtom);
+    const addFloatingPopupMessage = useSetAtom(addFloatingPopupMessageAtom);
+
+    // === Popup 1: Welcome popup on first install ===
+    useEffect(() => {
+
+        const alreadyShown = getPref('onboardingWelcomeShown');
+        if (alreadyShown) return;
+
+        // Don't show if AsterMargin is already open
+        if (isAsterMarginUIVisible) return;
+
+        if (!Zotero.AsterMargin.background?.claimNotification(WELCOME_POPUP_ID)) return;
+        setPref('onboardingWelcomeShown', true);
+        setPref('onboardingWelcomeShownAt', new Date().toISOString());
+        logger('useOnboardingPopups: Showing welcome onboarding popup');
+
+        addFloatingPopupMessage({
+            id: WELCOME_POPUP_ID,
+            type: 'welcome_onboarding',
+            expire: false,
+            cancelable: false,
+        });
+    }, [isAsterMarginUIVisible, addFloatingPopupMessage]);
+
+    // === Popup 2: Reader tip on first PDF reader tab ===
+    useEffect(() => {
+
+        // Only trigger when user is on a reader tab (not library)
+        if (isLibraryTab) return;
+
+        // Versioned pref: the reader tip was substantially revised, so re-show it
+        // once to existing users who only saw the previous version.
+        const alreadyShown = getPref('onboardingReaderTipShownV2');
+        if (alreadyShown) return;
+
+        // Don't show if AsterMargin is already open
+        if (isAsterMarginUIVisible) return;
+
+        // Don't compete with the version-update popup: skip while one is showing, and
+        // enforce a gap after it was last shown so the tip doesn't appear right after it.
+        if (floatingPopupMessages.some((msg) => msg.type === 'version_update')) {
+            logger('useOnboardingPopups: Skipping reader tip (version update popup is showing)');
+            return;
+        }
+        // Same for the interrupted-chat popup: it is time-sensitive and would
+        // otherwise stack on top of the tip.
+        if (floatingPopupMessages.some((msg) => msg.id === INTERRUPTED_THREAD_POPUP_ID)) {
+            logger('useOnboardingPopups: Skipping reader tip (interrupted chat popup is showing)');
+            return;
+        }
+        const versionPopupShownAt = getPref('versionUpdatePopupShownAt');
+        if (versionPopupShownAt) {
+            const elapsed = Date.now() - new Date(versionPopupShownAt).getTime();
+            if (elapsed < ONE_HOUR_MS) {
+                logger('useOnboardingPopups: Skipping reader tip (within 1-hour gap from version update popup)');
+                return;
+            }
+        }
+
+        // Verify it's a PDF (not EPUB, HTML snapshot, etc.)
+        const reader = getCurrentReader(getContextWindow());
+        if (!reader) return;
+        try {
+            const item = Zotero.Items.get(reader.itemID);
+            if (!item || !item.isPDFAttachment()) return;
+        } catch {
+            return;
+        }
+
+        // Enforce 1-hour gap from welcome popup
+        const welcomeShownAt = getPref('onboardingWelcomeShownAt');
+        if (welcomeShownAt) {
+            const elapsed = Date.now() - new Date(welcomeShownAt).getTime();
+            if (elapsed < ONE_HOUR_MS) {
+                logger('useOnboardingPopups: Skipping reader tip (within 1-hour gap from welcome popup)');
+                return;
+            }
+        }
+
+        // Only mark the tip as shown once it is actually displayed
+        const timerId = setTimeout(() => {
+            if (!Zotero.AsterMargin.background?.claimNotification(READER_TIP_POPUP_ID)) return;
+            setPref('onboardingReaderTipShownV2', true);
+            logger('useOnboardingPopups: Showing reader tip popup');
+            addFloatingPopupMessage({
+                id: READER_TIP_POPUP_ID,
+                type: 'reader_tip',
+                expire: false,
+                cancelable: false,
+            });
+        }, READER_TIP_DELAY_MS);
+
+        return () => clearTimeout(timerId);
+    }, [isLibraryTab, isAsterMarginUIVisible, floatingPopupMessages, addFloatingPopupMessage]);
+
+    // === Popup 3: Note tip on first note tab ===
+    useEffect(() => {
+
+        // Only trigger when a note is open in a tab
+        if (!noteItem) return;
+
+        const alreadyShown = getPref('onboardingNoteTipShown');
+        if (alreadyShown) return;
+
+        // Don't show if AsterMargin is already open
+        if (isAsterMarginUIVisible) return;
+
+        // Don't stack on the time-sensitive interrupted-chat popup
+        if (floatingPopupMessages.some((msg) => msg.id === INTERRUPTED_THREAD_POPUP_ID)) {
+            logger('useOnboardingPopups: Skipping note tip (interrupted chat popup is showing)');
+            return;
+        }
+
+        // Enforce 1-hour gap from welcome popup
+        const welcomeShownAt = getPref('onboardingWelcomeShownAt');
+        if (welcomeShownAt) {
+            const elapsed = Date.now() - new Date(welcomeShownAt).getTime();
+            if (elapsed < ONE_HOUR_MS) {
+                logger('useOnboardingPopups: Skipping note tip (within 1-hour gap from welcome popup)');
+                return;
+            }
+        }
+
+        // Only mark the tip as shown once it is actually displayed: a
+        // dependency change during the delay cancels this timer and re-runs
+        // the effect, and a pref written up front would retire the tip
+        // without ever having shown it.
+        const timerId = setTimeout(() => {
+            if (!Zotero.AsterMargin.background?.claimNotification(NOTE_TIP_POPUP_ID)) return;
+            setPref('onboardingNoteTipShown', true);
+            logger('useOnboardingPopups: Showing note tip popup');
+            addFloatingPopupMessage({
+                id: NOTE_TIP_POPUP_ID,
+                type: 'note_tip',
+                expire: false,
+                cancelable: false,
+            });
+        }, NOTE_TIP_DELAY_MS);
+
+        return () => clearTimeout(timerId);
+    }, [noteItem, isAsterMarginUIVisible, floatingPopupMessages, addFloatingPopupMessage]);
+}

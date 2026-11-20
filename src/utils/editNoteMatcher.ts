@@ -1,0 +1,1537 @@
+/**
+ * Ranked matcher for `edit_note` `old_string` lookup.
+ *
+ * Each strategy attempts one transformation; the first one that yields
+ * at least one match wins. Disambiguation of multi-match results
+ * is the caller's responsibility — strategies never decide between
+ * multiple occurrences.
+ *
+ * Strategies are tried in this order (ranked most- to least-specific):
+ *   1. exact                    — no transformation
+ *   2. entity_decode            — `&#x27;` → `'` on the search needle
+ *   3. entity_encode            — `'` → `&#x27;` / `&#39;` / `&apos;`
+ *   4. nfkc                     — CJK full-width → half-width
+ *   5. quote_normalized         — fold typographic / guillemet quotes (`„"«»'`)
+ *                                 to ASCII so needle and note can differ only
+ *                                 in quote style
+ *   6. trim_trailing_newlines   — strip extra `\n` at end of old_string
+ *   7. json_unescape            — convert literal `\n`, `\"`, `\\` etc.
+ *   8. partial_element_strip    — strip malformed `<citation.../>` fragments
+ *   9. spurious_wrap_strip      — unwrap surrounding `<p>…</p>` etc.
+ *  10. tag_attribute_strip      — drop attributes from block tags (`<p style=…>`,
+ *                                 `<h2 class=…>`, `<blockquote …>`) so the
+ *                                 needle matches the bare form PM stored after
+ *                                 normalizing the model's rewrite payload.
+ *  11. markdown_to_html         — convert `**bold**` / `## h` to HTML equivalents
+ *  12. whitespace_relaxed       — allow whitespace runs to vary between needle
+ *                                 and note (NBSP vs space, literal `&nbsp;`
+ *                                 entity vs space, extra newlines, tab/space
+ *                                 drift). Also tolerates "Pangu spacing" drift
+ *                                 at CJK ↔ non-CJK character boundaries: a
+ *                                 needle `共识 [14]` matches a note `共识[14]`
+ *                                 and vice versa, because language models
+ *                                 silently insert / drop boundary spaces when
+ *                                 reproducing mixed-script text. Likewise
+ *                                 tolerates the newlines the note-editor
+ *                                 serializer writes around block elements
+ *                                 (`<td><p>` vs `<td>\n<p>`). Gated on
+ *                                 uniqueness and a non-ws character floor;
+ *                                 conservative last resort.
+ *  13. legacy_math              — restore dollar-only math from older read_note
+ *                                 output and retry strategies 1–12, after all
+ *                                 literal strategies miss
+ *  14. markdown_render          — match a handler-rendered Markdown fragment
+ *                                 against note HTML after first-pass strategies
+ *                                 miss. Rendering stays outside this synchronous
+ *                                 module.
+ */
+
+import {
+    countOccurrences,
+    type SimplificationMetadata,
+} from './noteHtmlSimplifier';
+import { classifyMathAnchorOccurrences } from './noteMathAnchors';
+import { stripNoteWrapperDiv } from './noteWrapper';
+import {
+    expandToRawHtml,
+    type ExternalRefContext,
+    type ResolvedLocatorPages,
+} from './noteCitationExpand';
+import {
+    decodeHtmlEntities,
+    encodeTextEntities,
+    ENTITY_FORMS,
+    foldTypographicQuotes,
+    hasCjkAsciiBoundary,
+    hasWhitespaceOrNbsp,
+    isCjkChar,
+    normalizeCjkSpacing,
+    normalizeWS,
+    WS_OR_NBSP_CLASS,
+} from './noteHtmlEntities';
+import {
+    stripPartialSimplifiedElements,
+    stripSpuriousWrappingTags,
+} from './editNoteStrippers';
+import type { EditNoteOperation } from '@astermargin/agent-core/types/agentActions/editNote';
+import type { PageLabelsByAttachmentId } from '@astermargin/agent-core/citations/atoms';
+import { locateEditTarget } from './editNotePositionLookup';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export type MatchStrategyName =
+    | 'exact'
+    | 'entity_decode'
+    | 'entity_encode'
+    | 'nfkc'
+    | 'quote_normalized'
+    | 'trim_trailing_newlines'
+    | 'json_unescape'
+    | 'partial_element_strip'
+    | 'spurious_wrap_strip'
+    | 'tag_attribute_strip'
+    | 'markdown_to_html'
+    | 'whitespace_relaxed'
+    | 'legacy_math'
+    | 'markdown_render';
+
+export interface MatchInput {
+    /** Enriched, simplified-space old_string. */
+    oldString: string;
+    /**
+     * Simplified-space new_string.
+     * For insert operations validation usually passes the raw payload, while
+     * execution often passes the already-merged replacement from
+     * normalized_action_data.
+     */
+    newString: string;
+    operation: EditNoteOperation;
+    metadata: SimplificationMetadata;
+    simplified: string;
+    /** `normalizeNoteHtml(rawHtml)` with `data-citation-items` stripped. */
+    strippedHtml: string;
+    externalRefContext: ExternalRefContext;
+    /**
+     * Pre-resolved page-label map (attachment item ID → 0-based page index →
+     * label) for NEW citations. Resolved up-front via
+     * `preloadPageLabelsForNewCitations` so expansion stays synchronous.
+     */
+    pageLabels: PageLabelsByAttachmentId;
+    /**
+     * Pre-resolved page for NEW citations whose locator is a non-page
+     * structural locator (sentence/paragraph/…). Resolved up-front via
+     * `preloadStructuralLocatorPages`; threaded into every `'new'` expansion so
+     * the stored citation keeps a page locator instead of dropping it.
+     */
+    resolvedLocatorPages?: ResolvedLocatorPages;
+    /**
+     * Handler-rendered Markdown old_string, simplified with the same note
+     * simplifier used for stored notes. Populated only after the normal match
+     * pass misses.
+     */
+    renderedOldSimplified?: string;
+    /**
+     * Handler-rendered replacement, already merged for insert operations.
+     * Populated together with renderedOldSimplified.
+     */
+    renderedNewSimplified?: string;
+}
+
+export interface BaseExpansion {
+    expandedOld: string;
+    expandedNew: string;
+}
+
+export interface MatchResult {
+    strategy: MatchStrategyName;
+    /** Simplified-space old_string after any strategy rewrite. */
+    oldString: string;
+    /** Simplified-space new_string after any strategy rewrite, preserving the input form. */
+    newString: string;
+    /** Raw-HTML-space match needle. */
+    expandedOld: string;
+    /** Raw-HTML-space replacement. */
+    expandedNew: string;
+    matchCount: number;
+    /**
+     * Pre-computed raw position into `strippedHtml`. Only set by
+     * `partial_element_strip` when disambiguation via simplified-position
+     * translation succeeds. Consumers should prefer this over running
+     * `locateEditTarget` when present.
+     */
+    rawPositionHint?: number;
+    /**
+     * Transforms a context anchor the same way the strategy transformed
+     * `expandedOld`. Identity for strategies that mutate the simplified-space
+     * input (trim, json_unescape, partial_strip, spurious_wrap). Non-identity
+     * for representation-level transforms (entity_decode, entity_encode, nfkc)
+     * so executors can re-apply to stored anchors.
+     */
+    normalizeAnchor: (anchor: string) => string;
+}
+
+/** A fallback that matched but was refused because it could not pick one target. */
+export interface RejectedMatch {
+    strategy: MatchStrategyName;
+    /** The rewritten simplified-space old_string the fallback searched for. */
+    oldString: string;
+    matchCount: number;
+}
+
+/** Filled by `findBestMatch` when the caller passes it. */
+export interface MatchDiagnostics {
+    rejected: RejectedMatch[];
+}
+
+interface StrategyInput extends MatchInput {
+    /** Internal second-pass policy; callers always start with literal math. */
+    oldMathContext?: 'legacy-old';
+    /** Receives fallbacks refused by `acceptsMatch`. */
+    diagnostics?: MatchDiagnostics;
+}
+
+interface Strategy {
+    name: MatchStrategyName;
+    tryMatch(input: StrategyInput, base: BaseExpansion): MatchResult | null;
+}
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
+
+const identity = (s: string): string => s;
+
+function expandOldAnchor(input: StrategyInput, anchor: string): string {
+    return expandToRawHtml(anchor, input.metadata, input.oldMathContext ?? 'old');
+}
+
+
+function rewriteInsertReplacementForTrim(
+    operation: EditNoteOperation,
+    oldString: string,
+    newString: string,
+    trimmedOld: string,
+): string {
+    if (operation === 'insert_after' && newString.startsWith(oldString)) {
+        return trimmedOld + newString.substring(oldString.length);
+    }
+    if (operation === 'insert_before' && newString.endsWith(oldString)) {
+        return newString.substring(0, newString.length - oldString.length) + trimmedOld;
+    }
+    return newString;
+}
+
+/**
+ * Expand `old_string` and `new_string` to raw-HTML space. Throws on invalid
+ * input; both production call sites (`validateEditNoteAction`,
+ * `executeEditNoteAction`) catch and translate into an `expansion_failed`
+ * response envelope.
+ */
+export function expandBase(input: MatchInput): BaseExpansion {
+    return {
+        expandedOld: expandOldAnchor(input, input.oldString),
+        expandedNew: expandToRawHtml(
+            input.newString,
+            input.metadata,
+            'new',
+            input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+        ),
+    };
+}
+
+/**
+ * Convert a small, conservative set of CommonMark/GFM inline patterns to the
+ * HTML the rendered note contains. Only `**bold**`, `__bold__`, and ATX
+ * headings on their own line are handled — these are the patterns production
+ * data shows the model reverts to when copying `old_string` from the markdown
+ * it originally wrote in `create_note`, instead of the rendered `note_content`.
+ *
+ * Skipped entirely: italic (ambiguous with bold), links, lists, tables, code,
+ * math, smart-punctuation drift. Splits on `<...>` boundaries so content inside
+ * HTML tag attributes (e.g. `<citation label="**x**"/>`) is never transformed.
+ *
+ * ATX headings follow CommonMark: up to 3 leading spaces, one or more
+ * spaces/tabs after the `#`s, optional closing `#+` fence preceded by
+ * whitespace, trailing whitespace (including a stray `\r` from CRLF input)
+ * stripped from the heading text. `## Section#5` keeps the trailing `#5`
+ * because there is no whitespace before the second `#`.
+ *
+ * Returns the input unchanged when nothing matches.
+ */
+function convertMarkdownToHtml(s: string): string {
+    if (!s) return s;
+    // Text at even indices, tags at odd indices — same pattern as noteHtmlEntities.
+    const parts = s.split(/(<[^>]*>)/);
+    let changed = false;
+    for (let i = 0; i < parts.length; i += 2) {
+        const before = parts[i];
+        let after = before;
+        // ATX headings: `# h` through `###### h`, each on its own line.
+        // `\r?` lets `$` (which matches before `\n`) absorb a stray `\r` from
+        // CRLF input so the captured text never contains a trailing `\r`.
+        after = after.replace(
+            /^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*\r?$/gm,
+            (_m, hashes, text) => `<h${hashes.length}>${text}</h${hashes.length}>`,
+        );
+        // Strong emphasis: `**text**` and `__text__`. Non-greedy and
+        // same-line so `**a** plain **b**` becomes two independent matches and
+        // markers can't straddle paragraph breaks.
+        after = after.replace(/\*\*([^\n*]+?)\*\*/g, '<strong>$1</strong>');
+        after = after.replace(/__([^\n_]+?)__/g, '<strong>$1</strong>');
+        if (after !== before) {
+            parts[i] = after;
+            changed = true;
+        }
+    }
+    return changed ? parts.join('') : s;
+}
+
+// =============================================================================
+// Strategies
+// =============================================================================
+
+const exactStrategy: Strategy = {
+    name: 'exact',
+    tryMatch(input, base) {
+        const matchCount = countOccurrences(input.strippedHtml, base.expandedOld);
+        if (matchCount === 0) return null;
+        return {
+            strategy: 'exact',
+            oldString: input.oldString,
+            newString: input.newString,
+            expandedOld: base.expandedOld,
+            expandedNew: base.expandedNew,
+            matchCount,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+const entityDecodeStrategy: Strategy = {
+    name: 'entity_decode',
+    tryMatch(input, base) {
+        // Forward direction: model wrote entity form (`&#x27;`) but PM has
+        // already decoded the note to the literal character (`'`). Decode the
+        // expanded search needle so it lines up with the note's text.
+        const decodedOld = decodeHtmlEntities(base.expandedOld);
+        if (decodedOld === base.expandedOld) return null;
+        const matchCount = countOccurrences(input.strippedHtml, decodedOld);
+        if (matchCount === 0) return null;
+        return {
+            strategy: 'entity_decode',
+            oldString: input.oldString,
+            newString: input.newString,
+            expandedOld: decodedOld,
+            expandedNew: decodeHtmlEntities(base.expandedNew),
+            matchCount,
+            normalizeAnchor: decodeHtmlEntities,
+        };
+    },
+};
+
+const entityEncodeStrategy: Strategy = {
+    name: 'entity_encode',
+    tryMatch(input, base) {
+        // Reverse direction: model wrote literal char (`'`) but the note
+        // stored an entity-encoded form. Try each known entity spelling and
+        // use the first one that matches.
+        for (const form of ENTITY_FORMS) {
+            const encodedOld = encodeTextEntities(base.expandedOld, form);
+            if (encodedOld === base.expandedOld) continue;
+            const matchCount = countOccurrences(input.strippedHtml, encodedOld);
+            if (matchCount === 0) continue;
+            return {
+                strategy: 'entity_encode',
+                oldString: input.oldString,
+                newString: input.newString,
+                expandedOld: encodedOld,
+                expandedNew: encodeTextEntities(base.expandedNew, form),
+                matchCount,
+                normalizeAnchor: (s) => encodeTextEntities(s, form),
+            };
+        }
+        return null;
+    },
+};
+
+const nfkcStrategy: Strategy = {
+    name: 'nfkc',
+    tryMatch(input, base) {
+        // CJK full-width → half-width drift: notes written originally with
+        // full-width punctuation (，（）) may be stored in half-width after a
+        // prior create_note round. NFKC-normalize both sides symmetrically.
+        const nfkcOld = base.expandedOld.normalize('NFKC');
+        if (nfkcOld === base.expandedOld) return null;
+        const matchCount = countOccurrences(input.strippedHtml, nfkcOld);
+        if (matchCount === 0) return null;
+        return {
+            strategy: 'nfkc',
+            oldString: input.oldString,
+            newString: input.newString,
+            expandedOld: nfkcOld,
+            expandedNew: base.expandedNew.normalize('NFKC'),
+            matchCount,
+            normalizeAnchor: (s) => s.normalize('NFKC'),
+        };
+    },
+};
+
+const quoteNormalizedStrategy: Strategy = {
+    name: 'quote_normalized',
+    tryMatch(input, base) {
+        // Quote-style drift: either side uses typographic / curly / guillemet
+        // quotes where the other uses ASCII (or a different curly form).
+        const foldedOld = foldTypographicQuotes(base.expandedOld);
+        const foldedHaystack = foldTypographicQuotes(input.strippedHtml);
+
+        // If neither side has typographic quotes, nothing to normalize — let
+        // earlier strategies (which already ran) or later ones claim this case.
+        if (
+            foldedOld === base.expandedOld
+            && foldedHaystack === input.strippedHtml
+        ) {
+            return null;
+        }
+
+        const foldedCount = countOccurrences(foldedHaystack, foldedOld);
+        if (foldedCount === 0) return null;
+
+        // Preserve the note's original quote characters outside the replaced
+        // region by slicing `actualRawSlice` from the original strippedHtml
+        // at the folded position. 1:1 character map guarantees positions
+        // line up between foldedHaystack and strippedHtml.
+        const rawPos = foldedHaystack.indexOf(foldedOld);
+        const actualRawSlice = input.strippedHtml.substring(
+            rawPos, rawPos + foldedOld.length,
+        );
+        const rawMatchCount = countOccurrences(input.strippedHtml, actualRawSlice);
+
+        // Uniqueness gate (mirrors `whitespace_relaxed`'s normalized-space
+        // check). When the folded form matches more places in the haystack
+        // than the first occurrence's raw form, the model's ASCII needle is
+        // genuinely ambiguous across curly variants — picking the first
+        // folded position's raw slice silently would edit the wrong one.
+        // Refuse and let the retry_prompt's candidate hints show both forms
+        // so the model can pick explicitly. Same rule applies to
+        // `str_replace_all`, where the executor's split/join on the chosen
+        // raw slice would miss the non-matching shapes.
+        if (foldedCount !== rawMatchCount) return null;
+
+        // Build expandedNew. For insert ops, mirror `whitespaceRelaxedStrategy`
+        // and strip the merged `oldString` prefix/suffix from `newString`
+        let expandedNew: string;
+        try {
+            if (input.operation === 'insert_after') {
+                const injected = input.newString.startsWith(input.oldString)
+                    ? input.newString.substring(input.oldString.length)
+                    : input.newString;
+                const expandedInjected = expandToRawHtml(
+                    injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+                expandedNew = actualRawSlice + expandedInjected;
+            } else if (input.operation === 'insert_before') {
+                const injected = input.newString.endsWith(input.oldString)
+                    ? input.newString.substring(0, input.newString.length - input.oldString.length)
+                    : input.newString;
+                const expandedInjected = expandToRawHtml(
+                    injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+                expandedNew = expandedInjected + actualRawSlice;
+            } else {
+                expandedNew = base.expandedNew;
+            }
+        } catch {
+            return null;
+        }
+
+        // Post-hoc invariants for insert ops (mirror `whitespaceRelaxedStrategy`).
+        if (input.operation === 'insert_after' && !expandedNew.startsWith(actualRawSlice)) return null;
+        if (input.operation === 'insert_before' && !expandedNew.endsWith(actualRawSlice)) return null;
+
+        return {
+            strategy: 'quote_normalized',
+            oldString: input.oldString,
+            newString: input.newString,
+            expandedOld: actualRawSlice,
+            expandedNew,
+            matchCount: rawMatchCount,
+            normalizeAnchor: foldTypographicQuotes,
+        };
+    },
+};
+
+const trimTrailingNewlinesStrategy: Strategy = {
+    name: 'trim_trailing_newlines',
+    tryMatch(input) {
+        if (!input.oldString) return null;
+        const trimmedOld = input.oldString.replace(/\n+$/, '');
+        if (trimmedOld === input.oldString) return null;
+
+        let expandedOld: string;
+        try {
+            expandedOld = expandOldAnchor(input, trimmedOld);
+        } catch {
+            return null;
+        }
+        const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+        if (matchCount === 0) return null;
+
+        // For insert operations validation usually passes the raw payload, but
+        // execution often passes a merged replacement from normalized_action_data.
+        // Preserve the input form while trimming the copied anchor fragment when
+        // it is already embedded in new_string.
+        const isInsert = input.operation === 'insert_after' || input.operation === 'insert_before';
+        const trimmedNew = isInsert
+            ? rewriteInsertReplacementForTrim(
+                input.operation,
+                input.oldString,
+                input.newString,
+                trimmedOld,
+            )
+            : input.newString.replace(/\n+$/, '');
+
+        let expandedNew: string;
+        try {
+            expandedNew = expandToRawHtml(
+                trimmedNew, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+            );
+        } catch {
+            return null;
+        }
+
+        return {
+            strategy: 'trim_trailing_newlines',
+            oldString: trimmedOld,
+            newString: trimmedNew,
+            expandedOld,
+            expandedNew,
+            matchCount,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+const JSON_ESCAPE_PATTERN = /\\(["\\/nrt])/g;
+const unescapeJsonEscapes = (s: string): string =>
+    s.replace(JSON_ESCAPE_PATTERN, (_match, c) => {
+        switch (c) {
+            case 'n': return '\n';
+            case 'r': return '\r';
+            case 't': return '\t';
+            default: return c; // " \ /
+        }
+    });
+
+const jsonUnescapeStrategy: Strategy = {
+    name: 'json_unescape',
+    tryMatch(input) {
+        if (!input.oldString) return null;
+        if (!/\\["\\/nrt]/.test(input.oldString)) return null;
+        const unescapedOld = unescapeJsonEscapes(input.oldString);
+        if (unescapedOld === input.oldString) return null;
+
+        let expandedOld: string;
+        try {
+            expandedOld = expandOldAnchor(input, unescapedOld);
+        } catch {
+            return null;
+        }
+        const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+        if (matchCount === 0) return null;
+
+        const unescapedNew = unescapeJsonEscapes(input.newString);
+        let expandedNew: string;
+        try {
+            expandedNew = expandToRawHtml(
+                unescapedNew, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+            );
+        } catch {
+            return null;
+        }
+
+        return {
+            strategy: 'json_unescape',
+            oldString: unescapedOld,
+            newString: unescapedNew,
+            expandedOld,
+            expandedNew,
+            matchCount,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+const partialElementStripStrategy: Strategy = {
+    name: 'partial_element_strip',
+    tryMatch(input) {
+        if (!input.oldString) return null;
+        const simplifiedPos = input.simplified.indexOf(input.oldString);
+        if (simplifiedPos === -1) return null;
+        // Gate on simplified-space uniqueness so the leadingStrip offset is
+        // meaningful — otherwise we can't translate back to a raw position.
+        if (input.simplified.indexOf(input.oldString, simplifiedPos + 1) !== -1) return null;
+
+        const stripped = stripPartialSimplifiedElements(
+            input.oldString, input.newString, input.simplified, simplifiedPos,
+        );
+        if (!stripped) return null;
+
+        let expandedOld: string;
+        let expandedNew: string;
+        try {
+            expandedOld = expandOldAnchor(input, stripped.strippedOld);
+            expandedNew = expandToRawHtml(
+                stripped.strippedNew, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+            );
+        } catch {
+            return null;
+        }
+        const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+        if (matchCount === 0) return null;
+
+        // Multi-match with str_replace: translate the known simplified position
+        // to a raw-HTML position so the caller can emit precise context
+        // anchors. If translation fails, fall through to the next strategy
+        // (mirrors the pre-refactor behavior of setting `matchCount = 0`).
+        let rawPositionHint: number | undefined;
+        if (matchCount > 1 && input.operation !== 'str_replace_all') {
+            try {
+                const strippedStart = simplifiedPos + stripped.leadingStrip;
+                // The prefix comes from the CURRENT simplified output, which
+                // keeps math wrappers, so expand it literally even on the
+                // legacy pass — dollar expansion would wrap literal prose
+                // dollars and inflate the offset.
+                const expandedBefore = expandToRawHtml(
+                    input.simplified.substring(0, strippedStart), input.metadata, 'old',
+                );
+                const unwrapped = stripNoteWrapperDiv(input.strippedHtml);
+                const wrapperPrefixLen = unwrapped !== input.strippedHtml
+                    ? input.strippedHtml.indexOf('>') + 1
+                    : 0;
+                const rawPos = wrapperPrefixLen + expandedBefore.length;
+                if (input.strippedHtml.substring(rawPos, rawPos + expandedOld.length) === expandedOld) {
+                    rawPositionHint = rawPos;
+                }
+            } catch {
+                // prefix expansion failed — no hint available
+            }
+            if (rawPositionHint === undefined) return null;
+        }
+
+        return {
+            strategy: 'partial_element_strip',
+            oldString: stripped.strippedOld,
+            newString: stripped.strippedNew,
+            expandedOld,
+            expandedNew,
+            matchCount,
+            rawPositionHint,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+const spuriousWrapStripStrategy: Strategy = {
+    name: 'spurious_wrap_strip',
+    tryMatch(input) {
+        if (!input.oldString) return null;
+        const candidates = stripSpuriousWrappingTags(input.oldString, input.newString);
+        // Candidates are ordered least-to-most aggressive (leading-only,
+        // trailing-only, both) — take the first that matches to preserve as
+        // much structural context as possible.
+        for (const candidate of candidates) {
+            let expandedOld: string;
+            let expandedNew: string;
+            try {
+                expandedOld = expandOldAnchor(input, candidate.strippedOld);
+                expandedNew = expandToRawHtml(
+                    candidate.strippedNew, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+            } catch {
+                continue;
+            }
+            const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+            if (matchCount === 0) continue;
+            const result: MatchResult = {
+                strategy: 'spurious_wrap_strip',
+                oldString: candidate.strippedOld,
+                newString: candidate.strippedNew,
+                expandedOld,
+                expandedNew,
+                matchCount,
+                normalizeAnchor: identity,
+            };
+            // A less aggressive strip that matches several places must not
+            // shadow a later one that pins a single target.
+            if (acceptsMatch(input, result)) return result;
+        }
+        return null;
+    },
+};
+
+/**
+ * Drop attributes from block-level structural tags so a needle that carries
+ * `<p style="…">` or `<h2 class="…">` matches the bare `<p>` / `<h2>` form
+ * Zotero's note editor produces after PM normalizes the model's create_note /
+ * rewrite payload.
+ *
+ * Conservative tag list: only `<p>`, `<h1>`–`<h6>`, `<blockquote>`. Excludes
+ * `<span>`, `<div>`, `<a>` because those legitimately carry attributes that PM
+ * preserves (e.g. `<span class="citation" data-citation="…">`, anchor `href`).
+ * Stripping their attributes would let the matcher silently drop citation data
+ * from the executor's replacement.
+ *
+ * Operates in simplified-space on `oldString` / `newString` (mutates *both*
+ * sides symmetrically). Identity `normalizeAnchor` because validator-supplied
+ * context anchors come from raw `strippedHtml`, which already lacks the
+ * attributes we just stripped.
+ */
+const STRIPPABLE_TAG_PATTERN = /<(p|h[1-6]|blockquote)(\s+[^>]*?)(\/?)>/gi;
+function stripBlockTagAttributes(s: string): string {
+    return s.replace(STRIPPABLE_TAG_PATTERN, (_m, tag, _attrs, slash) => `<${tag.toLowerCase()}${slash}>`);
+}
+
+const tagAttributeStripStrategy: Strategy = {
+    name: 'tag_attribute_strip',
+    tryMatch(input) {
+        if (!input.oldString) return null;
+        const strippedOld = stripBlockTagAttributes(input.oldString);
+        if (strippedOld === input.oldString) return null;
+
+        let expandedOld: string;
+        try {
+            expandedOld = expandOldAnchor(input, strippedOld);
+        } catch {
+            return null;
+        }
+        const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+        if (matchCount === 0) return null;
+
+        // Strip new_string symmetrically so the executor's splice produces
+        // attribute-free block tags too. For insert ops the merged
+        // `oldString + injected` form (execute-time normalized_action_data)
+        // contains both attribute-laden segments; stripping wholesale
+        // collapses both at once.
+        const strippedNew = stripBlockTagAttributes(input.newString);
+
+        // Build expandedNew. For insert ops on validate-time inputs (or when
+        // the executor receives a raw `new_string` without the validator's
+        // merged normalized_action_data), `input.newString` is just the
+        // injected payload — splicing it directly would replace the anchor
+        // with the payload instead of preserving it. Mirror the insert
+        // handling in `whitespaceRelaxedStrategy` / `quoteNormalizedStrategy`:
+        // construct `actualRawSlice + injected` (insert_after) or
+        // `injected + actualRawSlice` (insert_before) so the anchor survives.
+        // For execute-time merged inputs the prefix-strip is a no-op and the
+        // splice keeps the merged form intact.
+        let expandedNew: string;
+        try {
+            if (input.operation === 'insert_after') {
+                const injected = strippedNew.startsWith(strippedOld)
+                    ? strippedNew.substring(strippedOld.length)
+                    : strippedNew;
+                const expandedInjected = expandToRawHtml(
+                    injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+                expandedNew = expandedOld + expandedInjected;
+            } else if (input.operation === 'insert_before') {
+                const injected = strippedNew.endsWith(strippedOld)
+                    ? strippedNew.substring(0, strippedNew.length - strippedOld.length)
+                    : strippedNew;
+                const expandedInjected = expandToRawHtml(
+                    injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+                expandedNew = expandedInjected + expandedOld;
+            } else {
+                expandedNew = expandToRawHtml(
+                    strippedNew, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+            }
+        } catch {
+            return null;
+        }
+
+        // Post-hoc invariant for insert ops (mirrors whitespaceRelaxedStrategy):
+        // the splice result must start/end with the actual raw slice so the
+        // executor's str_replace genuinely behaves as an insertion.
+        if (input.operation === 'insert_after' && !expandedNew.startsWith(expandedOld)) return null;
+        if (input.operation === 'insert_before' && !expandedNew.endsWith(expandedOld)) return null;
+
+        return {
+            strategy: 'tag_attribute_strip',
+            oldString: strippedOld,
+            newString: strippedNew,
+            expandedOld,
+            expandedNew,
+            matchCount,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+const markdownToHtmlStrategy: Strategy = {
+    name: 'markdown_to_html',
+    tryMatch(input) {
+        if (!input.oldString) return null;
+        const convertedOld = convertMarkdownToHtml(input.oldString);
+        if (convertedOld === input.oldString) return null;
+
+        let expandedOld: string;
+        try {
+            expandedOld = expandOldAnchor(input, convertedOld);
+        } catch {
+            return null;
+        }
+        const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+        if (matchCount === 0) return null;
+
+        // Convert new_string the same way so the replacement is HTML too.
+        // For insert_after / insert_before at execution time, `newString` is
+        // the already-merged `old + injected`; converting the whole thing
+        // keeps the prefix aligned with `convertedOld` because the same
+        // transform is applied on both sides.
+        //
+        // Tradeoff: a caller that genuinely wants literal `**` / `##` in the
+        // saved note cannot reach this branch anyway — exact match runs first
+        // and wins for HTML old_strings like `<strong>bold</strong>`. The
+        // only way to land here is to use markdown in old_string, which
+        // signals "speaking markdown" and makes symmetric conversion of
+        // new_string the consistent choice. Leaving new_string literal would
+        // instead persist raw `**` into HTML (rendered as plain asterisks),
+        // which is almost never what the model intended.
+        const convertedNew = convertMarkdownToHtml(input.newString);
+
+        let expandedNew: string;
+        try {
+            expandedNew = expandToRawHtml(
+                convertedNew, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+            );
+        } catch {
+            return null;
+        }
+
+        return {
+            strategy: 'markdown_to_html',
+            oldString: convertedOld,
+            newString: convertedNew,
+            expandedOld,
+            expandedNew,
+            matchCount,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+// =============================================================================
+// whitespace_relaxed
+// =============================================================================
+
+/**
+ * Minimum normalized length for the needle. Below this the strategy refuses
+ * to act — short strings collide too easily under whitespace collapse.
+ */
+const MIN_WS_RELAXED_NORMALIZED_LENGTH = 20;
+/**
+ * Minimum number of non-whitespace characters in the normalized needle.
+ * Guards against needles that pass the length check but are mostly whitespace.
+ */
+const MIN_WS_RELAXED_NON_WS_LENGTH = 12;
+/**
+ * Defensive cap on needle length to bound regex work. Production edit_note
+ * old_strings are routinely under 3 000 chars; 5 000 is slack.
+ */
+const MAX_WS_RELAXED_INPUT_LENGTH = 5000;
+
+const REGEX_ESCAPE_PATTERN = /[.*+?^${}()|[\]\\]/g;
+function escapeRegExp(s: string): string {
+    return s.replace(REGEX_ESCAPE_PATTERN, '\\$&');
+}
+
+/**
+ * Build a regex that matches the needle with whitespace runs allowed to vary,
+ * and additionally tolerates Pangu-style spacing drift at CJK ↔ non-CJK
+ * character boundaries.
+ *
+ * Three relaxations are applied:
+ * 1. Whitespace runs in the needle become `\s+` (or `\s*` if at least one
+ *    side of the run is CJK, or if the run is ASCII whitespace sitting in a
+ *    serializer gap — needles with a space between `识` and `[`, or a newline
+ *    between `<td>` and `<p>`, must still match notes that elide it).
+ * 2. Adjacent non-whitespace characters whose scripts differ (one CJK, one
+ *    not) get an optional `\s*` inserted between them — needles WITHOUT a
+ *    boundary space must still match notes that have one.
+ * 3. A serializer gap — a `>` that ends one of the note-editor serializer's
+ *    newline sites, immediately followed by `<` — gets an optional
+ *    `[\t\n\f\r ]*` inserted between the two. The haystack is
+ *    `normalizeNoteHtml(rawHtml)`, the same round trip the editor performs, so
+ *    a note AsterMargin stored as `<td><p>…` is always matched against `<td>\n<p>…`.
+ *    Models anchor on their own earlier HTML, so both directions have to match.
+ *    `findWhitespaceTolerant` in `editNotePositionLookup.ts` does a looser
+ *    version of this on the undo side.
+ *
+ *    Two restrictions on relaxation 3 are load-bearing, because outside the
+ *    serializer's own sites this whitespace is visible content:
+ *      - the gap must be one the serializer actually writes at
+ *        (`CLOSE_TAG_GAP_ELEMENTS` / `OPEN_TAG_GAP_ELEMENTS`). Between two
+ *        INLINE elements it is prose, so `<strong>a</strong><em>b</em>` must
+ *        NOT match `<strong>a</strong> <em>b</em>`; and an opening `<p>` is not
+ *        a site at all, so `<p><em>x</em>` must not match `<p>\n<em>x</em>`.
+ *      - only ASCII whitespace qualifies. `&nbsp;` and U+00A0 do not collapse
+ *        when rendered, so `<p><em>x</em></p>` must NOT match
+ *        `<p>&nbsp;<em>x</em></p>`.
+ *
+ * Relaxations 1 and 2 apply ONLY to visible prose. While walking inside an HTML
+ * tag (between `<` and the matching `>`) or when either side of a boundary is
+ * an HTML delimiter (`< > = " ' /`), the relaxation is suppressed so that
+ * needles like `<span title="中文">` cannot match `<span title="中文 ">` —
+ * attribute and tag markup must match byte-for-byte.
+ *
+ * Relaxation is also suppressed inside code-block `<pre>` elements so a
+ * replacement cannot overwrite significant indentation. The strategy's
+ * overlap gate handles needles that start partway inside a `<pre>`.
+ *
+ * The whitespace class includes both regex `\s` and the literal HTML entity
+ * `&nbsp;` so drift between regular spaces and `&nbsp;`-encoded spaces also
+ * folds. Non-whitespace runs that don't cross a CJK boundary are regex-escaped
+ * and must match byte-for-byte. Caller guarantees first/last char of `needle`
+ * is non-whitespace.
+ */
+const HTML_DELIM_PATTERN = /[<>="'/]/;
+const NBSP_ENTITY = '&nbsp;';
+const isHtmlDelim = (ch: string): boolean => HTML_DELIM_PATTERN.test(ch);
+
+// Code-block `<pre>` whitespace must match exactly to preserve indentation.
+// Math `<pre>` elements are excluded because their spacing is not indentation.
+const MATH_CLASS_ATTR = /class\s*=\s*(?:"[^"]*\bmath\b[^"]*"|'[^']*\bmath\b[^']*')/i;
+/** Sticky: probed at a specific offset while walking the needle. */
+const PRE_OPEN_TAG_STICKY = /<pre\b([^>]*)>/iy;
+const PRE_CLOSE_TAG_STICKY = /<\/pre\s*>/iy;
+const PRE_ELEMENT_PATTERN = /<pre\b([^>]*)>[\s\S]*?<\/pre\s*>/gi;
+
+// Where the note-editor serializer puts its newlines, taken verbatim from
+// `buildToHTML` (note-editor's `src/core/schema/utils.js`, mirrored by
+// `src/prosemirror/serializer.ts`). It walks `textNodes` + `blockNodes` and:
+//   - inserts `\n` AFTER every one of them  → after each CLOSING tag below
+//     (and after `<hr>`, which is void so its only tag is the opening one);
+//   - inserts `\n` before the first child of the `blockNodes` only
+//     → after those elements' OPENING tag.
+// An opening `<p>` / `<h2>` / `<pre>` is therefore NOT a place the serializer
+// writes anything, so those gaps stay byte-exact.
+const AFTER_CLOSE_NEWLINE_ELEMENTS
+    = 'h1|h2|h3|h4|h5|h6|p|pre|ol|ul|li|hr|blockquote|table|th|tr|thead|tbody|tfoot|td';
+const AFTER_OPEN_NEWLINE_ELEMENTS
+    = 'ol|ul|li|hr|blockquote|table|th|tr|thead|tbody|tfoot|td';
+const CLOSE_TAG_GAP_ELEMENTS = new Set(AFTER_CLOSE_NEWLINE_ELEMENTS.split('|'));
+const OPEN_TAG_GAP_ELEMENTS = new Set(AFTER_OPEN_NEWLINE_ELEMENTS.split('|'));
+
+// The serializer writes a plain `\n` and nothing else, so only ASCII
+// whitespace may be treated as its formatting. `WS_OR_NBSP_CLASS` must NOT be
+// used here: `&nbsp;` (and U+00A0, which JS `\s` matches) is visible content —
+// `<p><em>x</em></p>` must not match `<p>&nbsp;<em>x</em></p>`.
+const HTML_WS_CLASS = '[\\t\\n\\f\\r ]';
+const ASCII_WS_RUN = /^[\t\n\f\r ]+$/;
+
+/** Sticky: reads `/` + tag name at a `<` while walking the needle. */
+const TAG_NAME_STICKY = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)/y;
+/** A tag whose `>` is one of the serializer's newline sites. */
+const SERIALIZER_GAP_TAG
+    = `(?:</(?:${AFTER_CLOSE_NEWLINE_ELEMENTS})\\s*>`
+    + `|<(?:${AFTER_OPEN_NEWLINE_ELEMENTS})(?:\\s[^<>]*)?/?>)`;
+/** Such a tag followed, across ASCII whitespace only, by another tag. */
+const SERIALIZER_GAP_IN_NEEDLE = new RegExp(
+    `${SERIALIZER_GAP_TAG}${HTML_WS_CLASS}*<`, 'i',
+);
+/** The same gap, for removal before whitespace collapsing. Zero-width
+ *  lookahead so a run of adjacent gaps all collapse. */
+const SERIALIZER_GAP_RAW = new RegExp(
+    `(${SERIALIZER_GAP_TAG})${HTML_WS_CLASS}+(?=<)`, 'gi',
+);
+
+interface PreRegion {
+    /** Offset of the `<` that opens the element. */
+    start: number;
+    /** Offset just past the `>` that closes it. */
+    end: number;
+}
+
+/** Locate closed, non-math `<pre>` elements. */
+function findSignificantPreRegions(html: string): PreRegion[] {
+    const regions: PreRegion[] = [];
+    PRE_ELEMENT_PATTERN.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = PRE_ELEMENT_PATTERN.exec(html)) !== null) {
+        if (MATH_CLASS_ATTR.test(m[1])) continue;
+        regions.push({ start: m.index, end: m.index + m[0].length });
+    }
+    return regions;
+}
+
+function buildWhitespaceRelaxedPattern(needle: string): RegExp {
+    const parts: string[] = [];
+    let literalBuf = '';
+    const flushLiteral = () => {
+        if (literalBuf) {
+            parts.push(escapeRegExp(literalBuf));
+            literalBuf = '';
+        }
+    };
+
+    let inTag = false;
+    // Track nested `<pre>` types so math blocks cannot affect code blocks.
+    const preStack: boolean[] = [];
+    let significantPreDepth = 0;
+    // Tag read at the last `<`, and whether the `>` most recently consumed ends
+    // one of the serializer's newline sites. Only there may whitespace be
+    // optional. A bare `>` in prose leaves `pendingTagName` empty, so it never
+    // qualifies.
+    let pendingTagName = '';
+    let pendingTagIsClosing = false;
+    let lastTagStartsSerializerGap = false;
+    let i = 0;
+    while (i < needle.length) {
+        // Whitespace run (regex `\s` or literal `&nbsp;` entity) anchored at i.
+        let runLen = 0;
+        while (i + runLen < needle.length) {
+            if (/\s/.test(needle.charAt(i + runLen))) {
+                runLen += 1;
+            } else if (needle.substring(i + runLen, i + runLen + NBSP_ENTITY.length) === NBSP_ENTITY) {
+                runLen += NBSP_ENTITY.length;
+            } else {
+                break;
+            }
+        }
+        if (runLen > 0) {
+            // Preserve code-block whitespace byte-for-byte.
+            if (significantPreDepth > 0) {
+                literalBuf += needle.substring(i, i + runLen);
+                i += runLen;
+                continue;
+            }
+            flushLiteral();
+            const before = i > 0 ? needle.charAt(i - 1) : '';
+            const after = needle.charAt(i + runLen);
+            const crossesCjkBoundary = !inTag
+                && !!before && !!after
+                && !isHtmlDelim(before) && !isHtmlDelim(after)
+                && isCjkChar(before) !== isCjkChar(after);
+            // Serializer-inserted newline: optional in this direction too, so a
+            // needle carrying `>\n<` matches a note written as `><`. The run
+            // itself must be ASCII whitespace — a needle holding an `&nbsp;`
+            // here is describing visible content, not formatting.
+            const isSerializerGap = before === '>' && after === '<'
+                && lastTagStartsSerializerGap
+                && ASCII_WS_RUN.test(needle.substring(i, i + runLen));
+            if (isSerializerGap) {
+                parts.push(`${HTML_WS_CLASS}*`);
+            } else {
+                parts.push(`${WS_OR_NBSP_CLASS}${crossesCjkBoundary ? '*' : '+'}`);
+            }
+            i += runLen;
+            continue;
+        }
+
+        const ch = needle.charAt(i);
+        literalBuf += ch;
+        // Update tag state. The boundary check below sees the POST-update
+        // state, so HTML delimiters and tag interiors never trigger CJK
+        // relaxation.
+        if (ch === '<') {
+            inTag = true;
+            TAG_NAME_STICKY.lastIndex = i;
+            const nameMatch = TAG_NAME_STICKY.exec(needle);
+            pendingTagIsClosing = nameMatch ? nameMatch[1] === '/' : false;
+            pendingTagName = nameMatch ? nameMatch[2].toLowerCase() : '';
+            // Enter/leave `<pre>` when its tag opens.
+            PRE_OPEN_TAG_STICKY.lastIndex = i;
+            const openTag = PRE_OPEN_TAG_STICKY.exec(needle);
+            if (openTag) {
+                const significant = !MATH_CLASS_ATTR.test(openTag[1]);
+                preStack.push(significant);
+                if (significant) significantPreDepth += 1;
+            } else {
+                PRE_CLOSE_TAG_STICKY.lastIndex = i;
+                if (PRE_CLOSE_TAG_STICKY.test(needle) && preStack.pop()) {
+                    significantPreDepth -= 1;
+                }
+            }
+        } else if (ch === '>') {
+            inTag = false;
+            lastTagStartsSerializerGap = pendingTagIsClosing
+                ? CLOSE_TAG_GAP_ELEMENTS.has(pendingTagName)
+                : OPEN_TAG_GAP_ELEMENTS.has(pendingTagName);
+            pendingTagName = '';
+            pendingTagIsClosing = false;
+        }
+
+        const next = needle.charAt(i + 1);
+        const nextStartsWs = !!next && (
+            /\s/.test(next)
+            || needle.substring(i + 1, i + 1 + NBSP_ENTITY.length) === NBSP_ENTITY
+        );
+        if (ch === '>' && next === '<' && lastTagStartsSerializerGap && significantPreDepth === 0) {
+            // An opening `<pre>` is not a gap site anyway (it is a textNode, so
+            // the serializer writes nothing after it); the depth check keeps
+            // whitespace inside the block byte-exact as well.
+            flushLiteral();
+            parts.push(`${HTML_WS_CLASS}*`);
+        } else if (
+            next
+            && !nextStartsWs
+            && !inTag
+            && significantPreDepth === 0
+            && !isHtmlDelim(ch)
+            && !isHtmlDelim(next)
+            && isCjkChar(ch) !== isCjkChar(next)
+        ) {
+            flushLiteral();
+            parts.push(`${WS_OR_NBSP_CLASS}*`);
+        }
+        i += 1;
+    }
+    flushLiteral();
+    return new RegExp(parts.join(''), 'g');
+}
+
+/**
+ * Comparator for the relaxed strategy's uniqueness and sanity gates: drop the
+ * serializer's own inter-tag newlines, then collapse whitespace CJK-aware, so
+ * `<td>\n<p>` and `<td><p>` compare equal. Without the first step the gates
+ * would reject the very drift `buildWhitespaceRelaxedPattern` just matched.
+ *
+ * It must drop no more than the pattern relaxes, or the sanity gate would wave
+ * through a slice the anchor never specified — `</strong> <em>` vs
+ * `</strong><em>`, or `<p>&nbsp;<em>` vs `<p><em>`. That is why it reuses the
+ * same gap definition and runs before, not after, whitespace collapsing.
+ * `normalizeUndoComparisonHtml` does the unrestricted collapse on the undo side.
+ */
+function normalizeForRelaxedMatch(s: string): string {
+    // Drop the gaps BEFORE collapsing whitespace: afterwards an `&nbsp;` and a
+    // serializer `\n` have both become a plain space and are indistinguishable.
+    return normalizeCjkSpacing(s.replace(SERIALIZER_GAP_RAW, '$1'));
+}
+
+const whitespaceRelaxedStrategy: Strategy = {
+    name: 'whitespace_relaxed',
+    tryMatch(input, base) {
+        // Operate in raw-HTML space so needles that contain `<citation>` /
+        // `<annotation>` / math delimiters can still match despite whitespace
+        // drift
+        const needle = base.expandedOld;
+        if (!needle) return null;
+        if (needle.length > MAX_WS_RELAXED_INPUT_LENGTH) return null;
+
+        // Bracket the needle with non-whitespace anchors so the regex cannot
+        // greedy-match across the wrapper div or degenerate into all-whitespace.
+        const first = needle.charAt(0);
+        const last = needle.charAt(needle.length - 1);
+        if (!/\S/.test(first) || !/\S/.test(last)) return null;
+
+        // Defensive: if the needle has no whitespace at all (and no literal
+        // `&nbsp;`) AND no CJK ↔ non-CJK boundary, `exact` would already have
+        // matched. Skip to keep the strategy focused. The CJK-boundary check
+        // is what lets `共识[14]` enter the strategy even though it has no
+        // whitespace — the haystack may have `共识 [14]` (Pangu spacing the
+        // model dropped). Using `hasWhitespaceOrNbsp` covers the symmetric
+        // case where the needle's only whitespace is `&nbsp;`.
+        // A serializer gap is the third entry point: an all-tags needle such as
+        // `<td><p>…</p></td>` has neither whitespace nor a CJK boundary, yet
+        // must still reach the serializer-newline relaxation.
+        const needleHasWs = hasWhitespaceOrNbsp(needle);
+        const needleHasCjkBoundary = hasCjkAsciiBoundary(needle);
+        const needleHasTagBoundary = SERIALIZER_GAP_IN_NEEDLE.test(needle);
+        if (!needleHasWs && !needleHasCjkBoundary && !needleHasTagBoundary) return null;
+
+        // Use the relaxed normalizer so the length/uniqueness gates below treat
+        // Pangu spacing and inter-tag whitespace as non-differences (otherwise
+        // `共识 [14]` and `共识[14]`, or `<td>\n<p>` and `<td><p>`, would
+        // normalize differently and fail the sanity check even when the regex
+        // correctly matched).
+        const normalizedOld = normalizeForRelaxedMatch(needle);
+        if (normalizedOld.length < MIN_WS_RELAXED_NORMALIZED_LENGTH) return null;
+        if (normalizedOld.replace(/\s/g, '').length < MIN_WS_RELAXED_NON_WS_LENGTH) return null;
+
+        // `str_replace_all` expects multiple replacements; our uniqueness gate
+        // contradicts that contract. Refuse so the model picks a more specific
+        // anchor or switches operation.
+        if (input.operation === 'str_replace_all') return null;
+
+        const pattern = buildWhitespaceRelaxedPattern(needle);
+        const matches = [...input.strippedHtml.matchAll(pattern)];
+        if (matches.length !== 1) return null;
+
+        const m = matches[0];
+        const actualRawSlice = m[0];
+        const rawPos = m.index ?? -1;
+        if (rawPos === -1) return null;
+
+        // Normalized-space uniqueness: catches scenarios where the regex
+        // happened to find a single shape but the model's reference is
+        // ambiguous because the normalized form repeats elsewhere.
+        const normalizedHaystack = normalizeForRelaxedMatch(input.strippedHtml);
+        const normFirst = normalizedHaystack.indexOf(normalizedOld);
+        if (normFirst === -1) return null;
+        if (normalizedHaystack.indexOf(normalizedOld, normFirst + 1) !== -1) return null;
+
+        // Sanity: the matched raw slice must normalize to the same form as
+        // the needle under the same relaxed rules. Guards against adversarial
+        // input where the regex engine interpreted the pattern differently
+        // than `normalizeForRelaxedMatch` would.
+        if (normalizeForRelaxedMatch(actualRawSlice) !== normalizedOld) return null;
+
+        // A needle starting inside `<pre>` lacks enough context for the pattern
+        // builder to protect indentation. Insert ops are safe because they
+        // splice the matched bytes back into the result.
+        if (input.operation !== 'insert_after' && input.operation !== 'insert_before') {
+            const opensBeforeMatch = findSignificantPreRegions(input.strippedHtml)
+                .some(region => region.start < rawPos && region.end > rawPos);
+            if (opensBeforeMatch) return null;
+        }
+
+        // Build expandedNew. For insert ops, mirror `rewriteInsertReplacementForTrim`:
+        // when `input.newString` is the already-merged `oldString + injected`
+        // form (execute-time from normalized_action_data), strip the prefix
+        // before expanding so we splice `actualRawSlice + injected` and not
+        // `actualRawSlice + oldString + injected`.
+        let expandedNew: string;
+        try {
+            if (input.operation === 'insert_after') {
+                const injected = input.newString.startsWith(input.oldString)
+                    ? input.newString.substring(input.oldString.length)
+                    : input.newString;
+                const expandedInjected = expandToRawHtml(
+                    injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+                expandedNew = actualRawSlice + expandedInjected;
+            } else if (input.operation === 'insert_before') {
+                const injected = input.newString.endsWith(input.oldString)
+                    ? input.newString.substring(0, input.newString.length - input.oldString.length)
+                    : input.newString;
+                const expandedInjected = expandToRawHtml(
+                    injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+                );
+                expandedNew = expandedInjected + actualRawSlice;
+            } else {
+                expandedNew = base.expandedNew;
+            }
+        } catch {
+            return null;
+        }
+
+        // Invariant: for insert ops, the splice result must start/end with the
+        // actual raw slice. Cheap post-hoc check that catches refactor
+        // regressions (e.g., someone changes `rewriteInsertReplacementForTrim`
+        // and breaks the shared contract).
+        if (input.operation === 'insert_after' && !expandedNew.startsWith(actualRawSlice)) return null;
+        if (input.operation === 'insert_before' && !expandedNew.endsWith(actualRawSlice)) return null;
+
+        return {
+            strategy: 'whitespace_relaxed',
+            oldString: actualRawSlice,
+            newString: input.newString,
+            expandedOld: actualRawSlice,
+            expandedNew,
+            matchCount: 1,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+/** Preserve a dollar-bearing insertion anchor; expand only the injected text. */
+function preserveMathInsertAnchor(input: MatchInput, result: MatchResult): MatchResult {
+    if (!result.oldString.includes('$')) return result;
+    const { operation } = input;
+    if (operation !== 'insert_after' && operation !== 'insert_before') return result;
+    // Strategies that return the actual raw slice may also change oldString.
+    // Rewrite a copied anchor in merged payloads before storing normalized data.
+    const newString = rewriteInsertReplacementForTrim(
+        operation, input.oldString, result.newString, result.oldString,
+    );
+    result = { ...result, newString };
+    const injected = operation === 'insert_after' && result.newString.startsWith(result.oldString)
+        ? result.newString.substring(result.oldString.length)
+        : operation === 'insert_before' && result.newString.endsWith(result.oldString)
+            ? result.newString.substring(0, result.newString.length - result.oldString.length)
+            : result.newString;
+    const expandedInjected = expandToRawHtml(
+        injected, input.metadata, 'new', input.externalRefContext, input.pageLabels, input.resolvedLocatorPages,
+    );
+    return {
+        ...result,
+        expandedNew: operation === 'insert_after'
+            ? result.expandedOld + expandedInjected
+            : expandedInjected + result.expandedOld,
+    };
+}
+
+const markdownRenderStrategy: Strategy = {
+    name: 'markdown_render',
+    tryMatch(input) {
+        const renderedOld = input.renderedOldSimplified;
+        if (!renderedOld) return null;
+
+        let expandedOld: string;
+        try {
+            expandedOld = expandOldAnchor(input, renderedOld);
+        } catch {
+            return null;
+        }
+
+        const matchCount = countOccurrences(input.strippedHtml, expandedOld);
+        if (matchCount === 0) return null;
+
+        const renderedNew = input.renderedNewSimplified ?? renderedOld;
+        let expandedNew: string;
+        try {
+            expandedNew = expandToRawHtml(
+                renderedNew,
+                input.metadata,
+                'new',
+                input.externalRefContext,
+                input.pageLabels,
+                input.resolvedLocatorPages,
+            );
+        } catch {
+            return null;
+        }
+
+        if (input.operation === 'insert_after' && !expandedNew.startsWith(expandedOld)) return null;
+        if (input.operation === 'insert_before' && !expandedNew.endsWith(expandedOld)) return null;
+
+        return {
+            strategy: 'markdown_render',
+            oldString: renderedOld,
+            newString: renderedNew,
+            expandedOld,
+            expandedNew,
+            matchCount,
+            normalizeAnchor: identity,
+        };
+    },
+};
+
+// =============================================================================
+// Fallback policy
+// =============================================================================
+
+/**
+ * Strategies that drop part of old_string (tags, attributes, a partial
+ * element) instead of re-spelling the same text. What they search for can be
+ * broader than what the model wrote, so a match counts only when it pins down
+ * a single target; see `acceptsMatch`.
+ */
+const TEXT_DROPPING_STRATEGIES: ReadonlySet<MatchStrategyName> = new Set([
+    'partial_element_strip',
+    'spurious_wrap_strip',
+    'tag_attribute_strip',
+]);
+
+/** True when `strategy` matched only after dropping part of old_string. */
+function dropsOldStringText(strategy: MatchStrategyName): boolean {
+    return TEXT_DROPPING_STRATEGIES.has(strategy);
+}
+
+function recordRejected(input: StrategyInput, result: MatchResult): void {
+    input.diagnostics?.rejected.push({
+        strategy: result.strategy,
+        oldString: result.oldString,
+        matchCount: result.matchCount,
+    });
+}
+
+/**
+ * Whether a strategy's match may stand. Re-spelling strategies always may:
+ * several matches there are a real ambiguity of the model's own text, which
+ * the caller reports. A text-dropping strategy may only when it resolves to a
+ * single target: one match, its own raw position, or one occurrence that the
+ * ref-aware validate-time lookup pins down. Otherwise the error would describe
+ * a string the model never wrote ("found 20 times" for a bare `</p>` left
+ * after stripping a citation) and a `str_replace_all` would replace every hit
+ * of it. Refused matches are recorded so a not-found error can explain them,
+ * and later strategies still get their turn.
+ */
+function acceptsMatch(input: StrategyInput, result: MatchResult): boolean {
+    if (!dropsOldStringText(result.strategy) || result.matchCount <= 1) return true;
+    if (input.operation !== 'str_replace_all') {
+        if (result.rawPositionHint !== undefined) return true;
+        const location = locateEditTarget({
+            strippedHtml: input.strippedHtml,
+            simplified: input.simplified,
+            oldString: result.oldString,
+            expandedOld: result.expandedOld,
+            metadata: input.metadata,
+        });
+        if (location.kind !== 'ambiguous') return true;
+    }
+    recordRejected(input, result);
+    return false;
+}
+
+/** Head-tail truncate a snippet for a single-line warning string. */
+export function truncateForWarning(s: string, headTail = 30): string {
+    const escaped = s.replace(/\n/g, '\\n');
+    const threshold = headTail * 2 + 5;
+    if (escaped.length <= threshold) return escaped;
+    return `${escaped.slice(0, headTail)}…${escaped.slice(-headTail)}`;
+}
+
+/**
+ * Describe how a strategy changed old_string before matching, as a phrase
+ * that completes "after …", or `null` for an exact match. `originalOld` is
+ * what the model sent; `matchedOld` is the strategy's simplified-space needle.
+ */
+export function describeMatchRewrite(
+    strategy: MatchStrategyName,
+    originalOld: string,
+    matchedOld: string,
+): string | null {
+    switch (strategy) {
+        case 'exact': return null;
+        case 'entity_decode': return 'decoding its HTML entities';
+        case 'entity_encode': return 'writing its special characters as HTML entities';
+        case 'nfkc': return 'converting full-width characters to their standard forms';
+        case 'quote_normalized': return 'treating curly and straight quotation marks as equal';
+        case 'trim_trailing_newlines': return 'removing its trailing newlines';
+        case 'json_unescape': return 'turning escape sequences such as `\\n` into the characters they stand for';
+        case 'tag_attribute_strip': return 'removing the attributes of its block tags';
+        case 'markdown_to_html': return 'converting its Markdown to HTML';
+        case 'whitespace_relaxed': return 'ignoring differences in whitespace';
+        case 'legacy_math': return 'reading its `$…$` text as math';
+        case 'markdown_render': return 'rendering it as Markdown';
+        case 'partial_element_strip':
+        case 'spurious_wrap_strip': {
+            const at = originalOld.indexOf(matchedOld);
+            const parts: string[] = [];
+            if (at > 0) parts.push(`\`${truncateForWarning(originalOld.substring(0, at))}\` from its start`);
+            const tail = at >= 0 ? originalOld.substring(at + matchedOld.length) : '';
+            if (tail) parts.push(`\`${truncateForWarning(tail)}\` from its end`);
+            if (parts.length === 0) {
+                return strategy === 'spurious_wrap_strip'
+                    ? 'removing the tags it shares with new_string'
+                    : 'removing an incomplete citation or annotation tag';
+            }
+            return `removing ${parts.join(' and ')}`;
+        }
+    }
+}
+
+/**
+ * Sentence for a not-found error when a text-dropping fallback matched but was
+ * refused, or `null`. Explains why the match was not used, so the agent does
+ * not conclude its text is absent everywhere.
+ */
+export function describeRejectedFallback(
+    originalOld: string,
+    diagnostics: MatchDiagnostics | undefined,
+): string | null {
+    const rejected = diagnostics?.rejected[0];
+    if (!rejected) return null;
+    const rewrite = describeMatchRewrite(rejected.strategy, originalOld, rejected.oldString);
+    return `After ${rewrite ?? 'adjusting it'}, it would match ${rejected.matchCount} places, `
+        + 'too many to tell which one you meant, so that match was not used.';
+}
+
+/**
+ * Warning for an edit that applied only after a text-dropping fallback, or
+ * `null`. The agent believes its exact text was found; this tells it what was
+ * matched instead so it can check the result.
+ */
+export function buildFallbackMatchWarning(originalOld: string, match: MatchResult): string | null {
+    if (!dropsOldStringText(match.strategy)) return null;
+    const rewrite = describeMatchRewrite(match.strategy, originalOld, match.oldString);
+    return `old_string "${truncateForWarning(originalOld)}" was not found exactly as written; it matched after `
+        + `${rewrite}, and new_string was adjusted the same way. Check that the edited text reads as intended.`;
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+const STRATEGIES: Strategy[] = [
+    exactStrategy,
+    entityDecodeStrategy,
+    entityEncodeStrategy,
+    nfkcStrategy,
+    quoteNormalizedStrategy,
+    trimTrailingNewlinesStrategy,
+    jsonUnescapeStrategy,
+    partialElementStripStrategy,
+    spuriousWrapStripStrategy,
+    tagAttributeStripStrategy,
+    markdownToHtmlStrategy,
+    whitespaceRelaxedStrategy,
+];
+
+/**
+ * Apply the same boundary and insertion safeguards to either expansion mode.
+ *
+ * A dollar-delimited anchor that only matches *inside* a math wrapper must
+ * target the whole wrapper through the legacy pass, not nest a second math
+ * element or leave an orphan wrapper when a formula becomes prose. An anchor
+ * matching both literal dollar text and math needs a more specific anchor,
+ * including for replace-all.
+ */
+function runStrategies(
+    input: StrategyInput,
+    base: BaseExpansion,
+    strategies: Strategy[] = STRATEGIES,
+): MatchResult | null {
+    for (const strategy of strategies) {
+        const result = strategy.tryMatch(input, base);
+        if (!result || result.matchCount === 0) continue;
+        const mathMatches = classifyMathAnchorOccurrences(input.strippedHtml, result.expandedOld);
+        if (mathMatches === 'mixed' && dropsOldStringText(result.strategy)) {
+            // The mix comes from the text the fallback dropped, not from
+            // what the model wrote.
+            recordRejected(input, result);
+            continue;
+        }
+        if (!acceptsMatch(input, result)) continue;
+        if (mathMatches === 'mixed') {
+            throw Object.assign(new Error(
+                'old_string matches both literal dollar text and part of a math element. '
+                + 'For math, copy the whole <span class="math"> or <pre class="math"> '
+                + 'element from read_note. For literal text, include surrounding prose '
+                + 'or its paragraph so the anchor does not also match inside math.',
+            ), { code: 'ambiguous_match' });
+        }
+        if (mathMatches === 'wrapped') continue;
+        return preserveMathInsertAnchor(input, result);
+    }
+    return null;
+}
+
+/**
+ * Prefer every literal normalization strategy before retrying the same chain
+ * with legacy dollar expansion. Mutation strategies re-expand their rewritten
+ * anchors under the current pass's policy. Markdown rendering remains last.
+ */
+export function findBestMatch(
+    matchInput: MatchInput,
+    base: BaseExpansion,
+    diagnostics?: MatchDiagnostics,
+): MatchResult | null {
+    const input: StrategyInput = { ...matchInput, diagnostics };
+    const literal = runStrategies(input, base);
+    if (literal) return literal;
+
+    if (input.oldString.includes('$')) {
+        const legacyInput: StrategyInput = { ...input, oldMathContext: 'legacy-old' };
+        const legacyBase = { ...base, expandedOld: expandOldAnchor(legacyInput, input.oldString) };
+        const legacy = runStrategies(legacyInput, legacyBase);
+        if (legacy) {
+            return { ...legacy, strategy: legacy.strategy === 'exact' ? 'legacy_math' : legacy.strategy };
+        }
+    }
+    return runStrategies(input, base, [markdownRenderStrategy]);
+}
+
+/**
+ * Run only the handler-rendered Markdown fallback. This is used when base
+ * old_string expansion fails before the ranked matcher can run.
+ */
+export function findMarkdownRenderMatch(input: MatchInput): MatchResult | null {
+    const result = markdownRenderStrategy.tryMatch(input, { expandedOld: '', expandedNew: '' });
+    return result && result.matchCount > 0 ? result : null;
+}

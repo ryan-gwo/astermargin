@@ -1,0 +1,27 @@
+import React from 'react';
+import { TextPart } from '@astermargin/agent-core/agents/types';
+import MarkdownRenderer from '../messages/MarkdownRenderer';
+
+interface TextPartViewProps {
+    part: TextPart;
+}
+
+/**
+ * Renders a text part with markdown support.
+ * Since WSPartEvent sends accumulated content (not deltas),
+ * we simply render the current content state.
+ */
+export const TextPartView: React.FC<TextPartViewProps> = React.memo(function TextPartView({ part }) {
+    if (!part.content || part.content.trim() === '' || part.content == '_') {
+        return null;
+    }
+
+    return (
+        <MarkdownRenderer
+            className="markdown chat-prose"
+            content={part.content.trim()}
+        />
+    );
+});
+
+export default TextPartView;

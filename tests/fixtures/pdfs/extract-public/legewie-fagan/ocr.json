@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "id": "legewie-fagan",
+  "capturedAt": "2026-05-11T16:39:19.582Z",
+  "updatedAt": "2026-05-17T16:36:49.134Z",
+  "pdfSha256": "d86a26bf17a0e19194abe41f10b32b4cf86e8caddf3c854773802e5a76b607cf",
+  "pdfBytes": 50492,
+  "config": {
+    "options": {},
+    "effectiveOptions": {
+      "minTextPerPage": 100,
+      "minMeanTextPerPage": 24,
+      "sampleSize": 6,
+      "expandedSampleSize": 20,
+      "expandLowerThreshold": 0.1,
+      "expandUpperThreshold": 0.8,
+      "confirmationThreshold": 0.5,
+      "maxWhitespaceRatio": 0.7,
+      "maxNewlineRatio": 0.6,
+      "minAlphanumericRatio": 0.3,
+      "maxInvalidCharRatio": 0.3,
+      "minValidCharsToAccept": 1000,
+      "imageCoverageThreshold": 0.65,
+      "maxLineOverlapRatio": 0.1,
+      "boundaryMargin": 5,
+      "checkBoundingBoxes": false
+    }
+  },
+  "fingerprints": {
+    "extractorGitSha": "187a29ed",
+    "extractorVersion": "0.19.3",
+    "mupdfWasmSha256": "767d9960e2483f9ab925e46a1f560520ff3615d63fa11198c2fddf991f612578"
+  },
+  "tolerance": {
+    "issueRatioAbs": 0.02,
+    "textLengthAbs": 5
+  },
+  "expected": {
+    "needsOCR": false,
+    "primaryReason": "text_extraction_acceptable",
+    "issueRatio": 0,
+    "issueBreakdown": {
+      "no_text_blocks": 0,
+      "insufficient_text": 0,
+      "high_whitespace_ratio": 0,
+      "high_newline_ratio": 0,
+      "low_alphanumeric_ratio": 0,
+      "invalid_characters": 0,
+      "large_image_coverage": 0,
+      "bbox_overflow": 0,
+      "excessive_line_overlap": 0
+    },
+    "sampledPages": 1,
+    "totalPages": 1,
+    "pageAnalyses": [
+      {
+        "pageIndex": 0,
+        "hasIssues": false,
+        "issues": [],
+        "textLength": 3280,
+        "hasImages": false
+      }
+    ]
+  }
+}

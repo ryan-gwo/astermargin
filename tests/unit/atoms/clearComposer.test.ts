@@ -1,0 +1,258 @@
+/**
+ * `clearComposerAtom` is the choke point for discarding a draft (new thread,
+ * thread switch, after sending). Everything an action staged for that draft
+ * must go with it: an action attaches its targets when the user picks it, so a
+ * pill left waiting for insertion would surface in the next draft with nothing
+ * behind it.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { atom, createStore } from 'jotai';
+
+// The real module's import chain reaches Supabase and Zotero APIs at load
+// time; stub those out.
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: { auth: { getSession: vi.fn() } },
+}));
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({ logger: vi.fn() }));
+
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test' })),
+}));
+
+vi.mock('../../../src/utils/prefs', () => ({
+    getPref: vi.fn(() => true),
+    setPref: vi.fn(),
+}));
+
+vi.mock('../../../react/utils/popupMessageUtils', async () => {
+    const { atom: jotaiAtom } = await import('jotai');
+    return {
+        addPopupMessageAtom: jotaiAtom(null, () => undefined),
+        addRegularItemPopupAtom: jotaiAtom(null, () => undefined),
+        addRegularItemsSummaryPopupAtom: jotaiAtom(null, () => undefined),
+        removePopupMessageAtom: jotaiAtom(null, () => undefined),
+        safeChildAttachments: vi.fn(() => []),
+    };
+});
+
+vi.mock('../../../react/atoms/itemValidation', async () => {
+    const { atom: jotaiAtom } = await import('jotai');
+    return {
+        getItemValidationAtom: jotaiAtom(() => () => undefined),
+        isHardBlockedValidation: vi.fn(() => false),
+        isRejectedItemValidation: vi.fn(() => false),
+        validateItemsAtom: jotaiAtom(null, () => Promise.resolve()),
+        validateRegularItemAtom: jotaiAtom(null, () => Promise.resolve()),
+    };
+});
+
+vi.mock('../../../react/components/ui/popup/InvalidItemsMessageContent', () => ({
+    InvalidItemsMessageContent: () => null,
+}));
+
+vi.mock('../../../react/utils/readerUtils', () => ({
+    getCurrentReader: vi.fn(() => undefined),
+}));
+
+// The add path pre-filters with the real support check, which needs a fuller
+// Zotero.Item than these tests build.
+vi.mock('../../../src/utils/agentItemSupport', () => ({
+    agentItemFilter: vi.fn(() => true),
+}));
+
+vi.mock('../../../react/atoms/profile', () => ({
+    searchableLibraryIdsAtom: atom<number[]>([1]),
+}));
+
+const {
+    addItemsToCurrentMessageItemsAtom,
+    clearComposerAtom,
+    composerResetTokenAtom,
+    currentMessageContentAtom,
+    currentMessageItemsAtom,
+    currentMessagePillsAtom,
+    composerDraftAtom,
+    messageItemDataRevisionAtom,
+    pendingPillInsertsAtom,
+    removeItemFromMessageAtom,
+    readerActionContextAtom,
+    stagedReaderActionContextAtom,
+    effectiveReaderTextSelectionAtom,
+    readerTextSelectionAtom,
+} = await import('../../../react/atoms/messageComposition');
+
+const pill = { commandName: 'summarize', actionId: 'custom-1' };
+
+function draftStore() {
+    const store = createStore();
+    store.set(currentMessageContentAtom, '/summarize draft text');
+    store.set(currentMessagePillsAtom, [pill]);
+    return store;
+}
+
+describe('clearComposerAtom', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('clears the text and the pills in it', () => {
+        const store = draftStore();
+        store.set(clearComposerAtom);
+        expect(store.get(currentMessageContentAtom)).toBe('');
+        expect(store.get(currentMessagePillsAtom)).toEqual([]);
+    });
+
+    it('cancels pills that were staged but not yet inserted', () => {
+        // An editor claims a staged pill on a timer, so a thread switch can
+        // land between staging and insertion. Their targets went with the
+        // draft, so none of them may reach the next one.
+        const store = draftStore();
+        store.set(pendingPillInsertsAtom, [{ descriptor: pill }, { descriptor: pill }]);
+        store.set(clearComposerAtom);
+        expect(store.get(pendingPillInsertsAtom)).toEqual([]);
+    });
+
+    it('bumps the reset token so mounted editors learn about the clear', () => {
+        const store = draftStore();
+        const before = store.get(composerResetTokenAtom);
+        store.set(clearComposerAtom);
+        expect(store.get(composerResetTokenAtom)).toBe(before + 1);
+    });
+
+    it('bumps the reset token even when the composer is already empty', () => {
+        const store = createStore();
+        const before = store.get(composerResetTokenAtom);
+        store.set(clearComposerAtom);
+        expect(store.get(composerResetTokenAtom)).toBe(before + 1);
+        expect(store.get(pendingPillInsertsAtom)).toEqual([]);
+    });
+});
+
+// A Zotero key is only unique within its library, so two libraries can hold
+// the same key. Attached items — including the targets an action binds — are
+// identified by library and key together.
+describe('attached item identity', () => {
+    const item = (libraryID: number, key: string) => ({
+        libraryID,
+        key,
+        isRegularItem: () => true,
+        isAttachment: () => false,
+        isNote: () => false,
+        isAnnotation: () => false,
+    }) as unknown as Zotero.Item;
+
+    beforeEach(() => {
+        vi.stubGlobal('Zotero', { Items: {} });
+    });
+
+    it('adds an item that shares a key with one from another library', async () => {
+        const store = createStore();
+        const mine = item(1, 'SAMEKEY');
+        const group = item(2, 'SAMEKEY');
+        await store.set(addItemsToCurrentMessageItemsAtom, [mine]);
+        await store.set(addItemsToCurrentMessageItemsAtom, [group]);
+        expect(store.get(currentMessageItemsAtom)).toEqual([mine, group]);
+    });
+
+    it('removes only the item from the library it was removed in', () => {
+        const store = createStore();
+        const mine = item(1, 'SAMEKEY');
+        const group = item(2, 'SAMEKEY');
+        store.set(currentMessageItemsAtom, [mine, group]);
+        store.set(removeItemFromMessageAtom, group);
+        expect(store.get(currentMessageItemsAtom)).toEqual([mine]);
+    });
+});
+
+
+it('does not revive an old reader selection when its removed source is reattached', () => {
+    const store = createStore();
+    const source = { id: 42, libraryID: 1, key: 'SOURCE' } as any;
+    store.set(currentMessageItemsAtom, [source]);
+    store.set(readerActionContextAtom, { item: source, selection: { text: 'old passage' } });
+    store.set(removeItemFromMessageAtom, source);
+    store.set(currentMessageItemsAtom, [source]);
+    expect(store.get(stagedReaderActionContextAtom)).toBeNull();
+});
+
+
+it('displays and removes the staged selection without falling back to destination text', () => {
+    const store = createStore();
+    const source = { id: 42, libraryID: 1, key: 'SOURCE' } as any;
+    store.set(readerTextSelectionAtom, { text: 'destination passage' });
+    store.set(currentMessageItemsAtom, [source]);
+    store.set(readerActionContextAtom, { item: source, selection: { text: 'source passage', page: 3 } });
+    expect(store.get(effectiveReaderTextSelectionAtom)).toEqual({ text: 'source passage', page: 3 });
+    store.set(effectiveReaderTextSelectionAtom, null);
+    expect(store.get(effectiveReaderTextSelectionAtom)).toBeNull();
+    expect(store.get(stagedReaderActionContextAtom)?.selection).toBeNull();
+});
+
+it('removes the live selection when no reader action is staged', () => {
+    const store = createStore();
+    store.set(readerTextSelectionAtom, { text: 'live passage' });
+    expect(store.get(effectiveReaderTextSelectionAtom)).toEqual({ text: 'live passage' });
+    store.set(effectiveReaderTextSelectionAtom, null);
+    expect(store.get(readerTextSelectionAtom)).toBeNull();
+});
+
+// An item from a library not opened this session carries only primary data;
+// the composer loads the rest and bumps a label revision so labels pick up the
+// title. Loading data is not a draft edit.
+describe('attached items with unloaded data', () => {
+    const loadedItems = new Set<unknown>();
+
+    beforeEach(() => {
+        loadedItems.clear();
+        (globalThis as any).Zotero.Items = {
+            ...(globalThis as any).Zotero.Items,
+            loadDataTypes: vi.fn(async (items: unknown[]) => { items.forEach(item => loadedItems.add(item)); }),
+        };
+    });
+
+    function unloadedItem(key: string) {
+        const item = {
+            id: 46,
+            libraryID: 3,
+            key,
+            parentID: false,
+            parentItem: null,
+            getDisplayTitle: () => {
+                if (loadedItems.has(item)) return 'Loaded title';
+                const error = new Error("Item data not loaded and field 'title' not set");
+                error.name = 'UnloadedDataException';
+                throw error;
+            },
+        };
+        return item as unknown as Zotero.Item;
+    }
+
+    it('loads the data and bumps the label revision without touching the draft', async () => {
+        const store = createStore();
+        const item = unloadedItem('46GA3WJK');
+        store.set(currentMessageItemsAtom, [item]);
+        const published = store.get(currentMessageItemsAtom);
+        const draftChanged = vi.fn();
+        const unsubscribe = store.sub(composerDraftAtom, draftChanged);
+
+        await vi.waitFor(() => expect(store.get(messageItemDataRevisionAtom)).toBe(1));
+        unsubscribe();
+
+        expect(item.getDisplayTitle()).toBe('Loaded title');
+        expect(store.get(currentMessageItemsAtom)).toBe(published);
+        expect(draftChanged).not.toHaveBeenCalled();
+    });
+
+    it('does not bump the revision when the item was removed before loading finished', async () => {
+        const store = createStore();
+        const item = unloadedItem('46GA3WJK');
+        store.set(currentMessageItemsAtom, [item]);
+        store.set(currentMessageItemsAtom, []);
+
+        await vi.waitFor(() => expect((globalThis as any).Zotero.Items.loadDataTypes).toHaveBeenCalled());
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        expect(store.get(messageItemDataRevisionAtom)).toBe(0);
+    });
+});

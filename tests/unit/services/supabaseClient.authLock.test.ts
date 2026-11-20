@@ -1,0 +1,448 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { capturedLocks, mockCreateClient, mockLogger, mockMarkSupabaseConfigInUse } = vi.hoisted(() => ({
+    mockMarkSupabaseConfigInUse: vi.fn(),
+    capturedLocks: [] as Array<(name: string, acquireTimeout: number, fn: () => Promise<unknown>) => Promise<unknown>>,
+    mockCreateClient: vi.fn((_url: string, _key: string, options: {
+        auth: {
+            lock: (name: string, acquireTimeout: number, fn: () => Promise<unknown>) => Promise<unknown>;
+            storage: unknown;
+        };
+    }) => {
+        capturedLocks.push(options.auth.lock);
+        return {
+            auth: {
+                initialize: vi.fn().mockResolvedValue(undefined),
+                startAutoRefresh: vi.fn().mockResolvedValue(undefined),
+                stopAutoRefresh: vi.fn().mockResolvedValue(undefined),
+            },
+        };
+    }),
+    mockLogger: vi.fn(),
+}));
+
+vi.mock('@supabase/supabase-js', () => {
+    class MockAuthApiError extends Error {}
+
+    return {
+        AuthApiError: MockAuthApiError,
+        createClient: mockCreateClient,
+    };
+});
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({
+    logger: mockLogger,
+}));
+
+// The Supabase project URL and key reach the client through the transport
+// config seam. These tests reload the module repeatedly, so serve fixed values
+// instead of re-registering them for every generation.
+vi.mock('@astermargin/agent-core/transport/config', () => ({
+    setTransportConfig: vi.fn(),
+    isTransportConfigRegistered: () => true,
+    markSupabaseConfigInUse: mockMarkSupabaseConfigInUse,
+    getApiBaseUrl: () => 'https://api.example.com',
+    getSupabaseConfig: () => ({ url: 'https://example.supabase.co', anonKey: 'anon-key' }),
+}));
+
+function createMockStorageAdapter() {
+    return {
+        getItem: vi.fn(),
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
+    };
+}
+
+function createDeferred<T>(): {
+    promise: Promise<T>;
+    resolve: (value: T | PromiseLike<T>) => void;
+} {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>((innerResolve) => {
+        resolve = innerResolve;
+    });
+    return { promise, resolve };
+}
+
+/**
+ * Register the Zotero reload bridge for the freshly loaded module generation.
+ * The bridge is what stashes the disposer and the auth lock on the window, so
+ * a test that exercises reload behavior has to register it per generation.
+ */
+async function registerReloadBridge(): Promise<void> {
+    const { setSupabaseReloadBridge } = await import('@astermargin/agent-core/transport/supabaseClient');
+    const host = globalThis.window as any;
+    setSupabaseReloadBridge({
+        previousDisposer: () => host.__astermarginDisposeSupabase,
+        publishDisposer: dispose => { host.__astermarginDisposeSupabase = dispose; },
+        shareAuthLock: fallback => host.__astermarginAuthLock ??= fallback,
+    });
+}
+
+/** Let the disposer's promise chain settle. */
+async function flushAsync(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+beforeEach(() => {
+    capturedLocks.length = 0;
+    mockCreateClient.mockClear();
+    mockLogger.mockClear();
+    mockMarkSupabaseConfigInUse.mockClear();
+    vi.resetModules();
+
+    vi.stubGlobal('window', {});
+});
+
+describe('supabaseClient auth lock reload handling', () => {
+    it('does not create the client until the exported client is first used', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        expect(mockCreateClient).not.toHaveBeenCalled();
+
+        module.supabase.auth;
+
+        expect(mockCreateClient).toHaveBeenCalledTimes(1);
+    });
+
+    it('uses the registered storage adapter when the exported client is first used', async () => {
+        const registeredStorage = createMockStorageAdapter();
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+
+        module.setSupabaseStorageAdapter(registeredStorage);
+        module.supabase.auth;
+
+        expect(mockCreateClient).toHaveBeenCalledTimes(1);
+        expect(mockCreateClient.mock.calls[0][2].auth.storage).toBe(registeredStorage);
+    });
+
+    it('creates the client with the configured project URL and anon key, and pins them', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+        module.supabase.auth;
+
+        expect(mockCreateClient.mock.calls[0][0]).toBe('https://example.supabase.co');
+        expect(mockCreateClient.mock.calls[0][1]).toBe('anon-key');
+        // Pinning is what stops a later registration from stranding this client
+        // on a different project.
+        expect(mockMarkSupabaseConfigInUse).toHaveBeenCalledWith({
+            url: 'https://example.supabase.co',
+            anonKey: 'anon-key',
+        });
+    });
+
+    it('throws when the exported client is used without a registered storage adapter', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+
+        expect(() => module.supabase.auth).toThrow(
+            'No Supabase storage adapter registered.'
+        );
+        expect(mockCreateClient).not.toHaveBeenCalled();
+    });
+
+    it('rejects storage registration after the exported client has been used', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        module.supabase.auth;
+
+        expect(() => module.setSupabaseStorageAdapter(createMockStorageAdapter()))
+            .toThrow('Supabase storage adapter must be set before the Supabase client is first used');
+    });
+
+    it('keeps inherited waiters queued across module reloads', async () => {
+        const firstModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        firstModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        firstModule.supabase.auth;
+        const firstGenerationLock = capturedLocks.at(-1)!;
+        const initialWindowLock = (window as any).__astermarginAuthLock;
+
+        expect(initialWindowLock).toBeDefined();
+
+        const holderRelease = createDeferred<void>();
+        const events: string[] = [];
+
+        const holder = firstGenerationLock('refresh-session', -1, async () => {
+            events.push('holder:start');
+            await holderRelease.promise;
+            events.push('holder:end');
+            return 'holder';
+        });
+
+        const inheritedWaiter = firstGenerationLock('get-session', -1, async () => {
+            events.push('inherited');
+            return 'inherited';
+        });
+
+        await Promise.resolve();
+        expect(events).toEqual(['holder:start']);
+
+        vi.resetModules();
+        const secondModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        secondModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        secondModule.supabase.auth;
+        const reloadedLock = capturedLocks.at(-1)!;
+        expect((window as any).__astermarginAuthLock).toBe(initialWindowLock);
+
+        const reloadedWaiter = reloadedLock('refresh-after-reload', -1, async () => {
+            events.push('reloaded');
+            return 'reloaded';
+        });
+
+        await Promise.resolve();
+        expect(events).toEqual(['holder:start']);
+
+        holderRelease.resolve();
+
+        await expect(holder).resolves.toBe('holder');
+        await expect(inheritedWaiter).resolves.toBe('inherited');
+        await expect(reloadedWaiter).resolves.toBe('reloaded');
+        expect(events).toEqual([
+            'holder:start',
+            'holder:end',
+            'inherited',
+            'reloaded',
+        ]);
+    });
+
+    it('starts with a fresh auth lock after shutdown cleanup removes the persisted state', async () => {
+        const firstModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        firstModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        firstModule.supabase.auth;
+        const firstWindowLock = (window as any).__astermarginAuthLock;
+
+        // Mirrors the host shutdown path, which disposes the client and clears
+        // both pieces of reload-persistent state off the window.
+        delete (window as any).__astermarginAuthLock;
+        (window as any).__astermarginDisposeSupabase = undefined;
+
+        vi.resetModules();
+        const secondModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        secondModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        secondModule.supabase.auth;
+
+        expect((window as any).__astermarginAuthLock).toBeDefined();
+        expect((window as any).__astermarginAuthLock).not.toBe(firstWindowLock);
+        expect((window as any).__astermarginAuthLock).toMatchObject({
+            locked: false,
+            queue: [],
+            lockName: null,
+            lockToken: null,
+            tokenCounter: 0,
+        });
+    });
+});
+
+describe('supabaseClient auth policy', () => {
+    /** The auth surface of the most recently created mock client. */
+    function lastClientAuth(): {
+        initialize: ReturnType<typeof vi.fn>;
+        startAutoRefresh: ReturnType<typeof vi.fn>;
+        stopAutoRefresh: ReturnType<typeof vi.fn>;
+    } {
+        return (mockCreateClient.mock.results.at(-1)!.value as any).auth;
+    }
+
+    it('force-starts auto-refresh by default', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        module.supabase.auth;
+        await flushAsync();
+
+        expect(lastClientAuth().initialize).toHaveBeenCalledTimes(1);
+        expect(lastClientAuth().startAutoRefresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips the forced start when the host opts out, but still initializes', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+        module.setSupabaseAuthPolicy({ forceAutoRefresh: false });
+
+        module.supabase.auth;
+        await flushAsync();
+
+        expect(lastClientAuth().initialize).toHaveBeenCalledTimes(1);
+        expect(lastClientAuth().startAutoRefresh).not.toHaveBeenCalled();
+    });
+
+    // initialize()'s finally block re-registers the SDK's visibility listener,
+    // so a client disposed while initialize() is in flight must still be
+    // stopped afterwards — under either policy.
+    it('stops a client disposed mid-initialize when the host opts out', async () => {
+        const initialized = createDeferred<undefined>();
+        mockCreateClient.mockImplementationOnce((_url: string, _key: string, options: any) => {
+            capturedLocks.push(options.auth.lock);
+            return {
+                auth: {
+                    initialize: vi.fn().mockReturnValue(initialized.promise),
+                    startAutoRefresh: vi.fn().mockResolvedValue(undefined),
+                    stopAutoRefresh: vi.fn().mockResolvedValue(undefined),
+                },
+            };
+        });
+
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+        module.setSupabaseAuthPolicy({ forceAutoRefresh: false });
+
+        module.supabase.auth;
+        await module.disposeSupabaseClient();
+        const stopsBeforeInitializeSettles = lastClientAuth().stopAutoRefresh.mock.calls.length;
+
+        initialized.resolve(undefined);
+        await flushAsync();
+
+        expect(lastClientAuth().startAutoRefresh).not.toHaveBeenCalled();
+        // The stop that matters is the one after initialize() settles: the
+        // disposer's own stop ran before the listener was re-registered.
+        expect(lastClientAuth().stopAutoRefresh.mock.calls.length)
+            .toBeGreaterThan(stopsBeforeInitializeSettles);
+    });
+
+    it('rejects policy registration after the exported client has been used', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        module.supabase.auth;
+
+        expect(() => module.setSupabaseAuthPolicy({ forceAutoRefresh: false }))
+            .toThrow('Supabase auth policy must be set before the Supabase client is first used');
+    });
+});
+
+describe('supabaseClient reload bridge', () => {
+    it('creates a working client and touches no host state when no bridge is registered', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        module.supabase.auth;
+
+        expect(mockCreateClient).toHaveBeenCalledTimes(1);
+        expect((window as any).__astermarginDisposeSupabase).toBeUndefined();
+        expect((window as any).__astermarginAuthLock).toBeUndefined();
+    });
+
+    it('disposes without a client and without a bridge', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+
+        await expect(module.disposeSupabaseClient()).resolves.toBeUndefined();
+
+        expect(mockCreateClient).not.toHaveBeenCalled();
+    });
+
+    // Registering late would hand this generation its own disposer back and
+    // swap the lock out from under any queued waiter, both silently.
+    it('rejects bridge registration after the exported client has been used', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        module.supabase.auth;
+
+        await expect(registerReloadBridge()).rejects.toThrow(
+            'Supabase reload bridge must be set before the Supabase client is first used'
+        );
+    });
+
+    it('publishes the disposer only once a client exists', async () => {
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+
+        expect((window as any).__astermarginDisposeSupabase).toBeUndefined();
+
+        module.supabase.auth;
+
+        expect((window as any).__astermarginDisposeSupabase).toBeTypeOf('function');
+    });
+
+    // Two auto-refresh tickers on one session race for the single-use refresh
+    // token, so the reloaded instance has to stop the previous one.
+    it('stops the previous instance when the next one registers the bridge', async () => {
+        const firstModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        firstModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        firstModule.supabase.auth;
+
+        const firstClient = mockCreateClient.mock.results[0].value as {
+            auth: { stopAutoRefresh: ReturnType<typeof vi.fn> };
+        };
+        expect(firstClient.auth.stopAutoRefresh).not.toHaveBeenCalled();
+
+        vi.resetModules();
+        const secondModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        await flushAsync();
+
+        expect(firstClient.auth.stopAutoRefresh).toHaveBeenCalled();
+        // Left in place until this instance publishes its own, so a stop that
+        // failed can still be retried from the host's shutdown path.
+        expect((window as any).__astermarginDisposeSupabase).toBeTypeOf('function');
+
+        secondModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        secondModule.supabase.auth;
+
+        expect((window as any).__astermarginDisposeSupabase).toBeTypeOf('function');
+        expect((window as any).__astermarginDisposeSupabase).toBe(secondModule.disposeSupabaseClient);
+    });
+
+    // A stop that fails leaves the old ticker running, so the disposer has to
+    // stay reachable for the host to retry rather than being consumed by the
+    // attempt that failed.
+    it('keeps the previous disposer reachable when stopping it fails', async () => {
+        const firstModule = await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        firstModule.setSupabaseStorageAdapter(createMockStorageAdapter());
+        firstModule.supabase.auth;
+
+        const firstClient = mockCreateClient.mock.results[0].value as {
+            auth: { stopAutoRefresh: ReturnType<typeof vi.fn> };
+        };
+        firstClient.auth.stopAutoRefresh.mockRejectedValueOnce(new Error('stop failed'));
+
+        vi.resetModules();
+        await import('@astermargin/agent-core/transport/supabaseClient');
+        await registerReloadBridge();
+        await flushAsync();
+
+        expect(firstClient.auth.stopAutoRefresh).toHaveBeenCalledTimes(1);
+
+        const disposer = (window as any).__astermarginDisposeSupabase;
+        expect(disposer).toBeTypeOf('function');
+
+        await disposer();
+        expect(firstClient.auth.stopAutoRefresh).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe('supabaseClient backend access policy', () => {
+    // vi.resetModules() in the top-level beforeEach gives each test a fresh
+    // policy module, so no registration leaks between tests.
+    it('never creates a client while backend access is blocked', async () => {
+        const policy = await import('@astermargin/agent-core/transport/backendAccessPolicy');
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        module.setSupabaseStorageAdapter(createMockStorageAdapter());
+        policy.setBackendAccessPolicy(() => false);
+
+        expect(() => module.supabase.auth).toThrow(policy.BackendAccessBlockedError);
+        expect(() => module.supabase.auth).toThrow(expect.objectContaining({ surface: 'supabase.client' }));
+        expect(mockCreateClient).not.toHaveBeenCalled();
+    });
+
+    it('does not reach a delegated host client while backend access is blocked', async () => {
+        const policy = await import('@astermargin/agent-core/transport/backendAccessPolicy');
+        const module = await import('@astermargin/agent-core/transport/supabaseClient');
+        const provider = vi.fn(() => ({ auth: {} }) as any);
+        module.setSupabaseClientProvider(provider);
+        policy.setBackendAccessPolicy(() => false);
+
+        expect(() => module.supabase.auth).toThrow(policy.BackendAccessBlockedError);
+        expect(provider).not.toHaveBeenCalled();
+    });
+});

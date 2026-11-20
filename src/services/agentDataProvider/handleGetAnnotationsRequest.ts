@@ -1,0 +1,152 @@
+/**
+ * Handle get_annotations requests from the backend.
+ */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { getAnnotationIDs } from '../../utils/zoteroDataLoading';
+import { modelObjectId, resolveItemReference, resolveObjectId, UNRESOLVED_LIBRARY_ID } from '../../utils/libraryIdentity';
+import {
+    formatZoteroCreatorsString,
+    getCreatorsFromItem,
+    getYearFromItem,
+    serializeAnnotation,
+} from '../../utils/zoteroSerializers';
+import {
+    WSGetAnnotationsRequest,
+    WSGetAnnotationsResponse,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import { checkLibraryExcluded } from './utils';
+
+
+function invalidResponse(
+    request: WSGetAnnotationsRequest,
+    error: string,
+    errorCode: string,
+): WSGetAnnotationsResponse {
+    return {
+        type: 'get_annotations',
+        request_id: request.request_id,
+        annotations: [],
+        total_count: 0,
+        error,
+        error_code: errorCode,
+    };
+}
+
+
+/**
+ * Return paginated annotations for a Zotero file attachment.
+ */
+export async function handleGetAnnotationsRequest(
+    request: WSGetAnnotationsRequest
+): Promise<WSGetAnnotationsResponse> {
+    logger(`handleGetAnnotationsRequest: Getting annotations for ${request.attachment_id}`, 1);
+
+    try {
+        const parsedRef = resolveObjectId(request.attachment_id);
+        if (!parsedRef) {
+            return invalidResponse(request, 'Invalid attachment_id format', 'invalid_attachment_id');
+        }
+
+        // Reject attachments in libraries the user excluded from AsterMargin before any
+        // lookup, so excluded annotations are never returned or confirmed to exist.
+        // An unresolved portable ref has no local library to check yet — the
+        // resolution below reports it as library_unavailable.
+        if (parsedRef.library_id !== UNRESOLVED_LIBRARY_ID) {
+            const excluded = checkLibraryExcluded(parsedRef.library_id);
+            if (excluded) {
+                return invalidResponse(request, excluded.message, 'library_excluded');
+            }
+        }
+
+        const resolved = await resolveItemReference(parsedRef);
+        if (resolved.status === 'library_unavailable') {
+            return invalidResponse(
+                request,
+                'Attachment is in a library that is not available on this computer.',
+                'library_unavailable',
+            );
+        }
+        if (resolved.status === 'not_found') {
+            return invalidResponse(request, 'Attachment not found', 'not_found');
+        }
+        const attachment = resolved.item;
+
+        if (!attachment.isFileAttachment?.()) {
+            return invalidResponse(request, 'Item is not a file attachment', 'not_attachment');
+        }
+
+        await Zotero.Items.loadDataTypes([attachment], ['primaryData', 'itemData', 'childItems']);
+
+        // Read IDs and fetch the page asynchronously: annotations in a library
+        // whose items are not loaded yet are not in Zotero's object cache.
+        // getAsync returns cached objects before newly loaded ones, so restore
+        // the document order of the IDs.
+        const allAnnotationIds = await getAnnotationIDs(attachment);
+        const totalCount = allAnnotationIds.length;
+        const offset = Math.max(0, request.offset || 0);
+        const limit = Math.max(0, request.limit || 0);
+        const pageIds = allAnnotationIds.slice(offset, offset + limit);
+        const loadedById = new Map<number, Zotero.Item>();
+        if (pageIds.length > 0) {
+            for (const annotation of await Zotero.Items.getAsync(pageIds)) {
+                if (annotation) loadedById.set(annotation.id, annotation);
+            }
+        }
+        const annotationItems = pageIds
+            .map(id => loadedById.get(id))
+            .filter((annotation): annotation is Zotero.Item => annotation !== undefined);
+
+        if (annotationItems.length > 0) {
+            await Zotero.Items.loadDataTypes(annotationItems, ['primaryData', 'itemData', 'tags', 'annotation', 'annotationDeferred']);
+        }
+
+        let itemInfo: {
+            item_id: string;
+            item_type?: string | null;
+            title: string;
+            creators?: string | null;
+            year?: number | null;
+        } | null = null;
+        if (attachment.parentID) {
+            const parent = await Zotero.Items.getAsync(attachment.parentID);
+            if (parent) {
+                await Zotero.Items.loadDataTypes([parent], ['primaryData', 'itemData', 'creators']);
+                let title = '';
+                try {
+                    title = (parent.getField('title') as string) || '';
+                } catch {
+                    title = parent.getDisplayTitle?.() || '';
+                }
+                itemInfo = {
+                    item_id: modelObjectId(parent.libraryID, parent.key),
+                    item_type: parent.itemType ?? null,
+                    title,
+                    creators: formatZoteroCreatorsString(getCreatorsFromItem(parent)),
+                    year: getYearFromItem(parent) ?? null,
+                };
+            }
+        }
+
+        const attachmentInfo = { item_id: request.attachment_id };
+        const annotations = annotationItems.map(annotation =>
+            serializeAnnotation(annotation, attachmentInfo, itemInfo)
+        );
+
+        logger(`handleGetAnnotationsRequest: Returning ${annotations.length}/${totalCount} annotations`, 1);
+
+        return {
+            type: 'get_annotations',
+            request_id: request.request_id,
+            annotations,
+            total_count: totalCount,
+        };
+    } catch (error: any) {
+        logger(`handleGetAnnotationsRequest: Failed: ${error}`, 1);
+        return invalidResponse(
+            request,
+            error instanceof Error ? error.message : String(error),
+            'internal_error',
+        );
+    }
+}

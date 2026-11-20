@@ -1,0 +1,1139 @@
+/**
+ * Background processing dispatcher.
+ *
+ * Owns the `"background"` MuPDFWorkerClient and drains registered lanes from
+ * the `background_jobs` queue. The exported class name is kept stable because
+ * addon lifecycle hooks and dev endpoints reach it through
+ * `Zotero.AsterMargin?.backgroundExtractor`.
+ */
+
+import { disposeMuPDFWorker } from '../astermargin-extract';
+import type {
+    BackgroundJobInput,
+    BackgroundJobRecord,
+    BackgroundJobType,
+} from './database';
+import { captureAccountGuard } from './accountGuard';
+import { DocumentExtractExecutor } from './backgroundQueue/documentExtractExecutor';
+import type {
+    JobExecutionContext,
+    JobExecutor,
+    JobOutcome,
+    QueueDB,
+} from './backgroundQueue/jobExecutor';
+import { MuPDFSerialLane } from './backgroundQueue/muPDFSerialLane';
+import { InteractiveOverflow, type InteractiveOverflowStats } from './backgroundQueue/interactiveOverflow';
+import { isLibraryInScope, isLibraryScopeKnown } from './libraryScope';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { createAbortController } from '../utils/abortController';
+import { UNRESOLVED_LIBRARY_ID } from '../utils/libraryIdentity';
+import { getPref } from '../utils/prefs';
+import { getSystemIdleTimeMs, registerIdleObserver } from '../utils/idleService';
+
+const IDLE_INTERVAL_MS = 30_000;
+/** Re-tick delay after a pass that launched work, so a backlog keeps draining. */
+const PROGRESS_INTERVAL_MS = 10;
+/**
+ * Backstop re-tick while jobs are in flight but nothing could be claimed (every
+ * lane with queued work is full). Lane progress is driven by `notify()` when a
+ * job settles, so this only has to catch what never notifies; ticking faster
+ * just burns main-thread time on the pref, idle-time and worker-stats reads
+ * every pass makes.
+ */
+const BUSY_BACKSTOP_INTERVAL_MS = 500;
+const VISIBILITY_TIMEOUT_MS = 6 * 60_000;
+const MAX_ATTEMPTS = 3;
+const BACKOFF_MS = (attempt: number) =>
+    Math.min(60_000 * Math.pow(2, attempt - 1), 30 * 60_000);
+
+const STARTUP_DELAY_MS = 30_000;
+const IDLE_THRESHOLD_MS = 30_000;
+const IDLE_THRESHOLD_SEC = 30;
+const LOW_PRIORITY_CEILING = 100;
+const PREF_ENABLED = 'backgroundExtractorEnabled';
+const PREF_PROCESSING_ENABLED = 'backgroundProcessingEnabled';
+const COOPERATIVE_THROTTLE = true;
+/** Lanes whose jobs may use the background MuPDF worker. */
+const MUPDF_JOB_TYPES: readonly BackgroundJobType[] = ['document_extract', 'document_ocr'];
+
+export type ProcessOnceReason =
+    | 'startup_delay'
+    | 'stopped'
+    | 'shutting_down'
+    | 'disabled'
+    | 'sync_in_progress'
+    | 'hot_busy'
+    | 'library_scope_unknown'
+    | 'empty'
+    | 'job_done';
+
+export interface ProcessOnceResult {
+    processed: boolean;
+    reason?: ProcessOnceReason;
+}
+
+export type BackgroundLaneStatus = Partial<
+    Record<BackgroundJobType, {
+        inFlight: number;
+        capacity: number;
+        /** True when the lane keeps claiming backlog work while the user is active. */
+        runsWhileActive?: boolean;
+        remoteWaiting?: number;
+        pauseUntil?: number;
+        pauseReason?: string;
+    }>
+>;
+
+/** Claim limits for one lane. */
+export interface LaneCapacity {
+    maxInFlight: number;
+    /**
+     * Backlog slots while the user is active. Lanes without it claim only
+     * work below the low-priority ceiling until the system is idle.
+     */
+    activeMaxInFlight?: number;
+}
+
+type LaneEntry = {
+    promise: Promise<void>;
+    abort: AbortController;
+    /** Library of the running job, so a scope change can target its abort. */
+    libraryId: number;
+    zoteroKey: string;
+};
+
+type ExecutorRegistration = {
+    executor: JobExecutor;
+    maxInFlight: number;
+    activeMaxInFlight?: number;
+    survivesLibraryExclusion: boolean;
+    pauseUntil?: number;
+    pauseReason?: string;
+};
+
+export class BackgroundExtractor {
+    private stopRequested = false;
+    private started = false;
+    private currentTickId: ReturnType<typeof setTimeout> | undefined;
+    private tickRunning = false;
+    private tickIdleWaiters: Array<() => void> = [];
+    private pendingWake = false;
+    /** Invalidates maintenance resume callbacks after a terminal stop. */
+    private lifecycleGeneration = 0;
+    private dbWritesPermanentlyDisabled = false;
+    private prefEnabled = true;
+    private syncInProgress = false;
+    private startupDelayUntil = 0;
+    private prefObserverSymbol: symbol | null = null;
+    private processingPrefObserverSymbol: symbol | null = null;
+    private syncObserverId: string | null = null;
+    private unregisterIdleObserver: (() => void) | null = null;
+    private workerRunning = false;
+    /**
+     * Set by {@link requestImmediateDrain}: the next passes claim backlog work
+     * regardless of the idle gate, until registered lanes have no queued or
+     * in-flight work left, including parked remote work and delayed retries.
+     */
+    private drainNowRequested = false;
+    private readonly executors = new Map<BackgroundJobType, ExecutorRegistration>();
+    private readonly laneInFlight = new Map<BackgroundJobType, Map<number, LaneEntry>>();
+    /**
+     * When each lane's recently freed slots opened, oldest first. The claim
+     * log reports how long a slot sat empty before the next job took it.
+     */
+    private readonly laneFreedAt = new Map<BackgroundJobType, number[]>();
+    private readonly muPDFLane = new MuPDFSerialLane();
+    /**
+     * Routes interactive PDF requests between the hot worker and the idle
+     * background worker, queueing them while both are busy. Shares
+     * `muPDFLane` with the jobs.
+     */
+    readonly interactiveOverflow = new InteractiveOverflow({
+        lane: this.muPDFLane,
+        isAvailable: () => this.started && !this.stopRequested && !this.shouldSkipDbWrites(),
+        hasWorkerJobInFlight: () => MUPDF_JOB_TYPES.some((type) => (this.laneInFlight.get(type)?.size ?? 0) > 0),
+        onDrained: () => this.notify(),
+    });
+
+    constructor() {
+        this.registerExecutor(new DocumentExtractExecutor(), { maxInFlight: 1 });
+    }
+
+    /** Return the current background worker activity state for UI subscribers. */
+    getStatus(): { running: boolean } {
+        return { running: this.workerRunning };
+    }
+
+    /**
+     * User-facing "process now": run the queued backlog without waiting for
+     * Zotero to be idle. One-off — the bypass clears itself once a dispatch
+     * pass finds the queue empty, so the idle gate governs again afterwards.
+     */
+    requestImmediateDrain(): void {
+        if (getPref(PREF_PROCESSING_ENABLED) !== true) return;
+        this.drainNowRequested = true;
+        this.notify();
+    }
+
+    /**
+     * Cancel a {@link requestImmediateDrain} session. In-flight work finishes;
+     * the idle gate governs the next claim. No-op when no drain is active.
+     */
+    cancelImmediateDrain(): void {
+        if (!this.drainNowRequested) return;
+        this.drainNowRequested = false;
+        this.notify();
+    }
+
+    /** True while a {@link requestImmediateDrain} bypass is still active. */
+    isImmediateDrainRequested(): boolean {
+        return this.drainNowRequested;
+    }
+
+    /**
+     * Whether a dispatch pass right now may claim backlog work in every lane:
+     * a one-off drain is pending, or Zotero has been idle long enough. Mirrors
+     * the gate {@link processOnce} applies, so the status UI can tell "queued
+     * and running" from "queued behind the idle timer". Lanes registered with
+     * an `activeMaxInFlight` also claim backlog work while this is closed.
+     */
+    isBacklogGateOpen(): boolean {
+        if (this.getDispatchBlocker() !== null) return false;
+        if (getPref(PREF_PROCESSING_ENABLED) !== true) return false;
+        if (this.drainNowRequested) return true;
+        return getSystemIdleTimeMs() >= IDLE_THRESHOLD_MS;
+    }
+
+    /** Claim preconditions shared by dispatch and status; manual passes bypass the startup timer. */
+    getDispatchBlocker(includeStartup = true): ProcessOnceReason | null {
+        if (this.stopRequested) return 'stopped';
+        if (this.dbWritesPermanentlyDisabled || Zotero.__astermarginShuttingDown === true) return 'shutting_down';
+        if (!this.prefEnabled || (!this.started && getPref(PREF_ENABLED) === false)) return 'disabled';
+        if (includeStartup && Date.now() < this.startupDelayUntil) return 'startup_delay';
+        if (this.syncInProgress) return 'sync_in_progress';
+        // Interactive work first: hot has work pending or queued, an overflow
+        // request holds the background worker, or it is warming up for one.
+        if (COOPERATIVE_THROTTLE && this.interactiveOverflow.blocksBackgroundJobs()) return 'hot_busy';
+        if (!isLibraryScopeKnown()) return 'library_scope_unknown';
+        if (!Zotero.AsterMargin?.db || this.executors.size === 0) return 'empty';
+        return null;
+    }
+
+    /** Return capacity and in-flight counts for registered lanes. */
+    getLaneStatus(): BackgroundLaneStatus {
+        const status: BackgroundLaneStatus = {};
+        for (const [jobType, registration] of this.executors) {
+            status[jobType] = {
+                inFlight: this.laneInFlight.get(jobType)?.size ?? 0,
+                capacity: registration.maxInFlight,
+                runsWhileActive: registration.activeMaxInFlight !== undefined,
+                pauseUntil: registration.pauseUntil,
+                pauseReason: registration.pauseReason,
+                remoteWaiting: registration.executor.getRemoteWaitingCount?.() ?? 0,
+            };
+        }
+        return status;
+    }
+
+    /** Interactive overflow routing counters, for diagnostics. */
+    getInteractiveOverflowStats(): InteractiveOverflowStats {
+        return this.interactiveOverflow.getStats();
+    }
+
+    /** Distinct attachments currently occupying the requested lanes. */
+    getInFlightFileCount(jobTypes: string[]): number {
+        const refs = new Set<string>();
+        for (const type of jobTypes) {
+            for (const job of this.laneInFlight.get(type as BackgroundJobType)?.values() ?? []) {
+                refs.add(`${job.libraryId}/${job.zoteroKey}`);
+            }
+        }
+        return refs.size;
+    }
+
+    /** Register a queue executor and activate its lane. */
+    registerExecutor(
+        executor: JobExecutor,
+        options: LaneCapacity & { survivesLibraryExclusion?: boolean },
+    ): void {
+        // Releasing a replaced executor stops any background work it owns (e.g.
+        // slot-free trackers behind a `defer`). The lane re-registers on window
+        // reload, so the previous instance must not keep polling.
+        const previous = this.executors.get(executor.jobType);
+        if (previous && previous.executor !== executor) {
+            this.disposeExecutor(previous.executor);
+        }
+        this.executors.set(executor.jobType, {
+            executor,
+            ...normalizeLaneCapacity(options),
+            survivesLibraryExclusion: options.survivesLibraryExclusion ?? false,
+        });
+        if (!this.laneInFlight.has(executor.jobType)) {
+            this.laneInFlight.set(executor.jobType, new Map());
+        }
+        this.notify();
+    }
+
+    /**
+     * Resize a registered lane. Running jobs are never interrupted; a smaller
+     * limit only stops new claims until the lane drains below it.
+     */
+    setLaneCapacity(jobType: BackgroundJobType, executor: JobExecutor, capacity: LaneCapacity): void {
+        const registration = this.executors.get(jobType);
+        if (!registration || registration.executor !== executor) return;
+        const next = normalizeLaneCapacity(capacity);
+        if (next.maxInFlight === registration.maxInFlight
+            && next.activeMaxInFlight === registration.activeMaxInFlight) return;
+        registration.maxInFlight = next.maxInFlight;
+        registration.activeMaxInFlight = next.activeMaxInFlight;
+        this.notify();
+    }
+
+    /** Deactivate a lane if it is still owned by the given executor. */
+    unregisterExecutor(jobType: BackgroundJobType, executor?: JobExecutor): void {
+        const current = this.executors.get(jobType);
+        if (!current || (executor && current.executor !== executor)) return;
+        this.executors.delete(jobType);
+        // Exclusions and other access-scope changes deactivate a lane through
+        // this method. Abort already-claimed work as well as preventing new
+        // claims, so an executor cannot continue across the boundary change.
+        for (const entry of this.laneInFlight.get(jobType)?.values() ?? []) {
+            try {
+                entry.abort.abort();
+            } catch {
+                // best-effort
+            }
+        }
+        this.disposeExecutor(current.executor);
+    }
+
+    private disposeExecutor(executor: JobExecutor): void {
+        try {
+            executor.dispose?.();
+        } catch (e) {
+            logger(`BackgroundExtractor: executor.dispose failed: ${e}`, 1);
+        }
+    }
+
+    /** Schedule the first tick. Safe to call more than once. */
+    start(): void {
+        if (this.started) return;
+        this.started = true;
+        this.stopRequested = false;
+        this.dbWritesPermanentlyDisabled = false;
+        this.pendingWake = false;
+        this.startupDelayUntil = Date.now() + STARTUP_DELAY_MS;
+
+        this.prefEnabled = (getPref(PREF_ENABLED) as boolean | undefined) ?? true;
+
+        try {
+            const syncObs = {
+                notify: (
+                    event: string,
+                    _type: string,
+                    _ids: string[] | number[],
+                    _extraData: object,
+                ) => {
+                    if (event === 'start') {
+                        this.syncInProgress = true;
+                    } else if (event === 'finish' || event === 'stop') {
+                        this.syncInProgress = false;
+                        this.notify();
+                    }
+                },
+            };
+            this.syncObserverId = Zotero.Notifier.registerObserver(
+                syncObs,
+                ['sync'],
+                'astermargin-bg-extractor',
+            );
+        } catch (e) {
+            logger(`BackgroundExtractor: registerObserver(sync) failed: ${e}`, 1);
+        }
+        try {
+            this.syncInProgress = (Zotero as any).Sync?.Runner?.syncInProgress === true;
+        } catch {
+            this.syncInProgress = false;
+        }
+
+        try {
+            this.prefObserverSymbol = Zotero.Prefs.registerObserver(
+                'extensions.zotero.astermargin.backgroundExtractorEnabled',
+                (value: unknown) => {
+                    const next = value !== false;
+                    const wasEnabled = this.prefEnabled;
+                    this.prefEnabled = next;
+                    if (!wasEnabled && next) this.notify();
+                },
+                true,
+            );
+        } catch (e) {
+            logger(`BackgroundExtractor: registerObserver(pref) failed: ${e}`, 1);
+        }
+
+        try {
+            this.processingPrefObserverSymbol = Zotero.Prefs.registerObserver(
+                'extensions.zotero.astermargin.backgroundProcessingEnabled',
+                (value: unknown) => {
+                    if (value !== true) this.drainNowRequested = false;
+                    this.notify();
+                },
+                true,
+            );
+        } catch (e) {
+            logger(`BackgroundExtractor: registerObserver(processing pref) failed: ${e}`, 1);
+        }
+
+        try {
+            this.unregisterIdleObserver = registerIdleObserver(
+                { onIdle: () => this.notify() },
+                IDLE_THRESHOLD_SEC,
+            );
+        } catch (e) {
+            logger(`BackgroundExtractor: registerIdleObserver failed: ${e}`, 1);
+        }
+
+        this.scheduleTick(STARTUP_DELAY_MS);
+    }
+
+    /** Suspend background work for local storage maintenance, preserving startup state. */
+    async suspendForMaintenance(): Promise<() => void> {
+        const wasStarted = this.started;
+        const lifecycleGeneration = this.lifecycleGeneration;
+        await this.stopDispatcher('suspend');
+        if (this.tickRunning) await new Promise<void>((resolve) => this.tickIdleWaiters.push(resolve));
+        return () => {
+            if (wasStarted && lifecycleGeneration === this.lifecycleGeneration
+                && !Zotero.__astermarginShuttingDown) this.start();
+        };
+    }
+
+    /**
+     * Stop the dispatcher, abort all active lanes, and release the background
+     * MuPDF worker.
+     */
+    async stop(): Promise<void> {
+        this.lifecycleGeneration++;
+        await this.stopDispatcher('dispose');
+    }
+
+    private async stopDispatcher(executorAction: 'suspend' | 'dispose'): Promise<void> {
+        this.stopRequested = true;
+        this.drainNowRequested = false;
+        if (Zotero.__astermarginShuttingDown === true) {
+            this.dbWritesPermanentlyDisabled = true;
+        }
+
+        if (this.prefObserverSymbol) {
+            try {
+                Zotero.Prefs.unregisterObserver(this.prefObserverSymbol);
+            } catch {
+                // best-effort
+            }
+            this.prefObserverSymbol = null;
+        }
+        if (this.processingPrefObserverSymbol) {
+            try {
+                Zotero.Prefs.unregisterObserver(this.processingPrefObserverSymbol);
+            } catch {
+                // best-effort
+            }
+            this.processingPrefObserverSymbol = null;
+        }
+        if (this.syncObserverId) {
+            try {
+                Zotero.Notifier.unregisterObserver(this.syncObserverId);
+            } catch {
+                // best-effort
+            }
+            this.syncObserverId = null;
+        }
+        if (this.unregisterIdleObserver) {
+            try {
+                this.unregisterIdleObserver();
+            } catch {
+                // best-effort
+            }
+            this.unregisterIdleObserver = null;
+        }
+        if (this.currentTickId !== undefined) {
+            clearTimeout(this.currentTickId);
+            this.currentTickId = undefined;
+        }
+
+        await this.abortAndAwaitInFlight();
+        // Maintenance keeps interactive reads working: let an overflow request
+        // that holds the background worker finish (it is bounded by the
+        // interactive deadline) before the worker is disposed. New requests
+        // stop overflowing once `stopRequested` is set.
+        if (executorAction === 'suspend') await this.muPDFLane.run(async () => undefined);
+        // Stop executor-owned background work (e.g. slot-free OCR trackers) that
+        // lives outside the lane in-flight maps and so is untouched by the abort.
+        let suspendFailed = false;
+        let suspendFailure: unknown;
+        if (executorAction === 'suspend') {
+            const results = await Promise.allSettled([...this.executors.values()].map(
+                async ({ executor }) => await executor.suspend?.(),
+            ));
+            const failure = results.find(
+                (result): result is PromiseRejectedResult => result.status === 'rejected',
+            );
+            if (failure) {
+                suspendFailed = true;
+                suspendFailure = failure.reason;
+            }
+        } else {
+            for (const { executor } of this.executors.values()) {
+                this.disposeExecutor(executor);
+            }
+        }
+        try {
+            await disposeMuPDFWorker('background');
+        } catch (e) {
+            logger(`BackgroundExtractor.stop: disposeMuPDFWorker failed: ${e}`, 1);
+        }
+        this.setWorkerRunning(false);
+        this.started = false;
+        this.pendingWake = false;
+        if (suspendFailed) throw suspendFailure;
+    }
+
+    /**
+     * Abort in-flight jobs after library access or required entitlements are revoked.
+     *
+     * Called when the instance access policy changes. A single extraction
+     * can run for minutes, so revoking access has to interrupt work already
+     * underway rather than only gating the next claim. The aborted job releases
+     * its row, which the claim-time gate then retires.
+     *
+     * Nothing is in scope while the scope is unknown (logout / account switch),
+     * so this stops in-flight work there too; those rows are released and run
+     * again once a scope is published.
+     */
+    abortJobsWithoutAccess(): void {
+        for (const [jobType, lane] of this.laneInFlight) {
+            for (const [id, entry] of lane) {
+                if (isLibraryScopeKnown() && this.executors.get(jobType)?.survivesLibraryExclusion) continue;
+                const deniedEntitlement = (jobType === 'document_ocr' && Zotero.AsterMargin?.hasOcrAccess === false)
+                    || (jobType === 'fulltext_upsert' && Zotero.AsterMargin?.hasSearchIndexAccess === false);
+                if (!deniedEntitlement && entry.libraryId === UNRESOLVED_LIBRARY_ID) continue;
+                if (!deniedEntitlement && isLibraryInScope(entry.libraryId)) continue;
+                logger(
+                    `BackgroundExtractor: aborting in-flight job id=${id} (access_revoked)`,
+                    2,
+                );
+                try {
+                    entry.abort.abort();
+                } catch {
+                    // best-effort
+                }
+            }
+        }
+    }
+
+    /** Abort every active lane and wait for all jobs to settle. */
+    async abortInFlight(): Promise<void> {
+        await this.abortAndAwaitInFlight();
+        this.setWorkerRunning(this.totalInFlight() > 0);
+    }
+
+    /**
+     * Producer-side wake. In-flight IO jobs do not block scheduling because
+     * free capacity in another lane may still be claimable.
+     */
+    notify(): void {
+        if (!this.started || this.stopRequested) return;
+        if (this.dbWritesPermanentlyDisabled) return;
+        if (Zotero.__astermarginShuttingDown === true) return;
+        if (this.tickRunning) {
+            this.pendingWake = true;
+            return;
+        }
+        const delay = Math.max(0, this.startupDelayUntil - Date.now());
+        this.scheduleTick(delay);
+    }
+
+    private async abortAndAwaitInFlight(): Promise<void> {
+        const promises: Promise<void>[] = [];
+        for (const lane of this.laneInFlight.values()) {
+            for (const entry of lane.values()) {
+                try {
+                    entry.abort.abort();
+                } catch {
+                    // best-effort
+                }
+                promises.push(entry.promise);
+            }
+        }
+        await Promise.allSettled(promises);
+    }
+
+    /** Skip DB writes once global shutdown has been observed. */
+    private shouldSkipDbWrites(): boolean {
+        if (this.dbWritesPermanentlyDisabled) return true;
+        if (Zotero.__astermarginShuttingDown === true) {
+            this.dbWritesPermanentlyDisabled = true;
+            return true;
+        }
+        return false;
+    }
+
+    private setWorkerRunning(running: boolean): void {
+        if (this.workerRunning === running) return;
+        this.workerRunning = running;
+        dispatchBackgroundEvent('background-worker:status', { running });
+    }
+
+    /**
+     * Drive one dispatcher pass. Tests can pass `awaitLaunchedJobs: true` to
+     * await IO lanes; the dev endpoint uses the default non-blocking behavior.
+     * A launched extraction is awaited unless `awaitExtraction` is false.
+     */
+    async processOnce(
+        options: {
+            keepRunningAfterJob?: boolean;
+            awaitLaunchedJobs?: boolean;
+            awaitExtraction?: boolean;
+        } = {},
+    ): Promise<ProcessOnceResult> {
+        if (getPref(PREF_PROCESSING_ENABLED) !== true) {
+            this.drainNowRequested = false;
+        }
+        const inactive = (reason: ProcessOnceReason): ProcessOnceResult => {
+            if (this.totalInFlight() === 0) this.setWorkerRunning(false);
+            return { processed: false, reason };
+        };
+
+        if (this.stopRequested) return inactive('stopped');
+        if (this.shouldSkipDbWrites()) return inactive('shutting_down');
+        const blocker = this.getDispatchBlocker(false);
+        if (blocker) return inactive(blocker);
+
+        const db = Zotero.AsterMargin?.db;
+        if (!db || this.executors.size === 0) return inactive('empty');
+
+        const idleMs = getSystemIdleTimeMs();
+        const processBacklog = getPref(PREF_PROCESSING_ENABLED) === true;
+        const drainNow = processBacklog && this.drainNowRequested;
+
+        const launched = await this.dispatchPass({
+            db,
+            processBacklog,
+            backlogGateOpen: processBacklog && (drainNow || idleMs >= IDLE_THRESHOLD_MS),
+            awaitLaunchedJobs: options.awaitLaunchedJobs === true,
+            awaitExtraction: options.awaitExtraction !== false,
+        });
+
+        if (launched === 0) {
+            // Remote OCR frees its lane slot while its queue row is parked.
+            // Keep the bypass through that wait and any subsequent stages, and
+            // through a discovery scan that has not enqueued its work yet: a
+            // "Start now" issued right after enabling cloud features must not
+            // be dropped by an empty pass that runs before the reconciler fills
+            // the queue.
+            if (this.drainNowRequested && this.totalInFlight() === 0
+                && Zotero.AsterMargin?.background?.isDiscovering() !== true) {
+                const queue = await db.getBackgroundQueueStats(Date.now(), [...this.executors.keys()]);
+                if (queue.pending === 0) this.drainNowRequested = false;
+            }
+            return inactive('empty');
+        }
+        if (!options.keepRunningAfterJob && this.totalInFlight() === 0) {
+            this.setWorkerRunning(false);
+        }
+        return { processed: true, reason: 'job_done' };
+    }
+
+    private async dispatchPass(options: {
+        db: QueueDB;
+        processBacklog: boolean;
+        backlogGateOpen: boolean;
+        awaitLaunchedJobs: boolean;
+        awaitExtraction: boolean;
+    }): Promise<number> {
+        let launched = 0;
+        const waits: Promise<void>[] = [];
+        for (const [jobType, registration] of this.executors) {
+            if (jobType === 'document_ocr' && Zotero.AsterMargin?.hasOcrAccess !== true) continue;
+            if (jobType === 'fulltext_upsert' && Zotero.AsterMargin?.hasSearchIndexAccess !== true) continue;
+            // Lanes with an active-use capacity keep draining their backlog
+            // while the user works, at that reduced width. Every other lane
+            // takes only low-priority-ceiling work until the system is idle.
+            const runsWhileActive = !options.backlogGateOpen && options.processBacklog
+                && registration.activeMaxInFlight !== undefined;
+            const maxPriority = options.backlogGateOpen || runsWhileActive
+                ? undefined
+                : LOW_PRIORITY_CEILING;
+            const capacity = runsWhileActive
+                ? registration.activeMaxInFlight!
+                : registration.maxInFlight;
+            const freeSlots = this.laneCapacityFree(jobType, capacity);
+            for (let slot = 0; slot < freeSlots; slot += 1) {
+                if (this.stopRequested) return launched;
+                if (!isLibraryScopeKnown()) break;
+                if (this.executors.get(jobType) !== registration || this.laneCapacityFree(jobType, capacity) === 0) break;
+                const record = await options.db.claimNextBackgroundJob(
+                    Date.now(),
+                    VISIBILITY_TIMEOUT_MS,
+                    maxPriority,
+                    [jobType],
+                );
+                if (!record) break;
+                if (this.stopRequested) {
+                    if (!this.shouldSkipDbWrites()) {
+                        await options.db.releaseBackgroundJob(record.id, Date.now());
+                    }
+                    return launched;
+                }
+
+                if (this.executors.get(jobType) !== registration || this.laneCapacityFree(jobType, capacity) === 0) {
+                    if (!this.shouldSkipDbWrites()) await options.db.releaseBackgroundJob(record.id, Date.now());
+                    break;
+                }
+                // An interactive request may have taken the background worker
+                // while the claim was in flight; the job waits for it to drain.
+                if (MUPDF_JOB_TYPES.includes(jobType) && this.interactiveOverflow.blocksBackgroundJobs()) {
+                    if (!this.shouldSkipDbWrites()) await options.db.releaseBackgroundJob(record.id, Date.now());
+                    return launched;
+                }
+                if (!isLibraryScopeKnown()) {
+                    // The scope went unknown (logout / account switch) while the
+                    // claim was in flight. Release rather than retire: the row is
+                    // not excluded, it is unverifiable right now, and completing
+                    // it here would silently drop queued work.
+                    if (!this.shouldSkipDbWrites()) {
+                        await options.db.releaseBackgroundJob(record.id, Date.now());
+                    }
+                    break;
+                }
+
+                if (this.isOutOfScope(record)) {
+                    launched += 1;
+                    logger(
+                        `BackgroundExtractor: job id=${record.id} type=${record.jobType} ${record.libraryId}-${record.zoteroKey} skipped (library_excluded)`,
+                        2,
+                    );
+                    await this.persistOutcome(
+                        record,
+                        registration.executor,
+                        { kind: 'complete', reason: 'library_excluded' },
+                        options.db,
+                        Date.now(),
+                    );
+                    continue;
+                }
+
+                const freedAt = this.laneFreedAt.get(jobType)?.shift();
+                logger(
+                    `BackgroundExtractor: claimed job id=${record.id} type=${record.jobType} ${record.libraryId}-${record.zoteroKey} content_kind=${record.contentKind} payload_kind=${record.payloadKind} attempt=${record.attemptCount + 1}`
+                        + (freedAt === undefined ? '' : ` slot_idle=${Date.now() - freedAt}ms`),
+                    3,
+                );
+                launched += 1;
+                const shouldAwait = options.awaitLaunchedJobs
+                    || (jobType === 'document_extract' && options.awaitExtraction);
+                // An awaited job is followed up by the caller's next pass; any
+                // other job wakes the dispatcher when its slot frees.
+                const promise = this.launchJob(
+                    record,
+                    registration.executor,
+                    !shouldAwait,
+                );
+                if (shouldAwait) {
+                    waits.push(promise);
+                }
+            }
+        }
+        if (waits.length > 0) {
+            await Promise.all(waits);
+        }
+        return launched;
+    }
+
+    private launchJob(
+        record: BackgroundJobRecord,
+        executor: JobExecutor,
+        notifyOnSettle: boolean,
+    ): Promise<void> {
+        const abort = createAbortController();
+        const lane = this.laneInFlight.get(record.jobType) ?? new Map<number, LaneEntry>();
+        this.laneInFlight.set(record.jobType, lane);
+        this.setWorkerRunning(true);
+
+        const promise = this.executeAndPersist(record, executor, abort.signal)
+            .catch((error) => {
+                const message = error instanceof Error ? error.message : String(error);
+                logger(`BackgroundExtractor: job id=${record.id} threw: ${message}`, 1);
+            })
+            .finally(() => {
+                lane.delete(record.id);
+                // Interactive requests waiting for a worker take the
+                // background worker before the dispatcher claims new work.
+                if (MUPDF_JOB_TYPES.includes(record.jobType)) this.interactiveOverflow.onJobSettled();
+                const freed = this.laneFreedAt.get(record.jobType) ?? [];
+                freed.push(Date.now());
+                // No more slots than the lane has can be waiting.
+                if (freed.length > (this.executors.get(record.jobType)?.maxInFlight ?? 1)) freed.shift();
+                this.laneFreedAt.set(record.jobType, freed);
+                // A settle that wakes a running dispatcher leaves the status to
+                // its next pass, so a backlog does not flicker idle between jobs.
+                const wakesDispatcher = notifyOnSettle && this.started && !this.stopRequested;
+                if (!wakesDispatcher && this.totalInFlight() === 0 && !this.tickRunning) {
+                    this.setWorkerRunning(false);
+                }
+                if (notifyOnSettle) {
+                    this.notify();
+                }
+            });
+        lane.set(record.id, { promise, abort, libraryId: record.libraryId, zoteroKey: record.zoteroKey });
+        return promise;
+    }
+
+    private async executeAndPersist(
+        record: BackgroundJobRecord,
+        executor: JobExecutor,
+        externalAbortSignal: AbortSignal,
+    ): Promise<void> {
+        const attemptedAt = Date.now();
+        const isIndexJob = record.jobType === 'fulltext_upsert' || record.jobType === 'fulltext_untag';
+        const accountIsCurrent = isIndexJob ? captureAccountGuard() : () => true;
+        dispatchBackgroundEvent('background-job:start', { id: record.id, record });
+        const db = Zotero.AsterMargin?.db;
+        if (!db) return;
+
+        const ctx: JobExecutionContext = {
+            db,
+            // Logs how long the job queued for the shared worker and held it,
+            // which with the settle time gives the worker's share of the job.
+            runOnMuPDFWorker: async (fn) => {
+                const requestedAt = Date.now();
+                let acquiredAt: number | undefined;
+                try {
+                    return await this.muPDFLane.run(() => {
+                        acquiredAt = Date.now();
+                        return fn();
+                    });
+                } finally {
+                    const now = Date.now();
+                    logger(
+                        `BackgroundExtractor: job id=${record.id} type=${record.jobType} MuPDF lane`
+                            + ` wait=${(acquiredAt ?? now) - requestedAt}ms held=${acquiredAt === undefined ? 0 : now - acquiredAt}ms`,
+                        3,
+                    );
+                }
+            },
+            externalAbortSignal,
+            shouldSkipDbWrites: () => this.shouldSkipDbWrites(),
+            enqueue: async (input: BackgroundJobInput) => {
+                await db.enqueueBackgroundJob(input);
+                this.notify();
+            },
+        };
+
+        let outcome: JobOutcome;
+        try {
+            outcome = await executor.execute(record, ctx);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            outcome = { kind: 'retry', error: `unexpected: ${message}` };
+        }
+
+        if (isIndexJob
+            && (externalAbortSignal.aborted || !accountIsCurrent()
+                || this.executors.get(record.jobType)?.executor !== executor)) {
+            outcome = { kind: 'release', reason: 'access_changed' };
+        }
+        await this.persistOutcome(record, executor, outcome, db, attemptedAt);
+    }
+
+    private async persistOutcome(
+        record: BackgroundJobRecord,
+        executor: JobExecutor,
+        outcome: JobOutcome,
+        db: QueueDB,
+        attemptedAt: number,
+    ): Promise<void> {
+        if (this.shouldSkipDbWrites()) return;
+
+        switch (outcome.kind) {
+            case 'complete': {
+                let reason = outcome.reason;
+                if (reason === 'cache_budget_reached') {
+                    const retired = await db.completeBackgroundPreparationJob(record.id, Date.now());
+                    if (!retired) {
+                        reason = 'promoted_to_on_demand';
+                        this.notify();
+                    }
+                } else {
+                    await db.completeBackgroundJob(record.id);
+                }
+                logger(
+                    `BackgroundExtractor: job id=${record.id} settled (${reason}) after ${Date.now() - attemptedAt}ms`,
+                    3,
+                );
+                dispatchBackgroundEvent('background-job:done', {
+                    id: record.id,
+                    reason,
+                });
+                return;
+            }
+            case 'release':
+                await db.releaseBackgroundJob(record.id, Date.now());
+                logger(
+                    `BackgroundExtractor: job id=${record.id} released (${outcome.reason})`,
+                    3,
+                );
+                dispatchBackgroundEvent('background-job:done', {
+                    id: record.id,
+                    reason: outcome.reason,
+                });
+                return;
+            case 'retry':
+                await this.recordRetryFailure(record, executor, outcome, db, attemptedAt);
+                return;
+            case 'failPermanent':
+                await db.recordDocumentProcessingFailure(outcome.failure);
+                await db.completeBackgroundJob(record.id);
+                dispatchBackgroundEvent('background-job:done', {
+                    id: record.id,
+                    reason:
+                        outcome.reason
+                        ?? (
+                            outcome.failure.terminalCode
+                                ? `terminal:${outcome.failure.terminalCode}`
+                                : 'terminal'
+                        ),
+                });
+                return;
+            case 'defer':
+                if (outcome.reason === 'payload_cache_miss') {
+                    // Extraction may finish before this executor releases its
+                    // lane. Complete the handoff before the lane can claim again.
+                    const woken = await db.deferFulltextCacheRecovery(record.id, record.availableAt, Date.now());
+                    if (woken) this.notify();
+                }
+                // Leave the row parked: the claim already bumped `available_at`
+                // by the visibility timeout, so doing nothing keeps the row
+                // invisible until the executor's own tracker wakes it (or the
+                // visibility window re-surfaces it). The lane slot is freed by
+                // launchJob's settle handler, like any other returned outcome.
+                logger(
+                    `BackgroundExtractor: job id=${record.id} deferred (${outcome.reason})`,
+                    3,
+                );
+                dispatchBackgroundEvent('background-job:deferred', {
+                    id: record.id,
+                    reason: outcome.reason,
+                });
+                return;
+        }
+    }
+
+    private async recordRetryFailure(
+        record: BackgroundJobRecord,
+        executor: JobExecutor,
+        outcome: Extract<JobOutcome, { kind: 'retry' }>,
+        db: QueueDB,
+        attemptedAt: number,
+    ): Promise<void> {
+        const registration = this.executors.get(record.jobType);
+        const now = Date.now();
+        if (outcome.laneCooldownMs && registration?.executor === executor) {
+            const pauseUntil = now + outcome.laneCooldownMs;
+            if (pauseUntil > (registration.pauseUntil ?? 0)) {
+                registration.pauseUntil = pauseUntil;
+                registration.pauseReason = outcome.reason ?? outcome.error;
+                logger(`BackgroundExtractor: lane ${record.jobType} paused until ${pauseUntil}: ${registration.pauseReason}`, 2);
+            }
+        }
+        if (outcome.countsAsAttempt === false) {
+            const availableAt = now + Math.max(1_000, outcome.retryAfterMs ?? 30_000);
+            await db.rescheduleBackgroundJob(record.id, availableAt, outcome.error);
+            logger(`BackgroundExtractor: job id=${record.id} waiting without attempt until ${availableAt}: ${outcome.error}`, 2);
+            dispatchBackgroundEvent('background-job:deferred', { id: record.id, reason: outcome.reason ?? outcome.error });
+            return;
+        }
+        const result = await db.failBackgroundJob(record.id, outcome.error, {
+            maxAttempts: MAX_ATTEMPTS,
+            backoffMs: (attempt) => outcome.retryAfterMs ?? BACKOFF_MS(attempt),
+            now: Date.now(),
+        });
+        if (result.dead) {
+            if (record.jobType === 'document_extract') {
+                await db.markAttachmentExtractFailure({
+                    libraryId: record.libraryId,
+                    zoteroKey: record.zoteroKey,
+                    status: 'failed',
+                    error: outcome.error,
+                    attemptedAt,
+                    extractionSource: outcome.attemptedExtractionSource,
+                });
+                // A denied stat ends the attempt before any read records an
+                // outcome, and the ledger keeps the status of an attachment that
+                // was already extracted. Record the denial as the latest read so
+                // the issues list reports it instead of the earlier success.
+                if (outcome.error === 'file_permission_denied' && record.payloadKind === 'structured') {
+                    await db.recordAttachmentReadingOutcome({
+                        libraryId: record.libraryId,
+                        zoteroKey: record.zoteroKey,
+                        contentKind: record.contentKind,
+                        errorCode: outcome.error,
+                        attemptedAt,
+                    });
+                }
+            } else if (record.jobType === 'fulltext_upsert' && record.payload?.doc_hash) {
+                await db.markAttachmentUpsertFailed(
+                    record.libraryId,
+                    record.zoteroKey,
+                    record.payload.doc_hash,
+                    outcome.error,
+                );
+            } else if (record.jobType === 'document_ocr') {
+                const ledger = await db.getAttachmentProcessingState(
+                    record.libraryId,
+                    record.zoteroKey,
+                );
+                if (ledger?.fileHash) {
+                    await db.markAttachmentOcrFailed(
+                        record.libraryId,
+                        record.zoteroKey,
+                        ledger.fileHash,
+                        outcome.error,
+                    );
+                }
+            }
+            const failure = executor.describeFailure?.(record, outcome.error) ?? null;
+            if (failure) {
+                await db.recordDocumentProcessingFailure(failure);
+            }
+            logger(
+                `BackgroundExtractor: job id=${record.id} dead-lettered: ${outcome.error}`,
+                1,
+            );
+            dispatchBackgroundEvent('background-job:dead', {
+                id: record.id,
+                error: outcome.error,
+                reason: outcome.reason,
+            });
+            return;
+        }
+
+        logger(
+            `BackgroundExtractor: job id=${record.id} failed, retry scheduled: ${outcome.error}`,
+            2,
+        );
+        dispatchBackgroundEvent('background-job:failed', {
+            id: record.id,
+            error: outcome.error,
+            reason: outcome.reason,
+        });
+    }
+
+    private scheduleTick(delayMs: number): void {
+        if (this.stopRequested) return;
+        const now = Date.now();
+        for (const registration of this.executors.values()) {
+            if ((registration.pauseUntil ?? 0) > now) {
+                delayMs = Math.min(delayMs, registration.pauseUntil! - now);
+            }
+        }
+        if (this.currentTickId !== undefined) clearTimeout(this.currentTickId);
+        const id = setTimeout(() => {
+            this.currentTickId = undefined;
+            this.tick().catch((e) => {
+                logger(`BackgroundExtractor: tick threw: ${e}`, 1);
+                this.scheduleTick(IDLE_INTERVAL_MS);
+            });
+        }, delayMs);
+        (id as any)?.unref?.();
+        this.currentTickId = id;
+    }
+
+    private async tick(): Promise<void> {
+        if (this.stopRequested) return;
+        if (this.tickRunning) return;
+        this.tickRunning = true;
+        try {
+            // Extraction is not awaited here: while one file is being read,
+            // IO lanes must keep refilling the slots their settled jobs free.
+            const result = await this.processOnce({
+                keepRunningAfterJob: true,
+                awaitExtraction: false,
+            });
+            if (this.stopRequested) return;
+
+            const wakeNow = this.pendingWake;
+            this.pendingWake = false;
+            if (wakeNow) {
+                const delay = Math.max(0, this.startupDelayUntil - Date.now());
+                this.scheduleTick(delay);
+                return;
+            }
+
+            // A pass that launched something is followed up promptly: the next
+            // row (or the next free lane slot) should not wait. A pass that
+            // launched nothing while work is still in flight only needs the
+            // slow backstop, because the settle handler notifies.
+            if (result.processed) {
+                this.scheduleTick(PROGRESS_INTERVAL_MS);
+                return;
+            }
+            this.scheduleTick(
+                this.totalInFlight() > 0
+                    ? BUSY_BACKSTOP_INTERVAL_MS
+                    : IDLE_INTERVAL_MS,
+            );
+        } finally {
+            this.tickRunning = false;
+            for (const resolve of this.tickIdleWaiters.splice(0)) resolve();
+        }
+    }
+
+    /**
+     * A claimed row whose library is no longer searchable must not run: the
+     * user can exclude a library after the row was enqueued, and rows survive
+     * restarts. Rows for a library that is not present on this device
+     * (`UNRESOLVED_LIBRARY_ID`) are left to the executor's own handling.
+     */
+    private isOutOfScope(record: BackgroundJobRecord): boolean {
+        if (this.executors.get(record.jobType)?.survivesLibraryExclusion) return false;
+        return record.libraryId !== UNRESOLVED_LIBRARY_ID
+            && !isLibraryInScope(record.libraryId);
+    }
+
+    private laneCapacityFree(jobType: BackgroundJobType, capacity?: number): number {
+        const registration = this.executors.get(jobType);
+        if (!registration) return 0;
+        if (registration.pauseUntil) {
+            if (registration.pauseUntil > Date.now()) return 0;
+            logger(`BackgroundExtractor: lane ${jobType} cooldown ended`, 3);
+            registration.pauseUntil = undefined;
+            registration.pauseReason = undefined;
+        }
+        const inFlight = this.laneInFlight.get(jobType)?.size ?? 0;
+        return Math.max(0, (capacity ?? registration.maxInFlight) - inFlight);
+    }
+
+    private totalInFlight(): number {
+        let total = 0;
+        for (const lane of this.laneInFlight.values()) {
+            total += lane.size;
+        }
+        return total;
+    }
+}
+
+function normalizeLaneCapacity(capacity: LaneCapacity): Pick<ExecutorRegistration, 'maxInFlight' | 'activeMaxInFlight'> {
+    const maxInFlight = Math.max(1, Math.floor(capacity.maxInFlight));
+    const active = capacity.activeMaxInFlight;
+    return {
+        maxInFlight,
+        activeMaxInFlight: active === undefined
+            ? undefined
+            : Math.min(maxInFlight, Math.max(1, Math.floor(active))),
+    };
+}
+
+function dispatchBackgroundEvent(name: string, detail: unknown): void {
+    Zotero.AsterMargin?.runtime?.publish(name, detail);
+}

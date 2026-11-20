@@ -1,0 +1,150 @@
+import { ZoteroTag } from '@astermargin/agent-core/types/zotero';
+import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
+import { useEffect, useState } from 'react';
+import { TagMenuItemContext, createTagMenuItem } from '../utils/menuItemFactories';
+
+interface UseTagsMenuOptions {
+    isActive: boolean;
+    searchQuery: string;
+    /** The library whose tags are listed; a searchable one, or null for none. */
+    libraryId: number | null;
+    searchableLibraryIds: number[];
+    tagMenuItemContext: TagMenuItemContext;
+    verticalPosition?: 'above' | 'below';
+}
+
+interface UseTagsMenuResult {
+    menuItems: SearchMenuItem[];
+}
+
+export const useTagsMenu = ({
+    isActive,
+    searchQuery,
+    libraryId,
+    searchableLibraryIds,
+    tagMenuItemContext,
+    verticalPosition = 'above'
+}: UseTagsMenuOptions): UseTagsMenuResult => {
+    const [menuItems, setMenuItems] = useState<SearchMenuItem[]>([]);
+    const [tags, setTags] = useState<ZoteroTag[]>([]);
+
+    useEffect(() => {
+        if (!isActive) {
+            setTags([]);
+            setMenuItems([]);
+            return;
+        }
+
+        let isCancelled = false;
+
+        const fetchTags = async () => {
+            if (!libraryId || !searchableLibraryIds.includes(libraryId)) {
+                if (!isCancelled) {
+                    setTags([]);
+                }
+                return;
+            }
+
+            try {
+                // Use Zotero.Tags.getAll to fetch tags (types: [0] excludes automatic tags)
+                // const tagData = await Zotero.Tags.getAll(libraryId, [0]);
+                const tagData = await Zotero.Tags.getAll(libraryId);
+
+                // Map tag data to ZoteroTag format, filtering out invalid tags
+                const availableTags = tagData
+                    .map((tagJson) => {
+                        const tagID = Zotero.Tags.getID(tagJson.tag);
+                        if (tagID === false) {
+                            return null;
+                        }
+                        
+                        // Fetch color for this tag
+                        const colorData = Zotero.Tags.getColor(libraryId, tagJson.tag);
+                        const color = colorData && typeof colorData === 'object' && 'color' in colorData 
+                            ? colorData.color 
+                            : undefined;
+                        
+                        return {
+                            id: tagID,
+                            tag: tagJson.tag,
+                            libraryId: libraryId,
+                            type: tagJson.type ?? 0,
+                            color: color
+                        } as ZoteroTag;
+                    })
+                    .filter((tag): tag is ZoteroTag => tag !== null)
+                    .sort((a, b) => {
+                        // First priority: selected tags
+                        const aIsSelected = tagMenuItemContext.currentTags.some((selected) => selected.id === a.id);
+                        const bIsSelected = tagMenuItemContext.currentTags.some((selected) => selected.id === b.id);
+                        if (aIsSelected !== bIsSelected) {
+                            return aIsSelected ? -1 : 1;
+                        }
+                        
+                        // Second priority: tags with color
+                        const aHasColor = a.color !== undefined;
+                        const bHasColor = b.color !== undefined;
+                        if (aHasColor !== bHasColor) {
+                            return aHasColor ? -1 : 1;
+                        }
+                        
+                        // Third priority: tags with type == 0
+                        const aTypeZero = a.type === 0;
+                        const bTypeZero = b.type === 0;
+                        if (aTypeZero !== bTypeZero) {
+                            return aTypeZero ? -1 : 1;
+                        }
+                        
+                        // Fourth priority: sort by name
+                        return a.tag.localeCompare(b.tag, undefined, { sensitivity: 'base' });
+                    })
+                    .reverse();
+
+                if (!isCancelled) {
+                    setTags(availableTags);
+                }
+            } catch (error) {
+                console.error('Error fetching tags:', error);
+                if (!isCancelled) {
+                    setTags([]);
+                }
+            }
+        };
+
+        fetchTags();
+
+        return () => {
+            isCancelled = true;
+        };
+    }, [isActive, libraryId, searchableLibraryIds, tagMenuItemContext]);
+
+    useEffect(() => {
+        if (!isActive) {
+            return;
+        }
+
+        const lowerCaseQuery = searchQuery.toLowerCase();
+        const filteredTags = tags.filter((tag) =>
+            tag.tag.toLowerCase().includes(lowerCaseQuery)
+        );
+        const items = filteredTags.map((tag) =>
+            createTagMenuItem(tag, tagMenuItemContext, searchQuery)
+        );
+
+        let headerLabel = 'Select Tags';
+        if (libraryId) {
+            const library = Zotero.Libraries.get(libraryId);
+            headerLabel = library ? `Tags in ${library.name}` : headerLabel;
+        }
+
+        const header: SearchMenuItem = { label: headerLabel, isGroupHeader: true, onClick: () => {} };
+        if (verticalPosition === 'above') {
+            setMenuItems([...items.reverse(), header]);
+        } else {
+            setMenuItems([header, ...[...items].reverse()]);
+        }
+    }, [isActive, searchQuery, tags, tagMenuItemContext, libraryId, verticalPosition]);
+
+    return { menuItems };
+};
+

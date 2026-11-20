@@ -1,0 +1,240 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@astermargin/agent-core/platform/logger", () => ({ logger: vi.fn() }));
+vi.mock("../../../../src/services/agentDataProvider/utils", () => ({
+  getAttachmentFileStatus: vi.fn(),
+  isLibrarySearchable: vi.fn(() => true),
+}));
+
+import {
+  createHighlightAnnotation,
+  createNoteAnnotation,
+} from "../../../../src/services/annotations/createAnnotation";
+import { normalizeAnnotationTags } from "@astermargin/agent-core/types/agentActions/createAnnotations";
+import { CoordOrigin } from "@astermargin/agent-core/types/citations";
+import type { PageGeometry } from "@astermargin/agent-core/extract/types";
+
+const geometry: PageGeometry = {
+  viewBox: [0, 0, 400, 600],
+  width: 400,
+  height: 600,
+  rotation: 0,
+};
+
+// Capture every annotation item the service constructs so tests can assert on
+// the tags applied and the order relative to saveTx.
+let constructedItems: MockAnnotationItem[] = [];
+
+class MockAnnotationItem {
+  key = "NEWANNOTKEY";
+  tags: string[] = [];
+  /** Snapshot of tags taken inside saveTx — proves tags were applied first. */
+  tagsAtSave: string[] | null = null;
+  saveTx = vi.fn(async () => {
+    this.tagsAtSave = [...this.tags];
+  });
+  /** In-transaction write; the writers pick this when one is already open. */
+  save = vi.fn(async () => {
+    this.tagsAtSave = [...this.tags];
+  });
+
+  constructor(public readonly itemType: string) {
+    constructedItems.push(this);
+  }
+
+  addTag(tag: string): void {
+    this.tags.push(tag);
+  }
+}
+
+function mockAttachment() {
+  return {
+    isAttachment: () => true,
+    attachmentContentType: "application/pdf",
+    libraryID: 1,
+    id: 42,
+    key: "ATT123",
+    getFilePathAsync: vi.fn().mockResolvedValue("/local/path/file.pdf"),
+  } as unknown as Zotero.Item;
+}
+
+describe("createAnnotation tag application", () => {
+  let previousZotero: any;
+  let inTransaction = false;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    constructedItems = [];
+    inTransaction = false;
+    previousZotero = (globalThis as any).Zotero;
+    (globalThis as any).Zotero = {
+      Item: MockAnnotationItem,
+      Attachments: { LINK_MODE_LINKED_URL: 3 },
+      DB: { inTransaction: () => inTransaction },
+      Prefs: { get: vi.fn() },
+      AsterMargin: {
+        documentCache: {
+          getMetadata: vi.fn().mockResolvedValue({ pages: [geometry] }),
+        },
+      },
+    };
+  });
+
+  afterEach(() => {
+    (globalThis as any).Zotero = previousZotero;
+  });
+
+  it("applies highlight tags before saveTx", async () => {
+    await createHighlightAnnotation(mockAttachment(), {
+      pageIndex: 0,
+      boxes: [{ l: 10, t: 20, r: 110, b: 50, coord_origin: CoordOrigin.TOPLEFT }],
+      text: "highlighted text",
+      tags: ["methods", "important"],
+    });
+
+    expect(constructedItems).toHaveLength(1);
+    expect(constructedItems[0].tags).toEqual(["methods", "important"]);
+    expect(constructedItems[0].tagsAtSave).toEqual(["methods", "important"]);
+    expect(constructedItems[0].saveTx).toHaveBeenCalledTimes(1);
+  });
+
+  it("corrects a mislabelled parent PDF before saving the annotation", async () => {
+    const attachment = Object.assign(mockAttachment(), {
+      attachmentContentType: "application/octet-stream",
+      attachmentFilename: "file.pdf",
+      saveTx: vi.fn(async () => {}),
+    }) as any;
+    Object.assign((globalThis as any).Zotero, {
+      Libraries: { get: () => ({ editable: true }) },
+      File: { getSample: vi.fn(async () => "%PDF-1.4") },
+      MIME: { sniffForMIMEType: vi.fn(() => "application/pdf") },
+    });
+
+    await createHighlightAnnotation(attachment, {
+      pageIndex: 0,
+      boxes: [{ l: 10, t: 20, r: 110, b: 50, coord_origin: CoordOrigin.TOPLEFT }],
+      text: "highlighted text",
+    });
+
+    expect(attachment.attachmentContentType).toBe("application/pdf");
+    expect(attachment.saveTx).toHaveBeenCalledOnce();
+    expect(attachment.saveTx.mock.invocationCallOrder[0])
+      .toBeLessThan(constructedItems[0].saveTx.mock.invocationCallOrder[0]);
+  });
+
+  it("does not save an annotation when the parent file cannot be confirmed as a PDF", async () => {
+    const attachment = Object.assign(mockAttachment(), {
+      attachmentContentType: "",
+      attachmentFilename: "file.pdf",
+      saveTx: vi.fn(async () => {}),
+    }) as any;
+    Object.assign((globalThis as any).Zotero, {
+      Libraries: { get: () => ({ editable: true }) },
+      File: { getSample: vi.fn(async () => "<html>") },
+      MIME: { sniffForMIMEType: vi.fn(() => "text/html") },
+    });
+
+    await expect(createHighlightAnnotation(attachment, {
+      pageIndex: 0,
+      boxes: [{ l: 10, t: 20, r: 110, b: 50, coord_origin: CoordOrigin.TOPLEFT }],
+      text: "highlighted text",
+    })).rejects.toThrow("Zotero cannot annotate this attachment");
+
+    expect(attachment.saveTx).not.toHaveBeenCalled();
+    expect(constructedItems[0].saveTx).not.toHaveBeenCalled();
+  });
+
+  it("keeps its own transaction while an unrelated one is open", async () => {
+    // Creation is a standalone write, so it must not join whatever transaction
+    // happens to be open (sync, another UI task): joining would report success
+    // for an annotation that a rollback elsewhere then discards.
+    inTransaction = true;
+
+    await createHighlightAnnotation(mockAttachment(), {
+      pageIndex: 0,
+      boxes: [{ l: 10, t: 20, r: 110, b: 50, coord_origin: CoordOrigin.TOPLEFT }],
+      text: "highlighted text",
+      tags: ["methods"],
+    });
+
+    expect(constructedItems[0].save).not.toHaveBeenCalled();
+    expect(constructedItems[0].saveTx).toHaveBeenCalledTimes(1);
+    expect(constructedItems[0].tagsAtSave).toEqual(["methods"]);
+  });
+
+  it("resolves an omitted PDF note label from cached document metadata", async () => {
+    (globalThis as any).Zotero.AsterMargin.documentCache.getMetadata.mockResolvedValue({ pages: [geometry], pageLabels: { 0: '220' } });
+    await createNoteAnnotation(mockAttachment(), {
+      notePosition: { page_index: 0, x: 100, y: 100, side: 'right', coord_origin: CoordOrigin.TOPLEFT },
+      comment: 'A note',
+    });
+    expect((constructedItems[0] as any).annotationPageLabel).toBe('220');
+  });
+
+  it("applies note tags before saveTx", async () => {
+    await createNoteAnnotation(mockAttachment(), {
+      notePosition: {
+        page_index: 0,
+        side: "left",
+        x: 0,
+        y: 100,
+        coord_origin: CoordOrigin.TOPLEFT,
+      },
+      comment: "a note",
+      tags: ["methods"],
+    });
+
+    expect(constructedItems).toHaveLength(1);
+    expect(constructedItems[0].tags).toEqual(["methods"]);
+    expect(constructedItems[0].tagsAtSave).toEqual(["methods"]);
+  });
+
+  it("adds no tags when none are supplied", async () => {
+    await createHighlightAnnotation(mockAttachment(), {
+      pageIndex: 0,
+      boxes: [{ l: 10, t: 20, r: 110, b: 50, coord_origin: CoordOrigin.TOPLEFT }],
+      text: "highlighted text",
+    });
+
+    expect(constructedItems[0].tags).toEqual([]);
+  });
+
+  it("ignores an empty tags array", async () => {
+    await createNoteAnnotation(mockAttachment(), {
+      notePosition: {
+        page_index: 0,
+        side: "left",
+        x: 0,
+        y: 100,
+        coord_origin: CoordOrigin.TOPLEFT,
+      },
+      comment: "a note",
+      tags: [],
+    });
+
+    expect(constructedItems[0].tags).toEqual([]);
+  });
+});
+
+describe("normalizeAnnotationTags", () => {
+  it("returns undefined for non-array input", () => {
+    expect(normalizeAnnotationTags(undefined)).toBeUndefined();
+    expect(normalizeAnnotationTags(null)).toBeUndefined();
+    expect(normalizeAnnotationTags("methods")).toBeUndefined();
+  });
+
+  it("trims entries and drops empty/whitespace strings", () => {
+    expect(normalizeAnnotationTags(["  methods  ", "", "  ", "important"]))
+      .toEqual(["methods", "important"]);
+  });
+
+  it("drops non-string entries", () => {
+    expect(normalizeAnnotationTags(["methods", 5, null, { x: 1 }, "important"]))
+      .toEqual(["methods", "important"]);
+  });
+
+  it("returns undefined when nothing remains after filtering", () => {
+    expect(normalizeAnnotationTags(["", "   "])).toBeUndefined();
+    expect(normalizeAnnotationTags([])).toBeUndefined();
+  });
+});

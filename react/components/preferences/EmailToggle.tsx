@@ -1,0 +1,24 @@
+import React from "react";
+import PreferenceToggle from "./PreferenceToggle";
+
+interface EmailToggleProps {
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+    disabled?: boolean;
+}
+
+const EmailToggle: React.FC<EmailToggleProps> = ({ checked, onChange, disabled }) => {
+    return (
+        <PreferenceToggle
+            checked={checked}
+            onChange={onChange}
+            disabled={disabled}
+            title="Email updates about AsterMargin"
+            subtitle="(optional)"
+            // description="Receive email updates about AsterMargin"
+            // tooltip="When enabled, you will receive email notifications for updates and important announcements."
+        />
+    );
+};
+
+export default EmailToggle;

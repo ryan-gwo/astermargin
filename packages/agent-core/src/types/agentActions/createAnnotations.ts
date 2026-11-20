@@ -1,0 +1,159 @@
+import type { PageLocation } from '../citations';
+import type { ZoteroItemReference } from '../zotero';
+import type { NotePosition, ToolAnnotationColor } from './annotations';
+
+/**
+ * Normalize raw call-level annotation tags: trim, drop empty/non-string
+ * entries, and return `undefined` when nothing remains. Shared by the
+ * action normalizer and the WS execute handlers so all paths agree.
+ */
+export function normalizeAnnotationTags(raw: unknown): string[] | undefined {
+    if (!Array.isArray(raw)) return undefined;
+    const tags = raw
+        .filter((tag): tag is string => typeof tag === 'string')
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0);
+    return tags.length > 0 ? tags : undefined;
+}
+
+/** Zotero annotation type a create_highlight_annotations action writes. */
+export type TextAnnotationStyle = 'highlight' | 'underline';
+
+/** Read an action's `style`; anything but 'underline' means highlight. */
+export function textAnnotationStyle(raw: unknown): TextAnnotationStyle {
+    return raw === 'underline' ? 'underline' : 'highlight';
+}
+
+export interface BackendLocator {
+    kind:
+        | 'sentence'
+        | 'paragraph'
+        | 'heading'
+        | 'list'
+        | 'caption'
+        | 'footnote'
+        | 'figure'
+        | 'equation'
+        | 'table'
+        | 'margin'
+        | 'reference'
+        | 'page'
+        | 'unknown';
+    value: string;
+    raw: string;
+}
+
+export interface HighlightAnnotationItem {
+    index: number;
+    /**
+     * Opaque backend correlation token. Older clients wrote one annotation per
+     * page, so one token can map to several CreatedAnnotationResult rows.
+     */
+    client_item_id: string;
+    title: string;
+    loc_raw: string;
+    loc: BackendLocator;
+    /** Highlighted text. Required for PDF; EPUB also uses it to locate the range. */
+    text?: string;
+    color: ToolAnnotationColor;
+    comment?: string | null;
+    /** PDF-only: page rects/geometry. Absent for EPUB. */
+    page_locations?: PageLocation[];
+    page_label?: string | null;
+    /** EPUB locator (content_kind === 'epub'): section file href, matched by basename. */
+    section_href?: string | null;
+    /** EPUB locator: 1-based extractor section ordinal. */
+    section_ordinal?: number | null;
+    /** EPUB locator: DOM id of the cited element inside the section. */
+    anchor_id?: string | null;
+}
+
+export interface NoteAnnotationItem {
+    index: number;
+    /** Opaque backend correlation token. */
+    client_item_id: string;
+    title: string;
+    loc_raw: string;
+    loc: BackendLocator;
+    comment: string;
+    color: ToolAnnotationColor;
+    /** PDF-only: page anchor position. Absent for EPUB. */
+    note_position?: NotePosition;
+    page_label?: string | null;
+    /** Per-page cumulative character offset in reading order (Zotero sortIndex offset). */
+    reading_order_offset?: number | null;
+    /** EPUB locator: cited passage text used to anchor the note point. */
+    text?: string;
+    /** EPUB locator: section file href, matched by basename. */
+    section_href?: string | null;
+    /** EPUB locator: 1-based extractor section ordinal. */
+    section_ordinal?: number | null;
+    /** EPUB locator: DOM id of the cited element inside the section. */
+    anchor_id?: string | null;
+}
+
+export interface CreatedAnnotationResult extends ZoteroItemReference {
+    client_item_id: string;
+    index: number;
+    loc_raw: string;
+    /**
+     * 0-based PDF page this annotation was written to (its first page when it
+     * continues onto the next one). Older clients wrote a highlight spanning
+     * several pages as one row per page, all sharing `client_item_id`; these
+     * fields are what let a consumer tell those rows apart. Absent for EPUB /
+     * snapshot annotations, which are always 1:1, and absent on rows created
+     * before the fields existed.
+     */
+    page_idx?: number;
+    /** Page label Zotero stored on the annotation (PDF label, else page number). */
+    page_label?: string | null;
+    /**
+     * PDF pages this annotation covers: 2 for a highlight that continues onto
+     * `page_idx + 1` (`position.nextPageRects`). Absent means one page.
+     */
+    page_count?: number;
+}
+
+export interface FailedAnnotationResult {
+    client_item_id: string;
+    index: number;
+    loc_raw: string;
+    error: string;
+    error_code?: string | null;
+}
+
+export interface CreateHighlightAnnotationsProposedData {
+    requested_ref: ZoteroItemReference;
+    resolved_ref: ZoteroItemReference;
+    items: HighlightAnnotationItem[];
+    /** Tags applied to every created annotation (call-level, not per item). */
+    tags?: string[];
+    /** Annotation type for every item. Absent means highlight. */
+    style?: TextAnnotationStyle;
+}
+
+export interface CreateNoteAnnotationsProposedData {
+    requested_ref: ZoteroItemReference;
+    resolved_ref: ZoteroItemReference;
+    items: NoteAnnotationItem[];
+    /** Tags applied to every created annotation (call-level, not per item). */
+    tags?: string[];
+}
+
+export interface CreateHighlightAnnotationsResultData {
+    requested_ref: ZoteroItemReference;
+    resolved_ref: ZoteroItemReference;
+    created: CreatedAnnotationResult[];
+    failed: FailedAnnotationResult[];
+    total_created: number;
+    total_failed: number;
+}
+
+export interface CreateNoteAnnotationsResultData {
+    requested_ref: ZoteroItemReference;
+    resolved_ref: ZoteroItemReference;
+    created: CreatedAnnotationResult[];
+    failed: FailedAnnotationResult[];
+    total_created: number;
+    total_failed: number;
+}

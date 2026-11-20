@@ -1,0 +1,1061 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+const mocks = vi.hoisted(() => ({
+    profile: vi.fn(),
+    exclusion: vi.fn(),
+    preference: vi.fn(),
+    claim: vi.fn(),
+    dispose: vi.fn(),
+}));
+vi.mock("@astermargin/agent-core/transport/clients/accountService", () => ({
+    accountService: {
+        getProfileWithPlan: mocks.profile,
+        updateExcludedLibraries: mocks.exclusion,
+        updatePreference: mocks.preference,
+    },
+}));
+vi.mock("@astermargin/agent-core/transport/threadService", () => ({
+    threadService: { claimThreads: mocks.claim },
+}));
+vi.mock("@astermargin/agent-core/transport/supabaseClient", () => ({
+    supabase: {},
+    disposeSupabaseClient: mocks.dispose,
+    setSupabaseAuthPolicy: vi.fn(),
+    setSupabaseFetchAdapter: vi.fn(),
+}));
+vi.mock("../../../src/runtime/realm", () => ({
+    prepareServiceRealm: vi.fn(),
+}));
+vi.mock("../../../src/services/zoteroSupabaseStorage", () => ({
+    registerZoteroSupabaseStorage: vi.fn(),
+}));
+vi.mock("../../../src/services/zoteroClientIdentity", () => ({
+    registerZoteroClientIdentity: vi.fn(),
+}));
+vi.mock("../../../src/utils/libraryIdentity", () => ({
+    libraryRefForLibraryID: () => "u",
+}));
+vi.mock("../../../src/utils/zoteroInstanceIdentity", () => ({
+    getZoteroUserIdentifier: () => ({ localUserKey: "install" }),
+}));
+import {
+    InstanceAccount,
+    createInstanceAccount,
+} from "../../../src/services/instanceAccount";
+import {
+    isBackendAccessAllowed,
+    resetBackendAccessPolicyForTesting,
+} from "@astermargin/agent-core/transport/backendAccessPolicy";
+import { getPref, setPref } from "../../../src/utils/prefs";
+
+const session = (id = "a", token = "token") =>
+    ({ user: { id }, access_token: token, expires_at: 9999999999 }) as any;
+const profile = (id = "a") =>
+    ({
+        profile: {
+            user_id: id,
+            data_version: 1,
+            excluded_libraries: [],
+            has_ocr_access: true,
+        },
+        model_configs: [],
+        required_data_version: 1,
+        minimum_frontend_version: "0",
+    }) as any;
+const deferred = <T>() => {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((a, b) => {
+        resolve = a;
+        reject = b;
+    });
+    return { promise, resolve, reject };
+};
+
+describe("instance account ownership", () => {
+    let account: InstanceAccount;
+    let event: (event: string, session: any) => void;
+    let sdk: any;
+    beforeEach(() => {
+        vi.useFakeTimers();
+        vi.clearAllMocks();
+        const prefs = new Map<string, unknown>();
+        vi.mocked(Zotero.Prefs.get).mockImplementation((key) => prefs.get(key) as any);
+        vi.mocked(Zotero.Prefs.set).mockImplementation((key, value) => { prefs.set(key, value); });
+        setPref("backgroundProcessingEnabled", false);
+        setPref("backgroundProcessingSearchInitialized", false);
+        vi.stubGlobal("Services", {
+            io: { offline: false },
+            obs: { addObserver: vi.fn(), removeObserver: vi.fn() },
+        });
+        mocks.profile.mockResolvedValue(profile());
+        mocks.exclusion.mockResolvedValue({});
+        const astermargin = {
+            backgroundExtractor: { abortJobsWithoutAccess: vi.fn(), notify: vi.fn() },
+            processingReconciler: { notify: vi.fn() },
+        };
+        (Zotero as any).AsterMargin = astermargin;
+        (Zotero.Libraries.getAll as any).mockReturnValue([
+            {
+                libraryID: 1,
+                libraryType: "user",
+                name: "Library",
+                editable: true,
+                filesEditable: true,
+            },
+        ]);
+        sdk = {
+            auth: {
+                onAuthStateChange: vi.fn((callback) => {
+                    event = callback;
+                    return { data: { subscription: { unsubscribe: vi.fn() } } };
+                }),
+                getSession: vi.fn().mockResolvedValue({
+                    data: { session: session() },
+                    error: null,
+                }),
+                refreshSession: vi.fn().mockResolvedValue({
+                    data: { session: session("a", "refreshed") },
+                    error: null,
+                }),
+                signOut: vi.fn().mockResolvedValue({ error: null }),
+            },
+            removeAllChannels: vi.fn().mockResolvedValue([]),
+        };
+        account = new InstanceAccount(sdk);
+        account.start();
+    });
+    afterEach(async () => {
+        await account.dispose();
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+    const load = async () => {
+        event("INITIAL_SESSION", session());
+        await account.refresh();
+    };
+    it("coalesces rejection verification and retains valid credentials", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        const generation = account.getGeneration();
+        const checks = Array.from({ length: 8 }, () => account.reportSessionRejected(generation));
+        expect(mocks.profile).toHaveBeenCalledTimes(2);
+        pending.resolve(profile());
+        await Promise.all(checks);
+        await account.reportSessionRejected(generation);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(mocks.profile).toHaveBeenCalledTimes(2);
+        expect(sdk.auth.signOut).not.toHaveBeenCalled();
+        expect(account.getSnapshot().session).not.toBeNull();
+    });
+
+    it("joins an existing profile refresh without scheduling another verification", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        const refresh = account.refresh();
+        const check = account.reportSessionRejected(account.getGeneration());
+        pending.resolve(profile());
+        await Promise.all([refresh, check]);
+        await account.reportSessionRejected(account.getGeneration());
+        await vi.advanceTimersByTimeAsync(100);
+        expect(mocks.profile).toHaveBeenCalledTimes(2);
+    });
+
+    it("preserves the session when the network drops during verification", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        const check = account.reportSessionRejected(account.getGeneration());
+        Services.io.offline = true;
+        pending.reject({ code: "SESSION_EXPIRED" });
+        await check;
+        expect(sdk.auth.signOut).not.toHaveBeenCalled();
+        expect(account.getSnapshot().status).toMatchObject({ kind: "transient", offline: true });
+    });
+
+    it("signs out only after a current verification confirms rejection", async () => {
+        await load();
+        mocks.profile.mockRejectedValueOnce({ code: "SESSION_EXPIRED" });
+        await account.reportSessionRejected(account.getGeneration());
+        expect(account.getSnapshot().session).toBeNull();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(sdk.auth.signOut).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores obsolete rejection reports and verification results", async () => {
+        await load();
+        const generation = account.getGeneration();
+        const pending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        const check = account.reportSessionRejected(generation);
+        event("SIGNED_IN", session("b"));
+        pending.reject({ code: "SESSION_EXPIRED" });
+        await check;
+        await account.reportSessionRejected(generation);
+        expect(mocks.profile).toHaveBeenCalledTimes(2);
+        expect(account.getSnapshot().session?.user.id).toBe("b");
+        expect(sdk.auth.signOut).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        { code: "SESSION_REFRESH_FAILED", message: "Network failed" },
+        { status: 429, message: "Rate limited" },
+        { status: 503, message: "Unavailable" },
+    ])("preserves outage backoff despite repeated rejection reports: %j", async error => {
+        await load();
+        mocks.profile.mockRejectedValue(error);
+        const generation = account.getGeneration();
+        await account.reportSessionRejected(generation);
+        for (let i = 0; i < 5; i++) await account.reportSessionRejected(generation);
+        expect(mocks.profile).toHaveBeenCalledTimes(2);
+        expect(account.getSnapshot().status.kind).toBe("transient");
+        expect(sdk.auth.signOut).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(mocks.profile).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not verify or sign out offline", async () => {
+        await load();
+        Services.io.offline = true;
+        await account.reportSessionRejected(account.getGeneration());
+        expect(mocks.profile).toHaveBeenCalledTimes(1);
+        expect(sdk.auth.signOut).not.toHaveBeenCalled();
+    });
+
+    it("consent covers the second feature and rejects a previous account's open prompt", async () => {
+        await load();
+        const granted = profile();
+        granted.profile.has_ocr_access = true;
+        granted.profile.has_search_index_access = false;
+        mocks.profile.mockResolvedValue(granted);
+        await account.refresh();
+        const generation = account.getGeneration();
+        account.setCloudConsent(true, generation);
+        granted.profile.has_search_index_access = true;
+        await account.refresh();
+        expect(Zotero.AsterMargin.hasSearchIndexAccess).toBe(true);
+        event("SIGNED_IN", session("b"));
+        await account.refresh();
+        account.setCloudConsent(true, generation);
+        expect(account.getSnapshot().cloudConsent).toBe("pending");
+        expect(Zotero.AsterMargin.hasOcrAccess).toBe(false);
+        event("SIGNED_IN", session("a"));
+        await account.refresh();
+        expect(account.getSnapshot().cloudConsent).toBe("accepted");
+        expect(Zotero.AsterMargin.hasOcrAccess).toBe(true);
+    });
+
+    it.each([[false, false], [true, false], [false, true], [true, true]])(
+        "requires account consent for OCR=%s search=%s, including local processing users",
+        async (ocr, search) => {
+            await load();
+            setPref("backgroundProcessingEnabled", true);
+            const entitled = profile();
+            entitled.profile.has_ocr_access = ocr;
+            entitled.profile.has_search_index_access = search;
+            mocks.profile.mockResolvedValue(entitled);
+            await account.refresh();
+            expect(Zotero.AsterMargin.hasOcrAccess).toBe(false);
+            expect(Zotero.AsterMargin.hasSearchIndexAccess).toBe(false);
+            account.setCloudConsent(false, account.getGeneration());
+            expect(account.getSnapshot().cloudConsent).toBe(ocr || search ? "declined" : "pending");
+            account.setCloudConsent(true, account.getGeneration());
+            expect(Zotero.AsterMargin.hasOcrAccess).toBe(ocr);
+            expect(Zotero.AsterMargin.hasSearchIndexAccess).toBe(search);
+            await account.refresh();
+            expect(Zotero.AsterMargin.hasSearchIndexAccess).toBe(search);
+            const lost = profile();
+            lost.profile.has_ocr_access = false;
+            lost.profile.has_search_index_access = false;
+            mocks.profile.mockResolvedValue(lost);
+            await account.refresh();
+            expect(Zotero.AsterMargin.hasOcrAccess).toBe(false);
+            mocks.profile.mockResolvedValue(entitled);
+            await account.refresh();
+            expect(Zotero.AsterMargin.hasOcrAccess).toBe(ocr);
+            expect(Zotero.AsterMargin.hasSearchIndexAccess).toBe(search);
+        },
+    );
+
+    it("starts one SDK listener and hydrates subscribers without an update gap", async () => {
+        account.start();
+        await load();
+        const seen: any[] = [];
+        account.subscribe((value) => seen.push(value));
+        expect(sdk.auth.onAuthStateChange).toHaveBeenCalledTimes(1);
+        expect(seen[0].data.profile.user_id).toBe("a");
+        expect(() =>
+            seen[0].data.profile.excluded_libraries.push({ type: "user" }),
+        ).toThrow();
+        expect(account.getSnapshot().data?.profile.excluded_libraries).toEqual(
+            [],
+        );
+    });
+    it("preserves the account generation and loaded profile on same-user token rotation", async () => {
+        await load();
+        const before = account.getSnapshot();
+        event("TOKEN_REFRESHED", session("a", "rotated"));
+        expect(account.getGeneration()).toBe(before.generation);
+        expect(account.getSnapshot().data).toEqual(before.data);
+        expect(account.getSnapshot().session?.access_token).toBe("rotated");
+    });
+    it("continues refreshing after every renderer unsubscribes", async () => {
+        await load();
+        const remove = account.subscribe(() => {});
+        remove();
+        const count = mocks.profile.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(4 * 60 * 60 * 1000);
+        expect(mocks.profile.mock.calls.length).toBeGreaterThan(count);
+        expect(account.getSnapshot().data).not.toBeNull();
+    });
+    it("refreshes every 4 hours while AsterMargin is hidden and every 15 minutes while visible", async () => {
+        await load();
+        const count = mocks.profile.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count);
+        await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 1);
+
+        account.setUIVisible("w1", true);
+        await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 2);
+        await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 3);
+
+        account.setUIVisible("w1", false);
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 3);
+    });
+    it("refreshes a stale profile as soon as AsterMargin becomes visible", async () => {
+        await load();
+        const count = mocks.profile.mock.calls.length;
+        account.setUIVisible("w1", true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mocks.profile).toHaveBeenCalledTimes(count);
+        account.setUIVisible("w1", false);
+        await vi.advanceTimersByTimeAsync(20 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count);
+        account.setUIVisible("w1", true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 1);
+    });
+    it("stays on the visible cadence until every window hides AsterMargin", async () => {
+        await load();
+        const count = mocks.profile.mock.calls.length;
+        account.setUIVisible("main", true);
+        account.setUIVisible("standalone", true);
+        account.setUIVisible("main", false);
+        await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 1);
+        account.setUIVisible("standalone", false);
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 1);
+    });
+    it("keeps the retry backoff when visibility changes during a transient failure", async () => {
+        await load();
+        const count = mocks.profile.mock.calls.length;
+        mocks.profile.mockRejectedValueOnce(Object.assign(new Error("down"), { status: 503 }));
+        await account.refresh(true);
+        expect(account.getSnapshot().status.kind).toBe("transient");
+        account.setUIVisible("w1", true);
+        account.setUIVisible("w1", false);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(mocks.profile).toHaveBeenCalledTimes(count + 2);
+        expect(account.getSnapshot().status.kind).toBe("ok");
+    });
+    it("pauses offline retries and resumes through one instance network observer", async () => {
+        await load();
+        account.start();
+        expect(Services.obs.addObserver).toHaveBeenCalledTimes(1);
+        const observer = vi.mocked(Services.obs.addObserver).mock
+            .calls[0][0] as any;
+        Services.io.offline = true;
+        observer.observe(null, "network:offline-status-changed", "offline");
+        const calls = mocks.profile.mock.calls.length;
+        await account.refresh(true);
+        await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+        expect(mocks.profile).toHaveBeenCalledTimes(calls);
+        expect(account.getSnapshot().status).toMatchObject({
+            kind: "transient",
+            offline: true,
+            attempt: 0,
+        });
+        expect(account.getSnapshot().scopeReady).toBe(true);
+        Services.io.offline = false;
+        observer.observe(null, "network:offline-status-changed", "online");
+        await account.refresh();
+        expect(mocks.profile).toHaveBeenCalledTimes(calls + 1);
+        expect(account.getSnapshot().status.kind).toBe("ok");
+        await account.dispose();
+        expect(Services.obs.removeObserver).toHaveBeenCalledWith(
+            observer,
+            "network:offline-status-changed",
+        );
+    });
+    it("shares an immutable publication and avoids access work on token-only updates", async () => {
+        await load();
+        const first = vi.fn();
+        const second = vi.fn();
+        account.subscribe(first);
+        account.subscribe(second);
+        vi.mocked(
+            Zotero.AsterMargin.backgroundExtractor!.abortJobsWithoutAccess,
+        ).mockClear();
+        vi.mocked(Zotero.AsterMargin.processingReconciler!.notify).mockClear();
+        event("TOKEN_REFRESHED", session("a", "next"));
+        const published = first.mock.calls.at(-1)![0];
+        expect(published).toBe(second.mock.calls.at(-1)![0]);
+        expect(() =>
+            published.data.profile.excluded_libraries.push({ type: "user" }),
+        ).toThrow();
+        expect(
+            Zotero.AsterMargin.backgroundExtractor!.abortJobsWithoutAccess,
+        ).not.toHaveBeenCalled();
+        expect(
+            Zotero.AsterMargin.processingReconciler!.notify,
+        ).not.toHaveBeenCalled();
+    });
+    it("awaits a fresh profile when invalidation supersedes a pending read", async () => {
+        await load();
+        const old = deferred<any>();
+        const fresh = deferred<any>();
+        mocks.profile
+            .mockReturnValueOnce(old.promise)
+            .mockReturnValueOnce(fresh.promise);
+        const reading = account.refresh();
+        let completed = false;
+        const invalidation = account.invalidateProfile().then(() => {
+            completed = true;
+        });
+        old.resolve(profile());
+        await reading;
+        await Promise.resolve();
+        expect(completed).toBe(false);
+        const next = profile();
+        next.profile.has_completed_onboarding = true;
+        fresh.resolve(next);
+        await invalidation;
+        expect(
+            account.getSnapshot().data?.profile.has_completed_onboarding,
+        ).toBe(true);
+    });
+    it("discards a profile response from the previous account, including an ABA switch", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        const refresh = account.refresh();
+        event("SIGNED_IN", session("b"));
+        event("SIGNED_IN", session("a"));
+        pending.resolve(profile());
+        await refresh;
+        expect(account.getSnapshot().data).toBeNull();
+        expect(Zotero.AsterMargin.libraryScopeInitialized).toBe(false);
+    });
+    it.each(["Invalid OTP", "Network unavailable"])(
+        "publishes a signed-out pending attempt and settles a failed verification: %s",
+        async (message) => {
+            event("INITIAL_SESSION", null);
+            const pending = deferred<any>();
+            sdk.auth.verifyOtp = vi.fn().mockReturnValue(pending.promise);
+            sdk.auth.getSession.mockResolvedValue({
+                data: { session: null },
+                error: null,
+            });
+            const before = account.getGeneration();
+            const attempt = account.auth.verifyOtp({
+                email: "test@example.test",
+                token: "123456",
+                type: "email",
+            });
+            expect(account.getSnapshot()).toMatchObject({
+                generation: before + 1,
+                authenticating: true,
+                session: null,
+            });
+            pending.resolve({ data: { session: null }, error: { message } });
+            await expect(attempt).resolves.toMatchObject({
+                error: { message },
+            });
+            expect(account.getSnapshot()).toMatchObject({
+                generation: before + 1,
+                authenticating: false,
+                session: null,
+            });
+        },
+    );
+    it("revokes access synchronously before sign-out waits for the SDK", async () => {
+        await load();
+        const pending = deferred<any>();
+        sdk.auth.signOut.mockReturnValueOnce(pending.promise);
+        sdk.auth.getSession.mockResolvedValue({
+            data: { session: null },
+            error: null,
+        });
+        const logout = account.auth.signOut();
+        expect(Zotero.AsterMargin.searchableLibraryIds).toEqual([]);
+        expect(Zotero.AsterMargin.hasOcrAccess).toBe(false);
+        expect(account.getSnapshot().session).toBeNull();
+        pending.resolve({ error: null });
+        await logout;
+    });
+    it("revokes scope before notifying renderers and before the preference request finishes", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.exclusion.mockReturnValueOnce(pending.promise);
+        let scope: number[] | undefined;
+        account.subscribe((s) => {
+            if (s.data?.profile.excluded_libraries.length)
+                scope = Zotero.AsterMargin.searchableLibraryIds;
+        });
+        const write = account.updateExcludedLibraries([{ type: "user" }]);
+        expect(scope).toEqual([]);
+        expect(
+            Zotero.AsterMargin.backgroundExtractor?.abortJobsWithoutAccess,
+        ).toHaveBeenCalled();
+        pending.resolve({});
+        await write;
+    });
+    it("counts every revocation of library access, and nothing else", async () => {
+        await load();
+        const before = Zotero.AsterMargin.libraryRevocations ?? 0;
+        await account.updateExcludedLibraries([{ type: "user" }]);
+        expect(Zotero.AsterMargin.libraryRevocations).toBe(before + 1);
+        // Restoring access is not a revocation.
+        await account.updateExcludedLibraries([]);
+        expect(Zotero.AsterMargin.libraryRevocations).toBe(before + 1);
+        await account.updateExcludedLibraries([{ type: "user" }]);
+        expect(Zotero.AsterMargin.libraryRevocations).toBe(before + 2);
+    });
+    it("cannot restore excluded scope from a profile fetch started before the write", async () => {
+        await load();
+        const pending = deferred<any>();
+        const writePending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        mocks.exclusion.mockReturnValueOnce(writePending.promise);
+        const refresh = account.refresh();
+        const write = account.updateExcludedLibraries([{ type: "user" }]);
+        pending.resolve(profile());
+        await refresh;
+        expect(Zotero.AsterMargin.searchableLibraryIds).toEqual([]);
+        writePending.resolve({});
+        await write;
+    });
+    it("rejects concurrent settings writes and never rolls back into a different account", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.exclusion.mockReturnValueOnce(pending.promise);
+        const write = account.updateExcludedLibraries([{ type: "user" }]);
+        await expect(account.updateExcludedLibraries([])).rejects.toThrow(
+            "pending",
+        );
+        event("SIGNED_IN", session("b"));
+        pending.reject(new Error("offline"));
+        await expect(write).rejects.toThrow("offline");
+        expect(account.getSnapshot().data).toBeNull();
+    });
+    it("does not apply a profile whose identity differs from the authenticated account", async () => {
+        mocks.profile.mockResolvedValue(profile("b"));
+        await load();
+        expect(account.getSnapshot().data).toBeNull();
+        expect(account.getSnapshot().status.kind).toBe("fatal");
+    });
+    it("rejects a credential result that crosses an account generation", async () => {
+        await load();
+        const pending = deferred<any>();
+        sdk.auth.getSession.mockReturnValueOnce(pending.promise);
+        const request = account.auth.getSession();
+        event("SIGNED_IN", session("b"));
+        pending.resolve({ data: { session: session() }, error: null });
+        await expect(request).rejects.toMatchObject({
+            code: "ACCOUNT_CHANGED",
+        });
+    });
+    it("preserves the profile and schedules retry for a structural transient error", async () => {
+        await load();
+        mocks.profile.mockRejectedValueOnce({
+            code: "SESSION_REFRESH_FAILED",
+            message: "Offline",
+        });
+        await account.refresh();
+        expect(account.getSnapshot().data).not.toBeNull();
+        expect(account.getSnapshot().status.kind).toBe("transient");
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(account.getSnapshot().status.kind).toBe("ok");
+    });
+    it("coalesces concurrent explicit token refreshes", async () => {
+        await load();
+        const pending = deferred<any>();
+        sdk.auth.refreshSession.mockReturnValueOnce(pending.promise);
+        const first = account.auth.refreshSession(),
+            second = account.auth.refreshSession();
+        expect(sdk.auth.refreshSession).toHaveBeenCalledOnce();
+        pending.resolve({
+            data: { session: session("a", "rotated") },
+            error: null,
+        });
+        await Promise.all([first, second]);
+    });
+    it("does not restore access from a late SDK event after sign-out", async () => {
+        await load();
+        sdk.auth.getSession.mockResolvedValue({
+            data: { session: null },
+            error: null,
+        });
+        await account.auth.signOut();
+        event("TOKEN_REFRESHED", session());
+        expect(account.getSnapshot().session).toBeNull();
+        expect((await account.auth.getSession()).data.session).toBeNull();
+    });
+    it("allows the new account to update settings while an old-account save is pending", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.exclusion.mockReturnValueOnce(pending.promise);
+        const oldWrite = account.updateExcludedLibraries([{ type: "user" }]);
+        event("SIGNED_IN", session("b"));
+        mocks.profile.mockResolvedValue(profile("b"));
+        await account.refresh();
+        await account.updateExcludedLibraries([]);
+        pending.reject(new Error("Old write failed"));
+        await expect(oldWrite).rejects.toThrow("Old write failed");
+        expect(account.getSnapshot().data?.profile.user_id).toBe("b");
+        expect(account.getSnapshot().data?.profile.excluded_libraries).toEqual(
+            [],
+        );
+    });
+    it("removes a subscriber whose initial hydration throws", () => {
+        const listener = vi.fn(() => {
+            throw new Error("Renderer failed");
+        });
+        expect(() => account.subscribe(listener)).toThrow("Renderer failed");
+        event("INITIAL_SESSION", null);
+        expect(listener).toHaveBeenCalledOnce();
+    });
+    it("disposes once and ignores late refresh completions", async () => {
+        await load();
+        const pending = deferred<any>();
+        mocks.profile.mockReturnValueOnce(pending.promise);
+        const refresh = account.refresh();
+        await account.dispose();
+        await account.dispose();
+        pending.resolve(profile());
+        await refresh;
+        expect(account.getSnapshot().data).toBeNull();
+        expect(sdk.removeAllChannels).toHaveBeenCalledTimes(1);
+    });
+    describe("restoring a saved session", () => {
+        const retryable = () =>
+            Object.assign(new Error("NetworkError when attempting to fetch resource."), {
+                name: "AuthRetryableFetchError",
+                status: 0,
+            });
+        const failOnce = () =>
+            sdk.auth.getSession.mockResolvedValueOnce({
+                data: { session: null },
+                error: retryable(),
+            });
+        const network = () =>
+            vi.mocked(Services.obs.addObserver).mock.calls[0][0] as unknown as {
+                observe(subject: unknown, topic: string, state: string): void;
+            };
+        const failedRestore = async () => {
+            failOnce();
+            event("INITIAL_SESSION", null);
+            await vi.advanceTimersByTimeAsync(0);
+        };
+
+        it("keeps a saved session that could not be refreshed instead of signing out", async () => {
+            await failedRestore();
+            const snapshot = account.getSnapshot();
+            expect(snapshot.initialized).toBe(false);
+            expect(snapshot.session).toBeNull();
+            expect(snapshot.restore).toMatchObject({ attempt: 1, offline: false });
+            expect(sdk.auth.signOut).not.toHaveBeenCalled();
+        });
+
+        it("signs in once a retry restores the session, and loads the profile", async () => {
+            await failedRestore();
+            await vi.advanceTimersByTimeAsync(5_000);
+            // The profile load is scheduled once the session is accepted.
+            await vi.advanceTimersByTimeAsync(10);
+            const snapshot = account.getSnapshot();
+            expect(snapshot.initialized).toBe(true);
+            expect(snapshot.session?.user.id).toBe("a");
+            expect(snapshot.restore).toBeNull();
+            expect(mocks.profile).toHaveBeenCalled();
+        });
+
+        it("shows sign-in at once when nothing is saved", async () => {
+            sdk.auth.getSession.mockResolvedValueOnce({ data: { session: null }, error: null });
+            event("INITIAL_SESSION", null);
+            await vi.advanceTimersByTimeAsync(0);
+            const snapshot = account.getSnapshot();
+            expect(snapshot.initialized).toBe(true);
+            expect(snapshot.session).toBeNull();
+            expect(snapshot.restore).toBeNull();
+        });
+
+        it("treats a throwing session read as transient", async () => {
+            sdk.auth.getSession.mockRejectedValueOnce(new Error("Storage unavailable"));
+            event("INITIAL_SESSION", null);
+            await vi.advanceTimersByTimeAsync(0);
+            expect(account.getSnapshot()).toMatchObject({
+                initialized: false,
+                restore: { attempt: 1 },
+            });
+        });
+
+        it("backs off between attempts", async () => {
+            sdk.auth.getSession.mockResolvedValue({ data: { session: null }, error: retryable() });
+            event("INITIAL_SESSION", null);
+            await vi.advanceTimersByTimeAsync(0);
+            const attempts = () => sdk.auth.getSession.mock.calls.length;
+            expect(attempts()).toBe(1);
+            await vi.advanceTimersByTimeAsync(4_999);
+            expect(attempts()).toBe(1);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(attempts()).toBe(2);
+            await vi.advanceTimersByTimeAsync(15_000);
+            expect(attempts()).toBe(3);
+            await vi.advanceTimersByTimeAsync(45_000);
+            expect(attempts()).toBe(4);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(attempts()).toBe(5);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(attempts()).toBe(6);
+            expect(account.getSnapshot().restore?.attempt).toBe(6);
+        });
+
+        it("waits for the network while offline and retries when it returns", async () => {
+            await failedRestore();
+            (Services as any).io.offline = true;
+            network().observe(null, "network:offline-status-changed", "offline");
+            expect(account.getSnapshot().restore?.offline).toBe(true);
+            await vi.advanceTimersByTimeAsync(120_000);
+            expect(sdk.auth.getSession).toHaveBeenCalledTimes(1);
+            (Services as any).io.offline = false;
+            network().observe(null, "network:offline-status-changed", "online");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(sdk.auth.getSession).toHaveBeenCalledTimes(2);
+            expect(account.getSnapshot().session?.user.id).toBe("a");
+        });
+
+        it("accepts a session the SDK restores on its own and stops retrying", async () => {
+            await failedRestore();
+            event("TOKEN_REFRESHED", session());
+            expect(account.getSnapshot()).toMatchObject({ initialized: true, restore: null });
+            await vi.advanceTimersByTimeAsync(120_000);
+            expect(sdk.auth.getSession).toHaveBeenCalledTimes(1);
+        });
+
+        it("signs out when the SDK discards the session and ignores the late attempt", async () => {
+            const pending = deferred<any>();
+            sdk.auth.getSession.mockReturnValueOnce(pending.promise);
+            event("INITIAL_SESSION", null);
+            event("SIGNED_OUT", null);
+            expect(account.getSnapshot()).toMatchObject({ initialized: true, session: null });
+            pending.resolve({ data: { session: null }, error: retryable() });
+            await vi.advanceTimersByTimeAsync(120_000);
+            expect(account.getSnapshot().restore).toBeNull();
+            expect(sdk.auth.getSession).toHaveBeenCalledTimes(1);
+        });
+
+        it("retries immediately on request and coalesces repeated requests", async () => {
+            await failedRestore();
+            const pending = deferred<any>();
+            sdk.auth.getSession.mockReturnValueOnce(pending.promise);
+            const first = account.retrySessionRestore();
+            const second = account.retrySessionRestore();
+            expect(sdk.auth.getSession).toHaveBeenCalledTimes(2);
+            pending.resolve({ data: { session: session() }, error: null });
+            await Promise.all([first, second]);
+            expect(account.getSnapshot().session?.user.id).toBe("a");
+        });
+
+        it("offers sign-in when the first restore runs long, without asking the SDK again", async () => {
+            await vi.advanceTimersByTimeAsync(14_999);
+            expect(account.getSnapshot().restore).toBeNull();
+            await vi.advanceTimersByTimeAsync(1);
+            expect(account.getSnapshot()).toMatchObject({
+                initialized: false,
+                restore: { attempt: 0 },
+            });
+            await account.retrySessionRestore();
+            expect(sdk.auth.getSession).not.toHaveBeenCalled();
+            event("INITIAL_SESSION", session());
+            expect(account.getSnapshot()).toMatchObject({ initialized: true, restore: null });
+        });
+
+        it("shows sign-in on request but still accepts a later SDK restore", async () => {
+            await failedRestore();
+            account.abandonSessionRestore();
+            expect(account.getSnapshot()).toMatchObject({
+                initialized: true,
+                session: null,
+                restore: null,
+            });
+            await vi.advanceTimersByTimeAsync(120_000);
+            expect(sdk.auth.getSession).toHaveBeenCalledTimes(1);
+            event("TOKEN_REFRESHED", session());
+            expect(account.getSnapshot().session?.user.id).toBe("a");
+        });
+
+        it("records a restore the SDK completes on its own", async () => {
+            await failedRestore();
+            event("TOKEN_REFRESHED", session());
+            expect(account.getAuthDiagnostics().at(-1)).toMatchObject({
+                event: "restore_succeeded",
+                detail: "after 1 failed attempts",
+            });
+        });
+
+        it("records a session the SDK restores after the user chose to sign in", async () => {
+            await failedRestore();
+            account.abandonSessionRestore();
+            event("TOKEN_REFRESHED", session());
+            expect(account.getAuthDiagnostics().at(-1)).toMatchObject({
+                event: "restore_succeeded",
+                detail: "after the user chose to sign in",
+            });
+        });
+
+        it("does not record a fresh sign-in after giving up on the restore as a restore", async () => {
+            await failedRestore();
+            account.abandonSessionRestore();
+            const before = account.getAuthDiagnostics().length;
+            sdk.auth.verifyOtp = vi.fn().mockResolvedValue({ data: { session: session("b") }, error: null });
+            sdk.auth.getSession.mockResolvedValue({ data: { session: session("b") }, error: null });
+            await account.auth.verifyOtp({ email: "b@example.test", token: "123456", type: "email" });
+            expect(account.getSnapshot().session?.user.id).toBe("b");
+            expect(
+                account.getAuthDiagnostics().slice(before).map((entry) => entry.event),
+            ).not.toContain("restore_succeeded");
+        });
+
+        it("labels sign-outs by who asked for them", async () => {
+            await load();
+            sdk.auth.signOut.mockImplementation(async () => {
+                event("SIGNED_OUT", null);
+                return { error: null };
+            });
+            await account.auth.signOut();
+            expect(
+                account.getAuthDiagnostics().filter((entry) => entry.event === "signed_out").at(-1)?.detail,
+            ).toBe("sign-out command");
+            event("SIGNED_OUT", null);
+            expect(account.getAuthDiagnostics().at(-1)?.detail).toBe("session discarded by the SDK");
+        });
+
+        it("records how the restore went for error reports", async () => {
+            await failedRestore();
+            await vi.advanceTimersByTimeAsync(5_000);
+            const events = account.getAuthDiagnostics().map((entry) => entry.event);
+            expect(events).toEqual(
+                expect.arrayContaining([
+                    "initial_session_empty",
+                    "restore_failed",
+                    "restore_succeeded",
+                ]),
+            );
+            const failure = account
+                .getAuthDiagnostics()
+                .find((entry) => entry.event === "restore_failed");
+            expect(failure?.detail).toContain("AuthRetryableFetchError");
+        });
+    });
+});
+
+describe("instance account in local mode", () => {
+    let account: InstanceAccount;
+    let astermargin: any;
+    let prefs: Map<string, unknown>;
+    // Any property read on the SDK fails the test: local mode must never
+    // reach the Supabase client, which would create it.
+    const sdk = new Proxy(
+        {},
+        {
+            get: (_target, key) => {
+                throw new Error(`Supabase SDK touched: ${String(key)}`);
+            },
+        },
+    ) as any;
+    beforeEach(() => {
+        vi.clearAllMocks();
+        resetBackendAccessPolicyForTesting();
+        prefs = new Map<string, unknown>();
+        vi.mocked(Zotero.Prefs.get).mockImplementation((key) => prefs.get(key) as any);
+        vi.mocked(Zotero.Prefs.set).mockImplementation((key, value) => { prefs.set(key, value); });
+        vi.stubGlobal("Services", {
+            io: { offline: false },
+            obs: { addObserver: vi.fn(), removeObserver: vi.fn() },
+            prefs: { addObserver: vi.fn(), removeObserver: vi.fn() },
+        });
+        (Zotero as any).logError = vi.fn();
+        astermargin = {
+            localMode: true,
+            voice: { authChanged: vi.fn() },
+            backgroundExtractor: { abortJobsWithoutAccess: vi.fn(), notify: vi.fn() },
+            processingReconciler: { notify: vi.fn() },
+        };
+        (Zotero as any).AsterMargin = astermargin;
+        (Zotero.Libraries.getAll as any).mockReturnValue([
+            { libraryID: 1, libraryType: "user", isGroup: false, name: "My Library", editable: true, filesEditable: true },
+            { libraryID: 2, libraryType: "group", isGroup: true, id: 7, name: "Lab", editable: true, filesEditable: true },
+            { libraryID: 3, libraryType: "feed", isGroup: false, name: "Feed", editable: false, filesEditable: false },
+        ]);
+        account = new InstanceAccount(sdk, () => {}, { localMode: true });
+    });
+    afterEach(async () => {
+        await account.dispose();
+        resetBackendAccessPolicyForTesting();
+        vi.unstubAllGlobals();
+    });
+
+    it("publishes an initialized local scope without creating a Supabase client", () => {
+        const listener = vi.fn();
+        account.subscribe(listener);
+        account.start();
+        const snapshot = account.getSnapshot();
+        expect(snapshot).toMatchObject({
+            initialized: true,
+            session: null,
+            data: null,
+            scopeReady: true,
+            status: { kind: "ok" },
+        });
+        expect(snapshot.libraries.map((lib) => lib.library_id)).toEqual([1, 2]);
+        expect(snapshot.libraries[1]).toMatchObject({ is_group: true, group_id: 7 });
+        expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ scopeReady: true }));
+        expect(astermargin.searchableLibraryIds).toEqual([1, 2]);
+        expect(astermargin.libraryScopeInitialized).toBe(true);
+        expect(astermargin.hasOcrAccess).toBe(false);
+        expect(astermargin.hasSearchIndexAccess).toBe(false);
+        expect(Services.obs.addObserver).not.toHaveBeenCalled();
+    });
+
+    it("keeps libraries on the local exclusion list out of the searchable scope", () => {
+        setPref("localExcludedLibraries", JSON.stringify([{ type: "group", group_id: 7 }]));
+        account.start();
+        expect(astermargin.searchableLibraryIds).toEqual([1]);
+        expect(account.getSnapshot().libraries.map((lib) => lib.library_id)).toEqual([1, 2]);
+    });
+
+    it("can exclude the user library", () => {
+        setPref("localExcludedLibraries", JSON.stringify([{ type: "user" }]));
+        account.start();
+        expect(astermargin.searchableLibraryIds).toEqual([2]);
+    });
+
+    it.each([
+        ["unparseable JSON", "{not json"],
+        ["a non-array value", JSON.stringify({ type: "user" })],
+        [
+            "one invalid entry among valid ones",
+            JSON.stringify([{ type: "user" }, { type: "group", group_id: "7" }]),
+        ],
+        ["a null entry", JSON.stringify([{ type: "group", group_id: 7 }, null])],
+    ])(
+        "makes no library searchable when the exclusion list has %s",
+        (_case, raw) => {
+            setPref("localExcludedLibraries", raw);
+            expect(() => account.start()).not.toThrow();
+            expect(astermargin.searchableLibraryIds).toEqual([]);
+            expect(astermargin.libraryScopeInitialized).toBe(true);
+            expect(account.getSnapshot().scopeReady).toBe(true);
+            expect(Zotero.logError).toHaveBeenCalledTimes(1);
+        },
+    );
+
+    const EXCLUSIONS_PREF = "extensions.zotero.astermargin.localExcludedLibraries";
+    const prefObserver = () => {
+        const call = vi.mocked(Services.prefs.addObserver).mock.calls.find(([key]) => key === EXCLUSIONS_PREF);
+        if (!call) throw new Error("no exclusion-list observer registered");
+        return call[1] as { observe: (subject: unknown, topic: string, key: string) => void };
+    };
+
+    it("re-publishes the scope when the exclusion list preference changes", () => {
+        account.start();
+        const listener = vi.fn();
+        account.subscribe(listener);
+        listener.mockClear();
+        setPref("localExcludedLibraries", JSON.stringify([{ type: "user" }]));
+        prefObserver().observe(null, "nsPref:changed", EXCLUSIONS_PREF);
+        expect(astermargin.searchableLibraryIds).toEqual([2]);
+        expect(listener).toHaveBeenCalledTimes(1);
+
+        setPref("localExcludedLibraries", "[]");
+        prefObserver().observe(null, "nsPref:changed", EXCLUSIONS_PREF);
+        expect(astermargin.searchableLibraryIds).toEqual([1, 2]);
+    });
+
+    it("fails closed when the exclusion list preference changes to an invalid value", () => {
+        account.start();
+        setPref("localExcludedLibraries", "{not json");
+        prefObserver().observe(null, "nsPref:changed", EXCLUSIONS_PREF);
+        expect(astermargin.searchableLibraryIds).toEqual([]);
+        expect(astermargin.libraryScopeInitialized).toBe(true);
+        expect(Zotero.logError).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops observing the exclusion list on dispose", async () => {
+        account.start();
+        const observer = prefObserver();
+        await account.dispose();
+        expect(Services.prefs.removeObserver).toHaveBeenCalledWith(EXCLUSIONS_PREF, observer);
+        setPref("localExcludedLibraries", JSON.stringify([{ type: "user" }]));
+        observer.observe(null, "nsPref:changed", EXCLUSIONS_PREF);
+        expect(astermargin.searchableLibraryIds).toEqual([]);
+        expect(astermargin.libraryScopeInitialized).toBe(false);
+    });
+
+    it("never contacts the backend from refresh, thread claiming or auth reads", async () => {
+        account.start();
+        await account.refresh(true);
+        await account.claimPreSyncThreads();
+        await account.reportSessionRejected(account.getGeneration());
+        expect(mocks.profile).not.toHaveBeenCalled();
+        expect(mocks.claim).not.toHaveBeenCalled();
+        await expect(account.auth.getSession()).resolves.toEqual({ data: { session: null }, error: null });
+        await expect(account.auth.refreshSession()).resolves.toEqual({ data: { session: null }, error: null });
+    });
+
+    it("answers auth reads with no session even before start", async () => {
+        await expect(account.auth.getSession()).resolves.toEqual({ data: { session: null }, error: null });
+    });
+
+    it("refuses sign-in without touching the SDK or dropping the local scope", async () => {
+        account.start();
+        const result = await account.auth.signInWithPassword({ email: "a@b.c", password: "x" });
+        expect(result.error).toMatchObject({ name: "BackendAccessBlockedError" });
+        expect(astermargin.searchableLibraryIds).toEqual([1, 2]);
+        expect(account.getSnapshot().authenticating).toBe(false);
+    });
+
+    it("disposes without touching the Supabase client", async () => {
+        account.start();
+        await account.dispose();
+        expect(mocks.dispose).not.toHaveBeenCalled();
+        expect(astermargin.searchableLibraryIds).toEqual([]);
+        expect(astermargin.libraryScopeInitialized).toBe(false);
+    });
+
+    it("createInstanceAccount blocks backend access in the plugin realm when local mode is on", () => {
+        const created = createInstanceAccount();
+        expect(isBackendAccessAllowed()).toBe(false);
+        created.start();
+        expect(created.getSnapshot().scopeReady).toBe(true);
+        void created.dispose();
+    });
+
+    it("createInstanceAccount keeps backend access blocked after the plugin object is torn down", () => {
+        createInstanceAccount();
+        (Zotero as any).AsterMargin = undefined;
+        expect(isBackendAccessAllowed()).toBe(false);
+    });
+
+    it("createInstanceAccount leaves backend access allowed when local mode is off", () => {
+        astermargin.localMode = false;
+        createInstanceAccount();
+        expect(isBackendAccessAllowed()).toBe(true);
+    });
+});

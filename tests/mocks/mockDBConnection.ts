@@ -1,0 +1,116 @@
+/**
+ * Mock Zotero.DBConnection backed by better-sqlite3.
+ *
+ * This gives us real SQLite semantics for testing the SQL in AsterMarginDB
+ * without needing a running Zotero instance.
+ *
+ * The API surface mimics the subset of Zotero.DBConnection that AsterMarginDB uses:
+ *   - queryAsync(sql, params?, options?)
+ *   - executeTransaction(fn)
+ *   - test()
+ *   - closeDatabase()
+ */
+
+import Database from 'better-sqlite3';
+import { parseQueryAndParams } from './zoteroQueryParams';
+
+export class MockDBConnection {
+    private db: Database.Database;
+
+    constructor(filename = ':memory:') {
+        this.db = new Database(filename);
+        // Enable WAL mode to mimic Zotero's default
+        this.db.pragma('journal_mode = WAL');
+    }
+
+    /**
+     * Mimics Zotero.DBConnection.queryAsync.
+     *
+     * Supports both the direct-return pattern (rows as array of objects)
+     * and the onRow callback pattern used in some AsterMarginDB methods.
+     */
+    async queryAsync(
+        sqlIn: string,
+        paramsIn: any[] = [],
+        options?: { onRow?: (row: any) => void }
+    ): Promise<any[]> {
+        // Zotero splices NULL parameters into the SQL rather than binding them,
+        // and gets the placeholder position wrong for anything but `= ?`/`, ?`/
+        // `( ?`. Reproduce that here so tests exercise the statement production
+        // actually runs. See zoteroQueryParams.ts.
+        const [sql, params] = parseQueryAndParams(sqlIn, paramsIn);
+        // Firefox's Sqlite.sys.mjs, under Zotero.DBConnection, refuses a LIKE
+        // whose pattern is not a bound parameter.
+        if (/\bLIKE\s+(?![?:@$])/i.test(sql)) {
+            throw new Error('Please enter a LIKE clause with bindings');
+        }
+
+        // Reader PRAGMAs like table_info return rows in Zotero's queryAsync, so
+        // they go through the reader path; assignment PRAGMAs fall through to
+        // run() (better-sqlite3 marks the difference via stmt.reader).
+        if (this.db.prepare(sql).reader) {
+            const stmt = this.db.prepare(sql);
+            const rows = stmt.all(...params);
+
+            if (options?.onRow) {
+                // Simulate Zotero's onRow callback with getResultByIndex
+                for (const row of rows) {
+                    const values = Object.values(row);
+                    const proxy = {
+                        getResultByIndex(i: number) {
+                            return values[i];
+                        },
+                    };
+                    options.onRow(proxy);
+                }
+                return [];
+            }
+
+            return rows;
+        }
+
+        // INSERT, UPDATE, DELETE, CREATE, DROP, etc.
+        const stmt = this.db.prepare(sql);
+        stmt.run(...params);
+        return [];
+    }
+
+    /** Transactions run one at a time, like Zotero's. */
+    private transactionQueue: Promise<void> = Promise.resolve();
+
+    /**
+     * Mimics Zotero.DBConnection.executeTransaction.
+     * Wraps fn in a real SQLite transaction; a call made while another
+     * transaction is open waits for it to finish.
+     */
+    executeTransaction(fn: () => Promise<void>): Promise<void> {
+        const run = async () => {
+            this.db.exec('BEGIN');
+            try {
+                await fn();
+                this.db.exec('COMMIT');
+            } catch (err) {
+                this.db.exec('ROLLBACK');
+                throw err;
+            }
+        };
+        const result = this.transactionQueue.then(run);
+        this.transactionQueue = result.catch(() => undefined);
+        return result;
+    }
+
+    /** Mimics Zotero.DBConnection.test — no-op for in-memory DB. */
+    async test(): Promise<void> {
+        // No-op
+    }
+
+    /** Close the database. */
+    async closeDatabase(_permanent?: boolean): Promise<void> {
+        this.db.close();
+    }
+
+    /** Helper: get the raw better-sqlite3 instance for assertions. */
+    getRawDB(): Database.Database {
+        return this.db;
+    }
+}

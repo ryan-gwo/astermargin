@@ -1,0 +1,59 @@
+/**
+ * The one-time feature tips: what each says, how it looks, and where it goes.
+ *
+ * A tip is a registry entry here plus a trigger (see `useRunStatusTip`,
+ * `useNoteExportTip`) that asks `showFeatureTipAtom` for it at the right
+ * moment. Showing, pacing and rendering are shared — see
+ * `react/atoms/featureTips.ts` and
+ * `FeatureTipContent` — so a new tip is an entry, a trigger, and at most a
+ * showcase of its own.
+ */
+import React from 'react';
+import { BubbleChatQuestionIcon, IdeaIcon } from '../components/icons/icons';
+import RunStatusTipShowcase, { RunStatusTipActions } from '../components/ui/popup/featureTips/RunStatusTipShowcase';
+import NoteExportTipShowcase from '../components/ui/popup/featureTips/NoteExportTipShowcase';
+
+export type FeatureTipId = 'run-status-popup' | 'note-export';
+
+export interface FeatureTipActionsProps {
+    /** Retires the tip. */
+    dismiss: () => void;
+}
+
+export interface FeatureTipDefinition {
+    id: FeatureTipId;
+    /** One line, the feature's promise. Truncates, so keep it short. */
+    title: string;
+    /** One or two sentences under it. */
+    text: string;
+    icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
+    /**
+     * Inside the sidebar, above the composer, like in-panel release notes;
+     * otherwise the floating card in the main window's corner.
+     */
+    inPanel: boolean;
+    /** A visual between the text and the buttons — a taste of the feature. */
+    Showcase?: React.ComponentType;
+    /** The button row. Defaults to a single "Got it". */
+    Actions?: React.ComponentType<FeatureTipActionsProps>;
+}
+
+export const FEATURE_TIPS: Record<FeatureTipId, FeatureTipDefinition> = {
+    'run-status-popup': {
+        id: 'run-status-popup',
+        title: 'AsterMargin keeps going when closed',
+        text: 'Close the sidebar while AsterMargin works. A small card in the corner keeps you posted and lets you approve changes.',
+        icon: BubbleChatQuestionIcon,
+        inPanel: true,
+        Showcase: RunStatusTipShowcase,
+        Actions: RunStatusTipActions,
+    },
+    'note-export': {
+        id: 'note-export',
+        title: 'Export notes to Word, PDF and more',
+        text: 'Save a note, a response or a whole chat as Word, PDF, Markdown or LaTeX, with formatted citations. In Word, they stay live Zotero citations.',
+        icon: IdeaIcon,
+        inPanel: true,
+        Showcase: NoteExportTipShowcase,
+    },
+};

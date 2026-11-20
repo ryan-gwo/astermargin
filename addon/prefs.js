@@ -1,0 +1,236 @@
+/* eslint-disable no-undef */
+
+// User ID and email
+pref("userId", "");
+pref("userEmail", "");
+pref("currentPlanId", "");
+pref("installedVersion", "");
+pref("showHighTokenUsageWarningMessage", true);
+pref("authMethod", "otp");
+
+// App settings
+pref("keyboardShortcut", "y");
+pref("statefulChat", true);
+pref("addSelectedItemsOnOpen", true);
+pref("addSelectedItemsOnNewThread", true);
+pref("addAsterMarginProvenanceNote", false);
+pref("focusResponseForScreenReaders", false);
+pref("chatLineSpacing", "standard");
+pref("annotationToolEnabled", true);
+// Author name on annotations AsterMargin creates. Empty string = no attribution.
+// Only affects new annotations. Reader-created annotations ignore this —
+// Zotero stores no author for them.
+pref("annotationAuthorName", "AsterMargin");
+pref("maxAddAttachmentToMessage", 10);
+pref("readerExplainPrompt", "Explain the selected passage or annotation(s) from this paper in plain language. Provide context for any technical terms, statistical methods, or domain-specific concepts. If it references other work, briefly explain that context too.");
+
+// Chat composer IME handling: on Windows, defer Lexical's composition-end
+// processing until the composition's final input event (prevents IMEs such as
+// Sogou Pinyin from discarding committed text). Kill-switch in case an IME
+// interacts badly with the deferral.
+pref("imeCompositionOrderFix", true);
+// Chat composer IME handling (opt-in): on Windows, stop the editor from
+// inserting its own marker character when a composition starts at a plain
+// caret. Keeps some IMEs (e.g. Shouxin) from placing their candidate window at
+// the screen's top-left corner. Only for users of such IMEs: with others it can
+// leave a commit selected or disturb the composition display, so off by default.
+pref("imeSuppressCompositionStartChar", false);
+// Verbose IME event tracing in the chat composer, for diagnosing composition
+// issues from debug output.
+pref("debugImeTrace", false);
+
+pref("accessRemoteFiles", true);
+
+// Data provider: keep a provider-wake subscription open while logged in so
+// agent runs started from other AsterMargin clients can
+// request library data from this Zotero on demand.
+pref("dataProviderEnabled", false);
+
+// Agent actions
+pref("autoApplyAnnotations", true);
+pref("autoImportItems", false);
+pref("confirmExtractionCosts", true);
+pref("confirmExternalSearchCosts", true);
+// Ask once per run before it spends credits, and the projected run total (in
+// credits) above which the backend asks.
+pref("confirmCredits", true);
+pref("creditConfirmThreshold", 5);
+pref("requestPlusTools", false);
+pref("showDiffPreviewInNoteEditor", true);
+
+// Show an OS-native system notification when an agent action needs approval
+pref("enableSystemNotifications", true);
+
+// Show an OS-native system notification when a response is complete and AsterMargin is not visible
+pref("enableResponseCompleteNotifications", true);
+
+// Show the run status popup in the corner of the main window while the sidebar is closed
+pref("enableRunStatusPopup", true);
+// Separate AsterMargin window: whether the chat history sidebar is collapsed.
+pref("windowSidebarCollapsed", false);
+// Width of the sidebar in a main window, in CSS pixels; 0 until it is first shown.
+pref("sidebarWidth", 0);
+
+// Deferred tool preferences: maps tool group to preference (always_ask, always_apply, continue_without_applying)
+// Defaults are defined in react/atoms/deferredToolPreferences.ts and merged at load time.
+// This pref only stores user overrides.
+pref("deferredToolPreferences", "");
+
+// AI settings
+pref("customInstructions", "");
+pref("googleGenerativeAiApiKey", "");
+pref("openAiApiKey", "");
+pref("anthropicApiKey", "");
+pref("lastUsedModel", "");
+pref("customChatModels", "[]");
+
+// Search
+pref("recentItems", "[]");
+
+// Citation format: author-year or numeric
+pref("citationFormat", "numeric");
+pref("citationStyle", "http://www.zotero.org/styles/chicago-author-date");
+pref("citationLocale", "en-US");
+// When true, citation clicks create temporary PDF highlight annotations
+// instead of using Zotero's native transient position highlight.
+pref("useTemporaryCitationAnnotations", false);
+// When true, in-text citations display PDF page labels (e.g., Roman numerals
+// for front matter) instead of raw 1-based page numbers.
+pref("usePageLabels", true);
+
+// Custom Prompts (versioned format: { version, prompts }; each prompt has a stable id)
+// Variables supported in prompt text: {{recent_items}}, {{recent_item}}, {{open_attachment}}, {{active_item}}, {{selected_items}}, {{current_collection}}
+pref("customPrompts", '{ "version": 2, "prompts": [ { "id": "default-fit-research", "title": "How does this paper fit into my library?", "text": "How does this paper connect to the rest of my library? Does it support, challenge, or extend ideas in papers I already have? Write a short report that directly compares the paper to other research in my library including a comparison table. Use a Zotero note attached to the item.{{active_item}}", "requiresAttachment": false, "shortcut": 1 }, { "id": "default-discover-missing", "title": "What recent research am I missing?", "text": "Based on the topics of these recently added papers, search for external references that I might be missing. Focus on papers from the last two years that are relevant to my main research areas.{{recent_items}}", "requiresAttachment": false, "shortcut": 2 }, { "id": "default-organize-collections", "title": "Organize my recent additions", "text": "Review the papers I added in the last two weeks. Check what collections I have, then help me file these items into the appropriate existing collections based on their topics.", "requiresAttachment": false, "shortcut": 3 }, { "id": "default-review-metadata", "title": "Review and fix metadata", "text": "Check my 10 most recently added items for missing or incomplete metadata — especially DOIs for journal articles, publication info, and abstracts. Look up the correct information and help me fix any issues.", "requiresAttachment": false, "shortcut": 4 } ] }');
+
+// Separate storage for prompt lastUsed timestamps (keyed by prompt id)
+// Kept outside customPrompts so using a prompt doesn't dirty the main pref default
+pref("customPromptsLastUsed", "{}");
+
+// Actions V2 — two-layer architecture: built-in actions (in code) + user overrides/custom
+pref("actions", '{"version":1,"overrides":{},"custom":[]}');
+pref("actionsLastUsed", "{}");
+pref("legacyPromptsImported", false);
+
+// Deletion jobs
+pref("deletionJobs", "[]");
+
+// Items skipped during sync
+pref("skippedItems", "[]")
+
+// Onboarding popups
+pref("onboardingWelcomeShown", false);
+pref("onboardingReaderTipShown", false);
+pref("onboardingReaderTipShownV2", false);
+pref("onboardingNoteTipShown", false);
+
+// One-time feature tips: JSON { shown: { [tipId]: isoDate }, lastShownAt: isoDate }
+// (see react/utils/featureTipPrefs.ts)
+pref("featureTips", "{}");
+pref("onboardingCitationTipShown", false);
+pref("onboardingWelcomeShownAt", "");
+pref("versionUpdatePopupShownAt", "");
+pref("onboardingSignInTextShown", false);
+
+// Thread whose agent run was cut off when AsterMargin's WebSocket was closed at
+// shutdown (JSON: threadId/userId/threadName/closedAt; userId is the AsterMargin
+// account, so a record is never offered to a different one). Consumed and
+// cleared by the "chat interrupted" popup on the next start.
+pref("interruptedThread", "");
+
+// AsterMargin tabs open when AsterMargin last closed them for a restart, a plugin
+// reload or the last main window closing (JSON). Reopened and cleared when a
+// main window that can host them next loads; never written to Zotero's
+// session.
+pref("astermarginTabsToRestore", "");
+
+// Table windows open when Zotero quit or AsterMargin shut down, reopened by the
+// first main window that loads afterwards.
+pref("tableWindowsToRestore", "");
+
+// Throttle for the automatic pre-sync thread claim: the
+// `${astermarginUserId}:${zoteroUserId}:${localUserKey}` combination that was
+// last claimed successfully. Empty = never claimed (or cleared after
+// logging out of the Zotero account so the next login can re-claim).
+pref("threadsClaimKey", "");
+
+// MCP server
+pref("mcpServerEnabled", false);
+// Gates every mutating MCP tool. The key predates annotation writing and keeps
+// its original name so users who opted in do not have to opt in again.
+pref("mcpCreateNoteToolEnabled", false);
+
+// Background extractor kill-switch (drains the background_jobs queue)
+pref("backgroundExtractorEnabled", true);
+// Kill switch: a PDF request that would queue behind the busy interactive
+// MuPDF worker may run on the idle background worker instead.
+pref("pdf.backgroundOverflow", true);
+// Whole-library producers are an explicit opt-in. The dispatcher above remains
+// enabled so user-initiated extraction jobs still work when this is off.
+pref("backgroundProcessingEnabled", false);
+pref("backgroundProcessingSearchInitialized", false);
+pref("backgroundProcessingWelcomeAck", false);
+pref("backgroundProcessingWelcomeDeferred", false);
+
+// Upgrade flags and pending version notifications
+pref("runEmbeddingFullDiff", false);
+pref("pendingVersionNotifications", "[]");
+
+// Library suggestions cache (JSON-encoded LibrarySuggestionsResponse + ISO timestamp)
+pref("librarySuggestions", "");
+pref("librarySuggestionsGeneratedAt", "");
+
+// Account-scoped first-run assignment map, keyed by AsterMargin user id.
+pref("firstRunAssignments", "{}");
+
+// Size budget for the local document-extraction cache
+// (profile/astermargin/document-cache). When the total compressed payload size
+// exceeds this, the least-recently-used payloads are evicted down to 90% of
+// it. Cached metadata (page counts, labels, OCR verdicts) is never evicted,
+// and an evicted payload is simply re-extracted on demand. 0 disables the
+// budget.
+pref("documentCacheMaxBytes", 1073741824);
+
+// Largest attachment file, in MB, that AsterMargin will read
+// for document extraction, page and image rendering, in-file search, and
+// attaching an external file. It also decides which attachments count as
+// readable at all, so raising it un-blocks oversized ones in the sidebar.
+pref("maxAttachmentFileSizeMB", 100);
+
+// Library new comparison tables are filed in. 0 = no preference, which means
+// the user library. Never overrides a library the user excluded in AsterMargin
+// preferences — see resolveTableLibrary().
+pref("tables.defaultLibraryID", 0);
+// Switch to a new research table after confirming its creation in chat.
+pref("tables.openAfterCreate", true);
+// How long a chat's `fill_table` waits for a small fill before answering that
+// it runs on in the background, in seconds; stays under the backend's
+// ten-minute ceiling on a request.
+pref("tables.fillWaitSeconds", 480);
+
+pref("cloudPreparationConsent", "");
+
+// Local mode: run the agent inside the plugin against the user's own provider
+// instead of AsterMargin's backend. Read once at plugin startup, so a change takes
+// effect on the next plugin reload, not mid-session.
+pref("localMode", false);
+// Round cap for one local run: how many tool-calling turns before the loop
+// stops and reports. 0 or unset uses the built-in default.
+pref("localMaxRounds", 0);
+// Libraries local mode keeps away from the model: a JSON array in the same
+// shape as the account's excluded libraries, e.g. [{"type":"group","group_id":1}].
+// Read once at plugin startup in local mode, so a change applies on the next
+// plugin reload. An invalid value makes no library searchable.
+pref("localExcludedLibraries", "[]");
+// Local-mode literature search (OpenAlex and Semantic Scholar). Read at the
+// start of every local run, so changes apply without a restart. The API keys
+// are optional; without one, OpenAlex allows only a small daily budget and
+// Semantic Scholar a shared rate limit.
+pref("localScholarlySearch", true);
+pref("openAlexApiKey", "");
+pref("semanticScholarApiKey", "");
+// Local-mode web search through the model provider's own hosted search tool
+// (Anthropic, OpenAI, OpenRouter). Off by default because the provider may
+// bill per search. `localWebSearchMaxUses` caps searches per provider
+// request. Both are read at the start of every local run.
+pref("localWebSearch", false);
+pref("localWebSearchMaxUses", 3);

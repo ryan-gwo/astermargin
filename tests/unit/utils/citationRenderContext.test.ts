@@ -1,0 +1,408 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../../react/store', () => ({
+    store: {
+        get: vi.fn(() => ({})),
+    },
+}));
+
+vi.mock('@astermargin/agent-core/citations/atoms', () => ({
+    citationDataMapAtom: Symbol('citationDataMapAtom'),
+}));
+
+vi.mock('@astermargin/agent-core/citations/externalReferences', () => ({
+    externalReferenceItemMappingAtom: Symbol('externalReferenceItemMappingAtom'),
+    externalReferenceMappingAtom: Symbol('externalReferenceMappingAtom'),
+}));
+
+vi.mock('../../../react/utils/pageLabels', () => ({
+    getCitationPreloadFilePath: vi.fn(),
+    preloadPageLabelsForCitations: vi.fn().mockResolvedValue({}),
+    preloadPageLabelsForContent: vi.fn().mockResolvedValue({}),
+}));
+
+import {
+    buildLocalCitationDataMapForContent,
+    loadCitedLibraries,
+    prepareCitationRenderContext,
+    resolveExternalFileCitations,
+} from '../../../react/utils/citationRenderContext';
+import {
+    getCitationPreloadFilePath,
+    preloadPageLabelsForCitations,
+    preloadPageLabelsForContent,
+} from '../../../react/utils/pageLabels';
+import { structuredResultWithCitablePages } from '../../helpers/structuredDocuments';
+
+const mockGetCitationPreloadFilePath = vi.mocked(getCitationPreloadFilePath);
+const mockPreloadPageLabelsForContent = vi.mocked(preloadPageLabelsForContent);
+
+function structuredResult() {
+    return structuredResultWithCitablePages(5, [
+        { index: 1, label: '6', items: [{ id: 'p12' }] },
+        { index: 2, label: '7', items: [{ id: 'p4', sentences: ['s25', 's26'] }] },
+        { index: 4, label: '12', items: [{ id: 'table3' }] },
+    ]);
+}
+
+describe('citation render context', () => {
+    let attachment: any;
+    let cache: any;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+
+        attachment = {
+            id: 42,
+            key: 'ATTACH01',
+            libraryID: 1,
+            isAttachment: () => true,
+            attachmentContentType: '',
+        };
+        cache = {
+            getResult: vi.fn().mockResolvedValue(structuredResult()),
+        };
+
+        (globalThis as any).Zotero = {
+            ...(globalThis as any).Zotero,
+            AsterMargin: { documentCache: cache },
+            Items: {
+                // The sync lookup throws as it does for a library Zotero has not loaded.
+                getByLibraryAndKey: vi.fn(() => {
+                    throw new Error('Item 42 not yet loaded');
+                }),
+                getByLibraryAndKeyAsync: vi.fn(async () => attachment),
+            },
+        };
+
+        mockGetCitationPreloadFilePath.mockResolvedValue({
+            item: attachment,
+            filePath: '/storage/ATTACH01/file.pdf',
+            isRemoteOnly: false,
+        });
+        mockPreloadPageLabelsForContent.mockResolvedValue({});
+        vi.mocked(preloadPageLabelsForCitations).mockResolvedValue({});
+    });
+
+    it('builds local page metadata for sentence locators from the structured cache', async () => {
+        const map = await buildLocalCitationDataMapForContent(
+            'Claim <citation id="1-ATTACH01" loc="s25-s26"/>'
+        );
+
+        const data = map['local:zotero:1-ATTACH01:s25-s26'];
+        expect(data).toBeTruthy();
+        expect(cache.getResult).toHaveBeenCalledWith(
+            { libraryId: 1, zoteroKey: 'ATTACH01' },
+            'structured',
+            '/storage/ATTACH01/file.pdf',
+        );
+        expect(data.pages).toEqual([3]);
+        expect(data.locations).toEqual([
+            { part_id: 's25', page_idx: 2 },
+        ]);
+        expect(data.page_labels).toEqual({ 2: '7' });
+        expect(data.requested_ref).toMatchObject({
+            kind: 'zotero',
+            library_id: 1,
+            zotero_key: 'ATTACH01',
+            loc: { kind: 'sentence', raw: 's25-s26' },
+        });
+    });
+
+    it('labels local page metadata with printed labels for file exports', async () => {
+        const result = structuredResult();
+        (result.document as any).derivedPageLabels = { '2': '1207' };
+        cache.getResult.mockResolvedValue(result);
+
+        const content = 'Claim <citation id="1-ATTACH01" loc="s25-s26"/>';
+        const printed = await buildLocalCitationDataMapForContent(content, 'printed');
+        expect(printed['local:zotero:1-ATTACH01:s25-s26'].page_labels).toEqual({ 2: '1207' });
+
+        const locator = await buildLocalCitationDataMapForContent(content);
+        expect(locator['local:zotero:1-ATTACH01:s25-s26'].page_labels).toEqual({ 2: '1207' });
+    });
+
+    it('labels Zotero locator metadata with the declared label where the page prints none', async () => {
+        const result = structuredResult();
+        (result.document as any).derivedPageLabels = null;
+        cache.getResult.mockResolvedValue(result);
+
+        const content = 'Claim <citation id="1-ATTACH01" loc="s25-s26"/>';
+        const locator = await buildLocalCitationDataMapForContent(content);
+        expect(locator['local:zotero:1-ATTACH01:s25-s26'].page_labels).toEqual({ 2: '7' });
+        const printed = await buildLocalCitationDataMapForContent(content, 'printed');
+        expect(printed['local:zotero:1-ATTACH01:s25-s26'].page_labels).toBeUndefined();
+    });
+
+    it('preloads Zotero locator labels for note export and printed labels when asked', async () => {
+        await prepareCitationRenderContext('Claim <citation id="1-ATTACH01" loc="page6"/>', {});
+        expect(mockPreloadPageLabelsForContent).toHaveBeenLastCalledWith(expect.any(String), 'locator');
+
+        await prepareCitationRenderContext('Claim <citation id="1-ATTACH01" loc="page6"/>', {}, 'printed');
+        expect(mockPreloadPageLabelsForContent).toHaveBeenLastCalledWith(expect.any(String), 'printed');
+    });
+
+    it('preloads labels for the attachment a citation resolved to, in the export namespace', async () => {
+        const resolved = {
+            citation_id: 'c1',
+            run_id: 'r1',
+            requested_ref: { kind: 'zotero', library_id: 1, zotero_key: 'ATTACH01', loc: { kind: 'page', value: '5', raw: 'page5' } },
+            resolved_ref: { kind: 'zotero', library_id: 1, zotero_key: 'OTHERPDF', loc: { kind: 'page', value: '5', raw: 'page5' } },
+            pages: [5],
+            locations: [],
+        } as any;
+        vi.mocked(preloadPageLabelsForCitations).mockResolvedValue({ 77: { 4: '1' } });
+
+        const context = await prepareCitationRenderContext(
+            'Claim <citation id="1-ATTACH01" loc="page5"/>',
+            { citationDataMap: { c1: resolved } },
+        );
+
+        expect(preloadPageLabelsForCitations).toHaveBeenCalledWith([resolved], 'locator');
+        expect(context?.pageLabelsByAttachmentId).toEqual({ 77: { 4: '1' } });
+    });
+
+    it('preloads resolved-target labels only after the content preload settles', async () => {
+        let resolveContent!: (labels: Record<number, Record<number, string>>) => void;
+        mockPreloadPageLabelsForContent.mockReturnValue(new Promise(resolve => { resolveContent = resolve; }));
+
+        const pending = prepareCitationRenderContext('Claim <citation id="1-ATTACH01" loc="page6"/>', {});
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(preloadPageLabelsForCitations).not.toHaveBeenCalled();
+
+        resolveContent({ 42: { 5: '6' } });
+        const context = await pending;
+        expect(preloadPageLabelsForCitations).toHaveBeenCalledTimes(1);
+        expect(context?.pageLabelsByAttachmentId).toEqual({ 42: { 5: '6' } });
+    });
+
+    it('resolves a cited standalone attachment file so link rendering knows it is reachable', async () => {
+        // Note creation renders citations synchronously; a standalone
+        // attachment link only opens the file when this preload has confirmed
+        // the file is here.
+        attachment.parentID = false;
+        attachment.isAttachment = () => true;
+        attachment.getFilePathAsync = vi.fn().mockResolvedValue('/storage/ATTACH01/file.pdf');
+        (Zotero as any).Items.getByLibraryAndKey = vi.fn(() => attachment);
+        (Zotero as any).Items.loadDataTypes = vi.fn().mockResolvedValue(undefined);
+
+        await prepareCitationRenderContext('Claim <citation id="1-ATTACH01" loc="page6"/>', {});
+
+        expect(attachment.getFilePathAsync).toHaveBeenCalled();
+    });
+
+    it('merges local citation metadata with explicit render context', async () => {
+        const existing = { citation_id: 'c1', run_id: 'r1', locations: [] } as any;
+        mockPreloadPageLabelsForContent.mockResolvedValue({ 42: { 2: '7' } });
+
+        const context = await prepareCitationRenderContext(
+            'Claim <citation id="1-ATTACH01" loc="s25-s26"/>',
+            {
+                citationDataMap: { c1: existing },
+                pageLabelsByAttachmentId: { 9: { 0: 'i' } },
+            },
+        );
+
+        expect(context?.citationDataMap?.c1).toBe(existing);
+        expect(context?.citationDataMap?.['local:zotero:1-ATTACH01:s25-s26']).toBeTruthy();
+        expect(context?.pageLabelsByAttachmentId).toEqual({
+            9: { 0: 'i' },
+            42: { 2: '7' },
+        });
+    });
+
+    it('resolves accepted locator aliases through canonical citation-index ids', async () => {
+        const map = await buildLocalCitationDataMapForContent(
+            [
+                'Paragraph <citation id="1-ATTACH01" loc="paragraph12"/>',
+                'Table <citation id="1-ATTACH01" loc="tab3"/>',
+            ].join('\n')
+        );
+
+        expect(map['local:zotero:1-ATTACH01:paragraph12']?.locations).toEqual([
+            { part_id: 'p12', page_idx: 1 },
+        ]);
+        expect(map['local:zotero:1-ATTACH01:paragraph12']?.pages).toEqual([2]);
+        expect(map['local:zotero:1-ATTACH01:paragraph12']?.page_labels).toEqual({ 1: '6' });
+
+        expect(map['local:zotero:1-ATTACH01:tab3']?.locations).toEqual([
+            { part_id: 'table3', page_idx: 4 },
+        ]);
+        expect(map['local:zotero:1-ATTACH01:tab3']?.pages).toEqual([5]);
+        expect(map['local:zotero:1-ATTACH01:tab3']?.page_labels).toEqual({ 4: '12' });
+    });
+
+    it('does not synthesize metadata for explicit page locators', async () => {
+        const map = await buildLocalCitationDataMapForContent(
+            'Claim <citation id="1-ATTACH01" loc="page3"/>'
+        );
+
+        expect(map).toEqual({});
+        expect(cache.getResult).not.toHaveBeenCalled();
+    });
+
+    describe('resolveExternalFileCitations', () => {
+        let db: any;
+        const record = {
+            extKey: 'AB12CD34',
+            filename: 'Field notes.pdf',
+            storedPath: '/astermargin/external-files/AB12CD34.pdf',
+            contentKind: 'pdf',
+        };
+
+        beforeEach(() => {
+            db = { getExternalFileByKey: vi.fn() };
+            (globalThis as any).Zotero.AsterMargin.db = db;
+        });
+
+        it('returns local paths for external files present on this computer', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(true);
+
+            const { localPaths } = await resolveExternalFileCitations('See <citation id="ext-ab12cd34"/>');
+
+            // Ext key normalized to uppercase before the DB lookup.
+            expect(db.getExternalFileByKey).toHaveBeenCalledWith('AB12CD34');
+            expect(localPaths).toEqual({ AB12CD34: '/astermargin/external-files/AB12CD34.pdf' });
+        });
+
+        it('omits external files with no local copy on this computer', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(false);
+
+            const { localPaths } = await resolveExternalFileCitations('See <citation id="ext-ab12cd34"/>');
+
+            expect(localPaths).toEqual({});
+        });
+
+        it('names an external file from the registry even with no local copy', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(false);
+
+            const { citationDataMap } = await resolveExternalFileCitations('See <citation id="ext-ab12cd34"/>');
+
+            expect(citationDataMap['local:extfile:AB12CD34']).toMatchObject({
+                citation_type: 'external_file',
+                content_kind: 'pdf',
+                display_name: 'Field notes.pdf',
+                resolved_ref: { kind: 'external_file', ext_key: 'AB12CD34' },
+            });
+        });
+
+        it('carries the cited page so the export keeps its locator', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(true);
+
+            const { citationDataMap } = await resolveExternalFileCitations(
+                'See <citation id="ext-ab12cd34" loc="page3"/>'
+            );
+
+            const citation = citationDataMap['local:extfile:AB12CD34:page3'];
+            expect(citation).toBeDefined();
+            expect(citation.pages).toEqual([3]);
+        });
+
+        it('keeps every page of a cited range so the export shows the full span', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(true);
+
+            const { citationDataMap } = await resolveExternalFileCitations(
+                'See <citation id="ext-ab12cd34" loc="page6-8"/>'
+            );
+
+            expect(citationDataMap['local:extfile:AB12CD34:page6-8'].pages).toEqual([6, 7, 8]);
+        });
+
+        it('keeps every page of a comma-separated locator', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(true);
+
+            const { citationDataMap } = await resolveExternalFileCitations(
+                'See <citation id="ext-ab12cd34" loc="page2,5-6"/>'
+            );
+
+            expect(citationDataMap['local:extfile:AB12CD34:page2,5-6'].pages).toEqual([2, 5, 6]);
+        });
+
+        it('keeps only the endpoints of an implausibly long range', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(true);
+
+            const { citationDataMap } = await resolveExternalFileCitations(
+                'See <citation id="ext-ab12cd34" loc="page1-999999"/>'
+            );
+
+            expect(citationDataMap['local:extfile:AB12CD34:page1-999999'].pages).toEqual([1, 999999]);
+        });
+
+        it('builds no citation for a file this device does not have', async () => {
+            db.getExternalFileByKey.mockResolvedValue(null);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(false);
+
+            const { localPaths, citationDataMap } = await resolveExternalFileCitations(
+                'See <citation id="ext-ab12cd34"/>'
+            );
+
+            expect(localPaths).toEqual({});
+            expect(citationDataMap).toEqual({});
+        });
+
+        it('reads each file once and ignores non-external-file citations', async () => {
+            db.getExternalFileByKey.mockResolvedValue(record);
+            (globalThis as any).IOUtils.exists = vi.fn().mockResolvedValue(true);
+
+            const { localPaths, citationDataMap } = await resolveExternalFileCitations(
+                'A <citation id="ext-ab12cd34"/> B <citation id="ext-ab12cd34" loc="page2"/> C <citation id="1-ATTACH01"/>'
+            );
+
+            expect(db.getExternalFileByKey).toHaveBeenCalledTimes(1);
+            expect(localPaths).toEqual({ AB12CD34: '/astermargin/external-files/AB12CD34.pdf' });
+            expect(Object.keys(citationDataMap)).toEqual([
+                'local:extfile:AB12CD34',
+                'local:extfile:AB12CD34:page2',
+            ]);
+        });
+    });
+
+    describe('loadCitedLibraries', () => {
+        let libraries: Record<number, { getDataLoaded: ReturnType<typeof vi.fn>; waitForDataLoad: ReturnType<typeof vi.fn> }>;
+
+        beforeEach(() => {
+            libraries = {};
+            for (const id of [1, 5, 7, 9]) {
+                libraries[id] = {
+                    getDataLoaded: vi.fn(() => id === 1),
+                    waitForDataLoad: vi.fn().mockResolvedValue(undefined),
+                };
+            }
+            (globalThis as any).Zotero.Libraries = {
+                exists: vi.fn((id: number) => id in libraries),
+                get: vi.fn((id: number) => libraries[id]),
+            };
+        });
+
+        it('loads unloaded libraries of cited items, resolved refs and mapped external references', async () => {
+            await loadCitedLibraries(
+                'A <citation id="5-ITEM0001"/> B <citation id="1-ITEM0002"/> C <citation external_id="ext1"/>',
+                [{
+                    citation_id: 'c1',
+                    requested_ref: { kind: 'zotero', library_id: 1, zotero_key: 'ITEM0002' },
+                    resolved_ref: { kind: 'zotero', library_id: 7, zotero_key: 'ITEM0003' },
+                } as any],
+                { ext1: { library_id: 9, zotero_key: 'ITEM0004' } },
+            );
+
+            expect(libraries[5].waitForDataLoad).toHaveBeenCalledWith('item');
+            expect(libraries[7].waitForDataLoad).toHaveBeenCalledWith('item');
+            expect(libraries[9].waitForDataLoad).toHaveBeenCalledWith('item');
+            // Already loaded: nothing to do.
+            expect(libraries[1].waitForDataLoad).not.toHaveBeenCalled();
+        });
+
+        it('loads cited libraries before note export renders', async () => {
+            await prepareCitationRenderContext('Claim <citation id="5-ATTACH01" loc="page6"/>', {});
+
+            expect(libraries[5].waitForDataLoad).toHaveBeenCalledWith('item');
+        });
+    });
+});

@@ -1,0 +1,56 @@
+/**
+ * Whether the account is in a state where a chat can be started, and if not,
+ * why. One definition for every surface that offers a composer: the sidebar
+ * swaps the composer for the screen that resolves the state, and the quick
+ * prompt tells the user which screen that is and opens AsterMargin to it.
+ */
+import { atom } from 'jotai';
+import { authLoadingAtom, isAuthenticatedAtom } from './auth';
+import {
+    hasAuthorizedFreeAccessAtom,
+    isMigratingDataAtom,
+    isProfileLoadedAtom,
+    pendingDowngradeAckAtom,
+    remainingAsterMarginCreditsAtom,
+    updateRequiredAtom,
+} from './profile';
+import { isLoadingThreadAtom } from './threads';
+import { isUsingAsterMarginCreditsAtom } from './models';
+import { requestPlusToolsAtom } from './ui';
+import { getPlusToolsAccess, type PlusToolsAccess } from '../utils/plusToolsAccess';
+import { localModeEnabledAtom } from './localMode';
+
+/**
+ * What stands between the user and a chat, in the order the sidebar resolves
+ * them. `loading` covers a thread being opened and data being migrated;
+ * `restoring` the saved sign-in still being restored, before AsterMargin knows
+ * whether the user is signed in; `connecting` an authenticated account whose
+ * profile has not arrived.
+ */
+export type ChatAccessGate =
+    | 'loading'
+    | 'restoring'
+    | 'signed-out'
+    | 'connecting'
+    | 'update-required'
+    | 'downgrade-ack'
+    | 'onboarding';
+
+export const chatAccessGateAtom = atom<ChatAccessGate | null>((get) => {
+    if (get(isLoadingThreadAtom) || get(isMigratingDataAtom)) return 'loading';
+    if (get(localModeEnabledAtom)) return null;
+    if (!get(isAuthenticatedAtom)) return get(authLoadingAtom) ? 'restoring' : 'signed-out';
+    if (!get(isProfileLoadedAtom)) return 'connecting';
+    if (get(updateRequiredAtom)) return 'update-required';
+    if (get(pendingDowngradeAckAtom)) return 'downgrade-ack';
+    if (!get(hasAuthorizedFreeAccessAtom)) return 'onboarding';
+    return null;
+});
+
+/** Whether the next message gets Plus Tools, and if not, why (see `getPlusToolsAccess`). */
+export const plusToolsAccessAtom = atom<PlusToolsAccess>((get) => getPlusToolsAccess({
+    gate: get(chatAccessGateAtom),
+    usesAsterMarginModel: get(isUsingAsterMarginCreditsAtom),
+    plusToolsPref: get(requestPlusToolsAtom),
+    credits: get(remainingAsterMarginCreditsAtom),
+}));

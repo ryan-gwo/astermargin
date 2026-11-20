@@ -1,0 +1,142 @@
+import type { ProcessingProgress } from './progress';
+import type {
+    AttachmentProcessingAggregates,
+    BackgroundJobType,
+    BackgroundProcessingFailureSummary,
+    BackgroundQueueStats,
+} from '../database';
+import type { BackgroundLaneStatus } from '../backgroundExtractor';
+import type { DocumentCacheStats } from '../documentCache';
+import type { ProcessingIssueSummary } from './issues';
+import type { IndexStatusResponse } from '../searchIndex/searchIndexApiClient';
+import { searchIndexApiClient } from '../searchIndex/searchIndexApiClient';
+import { getZoteroUserIdentifier } from '../../utils/zoteroUtils';
+import { getUncachedCandidates } from './cachePreparation';
+
+/** Entitlements the snapshot's shape depends on. */
+export interface ProcessingStatusEntitlements {
+    hasOcrAccess: boolean;
+    hasSearchIndexAccess: boolean;
+}
+
+export interface ProcessingStatusOptions {
+    /** Fetch cloud-index coverage (only meaningful with search-index access). */
+    includeCoverage?: boolean;
+    /**
+     * Fetch the recent-failures list (three-way union across tables) and the
+     * reason-grouped issues the preferences UI renders.
+     */
+    includeFailures?: boolean;
+    /** Restrict ledger aggregates to one library; omit for all libraries. */
+    libraryId?: number;
+}
+
+/** Dispatcher activity at read time, for the status sentence. */
+export interface BackgroundWorkerSnapshot {
+    /** A dispatcher precondition preventing new jobs from starting. */
+    dispatchBlocker: string | null;
+    /** Available and deferred jobs restricted to registered, entitled lanes. */
+    available: number;
+    deferred: number;
+    /**
+     * Distinct attachments behind those jobs, running ones included (a
+     * claimed job stays a queue row until it finishes). Absent from older
+     * snapshots.
+     */
+    queuedFiles?: number;
+    /** Jobs currently running across the file-processing lanes. */
+    inFlight: number;
+    /**
+     * The part of `inFlight` in lanes that keep running while the user is
+     * active, so it does not mean an idle-gated job is finishing.
+     */
+    activeInFlight?: number;
+    /** OCR attachments waiting for a remote result, outside local lane occupancy. */
+    remoteWaiting?: number;
+    /** Distinct running attachments, since multiple stages can overlap. */
+    inFlightFiles?: number;
+    /** A one-off "process now" is bypassing the idle gate until the queue drains. */
+    drainNow: boolean;
+    /** Queued backlog work may run right now (idle or draining). */
+    backlogGateOpen: boolean;
+}
+
+/**
+ * One background-processing status read: queue counts, ledger aggregates,
+ * failures and reason-grouped issues, worker activity, cloud coverage and
+ * local cache size.
+ *
+ * Entitlements arrive as parameters rather than being read here so the React
+ * hook can pass store-derived values while the dev endpoint passes the
+ * `Zotero.AsterMargin` mirrors. Fields the caller did not ask for come back
+ * `undefined`, which callers distinguish from "asked and got nothing" (`null`).
+ */
+export async function collectProcessingStatus(
+    entitlements: ProcessingStatusEntitlements,
+    options: ProcessingStatusOptions = {},
+): Promise<{
+    progress: ProcessingProgress | null;
+    queue: BackgroundQueueStats;
+    ledger: AttachmentProcessingAggregates;
+    failures: BackgroundProcessingFailureSummary[] | undefined;
+    issues: ProcessingIssueSummary[] | undefined;
+    worker: BackgroundWorkerSnapshot;
+    coverage: IndexStatusResponse | null | undefined;
+    documentCache: DocumentCacheStats | null;
+}> {
+    const db = Zotero.AsterMargin?.db;
+    if (!db) throw new Error('db not available');
+    const { hasOcrAccess, hasSearchIndexAccess } = entitlements;
+    const progress = await Zotero.AsterMargin?.background?.getProcessingProgress(options.libraryId) ?? null;
+    const [queue, ledger, failures, issues, coverage, documentCache] = await Promise.all([
+        db.getBackgroundQueueStats(Date.now()),
+        db.getAttachmentProcessingAggregates(options.libraryId, {
+            ocr: hasOcrAccess,
+            upsert: hasSearchIndexAccess,
+        }),
+        options.includeFailures
+            ? db.getBackgroundProcessingFailures(50)
+            : Promise.resolve(undefined),
+        options.includeFailures
+            ? db.getProcessingIssueCounts(entitlements)
+            : Promise.resolve(undefined),
+        options.includeCoverage && hasSearchIndexAccess
+            ? searchIndexApiClient.status(getZoteroUserIdentifier().localUserKey)
+                .catch(() => null)
+            : Promise.resolve(undefined),
+        Zotero.AsterMargin?.documentCache?.getStats().catch(() => null)
+            ?? Promise.resolve(null),
+    ]);
+    if (documentCache) {
+        documentCache.can_prepare_uncached_files = (await getUncachedCandidates(documentCache, true)).length > 0;
+    }
+    const extractor = Zotero.AsterMargin?.backgroundExtractor;
+    const lanes: BackgroundLaneStatus = extractor?.getLaneStatus?.() ?? {};
+    // Lanes that process files. Index untagging is cleanup for a library the
+    // user unchecked, not a backlog of files, so it never counts as waiting.
+    const activeTypes = (Object.keys(lanes) as BackgroundJobType[]).filter((type) =>
+        type !== 'fulltext_untag'
+        && (type !== 'fulltext_upsert' || hasSearchIndexAccess)
+        && (type !== 'document_ocr' || hasOcrAccess));
+    const pausedTypes = Object.entries(lanes)
+        .filter(([, lane]) => (lane?.pauseUntil ?? 0) > Date.now()).map(([type]) => type);
+    const activeQueue = progress?.queue ?? await (pausedTypes.length
+        ? db.getBackgroundQueueStats(Date.now(), activeTypes, pausedTypes)
+        : db.getBackgroundQueueStats(Date.now(), activeTypes));
+    const worker: BackgroundWorkerSnapshot = {
+        dispatchBlocker: extractor?.getDispatchBlocker?.() ?? null,
+        available: activeQueue.available,
+        deferred: activeQueue.deferred,
+        queuedFiles: activeQueue.attachments,
+        inFlight: activeTypes.reduce((sum, type) => sum + (lanes[type]?.inFlight ?? 0), 0),
+        activeInFlight: activeTypes.reduce((sum, type) => {
+            const lane = lanes[type];
+            return sum + (lane?.runsWhileActive ? lane.inFlight : 0);
+        }, 0),
+        inFlightFiles: extractor?.getInFlightFileCount?.(activeTypes),
+        remoteWaiting: hasOcrAccess ? (lanes.document_ocr?.remoteWaiting ?? 0) : 0,
+        drainNow: extractor?.isImmediateDrainRequested?.() ?? false,
+        backlogGateOpen: extractor?.isBacklogGateOpen?.() ?? false,
+    };
+    return { progress, queue, ledger, failures, issues, worker, coverage, documentCache };
+}

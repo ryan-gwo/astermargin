@@ -1,0 +1,595 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useAtomValue, useSetAtom } from 'jotai';
+import { AgentRunStatus, ToolCallPart, isEmptyWriteReturn, isNotFoundWriteReturn, isUnsuccessfulToolReturn } from '@astermargin/agent-core/agents/types';
+import { getToolCallStatusFromResult, toolResultAtom } from '@astermargin/agent-core/run-state/atoms';
+import { isTableToolName, isTableWriteToolName, tableResultMessages } from '@astermargin/agent-core/run-state/tableResults';
+import { getToolCallLabel, type ToolCallLabelEnrich } from '@astermargin/agent-core/run-state/toolLabels';
+import {
+    isExternalReferenceListView,
+    isToolResultView,
+    getToolResultRenderableCount,
+    searchHasDetails,
+    searchSiteLabel,
+    searchViewInfo,
+    type ToolResultView as ToolResultViewModel,
+} from '@astermargin/agent-core/run-state/toolResultViews';
+import IconButton from '@astermargin/agent-ui/primitives/IconButton';
+import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
+import { ToolResultView, hasRenderableResult } from './ToolResultView';
+import { GenericAgentActionView } from './GenericAgentActionView';
+import { TableToolCallView } from './TableToolCallView';
+import { getHost } from '@astermargin/agent-ui/host';
+import { pendingApprovalForToolcallAtom, agentActionsForToolcallAtom } from '../../agents/agentActions';
+import {
+    Spinner,
+    AlertIcon,
+    ArrowDownIcon,
+    ArrowRightIcon,
+    SearchIcon,
+    ViewIcon,
+    Icon,
+    PuzzleIcon,
+    HelpCircleIcon,
+    FileViewIcon,
+    GlobalSearchIcon,
+    TextAlignLeftIcon,
+    DocumentValidationIcon,
+    FolderDetailIcon,
+    FolderAddIcon,
+    DatabaseIcon,
+    IdeaIcon,
+    TaskDoneIcon,
+    TaskDailyIcon,
+    TagIcon,
+    PropertyEditIcon,
+    HighlighterIcon,
+    ChattingIcon,
+    LayersIcon,
+    FlowConnectionIcon,
+    WrenchIcon,
+    TableIcon,
+    BookCopyIcon,
+    BookSearchIcon,
+    MedicalFileIcon,
+    ArrowUpRightIcon,
+} from '../icons/icons';
+import { toolExpandedAtom, setToolExpandedAtom } from '../../atoms/messageUIState';
+import { resolveToolCallLabelEnrich } from '../../utils/toolCallLabelEnrich';
+
+type IconComponent = React.FC<React.SVGProps<SVGSVGElement>>;
+
+/**
+ * Maps tool names to their appropriate icons
+ */
+const TOOL_ICONS: Record<string, IconComponent> = {
+    // Search tools - library search
+    item_search: SearchIcon,
+    item_search_by_topic: SearchIcon,
+    item_search_by_metadata: SearchIcon,
+    fulltext_search: SearchIcon,
+    fulltext_search_keywords: SearchIcon,
+    zotero_search: SearchIcon,
+
+    // List tools - library management
+    list_items: TextAlignLeftIcon,
+    list_collections: FolderDetailIcon,
+    list_tags: TagIcon,
+    list_libraries: DatabaseIcon,
+
+    // Metadata tools
+    get_metadata: FileViewIcon,
+    edit_metadata: PropertyEditIcon,
+    edit_item: PropertyEditIcon,
+
+    // Annotation tools
+    get_annotations: HighlighterIcon,
+    find_annotations: HighlighterIcon,
+
+    // Reading tools
+    search_in_documents: TextAlignLeftIcon,
+    search_in_attachment: SearchIcon,
+    find_in_attachments: SearchIcon,
+    read: TextAlignLeftIcon,
+    read_pages: TextAlignLeftIcon,
+    read_attachment: TextAlignLeftIcon,
+    view_page_images: ViewIcon,
+    view_pages: ViewIcon,
+    view: ViewIcon,
+
+    // Note tools
+    read_note: TextAlignLeftIcon,
+    edit_note: PropertyEditIcon,
+    create_note: DocumentValidationIcon,
+
+    // Table tools (the writes render as TableToolCallView; read_table is a plain row)
+    create_table: TableIcon,
+    read_table: TableIcon,
+    edit_table: TableIcon,
+    fill_table: TableIcon,
+
+    // Extract tool
+    extract: TaskDailyIcon,
+
+    // External search tools
+    external_search: GlobalSearchIcon,
+    lookup_work: GlobalSearchIcon,
+    find_related_works: FlowConnectionIcon,
+    find_book_chapters: BookSearchIcon,
+    pubmed_search: GlobalSearchIcon,
+    search_trials: MedicalFileIcon,
+    get_trial: MedicalFileIcon,
+
+    // Create item tool
+    create_zotero_item: DocumentValidationIcon,
+    create_items: DocumentValidationIcon,
+
+    // Create collection tool
+    create_collection: FolderAddIcon,
+
+    // Organize items tool
+    organize_items: TaskDoneIcon,
+
+    // Tag and collection management (matches getAgentActionToolIcon)
+    manage_tags: TagIcon,
+    manage_collections: FolderDetailIcon,
+
+    // Duplicate tools
+    find_duplicates: BookCopyIcon,
+    merge_items: BookCopyIcon,
+
+    // Read tool result
+    read_file: TextAlignLeftIcon,
+    read_documentation: HelpCircleIcon,
+    load_tool_results: LayersIcon,
+    
+    // Progressive disclosure tools
+    load_capability: WrenchIcon,
+    search_tools: WrenchIcon,
+
+    // Batch jobs
+    batch_start: LayersIcon,
+    batch_resolve: LayersIcon,
+    batch_digest: LayersIcon,
+    batch_results: LayersIcon,
+
+    // User interaction
+    ask_user_question: ChattingIcon,
+};
+
+/**
+ * Progressive disclosure tools whose returns are framework-internal and shouldn't
+ * be expandable. Their result is a file or an instruction blob written for the
+ * model, so expanding one shows raw text rather than anything a reader can use.
+ */
+const NON_EXPANDABLE_TOOLS = new Set([
+    'read_file',
+    'read_documentation',
+    'load_capability',
+    'search_tools',
+    'load_tool_results',
+    'batch_resolve',
+    'batch_digest',
+    'batch_results',
+]);
+
+/** Tools that support streaming argument preview */
+const STREAMING_PREVIEW_TOOLS = new Set(['create_note']);
+
+/**
+ * Detect the type of file being read by the file-reading tools.
+ * Simplified version of detectReadFileType from toolLabels.ts
+ */
+function detectReadFileType(path: string): 'tool_result' | 'skill' | 'skill_resource' | 'documentation' | 'unknown' {
+    const pathLower = path.toLowerCase();
+    
+    if (pathLower.endsWith('.json.gz')) {
+        return 'tool_result';
+    }
+    
+    if (pathLower.includes('/skills/')) {
+        const fileName = path.split('/').pop()?.toUpperCase();
+        if (fileName === 'SKILL.MD') {
+            return 'skill';
+        }
+        
+        const parts = pathLower.split('/skills/');
+        if (parts.length > 1) {
+            const skillPath = parts[1];
+            const pathSegments = skillPath.split('/');
+            if (pathSegments.length > 1 && ['scripts', 'references', 'assets'].includes(pathSegments[1])) {
+                return 'skill_resource';
+            }
+        }
+        
+        return 'skill';
+    }
+    
+    if (pathLower.includes('/docs/')) {
+        return 'documentation';
+    }
+    
+    return 'unknown';
+}
+
+/**
+ * Get the icon for a tool based on its name and arguments
+ */
+function getToolIcon(part: ToolCallPart): IconComponent {
+    const toolName = part.tool_name;
+    
+    // Special handling for the file readers - check file type
+    if (toolName === 'read_file' || toolName === 'read_documentation') {
+        let args: Record<string, unknown> | undefined;
+        try {
+            args = typeof part.args === 'string'
+                ? JSON.parse(part.args)
+                : (part.args as Record<string, unknown>);
+        } catch {
+            // args may be incomplete while streaming
+        }
+        const path = args?.path as string | undefined;
+        
+        if (path) {
+            const fileType = detectReadFileType(path);
+            if (fileType === 'skill' || fileType === 'skill_resource') {
+                return IdeaIcon;
+            }
+        }
+    }
+    
+    return TOOL_ICONS[toolName] ?? PuzzleIcon;
+}
+
+interface ToolCallPartViewProps {
+    part: ToolCallPart;
+    /** Run ID for global UI state management */
+    runId: string;
+    /** Index of the parent response message within the run (for unique expansion keys) */
+    responseIndex: number;
+    /** Run status */
+    runStatus: AgentRunStatus;
+}
+
+/**
+ * Renders a tool call with its status and result.
+ * Uses toolResultAtom to look up the result for this tool call.
+ * Visibility state is managed globally via searchToolVisibilityAtom.
+ * Shows AgentActionView for tools with agent actions (e.g., edit_metadata).
+ */
+export const ToolCallPartView: React.FC<ToolCallPartViewProps> = ({ part, runId, responseIndex, runStatus }) => {
+    // Scoped to this call: subscribing to the thread's whole result lookup
+    // re-renders every tool card on every frame of a streaming response.
+    const result = useAtomValue(useMemo(() => toolResultAtom(part.tool_call_id), [part.tool_call_id]));
+    const hasResult = result !== undefined;
+    const status = getToolCallStatusFromResult(result, runStatus);
+
+    // Hydrated tool-result view model — present once the call has returned.
+    const rawView = result?.part_kind === 'tool-return' ? result.metadata?.view : undefined;
+    const view: ToolResultViewModel | null = isToolResultView(rawView) ? rawView : null;
+    // Renderable count, for expansion gating only (don't expand a zero-result tool).
+    // Prefer the view; fall back to the legacy summary count so view-less returns
+    // still block expansion at zero results.
+    const renderableCount = view
+        ? getToolResultRenderableCount(view)
+        : result?.part_kind === 'tool-return'
+            ? result.metadata?.summary?.result_count ?? null
+            : null;
+    // A source search (PubMed, ClinicalTrials.gov) can show what it searched for,
+    // and run the same search on the source's site, from its header.
+    const searchInfo = view && isExternalReferenceListView(view) ? searchViewInfo(view) : null;
+    const hasSearchDetails = !!searchInfo && searchHasDetails(searchInfo);
+    const searchUrl = searchInfo?.search_url || null;
+
+    // Host-resolved request-side display names for the parts the view model does
+    // not cover (pending/failed item names, list_* library/collection scope names).
+    // Resolved in an effect via the itemData host slice, mirroring CitedSourcesList;
+    // degrades to the base label on clients without that capability.
+    const [labelEnrich, setLabelEnrich] = useState<ToolCallLabelEnrich | null>(null);
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            const enrich = await resolveToolCallLabelEnrich(part, view);
+            if (!cancelled) setLabelEnrich(enrich);
+        })();
+        return () => { cancelled = true; };
+    }, [part.tool_call_id, part.args, view]);
+
+    // Check for pending approval for this tool call
+    const pendingApproval = useAtomValue(
+        useMemo(() => pendingApprovalForToolcallAtom(part.tool_call_id), [part.tool_call_id]),
+    );
+    const isAwaitingApproval = pendingApproval !== null;
+
+    // Check for agent actions associated with this tool call
+    const agentActions = useAtomValue(
+        useMemo(() => agentActionsForToolcallAtom(part.tool_call_id), [part.tool_call_id]),
+    );
+    const hasAgentAction = agentActions.length > 0;
+
+    // Determine if this tool should use AgentActionView
+    const isStandardAgentActionTool =
+        part.tool_name === 'edit_metadata' ||
+        part.tool_name === 'create_collection' ||
+        part.tool_name === 'create_highlight_annotations' ||
+        part.tool_name === 'create_note_annotations' ||
+        part.tool_name === 'edit_annotations' ||
+        part.tool_name === 'delete_annotations' ||
+        part.tool_name === 'organize_items' ||
+        part.tool_name === 'merge_items' ||
+        part.tool_name === 'manage_tags' ||
+        part.tool_name === 'manage_collections' ||
+        part.tool_name === 'create_items' ||
+        part.tool_name === 'create_note';
+    const isExtractConfirmApproval =
+        part.tool_name === 'extract' &&
+        pendingApproval?.actionType === 'confirm_extraction';
+    const isExternalSearchConfirmApproval =
+        part.tool_name === 'external_search' &&
+        pendingApproval?.actionType === 'confirm_external_search';
+    const isConfirmApproval = isExtractConfirmApproval || isExternalSearchConfirmApproval;
+    const isExtractionRejected =
+        part.tool_name === 'extract' &&
+        hasResult &&
+        result?.content?.status &&
+        result?.content?.status === 'REJECTED';
+    const isExternalSearchRejected =
+        part.tool_name === 'external_search' &&
+        hasResult &&
+        result?.content?.status &&
+        result?.content?.status === 'REJECTED';
+
+    // For extract/external_search, only render AgentActionView while approval is pending.
+    // After approval, fall back to normal tool-call rendering so the in-progress spinner stays visible.
+    const showAgentActionView =
+        (isStandardAgentActionTool && (isAwaitingApproval || hasAgentAction)) ||
+        isConfirmApproval;
+    const actionToolName = isExtractConfirmApproval
+        ? 'confirm_extraction'
+        : isExternalSearchConfirmApproval
+            ? 'confirm_external_search'
+            : part.tool_name;
+
+    // A write tool that returned successfully without producing an agent action
+    // wrote nothing — the item already held the requested value. Its payload is
+    // guidance for the model, not a result, so the row says "no change needed"
+    // and stays collapsed rather than exposing it (see isEmptyWriteReturn).
+    const isNoChangeReturn =
+        isStandardAgentActionTool &&
+        !showAgentActionView &&
+        isEmptyWriteReturn(result);
+
+    const label = getToolCallLabel(part, status, {
+        view,
+        enrich: labelEnrich,
+        noChange: isNoChangeReturn,
+        notFound: isNoChangeReturn && isNotFoundWriteReturn(result),
+    });
+
+    // Use global Jotai atom for expansion state (persists across re-renders and syncs between panes)
+    const expansionKey = `${runId}:${responseIndex}:${part.tool_call_id}`;
+    const storedExpanded = useAtomValue(useMemo(() => toolExpandedAtom(expansionKey), [expansionKey]));
+    const setExpanded = useSetAtom(setToolExpandedAtom);
+    // A failed table read can still carry recovery status worth opening.
+    const hasTableStatus = isTableToolName(part.tool_name) && !!result
+        && tableResultMessages(result.content, part.tool_name).length > 0;
+    const isExpanded = storedExpanded ?? hasTableStatus;
+    const wasConfirmApprovalRef = useRef(isConfirmApproval);
+
+    // When extract/external_search approval resolves, collapse once so the completed result
+    // doesn't auto-expand. Users can still expand manually afterward.
+    useEffect(() => {
+        const wasConfirmApproval = wasConfirmApprovalRef.current;
+        const isConfirmTool = part.tool_name === 'extract' || part.tool_name === 'external_search';
+        if (isConfirmTool && wasConfirmApproval && !isConfirmApproval) {
+            setExpanded({ key: expansionKey, expanded: false });
+        }
+        wasConfirmApprovalRef.current = isConfirmApproval;
+    }, [part.tool_name, isConfirmApproval, expansionKey, setExpanded]);
+
+    const [isHovered, setIsHovered] = useState(false);
+
+    const isInProgress = status === 'in_progress';
+    const hasError = status === 'error';
+
+    const canExpand =
+        hasResult &&
+        result?.part_kind === 'tool-return' &&
+        // A non-success return holds an explanatory message, not a result
+        // payload. Keep it collapsed so it reads as a failed call, not a result —
+        // unless it is a table status the user can act on.
+        (!isUnsuccessfulToolReturn(result) || hasTableStatus) &&
+        // If we can compute a count (search-like tools), block expansion for 0
+        // results, unless the search has details: what it ran is most useful
+        // when nothing came back.
+        (renderableCount === null || renderableCount > 0 || hasSearchDetails) &&
+        !NON_EXPANDABLE_TOOLS.has(part.tool_name) &&
+        // Only a view this client renders is shown; a raw return (unknown tool,
+        // missing or unsupported view) stays collapsed.
+        hasRenderableResult(result) &&
+        !isExtractionRejected &&
+        !isExternalSearchRejected &&
+        // A write that changed nothing has no result payload to show.
+        !isNoChangeReturn &&
+        !showAgentActionView; // Don't allow expand toggle for agent action tools
+
+    const effectiveExpanded = isExpanded && canExpand;
+
+    // The search-details panel: closed by default, open for a search that found
+    // nothing, and reset whenever the card collapses.
+    const [searchDetailsChoice, setSearchDetailsChoice] = useState<boolean | null>(null);
+    useEffect(() => {
+        if (!effectiveExpanded) setSearchDetailsChoice(null);
+    }, [effectiveExpanded]);
+    const searchDetailsOpen = hasSearchDetails && (searchDetailsChoice ?? renderableCount === 0);
+    const searchDetailsId = `search-details-${part.tool_call_id}`;
+    const showSearchActions = effectiveExpanded && (hasSearchDetails || !!searchUrl);
+
+    const handleToggleExpanded = () => {
+        if (canExpand) {
+            setExpanded({ key: expansionKey, expanded: !isExpanded });
+        }
+    };
+
+    const getIcon = () => {
+        if (isInProgress && (runStatus === 'canceled' || runStatus === 'error')) return AlertIcon;
+        if (isInProgress) return Spinner;
+        if (hasError) return AlertIcon;
+        if (effectiveExpanded) return ArrowDownIcon;
+        if (isHovered && canExpand) return ArrowRightIcon;
+        
+        return getToolIcon(part);
+    };
+
+    const hasExpandedResult = effectiveExpanded && canExpand;
+    const isShimmering = isInProgress && !hasResult && runStatus === 'in_progress';
+
+    // Streaming argument preview for tools that support live preview (e.g., create_note)
+    const streamingArgs = part.streaming_args;
+    const showStreamingPreview = !!streamingArgs && runStatus === 'in_progress'
+        && STREAMING_PREVIEW_TOOLS.has(part.tool_name) && !showAgentActionView && !hasError;
+
+    // Table writes are timeline lines naming the table, with fill status and
+    // notices; acting on the table belongs to the receipt under the answer.
+    if (isTableWriteToolName(part.tool_name)) {
+        return (
+            <TableToolCallView
+                part={part}
+                result={result}
+                runId={runId}
+                responseIndex={responseIndex}
+                runStatus={runStatus}
+            />
+        );
+    }
+
+    // Note: a pending ask_user_question renders as the composer-takeover panel
+    // (AskUserQuestionPanel, swapped in by Sidebar) — here the call stays a
+    // normal passive row (in-progress spinner, not expandable until the tool
+    // return arrives with the answered view).
+
+    // Agent-action UI (incl. streaming preview) is host-injected; non-Zotero
+    // clients fall back to a request-side summary.
+    if (showStreamingPreview && streamingArgs) {
+        return getHost().components?.agentActionInStream({
+            kind: 'tool-action',
+            part,
+            runId,
+            responseIndex,
+            runStatus,
+            toolName: part.tool_name,
+            pendingApproval: null,
+            hasToolReturn: false,
+            streamingArgs,
+        }) ?? <GenericAgentActionView part={part} runStatus={runStatus} streamingArgs={streamingArgs} />;
+    }
+
+    // For agent action tools, show the action UI instead of the normal tool result
+    if (showAgentActionView) {
+        return getHost().components?.agentActionInStream({
+            kind: 'tool-action',
+            part,
+            runId,
+            responseIndex,
+            runStatus,
+            toolName: actionToolName,
+            pendingApproval,
+            hasToolReturn: hasResult,
+        }) ?? <GenericAgentActionView part={part} runStatus={runStatus} />;
+    }
+
+    const effectiveLabelColor = effectiveExpanded
+        ? 'font-color-primary'
+        : NON_EXPANDABLE_TOOLS.has(part.tool_name) || isNoChangeReturn
+            ? 'font-color-secondary'
+            : '';
+
+    return (
+        <div
+            id={`tool-${part.tool_call_id}`}
+            className={`
+                rounded-card flex flex-col min-w-0
+                ${effectiveExpanded ? 'border-card' : 'border-transparent'}
+                ${hasExpandedResult ? 'mb-2' : ''}
+            `}
+        >
+            <div
+                className={`
+                    display-flex flex-row py-15
+                    ${effectiveExpanded ? 'bg-senary' : ''}
+                    ${effectiveExpanded && !searchDetailsOpen ? 'border-bottom-quinary' : ''}
+                `}
+                onMouseEnter={() => setIsHovered(true)}
+                onMouseLeave={() => setIsHovered(false)}
+            >
+                <button
+                    type="button"
+                    className={`variant-ghost-secondary display-flex flex-row py-15 gap-2 flex-1 text-left min-w-0 ${canExpand ? 'cursor-pointer' : ''}`}
+                    style={{ fontSize: '0.95rem', background: 'transparent', border: 0, padding: 0 }}
+                    aria-expanded={effectiveExpanded}
+                    aria-controls={`tool-result-${part.tool_call_id}`}
+                    onClick={handleToggleExpanded}
+                    disabled={!canExpand}
+                >
+                    <div className="display-flex flex-row px-3 gap-2 min-w-0">
+                        <div className={`flex-1 display-flex mt-010 ${effectiveLabelColor}`}>
+                            <Icon icon={getIcon()} />
+                        </div>
+
+                        {/* min-w-0 + truncate keep the label on a single line; long item
+                            names/locators get an ellipsis instead of wrapping. Must stay a
+                            block (not display-flex) — text-overflow:ellipsis is ignored on
+                            flex containers, which clips the text without the "…". */}
+                        <div className={`min-w-0 truncate ${effectiveLabelColor} ${isShimmering ? 'shimmer-text' : ''}`}>
+                            {label}
+                        </div>
+                    </div>
+                </button>
+                {/* Siblings of the header button, not children: a control nested
+                    in a native button is neither focusable nor keyboard-activable.
+                    Only an expanded card carries actions; a collapsed read tool
+                    stays a plain line. */}
+                {showSearchActions && (
+                    <div className="display-flex flex-row items-center gap-05 mr-2 flex-none">
+                        {hasSearchDetails && (
+                            <Tooltip content="Search details" showArrow singleLine>
+                                <IconButton
+                                    icon={SearchIcon}
+                                    variant="ghost-secondary"
+                                    iconClassName={`${searchDetailsOpen ? 'font-color-primary' : 'font-color-secondary'} scale-90`}
+                                    className="tool-header-toggle"
+                                    onClick={() => setSearchDetailsChoice(!searchDetailsOpen)}
+                                    ariaLabel="Search details"
+                                    ariaExpanded={searchDetailsOpen}
+                                    ariaControls={searchDetailsId}
+                                />
+                            </Tooltip>
+                        )}
+                        {searchUrl && searchInfo && (
+                            <Tooltip content={searchSiteLabel(searchInfo)} showArrow singleLine>
+                                <IconButton
+                                    icon={ArrowUpRightIcon}
+                                    variant="ghost-secondary"
+                                    iconClassName="font-color-secondary scale-10"
+                                    onClick={() => getHost().navigation?.openExternalUrl(searchUrl)}
+                                    ariaLabel={searchSiteLabel(searchInfo)}
+                                />
+                            </Tooltip>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            {/* Expanded result view */}
+            {hasExpandedResult && (
+                <div id={`tool-result-${part.tool_call_id}`}>
+                    <ToolResultView
+                        result={result}
+                        searchDetails={hasSearchDetails ? { open: searchDetailsOpen, id: searchDetailsId } : undefined}
+                    />
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default ToolCallPartView;

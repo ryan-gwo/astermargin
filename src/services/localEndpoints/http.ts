@@ -1,0 +1,1234 @@
+import { handleDuplicatesRequest } from '../duplicates/discovery';
+import { handleTestProtectedCacheHttpRequest } from './handlers/testProtectedCacheHandlers';
+import { handleTestExportHttpRequest, handleTestExportNoteHttpRequest } from './handlers/testExportHandlers';
+import { handleTestNoteCreateHttpRequest, handleTestNoteDeleteHttpRequest, handleTestNoteReadHttpRequest } from './handlers/testNoteHandlers';
+import { handleTestTableFillHttpRequest, handleTestTablePendingHttpRequest } from './handlers/testTableFillHandlers';
+import { handleTestTableCreateHttpRequest, handleTestTableReadHttpRequest, handleTestTableListHttpRequest, handleTestTableWriteHttpRequest, handleTestTableEditHttpRequest, handleTestTableVersionsHttpRequest, handleTestTableRevertHttpRequest, handleTestTableDeleteHttpRequest, handleTestTableOpenHttpRequest, handleTestTableCorruptHttpRequest, handleTestTableShadowHttpRequest, handleTestTableRestoreShadowHttpRequest, handleTestTableTrimHttpRequest } from './handlers/testTableHandlers';
+import {
+    handleTestAttachmentImageHttpRequest,
+    handleTestExcludedLibrariesHttpRequest,
+    handleTestGetAnnotationsHttpRequest,
+    handleTestViewImagesHttpRequest,
+} from './handlers/testExclusionHandlers';
+import {
+    handleTestProcessingLedgerHttpRequest,
+    handleTestProcessingReconcileNowHttpRequest,
+    handleTestIndexReconcileHttpRequest,
+    handleTestProcessingResetHttpRequest,
+    handleTestProcessingStatusHttpRequest,
+} from './handlers/testProcessingHandlers';
+import {
+    handleTestPdfAnalyzeLayoutHttpRequest,
+    handleTestPdfAnalyzeOcrHttpRequest,
+    handleTestPdfExtractHttpRequest,
+    handleTestPdfExtractParagraphHttpRequest,
+    handleTestPdfExtractRawDetailedHttpRequest,
+    handleTestPdfExtractTraceHttpRequest,
+    handleTestPdfHasTextLayerHttpRequest,
+    handleTestPdfPageCountHttpRequest,
+    handleTestPdfPageLabelsHttpRequest,
+    handleTestPdfRenderOverlayHttpRequest,
+    handleTestPdfRenderPagesHttpRequest,
+    handleTestPdfRenderPagesWithMetaHttpRequest,
+    handleTestPdfSearchScoredHttpRequest,
+    handleTestPdfSentenceBBoxesHttpRequest,
+} from './handlers/testPdfHandlers';
+import { captureInstanceOperation } from './operation';
+import { createEndpoint, registerEndpoint } from './registration';
+import { handleArtifactRequest } from '../artifacts/artifactProvider';
+import { handleTableTabProbe } from '../../ui/tableTabProbe';
+/** Local HTTP routes, owned by the plugin instance. */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import type {
+    WSAgentActionExecuteRequest,
+    // Deferred tools
+    WSAgentActionValidateRequest,
+    WSExternalReferenceCheckRequest,
+    WSFindAnnotationsRequest,
+    WSGetMetadataRequest,
+    WSItemQuickSearchRequest,
+    WSItemSearchByMetadataRequest,
+    WSItemSearchByTopicRequest,
+    WSListCollectionsRequest,
+    WSListItemsRequest,
+    WSListLibrariesRequest,
+    WSListTagsRequest,
+    // Notes
+    WSReadNoteRequest,
+    WSResolvePopulationRequest,
+    WSItemDisplayRequest,
+    WSZoteroAttachmentPageImagesRequest,
+    WSZoteroAttachmentSearchRequest,
+    WSZoteroDataRequest,
+    WSZoteroDocumentRequest,
+    // Library management tools
+    WSZoteroSearchRequest,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+
+import {
+    handleAgentActionExecuteRequest,
+    // Deferred tools
+    handleAgentActionValidateRequest,
+    // Utility
+    handleDeleteItemsRequest,
+    handleExternalReferenceCheckRequest,
+    handleFindAnnotationsRequest,
+    handleGetMetadataRequest,
+    handleItemQuickSearchRequest,
+    handleItemSearchByMetadataRequest,
+    handleItemSearchByTopicRequest,
+    handleListCollectionsRequest,
+    handleListItemsRequest,
+    handleListLibrariesRequest,
+    handleListTagsRequest,
+    // Notes
+    handleReadNoteRequest,
+    handleResolvePopulationRequest,
+    handleItemDisplayRequest,
+    handleZoteroAttachmentPageImagesRequest,
+    handleZoteroAttachmentSearchRequest,
+    handleZoteroDataRequest,
+    handleZoteroDocumentRequest,
+    // Library management tools
+    handleZoteroSearchRequest,
+} from '../agentDataProvider';
+import { getPref, setPref } from '../../utils/prefs';
+import { getZoteroUserIdentifier } from '../../utils/zoteroUtils';
+import {
+    handleTestAnnotationCreateHttpRequest,
+} from './handlers/testAnnotationHandlers';
+
+import {
+    handleTestBackgroundClearHttpRequest,
+    handleTestBackgroundEnqueueHttpRequest,
+    handleTestBackgroundPeekHttpRequest,
+    handleTestBackgroundProcessOnceHttpRequest,
+    handleTestBackgroundStatsHttpRequest,
+} from './handlers/testBackgroundHandlers';
+
+import {
+    handleTestBestEpubAttachmentHttpRequest,
+    handleTestCacheClearAllHttpRequest,
+    handleTestCacheInvalidateHttpRequest,
+    handleTestCacheMetadataHttpRequest,
+    handleTestCachePayloadHttpRequest,
+    handleTestCacheSeedPageLabelsHttpRequest,
+    handleTestCacheStatsHttpRequest,
+    handleTestDocumentSerializedHttpRequest,
+    handleTestExternalFileAttachHttpRequest,
+    handleTestExternalFileDeleteHttpRequest,
+    handleTestExternalFileViewImagesHttpRequest,
+    handleTestFileStatusHttpRequest,
+    handleTestMcpCreateNoteHttpRequest,
+    handleTestMcpReadNoteHttpRequest,
+    handleTestPingHttpRequest,
+    handleTestReadAttachmentHttpRequest,
+    handleTestResolveItemHttpRequest,
+    handleTestResolveReadableHttpRequest,
+    handleTestValidateItemHttpRequest,
+    handleTestValidateRegularItemHttpRequest,
+    handleTestWorkerCacheClearHttpRequest,
+    handleTestWorkerIdleProbeHttpRequest,
+    handleTestWorkerMarkStaleHttpRequest,
+    handleTestWorkerRealmProbeHttpRequest,
+    handleTestWorkerStatsHttpRequest,
+    handleTestWorkerWedgeProbeHttpRequest,
+} from './handlers/testCacheHandlers';
+
+import {
+    handleTestItemImportCapabilitiesHttpRequest,
+    handleTestItemImportResolveHttpRequest,
+    handleTestItemImportWriteHttpRequest,
+} from './handlers/testItemImportHandlers';
+
+
+import {
+    handleTestCollectionCreateHttpRequest,
+    handleTestCollectionDeleteHttpRequest,
+} from './handlers/testCollectionHandlers';
+
+import {
+    handleTestEpubExtractHttpRequest,
+} from './handlers/testEpubHandlers';
+
+import {
+    handleTestLibraryIdentityHttpRequest,
+} from './handlers/testLibraryIdentityHandlers';
+
+
+
+
+
+
+import {
+    handleTestCreateReportHttpRequest,
+} from './handlers/testReportHandlers';
+
+
+
+import {
+    handleTestSnapshotExtractHttpRequest,
+} from './handlers/testSnapshotHandlers';
+import {
+    handleTestSyncPauseHttpRequest,
+} from './handlers/testSyncHandlers';
+
+import {
+    handleTestSidebarWidthHandlerHttpRequest,
+    handleTestWindowRuntimeHttpRequest,
+} from './handlers/testUiHandlers';
+
+
+
+
+// =============================================================================
+// Types
+// =============================================================================
+
+
+
+
+// =============================================================================
+// Endpoint Helpers
+// =============================================================================
+
+/**
+ * Generate a simple unique ID for requests.
+ */
+function generateRequestId(): string {
+    if (typeof Zotero !== 'undefined' && Zotero.Utilities?.randomString) {
+        return Zotero.Utilities.randomString(16);
+    }
+    return `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+}
+
+/**
+ * Creates a Zotero HTTP endpoint from an async handler function.
+ */
+// =============================================================================
+// Endpoint Handlers
+// =============================================================================
+
+async function handleZoteroDataHttpRequest(request: any) {
+    const wsRequest: WSZoteroDataRequest = {
+        event: 'zotero_data_request',
+        request_id: generateRequestId(),
+        items: request.items,
+        include_attachments: request.include_attachments,
+        include_parents: request.include_parents,
+        include_notes: request.include_notes,
+        file_status_level: request.file_status_level,
+    };
+
+    const response = await handleZoteroDataRequest(wsRequest);
+
+    return {
+        items: response.items,
+        attachments: response.attachments,
+        notes: response.notes,
+        annotations: response.annotations,
+        errors: response.errors,
+    };
+}
+
+async function handleExternalReferenceCheckHttpRequest(request: any) {
+    const wsRequest: WSExternalReferenceCheckRequest = {
+        event: 'external_reference_check_request',
+        request_id: generateRequestId(),
+        library_ids: request.library_ids,
+        items: request.items,
+    };
+    
+    const response = await handleExternalReferenceCheckRequest(wsRequest);
+    
+    return {
+        results: response.results,
+    };
+}
+
+async function handleMetadataSearchHttpRequest(request: any) {
+    const wsRequest: WSItemSearchByMetadataRequest = {
+        event: 'item_search_by_metadata_request',
+        request_id: generateRequestId(),
+        title_query: request.title_query,
+        author_query: request.author_query,
+        publication_query: request.publication_query,
+        year_min: request.year_min,
+        year_max: request.year_max,
+        item_type_filter: request.item_type_filter,
+        libraries_filter: request.libraries_filter,
+        tags_filter: request.tags_filter,
+        collections_filter: request.collections_filter,
+        limit: request.limit,
+        offset: request.offset,
+    };
+    
+    const response = await handleItemSearchByMetadataRequest(wsRequest);
+
+    return {
+        items: response.items,
+        unresolved_collections: response.unresolved_collections,
+        error: response.error ?? null,
+        error_code: response.error_code ?? null,
+    };
+}
+
+async function handleTopicSearchHttpRequest(request: any) {
+    const wsRequest: WSItemSearchByTopicRequest = {
+        event: 'item_search_by_topic_request',
+        request_id: generateRequestId(),
+        topic_query: request.topic_query,
+        author_filter: request.author_filter,
+        year_min: request.year_min,
+        year_max: request.year_max,
+        libraries_filter: request.libraries_filter,
+        tags_filter: request.tags_filter,
+        collections_filter: request.collections_filter,
+        limit: request.limit,
+        offset: request.offset,
+    };
+    
+    const response = await handleItemSearchByTopicRequest(wsRequest);
+
+    return {
+        items: response.items,
+        unresolved_collections: response.unresolved_collections,
+        error: response.error ?? null,
+        error_code: response.error_code ?? null,
+    };
+}
+
+async function handleQuickSearchHttpRequest(request: any) {
+    const wsRequest: WSItemQuickSearchRequest = {
+        event: 'item_quick_search_request',
+        request_id: generateRequestId(),
+        query: request.query,
+        item_type_filter: request.item_type_filter,
+        libraries_filter: request.libraries_filter,
+        tags_filter: request.tags_filter,
+        collections_filter: request.collections_filter,
+        detail: request.detail,
+        limit: request.limit,
+        offset: request.offset,
+    };
+
+    const response = await handleItemQuickSearchRequest(wsRequest);
+
+    return {
+        items: response.items,
+        unresolved_collections: response.unresolved_collections,
+        detail: response.detail,
+        total_count: response.total_count,
+        // Without this a caller reads a truncated total as the complete match
+        // count and pages into a hole. LocalhostFrontendCapability reads it.
+        truncated: response.truncated ?? false,
+        error: response.error ?? null,
+        error_code: response.error_code ?? null,
+    };
+}
+
+async function handleAttachmentDocumentHttpRequest(request: any) {
+    const wsRequest: WSZoteroDocumentRequest = {
+        event: 'zotero_document_request',
+        request_id: generateRequestId(),
+        attachment: request.attachment,
+        external_file_key: request.external_file_key,
+        mode: request.mode ?? 'structured',
+        max_pages: request.max_pages,
+        timeout_seconds: request.timeout_seconds,
+    };
+
+    const response = await handleZoteroDocumentRequest(wsRequest);
+
+    return {
+        resolved_attachment: response.resolved_attachment,
+        external_file_key: response.external_file_key,
+        content_type: response.content_type,
+        content_kind: response.content_kind,
+        result: response.result,
+        total_pages: response.total_pages,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleAttachmentPageImagesHttpRequest(request: any) {
+    const wsRequest: WSZoteroAttachmentPageImagesRequest = {
+        event: 'zotero_attachment_page_images_request',
+        request_id: generateRequestId(),
+        attachment: request.attachment,
+        pages: request.pages,
+        scale: request.scale,
+        dpi: request.dpi,
+        format: request.format,
+        jpeg_quality: request.jpeg_quality,
+        skip_local_limits: request.skip_local_limits,
+        prefer_page_labels: request.prefer_page_labels,
+        timeout_seconds: request.timeout_seconds,
+    };
+    
+    const response = await handleZoteroAttachmentPageImagesRequest(wsRequest);
+    
+    return {
+        attachment: response.attachment,
+        pages: response.pages,
+        total_pages: response.total_pages,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleAttachmentSearchHttpRequest(request: any) {
+    const wsRequest: WSZoteroAttachmentSearchRequest = {
+        event: 'zotero_attachment_search_request',
+        request_id: generateRequestId(),
+        attachment: request.attachment,
+        query: request.query,
+        max_hits_per_page: request.max_hits_per_page,
+        skip_local_limits: request.skip_local_limits,
+        timeout_seconds: request.timeout_seconds,
+    };
+    
+    const response = await handleZoteroAttachmentSearchRequest(wsRequest);
+    
+    return {
+        attachment: response.attachment,
+        query: response.query,
+        total_matches: response.total_matches,
+        pages_with_matches: response.pages_with_matches,
+        total_pages: response.total_pages,
+        pages: response.pages,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+
+// =============================================================================
+// Library Management HTTP Handlers
+// =============================================================================
+
+async function handleLibrarySearchHttpRequest(request: any) {
+    const wsRequest: WSZoteroSearchRequest = {
+        event: 'zotero_search_request',
+        request_id: generateRequestId(),
+        conditions: request.conditions || [],
+        join_mode: request.join_mode || 'all',
+        library_id: request.library_id,
+        include_children: request.include_children ?? false,
+        item_category: request.item_category ?? 'regular',
+        recursive: request.recursive ?? true,
+        sort_by: request.sort_by ?? null,
+        sort_order: request.sort_order ?? null,
+        limit: request.limit ?? 10,
+        offset: request.offset ?? 0,
+        fields: request.fields,
+    };
+    
+    const response = await handleZoteroSearchRequest(wsRequest);
+
+    return {
+        items: response.items,
+        total_count: response.total_count,
+        // Validation warnings identify invalid conditions that were not applied.
+        warnings: response.warnings,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleLibraryListHttpRequest(request: any) {
+    const wsRequest: WSListItemsRequest = {
+        event: 'list_items_request',
+        request_id: generateRequestId(),
+        library_id: request.library_id,
+        collection_key: request.collection_key,
+        special_collection: request.special_collection,
+        tag: request.tag,
+        item_category: request.item_category ?? 'regular',
+        include_children: request.include_children ?? false,
+        nest_children: request.nest_children ?? false,
+        include_abstract: request.include_abstract ?? false,
+        recursive: request.recursive ?? true,
+        sort_by: request.sort_by || 'dateModified',
+        sort_order: request.sort_order || 'desc',
+        limit: request.limit ?? 20,
+        offset: request.offset ?? 0,
+        has_attachments: request.has_attachments ?? null,
+    };
+    
+    const response = await handleListItemsRequest(wsRequest);
+    
+    return {
+        items: response.items,
+        total_count: response.total_count,
+        library_name: response.library_name,
+        collection_name: response.collection_name,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+/**
+ * Population resolution over HTTP. The backend's localhost frontend posts here,
+ * so the accepted body and the returned shape must stay identical to the
+ * `resolve_population` wire request/response.
+ */
+async function handleResolvePopulationHttpRequest(request: any) {
+    const wsRequest: WSResolvePopulationRequest = {
+        event: 'resolve_population_request',
+        request_id: generateRequestId(),
+        library_id: request.library_id,
+        collection_keys: request.collection_keys ?? [],
+        recursive: request.recursive ?? true,
+        tags: request.tags ?? [],
+        unfiled: request.unfiled ?? false,
+        untagged: request.untagged ?? false,
+        conditions: request.conditions || [],
+        conditions_join_mode: request.conditions_join_mode ?? null,
+        any_conditions: request.any_conditions || [],
+        item_category: request.item_category === 'attachment' ? 'attachment' : 'regular',
+        include_standalone_attachments: request.include_standalone_attachments ?? false,
+        skip_sibling_snapshots: request.skip_sibling_snapshots ?? false,
+        has_attachments: request.has_attachments ?? null,
+        max_items: request.max_items ?? 1000,
+        exclude_item_ids: request.exclude_item_ids ?? [],
+    };
+
+    const response = await handleResolvePopulationRequest(wsRequest);
+
+    return {
+        item_ids: response.item_ids,
+        total_count: response.total_count,
+        // Presence tells the caller this build applied `exclude_item_ids`.
+        // Forwarded here too, like `conditions_join_mode`, or a localhost
+        // run cannot continue a batch.
+        excluded_count: response.excluded_count,
+        // How many bibliographic items matched, before an attachment population
+        // was derived from them. Without it the caller cannot tell an empty
+        // attachment population from filters that matched nothing.
+        matched_item_count: response.matched_item_count,
+        truncated: response.truncated,
+        // The place the population lives, which the approval card states from
+        // these alone — the WebSocket transport forwards them, so this one has
+        // to as well or a localhost run loses the WHERE half of the card.
+        library_name: response.library_name,
+        collection_names: response.collection_names,
+        collection_ids: response.collection_ids,
+        saved_search_names: response.saved_search_names,
+        // The join mode actually applied to `conditions`. Its absence is how the
+        // caller detects a provider that predates the field, so it has to be
+        // forwarded here too.
+        conditions_join_mode: response.conditions_join_mode,
+        // Same again for the `any_conditions` group, and it matters more: a
+        // provider that predates the field drops the group and resolves a
+        // WIDER population than the caller described.
+        any_conditions_applied: response.any_conditions_applied,
+        standalone_attachments_included: response.standalone_attachments_included,
+        sibling_snapshots_skipped: response.sibling_snapshots_skipped,
+        // A dropped condition widens the population; the caller must not act on
+        // ids that came back with a warning.
+        warnings: response.warnings,
+        error: response.error,
+        error_code: response.error_code,
+        available_libraries: response.available_libraries,
+    };
+}
+
+/**
+ * Item display lookup over HTTP. The backend's localhost frontend posts here,
+ * so the accepted body and the returned shape must stay identical to the
+ * `item_display` wire request/response.
+ */
+async function handleItemDisplayHttpRequest(request: any) {
+    const wsRequest: WSItemDisplayRequest = {
+        event: 'item_display_request',
+        request_id: generateRequestId(),
+        item_ids: Array.isArray(request.item_ids) ? request.item_ids : [],
+    };
+
+    const response = await handleItemDisplayRequest(wsRequest);
+
+    return {
+        items: response.items,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleLibraryMetadataHttpRequest(request: any) {
+    const wsRequest: WSGetMetadataRequest = {
+        event: 'get_metadata_request',
+        request_id: generateRequestId(),
+        item_ids: request.item_ids || [],
+        include_attachments: request.include_attachments ?? false,
+        include_notes: request.include_notes ?? false,
+        detail: request.detail,
+    };
+
+    const response = await handleGetMetadataRequest(wsRequest);
+
+    return {
+        items: response.items,
+        detail: response.detail,
+        not_found: response.not_found,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleFindAnnotationsHttpRequest(request: any) {
+    const wsRequest: WSFindAnnotationsRequest = {
+        event: 'find_annotations_request',
+        request_id: generateRequestId(),
+        text_contains: request.text_contains,
+        comment_contains: request.comment_contains,
+        tag: request.tag,
+        color: request.color,
+        annotation_type: request.annotation_type,
+        author: request.author,
+        attachment_id: request.attachment_id,
+        collection: request.collection,
+        recursive: request.recursive ?? true,
+        library_id: request.library_id,
+        modified_in_last: request.modified_in_last,
+        sort_by: request.sort_by ?? 'date_modified',
+        sort_order: request.sort_order ?? 'desc',
+        limit: request.limit ?? 25,
+        offset: request.offset ?? 0,
+    };
+
+    const response = await handleFindAnnotationsRequest(wsRequest);
+
+    return {
+        annotations: response.annotations,
+        total_count: response.total_count,
+        note: response.note,
+        error: response.error,
+        error_code: response.error_code,
+        available_libraries: response.available_libraries,
+    };
+}
+
+async function handleListLibrariesHttpRequest(_request: any) {
+    const wsRequest: WSListLibrariesRequest = {
+        event: 'list_libraries_request',
+        request_id: generateRequestId(),
+    };
+
+    const response = await handleListLibrariesRequest(wsRequest);
+
+    return {
+        libraries: response.libraries,
+        total_count: response.total_count,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleListCollectionsHttpRequest(request: any) {
+    const wsRequest: WSListCollectionsRequest = {
+        event: 'list_collections_request',
+        request_id: generateRequestId(),
+        library_id: request.library_id,
+        parent_collection_key: request.parent_collection_key,
+        include_item_counts: request.include_item_counts ?? false,
+        recursive: request.recursive ?? false,
+        limit: request.limit ?? 50,
+        offset: request.offset ?? 0,
+    };
+
+    const response = await handleListCollectionsRequest(wsRequest);
+
+    return {
+        collections: response.collections,
+        total_count: response.total_count,
+        library_id: response.library_id,
+        library_name: response.library_name,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleListTagsHttpRequest(request: any) {
+    const wsRequest: WSListTagsRequest = {
+        event: 'list_tags_request',
+        request_id: generateRequestId(),
+        library_id: request.library_id,
+        collection_key: request.collection_key,
+        min_item_count: request.min_item_count ?? 0,
+        name_query: request.name_query,
+        // Pass through so omitted stays 'all' in the handler.
+        tag_type: request.tag_type,
+        limit: request.limit ?? 50,
+        offset: request.offset ?? 0,
+    };
+
+    const response = await handleListTagsRequest(wsRequest);
+
+    return {
+        tags: response.tags,
+        total_count: response.total_count,
+        manual_count: response.manual_count,
+        automatic_count: response.automatic_count,
+        library_id: response.library_id,
+        library_name: response.library_name,
+        error: response.error,
+        error_code: response.error_code,
+    };
+}
+
+async function handleAgentActionValidateHttpRequest(request: any) {
+    const wsRequest: WSAgentActionValidateRequest = {
+        event: 'agent_action_validate',
+        request_id: generateRequestId(),
+        action_type: request.action_type,
+        action_data: request.action_data,
+    };
+
+    const response = await handleAgentActionValidateRequest({ ...wsRequest, operation: captureInstanceOperation() });
+
+    // Hand-maintained projection of WSAgentActionValidateResponse minus the
+    // transport envelope.
+    return {
+        valid: response.valid,
+        error: response.error,
+        error_code: response.error_code,
+        error_candidates: response.error_candidates,
+        edit_errors: response.edit_errors,
+        current_value: response.current_value,
+        normalized_action_data: response.normalized_action_data,
+        collection_names: response.collection_names,
+        preference: response.preference,
+        warnings: response.warnings,
+        match_strategy: response.match_strategy,
+    };
+}
+
+async function handleAgentActionExecuteHttpRequest(request: any) {
+    const wsRequest: WSAgentActionExecuteRequest = {
+        event: 'agent_action_execute',
+        request_id: generateRequestId(),
+        action_type: request.action_type,
+        action_data: request.action_data,
+        timeout_seconds: request.timeout_seconds,
+    };
+
+    const response = await handleAgentActionExecuteRequest({ ...wsRequest, operation: captureInstanceOperation() });
+
+    return {
+        success: response.success,
+        error: response.error,
+        error_code: response.error_code,
+        error_candidates: response.error_candidates,
+        result_data: response.result_data,
+    };
+}
+
+async function handleUserInfoHttpRequest(_request: any) {
+    return getZoteroUserIdentifier();
+}
+
+async function handleDeleteItemsHttpRequest(request: any) {
+    return await handleDeleteItemsRequest({
+        item_ids: request.item_ids || [],
+    });
+}
+
+async function handleReadNoteHttpRequest(request: any) {
+    const wsRequest: WSReadNoteRequest = {
+        event: 'read_note_request',
+        request_id: generateRequestId(),
+        note_id: request.note_id,
+        offset: request.offset,
+        limit: request.limit,
+    };
+
+    return await handleReadNoteRequest(wsRequest);
+}
+
+// Provider-mode connection control (dev-only). Lets tests/agents open the
+// provider WebSocket without a wake broadcast, inspect its state, and close it.
+// Set a AsterMargin pref (dev-only). Lets agents/tests flip pref-gated features
+// (e.g. dataProviderEnabled) without the RDP bridge.
+async function handleTestSetPrefHttpRequest(request: any) {
+    const { key, value } = request ?? {};
+    if (typeof key !== 'string' || !key) {
+        throw new Error('key is required');
+    }
+    setPref(key as any, value);
+    return { ok: true, key, value: getPref(key as any) };
+}
+
+async function handleTestProviderConnectHttpRequest(request: any) {
+    await Zotero.AsterMargin.localEndpoints!.provider.connect({
+        wakeId: request?.wake_id,
+        wakeInstanceId: request?.wake_instance_id,
+    });
+    return { ok: true, status: Zotero.AsterMargin.localEndpoints!.provider.getStatus() };
+}
+
+async function handleTestProviderStatusHttpRequest(_request: any) {
+    return Zotero.AsterMargin.localEndpoints!.provider.getStatus();
+}
+
+async function handleTestProviderCloseHttpRequest(_request: any) {
+    Zotero.AsterMargin.localEndpoints!.provider.close();
+    return { ok: true, status: Zotero.AsterMargin.localEndpoints!.provider.getStatus() };
+}
+
+
+// =============================================================================
+// Registration Functions
+// =============================================================================
+
+/**
+ * Register the local HTTP surface.
+ *
+ * Callers must gate this on the build: `LocalEndpoints` registers only in
+ * development and staging builds, so NONE of the paths below — not just the
+ * `/astermargin/test/*` block near the end — reach a production build.
+ */
+export function registerEndpoints(): (() => void) | undefined {
+    if (!Zotero?.Server?.Endpoints) return;
+    const endpoints: Record<string, any> = {};
+    endpoints['/astermargin/zotero-data'] =
+        createEndpoint(handleZoteroDataHttpRequest);
+    
+    endpoints['/astermargin/external-reference-check'] =
+        createEndpoint(handleExternalReferenceCheckHttpRequest);
+    
+    endpoints['/astermargin/search/metadata'] =
+        createEndpoint(handleMetadataSearchHttpRequest);
+    
+    endpoints['/astermargin/search/topic'] =
+        createEndpoint(handleTopicSearchHttpRequest);
+
+    endpoints['/astermargin/search/quick'] =
+        createEndpoint(handleQuickSearchHttpRequest);
+
+    endpoints['/astermargin/attachment/document'] =
+        createEndpoint(handleAttachmentDocumentHttpRequest);
+    
+    endpoints['/astermargin/attachment/page-images'] =
+        createEndpoint(handleAttachmentPageImagesHttpRequest);
+    
+    endpoints['/astermargin/attachment/search'] =
+        createEndpoint(handleAttachmentSearchHttpRequest);
+    
+    // Library management endpoints
+    endpoints['/astermargin/library/search'] =
+        createEndpoint(handleLibrarySearchHttpRequest);
+    
+    endpoints['/astermargin/library/list'] =
+        createEndpoint(handleLibraryListHttpRequest);
+    
+    endpoints['/astermargin/library/resolve-population'] =
+        createEndpoint(handleResolvePopulationHttpRequest);
+
+    endpoints['/astermargin/library/item-display'] =
+        createEndpoint(handleItemDisplayHttpRequest);
+
+    endpoints['/astermargin/library/metadata'] =
+        createEndpoint(handleLibraryMetadataHttpRequest);
+
+    endpoints['/astermargin/library/find-annotations'] =
+        createEndpoint(handleFindAnnotationsHttpRequest);
+
+    endpoints['/astermargin/artifact'] = createEndpoint(handleArtifactRequest);
+
+    endpoints['/astermargin/library/libraries'] =
+        createEndpoint(handleListLibrariesHttpRequest);
+
+    endpoints['/astermargin/library/collections'] =
+        createEndpoint(handleListCollectionsHttpRequest);
+
+    endpoints['/astermargin/library/tags'] =
+        createEndpoint(handleListTagsHttpRequest);
+
+    // Deferred tool endpoints
+    endpoints['/astermargin/library/duplicates'] = createEndpoint((request: any) => handleDuplicatesRequest({ ...request, event: 'duplicates_request', request_id: generateRequestId() }));
+
+    endpoints['/astermargin/agent-action/validate'] =
+        createEndpoint(handleAgentActionValidateHttpRequest);
+
+    endpoints['/astermargin/agent-action/execute'] =
+        createEndpoint(handleAgentActionExecuteHttpRequest);
+
+    // Utility endpoints
+    endpoints['/astermargin/user-info'] =
+        createEndpoint(handleUserInfoHttpRequest);
+
+    endpoints['/astermargin/delete-items'] =
+        createEndpoint(handleDeleteItemsHttpRequest);
+
+    // Note endpoints
+    endpoints['/astermargin/note/read'] =
+        createEndpoint(handleReadNoteHttpRequest);
+
+    // Diagnostics and test commands are available in development and staging.
+    if (process.env.NODE_ENV === 'development' || process.env.BUILD_ENV === 'staging') {
+        endpoints['/astermargin/test/ping'] =
+            createEndpoint(handleTestPingHttpRequest);
+
+        endpoints['/astermargin/test/cache-metadata'] =
+            createEndpoint(handleTestCacheMetadataHttpRequest);
+
+        endpoints['/astermargin/test/cache-payload'] =
+            createEndpoint(handleTestCachePayloadHttpRequest);
+
+        endpoints['/astermargin/test/cache-invalidate'] =
+            createEndpoint(handleTestCacheInvalidateHttpRequest);
+
+        endpoints['/astermargin/test/protected-cache-check'] = createEndpoint(handleTestProtectedCacheHttpRequest);
+        endpoints['/astermargin/test/cache-seed-page-labels'] =
+            createEndpoint(handleTestCacheSeedPageLabelsHttpRequest);
+
+        endpoints['/astermargin/test/cache-clear-all'] =
+            createEndpoint(handleTestCacheClearAllHttpRequest);
+
+        endpoints['/astermargin/test/cache-stats'] =
+            createEndpoint(handleTestCacheStatsHttpRequest);
+
+        endpoints['/astermargin/test/read-attachment'] =
+            createEndpoint(handleTestReadAttachmentHttpRequest);
+
+        endpoints['/astermargin/test/mcp-read-note'] =
+            createEndpoint(handleTestMcpReadNoteHttpRequest);
+
+        endpoints['/astermargin/test/mcp-create-note'] =
+            createEndpoint(handleTestMcpCreateNoteHttpRequest);
+
+        endpoints['/astermargin/test/resolve-item'] =
+            createEndpoint(handleTestResolveItemHttpRequest);
+        endpoints['/astermargin/test/item-import-resolve'] =
+            createEndpoint(handleTestItemImportResolveHttpRequest);
+        endpoints['/astermargin/test/item-import-write'] =
+            createEndpoint(handleTestItemImportWriteHttpRequest);
+        endpoints['/astermargin/test/item-import-capabilities'] =
+            createEndpoint(handleTestItemImportCapabilitiesHttpRequest);
+        endpoints['/astermargin/test/resolve-readable'] =
+            createEndpoint(handleTestResolveReadableHttpRequest);
+        endpoints['/astermargin/test/best-epub-attachment'] =
+            createEndpoint(handleTestBestEpubAttachmentHttpRequest);
+        endpoints['/astermargin/test/validate-item'] =
+            createEndpoint(handleTestValidateItemHttpRequest);
+        endpoints['/astermargin/test/validate-regular-item'] =
+            createEndpoint(handleTestValidateRegularItemHttpRequest);
+
+        // External-file attach/delete/view-images (dev-only; seeds the registry for live tests)
+        endpoints['/astermargin/test/external-file-attach'] =
+            createEndpoint(handleTestExternalFileAttachHttpRequest);
+        endpoints['/astermargin/test/external-file-delete'] =
+            createEndpoint(handleTestExternalFileDeleteHttpRequest);
+        endpoints['/astermargin/test/external-file-view-images'] =
+            createEndpoint(handleTestExternalFileViewImagesHttpRequest);
+
+        // Serialized PDF document-request wire path (dev-only): exercises the
+        // websocket response mode, PreparedJsonMessage splice, and
+        // guardSerializedPayloadSize that the object-mode endpoint skips.
+        endpoints['/astermargin/test/document-serialized'] =
+            createEndpoint(handleTestDocumentSerializedHttpRequest);
+
+        // Batch progress bar preview (dev-only): stage a synthetic stamp so the
+        // bar can be inspected in every operation and ledger state without
+        // paying for a real batch run of each.
+        endpoints['/astermargin/test/batch-progress-preview'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/batch-progress-preview', request));
+
+        endpoints['/astermargin/test/batch-progress-clear'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/batch-progress-clear', request));
+
+        // MuPDF worker singleton stats / lifecycle (dev-only)
+        endpoints['/astermargin/test/worker-stats'] =
+            createEndpoint(handleTestWorkerStatsHttpRequest);
+
+        endpoints['/astermargin/test/worker-mark-stale'] =
+            createEndpoint(handleTestWorkerMarkStaleHttpRequest);
+
+        endpoints['/astermargin/test/worker-cache-clear'] =
+            createEndpoint(handleTestWorkerCacheClearHttpRequest);
+
+        endpoints['/astermargin/test/worker-wedge-probe'] =
+            createEndpoint(handleTestWorkerWedgeProbeHttpRequest);
+
+        endpoints['/astermargin/test/worker-idle-probe'] =
+            createEndpoint(handleTestWorkerIdleProbeHttpRequest);
+
+        endpoints['/astermargin/test/worker-realm-probe'] =
+            createEndpoint(handleTestWorkerRealmProbeHttpRequest);
+
+        // File-status side-effect trigger (dev-only)
+        endpoints['/astermargin/test/file-status'] =
+            createEndpoint(handleTestFileStatusHttpRequest);
+
+        // Note-specific test endpoints (seeding/teardown/inspection/undo)
+        endpoints['/astermargin/test/note-create'] = createEndpoint(handleTestNoteCreateHttpRequest);
+
+        endpoints['/astermargin/test/note-delete'] = createEndpoint(handleTestNoteDeleteHttpRequest);
+
+        endpoints['/astermargin/test/note-read'] = createEndpoint(handleTestNoteReadHttpRequest);
+
+        endpoints['/astermargin/test/note-open-editor'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/note-open-editor', request));
+
+        endpoints['/astermargin/test/note-close-editor'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/note-close-editor', request));
+
+        endpoints['/astermargin/test/note-undo'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/note-undo', request));
+
+        endpoints['/astermargin/test/note-apply'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/note-apply', request));
+
+        endpoints['/astermargin/test/note-preview'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/note-preview', request));
+
+        // Collection seeding/teardown (dev-only)
+        endpoints['/astermargin/test/collection-create'] =
+            createEndpoint(handleTestCollectionCreateHttpRequest);
+
+        endpoints['/astermargin/test/collection-delete'] =
+            createEndpoint(handleTestCollectionDeleteHttpRequest);
+
+        // PDF-retrieval measurement (dev-only)
+        endpoints['/astermargin/test/pdf-retrieval'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/pdf-retrieval', request));
+
+        endpoints['/astermargin/test/pdf-captcha-eligibility'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/pdf-captcha-eligibility', request));
+
+        // Headless PDF annotation primitives (dev-only)
+        endpoints['/astermargin/test/annotation-create'] =
+            createEndpoint(handleTestAnnotationCreateHttpRequest);
+
+        // MuPDF worker plumbing (dev-only)
+        endpoints['/astermargin/test/pdf-page-count'] = createEndpoint(handleTestPdfPageCountHttpRequest);
+
+        endpoints['/astermargin/test/pdf-page-labels'] = createEndpoint(handleTestPdfPageLabelsHttpRequest);
+
+        endpoints['/astermargin/test/pdf-render-pages'] = createEndpoint(handleTestPdfRenderPagesHttpRequest);
+
+        endpoints['/astermargin/test/pdf-render-pages-with-meta'] = createEndpoint(handleTestPdfRenderPagesWithMetaHttpRequest);
+
+        endpoints['/astermargin/test/pdf-extract-raw-detailed'] = createEndpoint(handleTestPdfExtractRawDetailedHttpRequest);
+
+        // orchestration parity endpoints
+        endpoints['/astermargin/test/pdf-extract'] = createEndpoint(handleTestPdfExtractHttpRequest);
+
+        endpoints['/astermargin/test/pdf-extract-paragraph'] = createEndpoint(handleTestPdfExtractParagraphHttpRequest);
+
+        endpoints['/astermargin/test/pdf-has-text-layer'] = createEndpoint(handleTestPdfHasTextLayerHttpRequest);
+
+        endpoints['/astermargin/test/pdf-analyze-ocr'] = createEndpoint(handleTestPdfAnalyzeOcrHttpRequest);
+
+        endpoints['/astermargin/test/pdf-search-scored'] = createEndpoint(handleTestPdfSearchScoredHttpRequest);
+
+        endpoints['/astermargin/test/pdf-sentence-bboxes'] = createEndpoint(handleTestPdfSentenceBBoxesHttpRequest);
+
+        // Bbox overlay endpoint — paints columns/lines/items/paragraphs/sentences/
+        // margins on a rendered page PNG for headless agent debugging.
+        endpoints['/astermargin/test/pdf-render-overlay'] = createEndpoint(handleTestPdfRenderOverlayHttpRequest);
+
+        // Per-page extract trace — emits every stage of the extraction
+        // pipeline as JSON with cross-stage IDs, so an agent can trace
+        // one piece of text from raw line through items to sentences.
+        endpoints['/astermargin/test/pdf-extract-trace'] = createEndpoint(handleTestPdfExtractTraceHttpRequest);
+
+        // Full analysis context (style profile + margin analysis + margin
+        // removal) computed by the same prefix `extract({ mode:
+        // "structured" })` runs before per-page processing. Backs the
+        // `level: "margins"` overlay and is also exposed standalone for
+        // debugging.
+        endpoints['/astermargin/test/pdf-analyze-layout'] = createEndpoint(handleTestPdfAnalyzeLayoutHttpRequest);
+
+        // EPUB extraction over a raw file path / attachment (corpus triage)
+        endpoints['/astermargin/test/epub-extract'] =
+            createEndpoint(handleTestEpubExtractHttpRequest);
+
+        // Snapshot extraction over a raw HTML file path / attachment
+        endpoints['/astermargin/test/snapshot-extract'] =
+            createEndpoint(handleTestSnapshotExtractHttpRequest);
+
+        // Generated HTML report stored as a snapshot attachment
+        endpoints['/astermargin/test/create-report'] =
+            createEndpoint(handleTestCreateReportHttpRequest);
+
+        // EPUB annotation CFI/sortIndex parity: headless resolver vs the reader's
+        // own getAnnotationFromRange for the same target.
+        endpoints['/astermargin/test/epub-annotation-parity'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/epub-annotation-parity', request));
+
+        // Snapshot annotation selector/sortIndex parity.
+        endpoints['/astermargin/test/snapshot-annotation-parity'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/snapshot-annotation-parity', request));
+
+        // Reader position (`getCurrentPage` / `content_kind`) and the EPUB
+        // citation-navigation path against the live reader.
+        endpoints['/astermargin/test/reader-state'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/reader-state', request));
+
+        endpoints['/astermargin/test/epub-citation-navigate'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/epub-citation-navigate', request));
+
+        // Citation host: itemData.resolveItemDisplay (icon item type +
+        // readable-attachment availability for cited-source rows).
+        endpoints['/astermargin/test/resolve-item-display'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/resolve-item-display', request));
+
+        // Background queue (dev-only)
+        endpoints['/astermargin/test/background-enqueue'] =
+            createEndpoint(handleTestBackgroundEnqueueHttpRequest);
+
+        endpoints['/astermargin/test/background-stats'] =
+            createEndpoint(handleTestBackgroundStatsHttpRequest);
+
+        endpoints['/astermargin/test/background-peek'] =
+            createEndpoint(handleTestBackgroundPeekHttpRequest);
+
+        endpoints['/astermargin/test/background-process-once'] =
+            createEndpoint(handleTestBackgroundProcessOnceHttpRequest);
+
+        endpoints['/astermargin/test/background-clear'] =
+            createEndpoint(handleTestBackgroundClearHttpRequest);
+
+        // Whole-library processing (dev-only): drives ReconcilerService and
+        // exposes the ledger the prefs section aggregates.
+        endpoints['/astermargin/test/processing-reconcile-now'] = createEndpoint(handleTestProcessingReconcileNowHttpRequest);
+        endpoints['/astermargin/test/index-reconcile'] = createEndpoint(handleTestIndexReconcileHttpRequest);
+
+        endpoints['/astermargin/test/processing-status'] = createEndpoint(handleTestProcessingStatusHttpRequest);
+
+        endpoints['/astermargin/test/processing-ledger'] = createEndpoint(handleTestProcessingLedgerHttpRequest);
+
+        endpoints['/astermargin/test/processing-reset'] = createEndpoint(handleTestProcessingResetHttpRequest);
+
+        // Pref control (dev-only)
+        endpoints['/astermargin/test/set-pref'] =
+            createEndpoint(handleTestSetPrefHttpRequest);
+
+        // Sync-suppression control/inspection (dev-only): drives the real
+        // syncPause module + raw Sync.Runner contract for live tests.
+        endpoints['/astermargin/test/sync-pause'] =
+            createEndpoint(handleTestSyncPauseHttpRequest);
+
+        // Reader sidebar-width wrapper lifecycle (dev-only): drives the real
+        // dispatcher install/unwrap/restore path against Zotero.Reader.
+        endpoints['/astermargin/test/window-runtime'] =
+            createEndpoint(handleTestWindowRuntimeHttpRequest);
+
+        endpoints['/astermargin/test/sidebar-width-handler'] =
+            createEndpoint(handleTestSidebarWidthHandlerHttpRequest);
+
+        // Provider-mode connection control (dev-only manual trigger/inspection)
+        endpoints['/astermargin/test/provider-connect'] =
+            createEndpoint(handleTestProviderConnectHttpRequest);
+
+        endpoints['/astermargin/test/provider-status'] =
+            createEndpoint(handleTestProviderStatusHttpRequest);
+
+        endpoints['/astermargin/test/provider-close'] =
+            createEndpoint(handleTestProviderCloseHttpRequest);
+
+        // Library-exclusion control/inspection (dev-only): drives the in-memory
+        // excluded-libraries set that gates every read/write path.
+        endpoints['/astermargin/test/excluded-libraries'] = createEndpoint(handleTestExcludedLibrariesHttpRequest, { allowScopeChange: true });
+
+        // Exclusion-gated handlers that have no production HTTP route.
+        endpoints['/astermargin/test/get-annotations'] = createEndpoint(handleTestGetAnnotationsHttpRequest);
+
+        endpoints['/astermargin/test/view-images'] = createEndpoint(handleTestViewImagesHttpRequest);
+
+        endpoints['/astermargin/test/attachment-image'] = createEndpoint(handleTestAttachmentImageHttpRequest);
+
+        // Device-portable library-identity resolvers (dev-only): thin wrappers
+        // over libraryRefForLibraryID / parseLibraryRef / resolveLibraryRef /
+        // resolveItemReference so live tests can assert them against real
+        // personal + group libraries.
+        endpoints['/astermargin/test/library-identity'] =
+            createEndpoint(handleTestLibraryIdentityHttpRequest);
+        // Headless chat/run lifecycle (dev-only): trigger the real send/approval/
+        // undo path over HTTP by writing the same Jotai action atoms the UI writes,
+        // so an automated agent can drive full agent runs without poking the
+        // Lexical editor (which can't be reliably driven by synthetic events).
+        endpoints['/astermargin/test/new-thread'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/new-thread', request));
+        endpoints['/astermargin/test/chat-send'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/chat-send', request));
+        endpoints['/astermargin/test/current-ids'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/current-ids', request));
+        endpoints['/astermargin/test/load-thread'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/load-thread', request));
+        endpoints['/astermargin/test/list-actions'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/list-actions', request));
+        endpoints['/astermargin/test/approve-action'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/approve-action', request));
+        endpoints['/astermargin/test/confirm-credits'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/confirm-credits', request));
+        endpoints['/astermargin/test/table-card'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/table-card', request));
+        endpoints['/astermargin/test/answer-question'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/answer-question', request));
+        endpoints['/astermargin/test/batch-approval'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/batch-approval', request));
+        endpoints['/astermargin/test/table-fill-progress'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/table-fill-progress', request));
+        endpoints['/astermargin/test/undo-action'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/undo-action', request));
+        endpoints['/astermargin/test/chat-drop-connection'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/chat-drop-connection', request));
+        endpoints['/astermargin/test/run-snapshot'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/run-snapshot', request));
+        endpoints['/astermargin/test/chat-stop'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/chat-stop', request));
+        endpoints['/astermargin/test/chat-continue'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/chat-continue', request));
+
+        endpoints['/astermargin/test/application-state'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/application-state', request));
+
+        endpoints['/astermargin/test/astermargin-window'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/astermargin-window', request));
+
+        // `openTable` itself — the product path chat cards and links take.
+        endpoints['/astermargin/test/open-stored-table'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/open-stored-table', request));
+
+        // Stored tables (dev-only): create the real snapshot attachment, read
+        // the spec back out of the file, and list what is in the library.
+        endpoints['/astermargin/test/table-create'] = createEndpoint(handleTestTableCreateHttpRequest);
+
+        endpoints['/astermargin/test/table-read'] = createEndpoint(handleTestTableReadHttpRequest);
+
+        endpoints['/astermargin/test/table-list'] = createEndpoint(handleTestTableListHttpRequest);
+
+        // The AsterMargin tab (dev-only): fixed commands that open, close and time
+        // it through the product paths, and report its tabs and the session.
+        endpoints['/astermargin/test/table-tab'] = createEndpoint(handleTableTabProbe);
+
+        // The versioned store (dev-only): the write protocol, the version log,
+        // revert, trash/restore, and the crash recovery `open` performs.
+        // `table-corrupt` damages the storage directory on purpose so that
+        // recovery can be exercised without staging a real crash.
+        endpoints['/astermargin/test/table-write'] = createEndpoint(handleTestTableWriteHttpRequest);
+
+        endpoints['/astermargin/test/table-edit'] = createEndpoint(handleTestTableEditHttpRequest);
+        // Table fills (dev-only): plan, start, wait for, stop and inspect the
+        // plugin's fill jobs, and read a table's pending work.
+        endpoints['/astermargin/test/table-fill'] = createEndpoint(handleTestTableFillHttpRequest);
+        endpoints['/astermargin/test/table-pending'] = createEndpoint(handleTestTablePendingHttpRequest);
+
+        endpoints['/astermargin/test/table-versions'] = createEndpoint(handleTestTableVersionsHttpRequest);
+
+        endpoints['/astermargin/test/table-revert'] = createEndpoint(handleTestTableRevertHttpRequest);
+
+        endpoints['/astermargin/test/table-trim'] = createEndpoint(handleTestTableTrimHttpRequest);
+
+        endpoints['/astermargin/test/table-delete'] = createEndpoint(handleTestTableDeleteHttpRequest);
+
+        endpoints['/astermargin/test/table-open'] = createEndpoint(handleTestTableOpenHttpRequest);
+
+        endpoints['/astermargin/test/table-corrupt'] = createEndpoint(handleTestTableCorruptHttpRequest);
+
+        // The recovery shadow (dev-only): what this device last wrote to a
+        // table, whether the table has gone backwards under it, and putting
+        // this device's version back.
+        endpoints['/astermargin/test/table-shadow'] = createEndpoint(handleTestTableShadowHttpRequest);
+
+        endpoints['/astermargin/test/table-restore-shadow'] = createEndpoint(handleTestTableRestoreShadowHttpRequest);
+
+        endpoints['/astermargin/test/astermargin-sidebar'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/astermargin-sidebar', request));
+
+        endpoints['/astermargin/test/select-tab'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/select-tab', request));
+
+        endpoints['/astermargin/test/run-status-popup'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/run-status-popup', request));
+
+        endpoints['/astermargin/test/feature-tip'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/feature-tip', request));
+
+        endpoints['/astermargin/test/quick-prompt'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/quick-prompt', request));
+
+        endpoints['/astermargin/test/version-popup'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/version-popup', request));
+
+        endpoints['/astermargin/test/saved-actions'] = createEndpoint(request => Zotero.AsterMargin.runtime.dispatchWindowCommand('/astermargin/test/saved-actions', request));
+
+        // File export without the save dialog: a given source, or a response of
+        // a window's open thread.
+        endpoints['/astermargin/test/export'] = createEndpoint(handleTestExportHttpRequest);
+        // Export of a Zotero note (or given note HTML) without the save dialog.
+        endpoints['/astermargin/test/export-note'] = createEndpoint(handleTestExportNoteHttpRequest);
+    }
+
+    const releases = Object.entries(endpoints).map(([path, handler]) =>
+        registerEndpoint(path, handler),
+    );
+    logger(`LocalEndpoints: Registered ${releases.length} HTTP endpoints`, 3);
+    return () => { for (const release of releases) release(); };
+}

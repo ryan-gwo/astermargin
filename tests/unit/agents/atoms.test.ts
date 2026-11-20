@@ -1,0 +1,170 @@
+import { createStore } from 'jotai';
+import { describe, expect, it, vi } from 'vitest';
+import type {
+    AgentRun,
+    RetryPromptPart,
+    ToolReturnPart,
+} from '@astermargin/agent-core/agents/types';
+import type {
+    MessageAttachment,
+    SourceAttachment,
+} from '@astermargin/agent-core/types/attachments/apiTypes';
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: { auth: { getSession: vi.fn() } },
+}));
+vi.mock('@astermargin/agent-core/platform/logger', () => ({ logger: vi.fn() }));
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: undefined, localUserKey: 'test' })),
+}));
+vi.mock('../../../src/utils/prefs', () => ({
+    getPref: vi.fn(() => true),
+    setPref: vi.fn(),
+}));
+
+import {
+    allUserAttachmentKeysAtom,
+    allUserAttachmentsAtom,
+    getToolCallStatus,
+    threadRunsAtom,
+} from '@astermargin/agent-core/run-state/atoms';
+
+function run(id: string, attachments: MessageAttachment[]): AgentRun {
+    return {
+        id,
+        user_id: 'user-1',
+        thread_id: 'thread-1',
+        agent_name: 'astermargin',
+        user_prompt: { content: '', attachments },
+        status: 'completed',
+        model_messages: [],
+        model_name: 'model',
+        created_at: '2026-01-01T00:00:00.000Z',
+        consent_to_share: false,
+    };
+}
+
+describe('getToolCallStatus', () => {
+    function resultsMap(
+        part: ToolReturnPart | RetryPromptPart,
+    ): Map<string, ToolReturnPart | RetryPromptPart> {
+        return new Map([['call-1', part]]);
+    }
+
+    const toolReturn = (extra: Partial<ToolReturnPart> = {}): ToolReturnPart => ({
+        part_kind: 'tool-return',
+        tool_name: 'read',
+        content: 'ok',
+        tool_call_id: 'call-1',
+        ...extra,
+    });
+
+    it('reports error for a terminal tool failure', () => {
+        const map = resultsMap(toolReturn({ outcome: 'failed', content: 'Reading files is not available.' }));
+        expect(getToolCallStatus('call-1', map)).toBe('error');
+    });
+
+    // Neither outcome is emitted today, but a backend that starts sending one
+    // must not have those calls render as successfully completed.
+    it('reports error for an interrupted call', () => {
+        const map = resultsMap(toolReturn({ outcome: 'interrupted', content: 'The tool call was interrupted.' }));
+        expect(getToolCallStatus('call-1', map)).toBe('error');
+    });
+
+    it('reports error for a denied call', () => {
+        const map = resultsMap(toolReturn({ outcome: 'denied', content: 'The user denied this call.' }));
+        expect(getToolCallStatus('call-1', map)).toBe('error');
+    });
+
+    it('reports error for a retry prompt', () => {
+        const map = resultsMap({
+            part_kind: 'retry-prompt',
+            tool_name: 'read',
+            content: 'Fix the errors and try again.',
+            tool_call_id: 'call-1',
+        });
+        expect(getToolCallStatus('call-1', map)).toBe('error');
+    });
+
+    it('reports completed for an explicit success outcome', () => {
+        expect(getToolCallStatus('call-1', resultsMap(toolReturn({ outcome: 'success' })))).toBe('completed');
+    });
+
+    // Only threads persisted by a pre-outcome backend lack the field. The new
+    // outcome check must stay inert for them so the legacy rule still decides:
+    // a tool-return is completed, and failure was expressed as a retry-prompt.
+    it('leaves an absent outcome to the legacy categorization', () => {
+        expect(getToolCallStatus('call-1', resultsMap(toolReturn()))).toBe('completed');
+    });
+
+    it('reports in_progress only while the run is active and no result has arrived', () => {
+        const empty = new Map<string, ToolReturnPart | RetryPromptPart>();
+        expect(getToolCallStatus('call-1', empty, 'in_progress')).toBe('in_progress');
+        expect(getToolCallStatus('call-1', empty)).toBe('error');
+    });
+});
+
+describe('allUserAttachmentsAtom', () => {
+    it('keeps saved searches and views out of item identity', () => {
+        const item: MessageAttachment = { type: 'item', library_id: 1, library_ref: 'u', zotero_key: 'KEY12345' };
+        const search: MessageAttachment = {
+            type: 'saved_search', library_ref: 'u', zotero_key: 'KEY12345', name: 'AsterMargin',
+        };
+        const store = createStore();
+        store.set(threadRunsAtom, [run('run-1', [item]), run('run-2', [search])]);
+        expect(store.get(allUserAttachmentsAtom)).toEqual(new Map([['u-KEY12345', item]]));
+    });
+
+    it('replaces a legacy representative with a later portable attachment', () => {
+        const legacy: SourceAttachment = {
+            type: 'source',
+            library_id: 5,
+            zotero_key: 'SOURCE12',
+            include: 'fulltext',
+        };
+        const portable: SourceAttachment = {
+            ...legacy,
+            library_ref: 'g42',
+        };
+        const store = createStore();
+
+        store.set(threadRunsAtom, [
+            run('legacy-run', [legacy]),
+            run('portable-run', [portable]),
+        ]);
+
+        expect(store.get(allUserAttachmentsAtom)).toEqual(
+            new Map([['g42-SOURCE12', portable]])
+        );
+        expect(store.get(allUserAttachmentKeysAtom)).toEqual(
+            new Set(['g42-SOURCE12'])
+        );
+    });
+
+    it('keeps a portable representative when a legacy attachment appears later', () => {
+        const portable: SourceAttachment = {
+            type: 'source',
+            library_id: 5,
+            library_ref: 'g42',
+            zotero_key: 'SOURCE12',
+            include: 'fulltext',
+        };
+        const legacy: SourceAttachment = {
+            ...portable,
+            library_ref: undefined,
+        };
+        const store = createStore();
+
+        store.set(threadRunsAtom, [
+            run('portable-run', [portable]),
+            run('legacy-run', [legacy]),
+        ]);
+
+        expect(store.get(allUserAttachmentsAtom)).toEqual(
+            new Map([['g42-SOURCE12', portable]])
+        );
+        expect(store.get(allUserAttachmentKeysAtom)).toEqual(
+            new Set(['g42-SOURCE12'])
+        );
+    });
+});

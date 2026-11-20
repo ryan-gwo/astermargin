@@ -1,0 +1,630 @@
+import { withMergeChoicesForDisplay } from '../../../atoms/mergeItemsChoices';
+import { getHostWindow } from '../../../runtime/windowRuntime';
+import React from 'react';
+import { AgentAction, isCreateAnnotationsAgentAction } from '../../../agents/agentActions';
+import type { PendingApproval } from '@astermargin/agent-ui/host';
+import {
+    CheckmarkCircleIcon,
+    CancelCircleIcon,
+    AlertIcon,
+    Spinner,
+    ClockIcon,
+    PropertyEditIcon,
+    FolderAddIcon,
+    FolderDetailIcon,
+    TaskDoneIcon,
+    TagIcon,
+    BookCopyIcon,
+    HighlighterIcon,
+    DocumentValidationIcon,
+    DollarCircleIcon,
+    GlobalSearchIcon,
+    NoteIcon,
+    EditIcon,
+} from '../../../components/icons/icons';
+import { truncateText } from '@astermargin/agent-ui/utils/stringUtils';
+import { countEditAnnotationTargets, isUnconfirmedAction } from './reviewChangeRows';
+import { textAnnotationStyle } from '@astermargin/agent-core/types/agentActions/createAnnotations';
+import { isStaleProposal, STALE_PROPOSAL_CODE } from '../../../../src/services/manualActions/staleProposal';
+import { isUnsuccessfulToolReturn } from '@astermargin/agent-core/agents/types';
+import type { ToolResult } from '@astermargin/agent-core/run-state/atoms';
+import { parseItemReference } from '@astermargin/agent-core/identity/libraryRef';
+
+export { isStaleProposal };
+
+export type ActionStatus = 'pending' | 'applied' | 'rejected' | 'undone' | 'error';
+
+/**
+ * Prompt user to confirm overwriting manually modified fields during undo.
+ * Returns true if user confirms, false otherwise.
+ */
+export function confirmOverwriteManualChanges(modifiedFields: string[], win = getHostWindow()): boolean {
+    const fieldList = modifiedFields.join(', ');
+    const title = 'Overwrite manual changes?';
+    const message = modifiedFields.length === 1
+        ? `The field "${fieldList}" has been manually modified since the edit was applied. Do you want to overwrite your changes and revert to the original value?`
+        : `The following fields have been manually modified since the edit was applied: ${fieldList}. Do you want to overwrite your changes and revert to the original values?`;
+
+    const buttonIndex = Zotero.Prompt.confirm({
+        window: win,
+        title,
+        text: message,
+        button0: Zotero.Prompt.BUTTON_TITLE_YES,
+        button1: Zotero.Prompt.BUTTON_TITLE_NO,
+        defaultButton: 1,
+    });
+
+    return buttonIndex === 0;
+}
+
+/** Tools that should remain expanded after approval resolves (never auto-collapse) */
+export const NEVER_AUTO_COLLAPSE_TOOLS = new Set(['create_note', 'create_highlight_annotations', 'create_note_annotations']);
+
+/**
+ * The progress note the backend posts on a tool call that is waiting on Zotero
+ * (e.g. "Zotero is still applying this change…" while a long save runs).
+ *
+ * Action cards render their own header instead of the tool-call label, which is
+ * the only other place a progress message shows, so each card has to pick the
+ * note up here or the user sees nothing during the wait. The note is not cleared
+ * when the response finally arrives, so it must only be shown while the card's
+ * call is still outstanding — what that means is the caller's to decide.
+ */
+export function inFlightProgressMessage(
+    progress: string | undefined,
+    isInFlight: boolean,
+): string | null {
+    return isInFlight && progress ? progress : null;
+}
+
+/**
+ * The progress note an action card shows, if any. Shown while the call is
+ * open and the card is not waiting on the user. For most tools only while
+ * the action itself is still outstanding, since the note outlives the
+ * request that produced it; `create_items` keeps it until the call returns,
+ * because it then reports the PDF fetches the call waits on.
+ */
+export function actionCardProgressMessage(
+    toolName: string,
+    progress: string | undefined,
+    state: { isCallOpen: boolean; isAwaitingApproval: boolean; status: ActionStatus | 'awaiting' },
+): string | null {
+    const isActionOutstanding = state.status === 'awaiting' || state.status === 'pending';
+    return inFlightProgressMessage(
+        progress,
+        state.isCallOpen
+        && !state.isAwaitingApproval
+        && (isActionOutstanding || toolName === 'create_items'),
+    );
+}
+
+/**
+ * The full text a created item ended up with, as the `create_items` return
+ * reports it: the content kind of its attachment ("pdf", "snapshot", …), null
+ * when it has none, or undefined when the return does not say.
+ */
+export interface CreatedItemFullText {
+    /** Zotero key of the created item. */
+    zoteroKey: string | null;
+    kind: string | null | undefined;
+}
+
+/**
+ * The created items of a `create_items` (v2) return and their full text. Null
+ * without a successful return, or for a return in another shape. Read once the
+ * call has returned: AsterMargin does not follow fetches that finish later.
+ */
+export function createdItemsFullText(result: ToolResult | null | undefined): CreatedItemFullText[] | null {
+    if (result?.part_kind !== 'tool-return' || isUnsuccessfulToolReturn(result)) return null;
+    const items = result.content && typeof result.content === 'object' ? result.content.items : null;
+    if (!Array.isArray(items)) return null;
+    return items
+        .filter((entry: any) => entry?.outcome === 'created')
+        .map((entry: any): CreatedItemFullText => {
+            const zoteroKey = typeof entry.item_id === 'string' ? parseItemReference(entry.item_id)?.zotero_key ?? null : null;
+            if (!Array.isArray(entry.attachments)) return { zoteroKey, kind: undefined };
+            if (entry.attachments.length === 0) return { zoteroKey, kind: null };
+            const primary = entry.attachments.find((attachment: any) => attachment?.is_primary) ?? entry.attachments[0];
+            return { zoteroKey, kind: typeof primary?.content_kind === 'string' ? primary.content_kind : 'file' };
+        });
+}
+
+/**
+ * How many created items got full text, appended to the `create_items` header
+ * title ("3 Items (2 with full text)"). `single` words it for a card titled by
+ * its one item. Null when no item was created or the return does not report
+ * every created item's attachments.
+ */
+export function createItemsFullTextSummary(created: CreatedItemFullText[] | null, single: boolean): string | null {
+    if (!created || created.length === 0 || created.some((item) => item.kind === undefined)) return null;
+    const withFullText = created.filter((item) => item.kind !== null).length;
+    if (withFullText === 0) return 'no full text';
+    return single ? 'with full text' : `${withFullText} with full text`;
+}
+
+/** What an expanded row says about a created item's full text. */
+export function fullTextRowLabel(kind: string | null): string {
+    switch (kind) {
+        case null: return 'No full text';
+        case 'pdf': return 'PDF attached';
+        case 'epub': return 'EPUB attached';
+        case 'snapshot': return 'Snapshot saved';
+        default: return 'File attached';
+    }
+}
+
+/**
+ * Shorten a backend error_message for inline display in action previews.
+ *
+ * Backend messages include agent-facing detail (multi-line lists, Zotero keys,
+ * "Cannot <verb> <entity> '<name>' because ..." framing) that duplicates what
+ * the headline + pill already show. Keep just the concise reason.
+ */
+export function shortenActionError(msg: string): string {
+    let s = msg.split('\n')[0].replace(/[:.\s]+$/, '').trim();
+    const becauseIdx = s.toLowerCase().indexOf(' because ');
+    if (becauseIdx >= 0) {
+        s = s.slice(becauseIdx + ' because '.length);
+        s = s.charAt(0).toUpperCase() + s.slice(1);
+    }
+    return s;
+}
+
+export interface StatusConfig {
+    icon: React.FC<React.SVGProps<SVGSVGElement>> | null;
+    label: string;
+    iconClassName?: string;
+    showApply: boolean;
+    showReject: boolean;
+    showUndo: boolean;
+    showRetry: boolean;
+    /** Offer to write the change although the library moved since the proposal. */
+    showApplyAnyway?: boolean;
+}
+
+export const STATUS_CONFIGS: Record<ActionStatus | 'awaiting', StatusConfig> = {
+    awaiting: {
+        icon: Spinner,
+        label: 'Awaiting approval',
+        showApply: true,
+        showReject: true,
+        showUndo: false,
+        showRetry: false,
+    },
+    pending: {
+        icon: null,
+        label: 'Pending',
+        iconClassName: 'font-color-secondary',
+        showApply: true,
+        showReject: true,
+        showUndo: false,
+        showRetry: false,
+    },
+    applied: {
+        icon: CheckmarkCircleIcon,
+        label: 'Applied',
+        iconClassName: 'font-color-green scale-11',
+        showApply: false,
+        showReject: false,
+        showUndo: true,
+        showRetry: false,
+    },
+    rejected: {
+        icon: CancelCircleIcon,
+        label: 'Rejected',
+        iconClassName: 'font-color-red scale-11',
+        showApply: true,
+        showReject: false,
+        showUndo: false,
+        showRetry: false,
+    },
+    undone: {
+        icon: CancelCircleIcon,
+        label: 'Undone',
+        iconClassName: 'font-color-red scale-11',
+        showApply: true,
+        showReject: false,
+        showUndo: false,
+        showRetry: false,
+    },
+    error: {
+        icon: AlertIcon,
+        label: 'Failed',
+        iconClassName: 'color-error',
+        showApply: false,
+        showReject: false,
+        showUndo: false,
+        showRetry: true,
+    },
+};
+
+/**
+ * How a card shows an action Zotero received but never reported on (see
+ * `isUnconfirmedAction`). The change may have landed, so the card offers
+ * neither applying it again nor retrying it; its message asks the user to
+ * check the library.
+ */
+const UNCONFIRMED_STATUS_CONFIG: StatusConfig = {
+    icon: AlertIcon,
+    label: 'Unconfirmed',
+    iconClassName: 'font-color-orange',
+    showApply: false,
+    showReject: false,
+    showUndo: false,
+    showRetry: false,
+};
+
+/** Tooltip on a collapsed stale card's ✓, which applies it anyway. */
+export const STALE_APPLY_ANYWAY_TOOLTIP = 'Changed since proposed. Apply anyway';
+
+/**
+ * How a card shows an apply refused because the library changed since the
+ * proposal (see `isStaleProposal`). Retrying fails the same way, so the card
+ * offers to apply it anyway or to reject it.
+ */
+const STALE_PROPOSAL_STATUS_CONFIG: StatusConfig = {
+    icon: AlertIcon,
+    label: 'Changed since proposed',
+    iconClassName: 'font-color-orange',
+    showApply: false,
+    showReject: true,
+    showUndo: false,
+    showRetry: false,
+    showApplyAnyway: true,
+};
+
+/**
+ * The card config for `status`, with an unconfirmed outcome in place of a
+ * failure when every failed action is unconfirmed, and a stale proposal's
+ * choices when every failed action is one. A batch that also holds a known
+ * failure keeps Retry, which leaves its unconfirmed actions alone.
+ */
+export function getStatusConfig(status: ActionStatus | 'awaiting', actions: AgentAction[]): StatusConfig {
+    const failed = actions.filter((action) => action.status === 'error');
+    if (status === 'error' && failed.length > 0 && failed.every(isUnconfirmedAction)) {
+        return UNCONFIRMED_STATUS_CONFIG;
+    }
+    if (status === 'error' && failed.length > 0 && failed.every(isStaleProposal)) {
+        return STALE_PROPOSAL_STATUS_CONFIG;
+    }
+    return STATUS_CONFIGS[status];
+}
+
+/**
+ * What changed since a proposal whose apply was refused: the executor's
+ * message, shown in the expanded card. Null when no action on the card is one.
+ */
+export function staleProposalDetail(actions: AgentAction[]): string | null {
+    const stale = actions.find(isStaleProposal);
+    if (!stale) return null;
+    return stale.error_message || 'The library changed after this was proposed.';
+}
+
+/** Whether an apply was refused because the library changed since the proposal. */
+export function wasRefusedAsStale(result: { failed: Array<{ errorDetails?: Record<string, any> }> }): boolean {
+    return result.failed.some((failure) => failure.errorDetails?.error_code === STALE_PROPOSAL_CODE);
+}
+
+/** For an unconfirmed action stored without the server's explanation. */
+const UNCONFIRMED_FALLBACK_MESSAGE =
+    'Zotero did not report whether this change was applied. Check the item in Zotero before asking for it again.';
+
+/**
+ * What a card says about its unconfirmed actions (see `isUnconfirmedAction`).
+ * They offer nothing to click, so this is all that tells the user to check
+ * the library. The server's explanation, which names the cause, when every
+ * action on the card is unconfirmed for the same one; otherwise a count. A
+ * card that can also retry a known failure says the retry leaves them out.
+ * Null when there are none.
+ */
+export function unconfirmedCaption(actions: AgentAction[]): string | null {
+    const unconfirmed = actions.filter(isUnconfirmedAction);
+    if (unconfirmed.length === 0) return null;
+    const messages = new Set(unconfirmed.map((action) => action.error_message || UNCONFIRMED_FALLBACK_MESSAGE));
+    const count = unconfirmed.length;
+    const caption = messages.size === 1 && count === actions.length
+        ? [...messages][0]
+        : `Zotero did not report whether ${count === 1 ? 'one of these changes was' : `${count} of these changes were`} applied. `
+            + `Check ${count === 1 ? 'the item' : 'the items'} in Zotero before asking again.`;
+    const retryable = actions.some((action) => action.status === 'error' && !isUnconfirmedAction(action));
+    return retryable ? `${caption} Retrying leaves ${count === 1 ? 'it' : 'them'} out.` : caption;
+}
+
+/** Tool-specific icon shared by Zotero agent-action review surfaces. */
+export function getAgentActionToolIcon(toolName: string): React.FC<React.SVGProps<SVGSVGElement>> {
+    if (toolName === 'edit_metadata' || toolName === 'edit_item') return PropertyEditIcon;
+    if (toolName === 'edit_note' || toolName === 'edit_note_batch') return EditIcon;
+    if (toolName === 'create_note') return NoteIcon;
+    if (toolName === 'create_highlight_annotations') return HighlighterIcon;
+    if (toolName === 'create_note_annotations') return NoteIcon;
+    if (toolName === 'edit_annotations' || toolName === 'delete_annotations') return HighlighterIcon;
+    if (toolName === 'create_collection') return FolderAddIcon;
+    if (toolName === 'organize_items') return TaskDoneIcon;
+    if (toolName === 'merge_items') return BookCopyIcon;
+    if (toolName === 'manage_tags') return TagIcon;
+    if (toolName === 'manage_collections') return FolderDetailIcon;
+    if (toolName === 'create_items' || toolName === 'create_item') return DocumentValidationIcon;
+    if (toolName === 'confirm_extraction') return DollarCircleIcon;
+    if (toolName === 'confirm_external_search') return GlobalSearchIcon;
+    return ClockIcon;
+}
+
+/**
+ * Compute the overall status for a group of actions.
+ * Used for batch jobs where we need a single status to display.
+ * Priority: pending > applied (even partial) > error (only if none applied) > rejected/undone
+ *
+ * Note: We prioritize 'applied' over 'error' when there are mixed results,
+ * so users can still undo successfully applied items even if some failed.
+ */
+export function getOverallStatus(actions: AgentAction[]): ActionStatus {
+    if (actions.length === 0) return 'pending';
+
+    const statuses = actions.map(a => a.status);
+    const hasApplied = statuses.some(s => s === 'applied');
+    const hasPending = statuses.some(s => s === 'pending');
+    const hasError = statuses.some(s => s === 'error');
+
+    // If any is pending, show pending (still waiting)
+    if (hasPending) return 'pending';
+    // If any are applied, show applied (enables Undo for partial success)
+    if (hasApplied) return 'applied';
+    // If all have errors (none applied), show error
+    if (hasError) return 'error';
+    // If all are rejected or undone
+    if (statuses.every(s => s === 'rejected' || s === 'undone')) return 'rejected';
+
+    return 'pending';
+}
+
+/**
+ * A bulk annotation apply that acked with nothing created reads as an error, not
+ * as the `applied` its action record claims.
+ */
+export function getCreateAnnotationsDisplayStatus(action: AgentAction): ActionStatus | null {
+    if (!isCreateAnnotationsAgentAction(action) || action.status !== 'applied') return null;
+    const createdCount = Array.isArray(action.result_data?.created)
+        ? action.result_data.created.length
+        : 0;
+    const failedCount = Array.isArray(action.result_data?.failed)
+        ? action.result_data.failed.length
+        : 0;
+    return createdCount === 0 && failedCount > 0 ? 'error' : null;
+}
+
+/**
+ * True when the failure on these actions came from an undo rather than an apply,
+ * so a Retry can be pointed back at undo instead of re-running the change.
+ *
+ * Read off the records rather than remembered in component state, which does not
+ * survive a remount or a failure triggered from another pane: only an applied
+ * action carries `result_data`, a successful undo clears it, and the error path
+ * preserves it — so an errored action that still has a result is one whose undo
+ * failed. A write that succeeded but failed to acknowledge lands here too, where
+ * undo is likewise the safer direction: re-applying would duplicate it.
+ */
+export function hasFailedUndo(actions: AgentAction[]): boolean {
+    return actions.some((action) => action.status === 'error' && action.result_data != null);
+}
+
+/**
+ * Get human-readable label for the action.
+ *
+ * `completed` switches the labels whose whole text is the verb into the past
+ * tense, for the surfaces that describe a change already made rather than one
+ * being proposed. The types left alone are the ones whose label is a noun
+ * ("3 Highlights") or whose verb lives in the title instead (manage_tags,
+ * manage_collections) — past-tensing those would fight the title.
+ */
+export function getActionLabel(
+    toolName: string,
+    actionData?: Record<string, any>,
+    completed = false,
+): string {
+    switch (toolName) {
+        case 'edit_metadata':
+        case 'edit_item':
+            return completed ? 'Edited' : 'Edit';
+        case 'edit_note':
+            return completed ? 'Edited Note' : 'Note Edit';
+        case 'edit_note_batch':
+            return completed ? 'Edited Note' : 'Note Edits';
+        case 'create_note':
+            return completed ? 'Created Note' : 'Create Note';
+        case 'create_highlight_annotations': {
+            const count = actionData?.items?.length ?? 0;
+            const noun = textAnnotationStyle(actionData?.style) === 'underline' ? 'Underline' : 'Highlight';
+            return count > 1
+                ? `${count} ${noun}s`
+                : noun;
+        }
+        case 'create_note_annotations': {
+            const count = actionData?.items?.length ?? 0;
+            return count > 1
+                ? `${count} Sticky Notes`
+                : 'Sticky Note';
+        }
+        // Both annotation-mutation tools share one action type. The tool name is
+        // what settles the verb: streaming tool arguments carry no `operation`,
+        // so a deletion would otherwise read as an edit until its action row
+        // arrives. The label carries the whole headline here — these actions
+        // have no separate title.
+        case 'edit_annotations':
+        case 'delete_annotations': {
+            const count = countEditAnnotationTargets(actionData);
+            const isDelete = toolName === 'delete_annotations' || actionData?.operation === 'delete';
+            const verb = isDelete
+                ? (completed ? 'Deleted' : 'Delete')
+                : (completed ? 'Edited' : 'Edit');
+            return count > 1
+                ? `${verb} ${count} Annotations`
+                : `${verb} Annotation`;
+        }
+        case 'create_item':
+        case 'import_item':
+        case 'create_items':
+            return completed ? 'Imported' : 'Import';
+        case 'create_collection':
+            return completed ? 'Created Collection' : 'Create Collection';
+        case 'organize_items':
+            return completed ? 'Organized' : 'Organize';
+        case 'merge_items':
+            return completed ? 'Merged Duplicates' : 'Merge Duplicates';
+        case 'manage_tags':
+            return 'Tag';
+        case 'manage_collections':
+            return 'Collection';
+        case 'confirm_extraction':
+            return 'Extract';
+        case 'confirm_external_search':
+            return 'Search';
+        default:
+            return toolName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+}
+
+export function getActionTitle(
+    toolName: string,
+    actionData: Record<string, any> | undefined,
+    itemTitle: string | null,
+    actions: AgentAction[] | undefined
+): string | null {
+    switch (toolName) {
+        case 'edit_metadata':
+        case 'edit_item':
+        case 'edit_note':
+        case 'edit_note_batch':
+            return itemTitle ? itemTitle : null;
+        case 'create_note':
+            return actionData?.title ?? null;
+        case 'create_highlight_annotations': {
+            return itemTitle;
+        }
+        case 'create_note_annotations': {
+            return itemTitle;
+        }
+        // No title: the label already reads "Edit 2 Annotations", and the
+        // preview names the annotations themselves.
+        case 'edit_annotations':
+        case 'delete_annotations':
+            return null;
+        case 'create_collection':
+            return actionData?.name ?? actionData?.proposed_data?.name ?? null;
+        case 'organize_items': {
+            const itemCount = actionData?.item_ids?.length ?? 0;
+            if (itemCount === 0) return null;
+            return itemCount === 1 && itemTitle
+                ? itemTitle
+                : `${itemCount} item${itemCount !== 1 ? 's' : ''}`;
+        }
+        case 'merge_items':
+            return actionData?.preview?.members?.find((m: any) => m.item_id === actionData.master_item_id)?.title ?? null;
+        case 'manage_tags': {
+            const name = actionData?.name;
+            const op = actionData?.action;
+            if (!name) return null;
+            if (op === 'delete') return `Delete tag "${name}"`;
+            const newName = actionData?.new_name;
+            if (newName) {
+                return actionData?.is_merge
+                    ? `Merge "${name}" → "${newName}"`
+                    : `Rename "${name}" → "${newName}"`;
+            }
+            return `Tag "${name}"`;
+        }
+        case 'manage_collections': {
+            const op = actionData?.action;
+            const collectionName = actionData?.collection_name ?? actionData?.old_name ?? actionData?.name;
+            if (op === 'delete') {
+                return collectionName ? `Delete "${collectionName}"` : 'Delete collection';
+            }
+            if (op === 'move') {
+                return collectionName ? `Move "${collectionName}"` : 'Move collection';
+            }
+            if (op === 'rename') {
+                const newName = actionData?.new_name;
+                if (collectionName && newName) return `Rename "${collectionName}" → "${newName}"`;
+                if (newName) return `Rename → "${newName}"`;
+            }
+            return collectionName ?? null;
+        }
+        case 'confirm_extraction': {
+            const count = actionData?.attachment_count ?? 0;
+            return `Confirm ${count} Item Batch Processing`;
+        }
+        case 'confirm_external_search': {
+            return 'Confirm External Search';
+        }
+        case 'create_item':
+        case 'import_item':
+        case 'create_items': {
+            if (!actions || actions.length === 0) {
+                // v2 approval: the actions carry the items; the request carries
+                // their count and the first titles.
+                const titles = Array.isArray(actionData?.titles) ? actionData.titles : [];
+                if (actionData?.items_count === 1 && typeof titles[0] === 'string' && titles[0]) {
+                    return truncateText(titles[0], 60);
+                }
+                if (typeof actionData?.items_count === 'number' && actionData.items_count > 1) {
+                    return `${actionData.items_count} Items`;
+                }
+            }
+            // For create_item, get title from the item data
+            // Check actions first, then fall back to actionData (for pending approvals where actions may be empty)
+            if (actions && actions.length === 1) {
+                const proposed = actions[0].proposed_data;
+                const item = proposed?.item ?? proposed?.pending_resolution?.fallback_item ?? actionData?.item;
+                if (item?.title) {
+                    return truncateText(item.title, 70);
+                }
+            } else if ((!actions || actions.length === 0) && actionData?.item?.title) {
+                // Pending approval case: actions not yet stored, but we have item data
+                return truncateText(actionData.item.title, 60);
+            }
+            return `${actions && actions.length > 1 ? `${actions.length} ` : ''}Item${actions && actions.length > 1 ? 's' : ''}`;
+        }
+        default:
+            return null;
+    }
+}
+
+/**
+ * Preview data produced from either a pending approval or a stored agent action.
+ * Consumed by the ActionPreview dispatcher component.
+ */
+export interface PreviewData {
+    actionType: string;
+    actionData: Record<string, any>;
+    currentValue?: any;
+    resultData?: Record<string, any>;
+    errorMessage?: string;
+}
+
+/**
+ * Build preview data from either pending approval or agent action
+ */
+export function buildPreviewData(
+    toolName: string,
+    pendingApproval: PendingApproval | null,
+    action: AgentAction | null
+): PreviewData | null {
+    if (pendingApproval) {
+        return {
+            actionType: pendingApproval.actionType,
+            actionData: pendingApproval.actionData,
+            currentValue: pendingApproval.currentValue,
+        };
+    }
+
+    if (action) {
+        return {
+            actionType: action.action_type,
+            actionData: withMergeChoicesForDisplay(action).proposed_data,
+            currentValue: undefined, // We don't have this for stored actions
+            resultData: action.result_data,
+            errorMessage: action.error_message,
+        };
+    }
+
+    return null;
+}

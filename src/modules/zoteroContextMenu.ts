@@ -1,0 +1,755 @@
+/**
+ * Zotero 8 context menu integration via MenuManager API.
+ *
+ * Registers right-click context menus in Zotero's library pane that let
+ * users run AsterMargin actions directly from item/collection selections.
+ *
+ * Gated behind a capability check: if `Zotero.MenuManager` is not available
+ * (Zotero 7), this module is a complete no-op.
+ *
+ * IMPORTANT: This module lives in the esbuild bundle. It must NOT import from
+ * `react/types/actionStorage` or `react/types/settings` because those
+ * transitively pull in `react/store` (Jotai), which is only available in
+ * the webpack bundle. Instead, we duplicate the minimal merge logic here,
+ * importing only from safe sources (builtinActions, actions types, prefs).
+ */
+
+import { resolveChatWindow } from '../runtime/navigation';
+
+import {
+    Action,
+    ActionCustomizations,
+    ActionTargetType,
+    isActionCustomizations,
+    isStoredAction,
+    normalizeStoredAction,
+    normalizeStoredOverride,
+} from '@astermargin/agent-core/types/actions';
+import { ALL_BUILTIN_ACTIONS } from '../../react/types/builtinActions';
+import { getPref } from '../utils/prefs';
+import { getSelectedCollection, getSelectedLibraryId, isCollectionTargetViewType } from '../utils/zoteroSelection';
+import { openPreferencesWindow } from '../ui/openPreferencesWindow';
+import { agentItemFilter, isAgentSupportedItem } from '../utils/agentItemSupport';
+import { exportNoteWithProgress, NOTE_EXPORT_FORMATS } from './noteExportCommand';
+import { canCreateTableIn, createAndOpenTable, newTableScope, newTableTitle } from './newTableCommand';
+import type { LibraryScope } from '@astermargin/agent-core/layouts/table';
+import { detachAllTableOpenLabels } from './tableOpenMenuLabel';
+import config from '../../package.json';
+
+// ---------------------------------------------------------------------------
+// Item gating uses the React-free agentItemSupport predicates (safe to import
+// from the esbuild bundle, unlike sync.ts/zoteroUtils.ts which transitively
+// pull in react/store). Only a local trash helper remains for note checks.
+// ---------------------------------------------------------------------------
+
+function safeIsInTrash(item: any): boolean {
+    try {
+        return typeof item?.isInTrash === 'function' && item.isInTrash();
+    } catch { return false; }
+}
+
+function isActionableContextItem(item: any): boolean {
+    return agentItemFilter(item);
+}
+
+// ---------------------------------------------------------------------------
+// Zotero 10 collection-selection compat.
+//
+// Collection menu contexts (`main/library/collection`) used to expose a
+// singular `collectionTreeRow`. Zotero 10 replaces it with a getter that
+// throws when read and adds `collectionTreeRows`, an array of the full
+// selection in selection order. Zotero 8/9 contexts only have the singular
+// property. Always probe the plural array first: on Zotero 10 the throw
+// fires on the property read itself, so touching `collectionTreeRow` first
+// (even via optional chaining or destructuring) throws before the plural
+// fallback can run.
+// ---------------------------------------------------------------------------
+
+function readCollectionTreeRows(context: any): any[] {
+    try {
+        if (Array.isArray(context?.collectionTreeRows)) return context.collectionTreeRows;
+    } catch { /* ignore */ }
+    try {
+        const row = context?.collectionTreeRow;
+        return row ? [row] : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * The rows a collection action should act on: every selected row, but only
+ * when they are all collections, saved searches, or the special views listed
+ * in `COLLECTION_TARGET_VIEW_TYPES` (never a library root). Mirrors
+ * `collectionTargetSelection` in the React bundle.
+ */
+function collectionTargetRows(context: any): any[] {
+    const rows = readCollectionTreeRows(context);
+    if (rows.length === 0) return [];
+    const allTargets = rows.every((row) => {
+        try {
+            return row?.isCollection?.() === true || isCollectionTargetViewType(row?.type);
+        } catch {
+            return false;
+        }
+    });
+    return allTargets ? rows : [];
+}
+
+/** A collections-tree row's display name, e.g. "Unfiled Items" or a saved search's name. */
+function readRowName(row: any): string {
+    try {
+        const name = row?.getName?.();
+        if (typeof name === 'string' && name) return name;
+    } catch {
+        // fall through
+    }
+    return typeof row?.ref?.name === 'string' ? row.ref.name : '';
+}
+
+// ---------------------------------------------------------------------------
+// Selection composition — determined per popup-show by submenu onShowing,
+// consumed by filterItemAction. Safe because submenu onShowing always fires
+// before inner menu items' onShowing (parent popup → submenu popup order).
+//
+// Each action is filtered by eligibility: it shows when the selection
+// contains at least one item of a kind the action targets. On execution the
+// eligible items (across all of the action's target kinds) are attached and
+// the rest of the selection is dropped.
+// ---------------------------------------------------------------------------
+
+interface SelectionComposition { items: number; attachment: number; note: number }
+let selectionComposition: SelectionComposition | null = null;
+
+function getSelectionComposition(items: any[]): SelectionComposition {
+    const actionable = items.filter((i: any) => isActionableContextItem(i));
+    return {
+        items: actionable.filter((i: any) => i.isRegularItem()).length,
+        attachment: actionable.filter((i: any) => i.isAttachment?.()).length,
+        note: items.filter((i: any) => i.isNote?.() && !safeIsInTrash(i)).length,
+    };
+}
+
+/** Count of selected items eligible for at least one action target kind. */
+function compositionTotal(c: SelectionComposition): number {
+    return c.items + c.attachment + c.note;
+}
+
+/** Human-readable composition label (e.g. "3 items, 1 note"). */
+function compositionLabel(c: SelectionComposition): string {
+    const parts: string[] = [];
+    if (c.items > 0) parts.push(`${c.items} item${c.items !== 1 ? 's' : ''}`);
+    if (c.attachment > 0) parts.push(`${c.attachment} attachment${c.attachment !== 1 ? 's' : ''}`);
+    if (c.note > 0) parts.push(`${c.note} note${c.note !== 1 ? 's' : ''}`);
+    return parts.join(', ');
+}
+
+/** Selected-item kinds an action accepts (item context menu only). */
+const ITEM_MENU_KINDS: ActionTargetType[] = ['items', 'attachment', 'note'];
+
+/** Whether the current selection contains at least one item eligible for the action. */
+function hasEligibleItems(action: Action, c: SelectionComposition): boolean {
+    return (action.targets.includes('items') && c.items > 0) ||
+        (action.targets.includes('attachment') && c.attachment > 0) ||
+        (action.targets.includes('note') && c.note > 0);
+}
+
+const ITEM_MENU_ID = 'astermargin-item-context-menu';
+const COLLECTION_MENU_ID = 'astermargin-collection-context-menu';
+const NOTE_EXPORT_MENU_ID = 'astermargin-note-export-menu';
+const NEW_TABLE_FILE_MENU_ID = 'astermargin-new-table-file-menu';
+const NEW_TABLE_COLLECTION_MENU_ID = 'astermargin-new-table-collection-menu';
+// Menu icons. Only for menus where Zotero shows icons on its own entries (the
+// item and collection context menus); MenuManager renders them the same way,
+// so they appear exactly where Zotero's own icons do on each platform.
+const TABLE_ICON = `chrome://${config.config.addonRef}/content/icons/table.svg`;
+const ACTIONS_ICON = `chrome://${config.config.addonRef}/content/icons/astermargin-actions.svg`;
+const PLUGIN_ID = config.config.addonID;
+
+// Store the namespaced keys returned by MenuManager.registerMenu().
+// MenuManager internally namespaces the menuID with the pluginID
+// (e.g. "astermargin@jlegewie.com-astermargin-item-context-menu") and
+// unregisterMenu() requires that namespaced key, not the raw menuID.
+let registeredKeys: string[] = [];
+let prefObserverSymbol: symbol | null = null;
+
+// ---------------------------------------------------------------------------
+// Minimal action merge (avoids importing actionStorage → settings → store)
+// ---------------------------------------------------------------------------
+
+function getActionCustomizations(): ActionCustomizations {
+    try {
+        const raw = getPref('actions');
+        if (raw && typeof raw === 'string') {
+            const parsed = JSON.parse(raw);
+            if (isActionCustomizations(parsed)) {
+                // Accept both stored shapes (legacy single `targetType` and
+                // current `targets` array) and normalize
+                parsed.custom = parsed.custom.filter(isStoredAction).map(a => normalizeStoredAction(a as unknown as Record<string, unknown>));
+                return parsed;
+            }
+        }
+    } catch (_e) { /* ignore */ }
+    return { version: 1, overrides: {}, custom: [] };
+}
+
+export function getMergedActions(): Action[] {
+    const c = getActionCustomizations();
+    const actions: Action[] = [];
+
+    for (const builtin of ALL_BUILTIN_ACTIONS) {
+        // Keep this esbuild-side merge aligned with actionStorage: a locked
+        // built-in always uses its shipped definition, including when an older
+        // version left behind field overrides or a hidden flag.
+        const override = builtin.locked ? undefined : c.overrides[builtin.id];
+        if (override?.hidden) continue;
+        if (builtin.deprecated && !override) continue;
+
+        const merged: Action = { ...builtin };
+        if (override) {
+            const o = normalizeStoredOverride(override);
+            if (o.title !== undefined) merged.title = o.title;
+            if (o.text !== undefined) merged.text = o.text;
+            if (o.name !== undefined) merged.name = o.name;
+            if (o.id_model !== undefined) merged.id_model = o.id_model;
+            if (o.targets !== undefined) merged.targets = o.targets;
+            // null = cleared; coerce to undefined so it doesn't leak onto Action.
+            if (o.category !== undefined) merged.category = o.category ?? undefined;
+            if (o.argumentHint !== undefined) merged.argumentHint = o.argumentHint;
+            if (o.sortOrder !== undefined) merged.sortOrder = o.sortOrder;
+        }
+        actions.push(merged);
+    }
+
+    for (const custom of c.custom) {
+        actions.push({ ...custom });
+    }
+
+    actions.sort((a, b) => {
+        const orderDiff = (a.sortOrder ?? 999) - (b.sortOrder ?? 999);
+        if (orderDiff !== 0) return orderDiff;
+        return a.title.localeCompare(b.title);
+    });
+
+    return actions;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+let readingObserver:string|null=null;
+export function initContextMenus(): void {
+    if(!readingObserver && Zotero.Notifier?.registerObserver){
+        readingObserver=Zotero.Notifier.registerObserver({notify(event:string,type:string,ids:string[]|number[]){
+            if(event!=="add" || type!=="item" || !Zotero.Prefs.get("extensions.zotero.astermargin.newItemAction",true))return;
+            // Leave Zotero's notifier transaction before calling the model or saving a note.
+            const win=Zotero.getMainWindow();
+            win?.setTimeout(()=>void Zotero.AsterMargin?.runtime?.dispatchWindowCommand("automatic-reading-note",{ids:ids.map(Number).filter(Number.isSafeInteger)}).catch(e=>Zotero.logError(e)),0);
+        }},["item"],"astermargin-auto-notes");
+    }
+    if (typeof (Zotero as any).MenuManager?.registerMenu !== 'function') {
+        ztoolkit.log('zoteroContextMenu: MenuManager not available, skipping');
+        return;
+    }
+    // Clear stale AsterMargin DOM left by a prior version that didn't get a chance
+    // to clean up (e.g., upgraded mid-session).
+    removeStaleMenuDOM();
+    registerMenus();
+    startPrefObserver();
+}
+
+export function cleanupContextMenus(): void {
+    if(readingObserver){Zotero.Notifier.unregisterObserver(readingObserver);readingObserver=null;}
+    stopPrefObserver();
+
+    // MenuManager's auto-cleanup doesn't seem remove DOM (selector mismatch).
+    // We unregister from cache and manually remove stale DOM elements.
+    unregisterMenus();
+    removeStaleMenuDOM();
+    detachAllTableOpenLabels();
+}
+
+// ---------------------------------------------------------------------------
+// Menu registration
+// ---------------------------------------------------------------------------
+
+/**
+ * Wrap an onShowing handler to swallow any throw and default to hidden.
+ * `label` identifies the handler in logs so a failing action is traceable
+ * when many wrappers share the same root cause.
+ */
+function safeOnShowing(
+    label: string,
+    fn: (event: any, context: any) => void,
+): (event: any, context: any) => void {
+    // Log at most once per wrapped handler to avoid spamming on every
+    // popupshowing when a handler throws consistently.
+    let logged = false;
+    return (event: any, context: any) => {
+        try {
+            fn(event, context);
+        } catch (e) {
+            try { context?.setVisible?.(false); } catch { /* ignore */ }
+            if (!logged) {
+                logged = true;
+                try {
+                    ztoolkit.log(`zoteroContextMenu: onShowing threw in "${label}", hiding menu item: ${e}`);
+                } catch { /* ignore — logger must not break the wrapper guarantee */ }
+            }
+        }
+    };
+}
+
+function unregisterMenus(): void {
+    const MenuManager = (Zotero as any).MenuManager;
+    if (!MenuManager) return;
+
+    for (const key of registeredKeys) {
+        try { MenuManager.unregisterMenu(key); } catch (_e) { /* ignore */ }
+    }
+    registeredKeys = [];
+}
+
+function registerMenus(): void {
+    const MenuManager = (Zotero as any).MenuManager;
+    if (!MenuManager) return;
+
+    // Unregister existing menus first using stored namespaced keys
+    unregisterMenus();
+
+    const actions = getMergedActions();
+
+    // --- Item context menu ---
+    const itemActions = actions.filter(a =>
+        a.targets.some(t => ITEM_MENU_KINDS.includes(t))
+    );
+
+    // Always register — at minimum shows "Add custom action..."
+    const itemKey = MenuManager.registerMenu({
+        menuID: ITEM_MENU_ID,
+        pluginID: PLUGIN_ID,
+        target: 'main/library/item',
+        menus: [{
+            menuType: 'submenu' as const,
+            l10nID: 'astermargin-context-menu-submenu',
+            icon: ACTIONS_ICON,
+            onShowing: safeOnShowing('item-submenu', (_event: any, context: any) => {
+                const { items, setVisible } = context;
+
+                // Reset module-level state
+                selectionComposition = null;
+
+                if (!items || items.length === 0) {
+                    setVisible(false);
+                    return;
+                }
+                // Hide for annotations — not yet supported
+                if (items.every((i: any) => i.isAnnotation?.())) {
+                    setVisible(false);
+                    return;
+                }
+
+                // Determine what eligible kinds the selection contains
+                const composition = getSelectionComposition(items);
+                if (compositionTotal(composition) === 0) {
+                    setVisible(false);
+                    return;
+                }
+
+                selectionComposition = composition;
+                setVisible(true);
+            }),
+            menus: buildItemMenuItems(itemActions),
+        }],
+    });
+    if (itemKey) registeredKeys.push(itemKey);
+
+    // --- Collection context menu ---
+    const collectionActions = actions.filter(a => a.targets.includes('collection'));
+
+    const collectionKey = MenuManager.registerMenu({
+        menuID: COLLECTION_MENU_ID,
+        pluginID: PLUGIN_ID,
+        target: 'main/library/collection',
+        menus: [{
+            menuType: 'submenu' as const,
+            l10nID: 'astermargin-context-menu-submenu',
+            icon: ACTIONS_ICON,
+            onShowing: safeOnShowing('collection-submenu', (_event: any, context: any) => {
+                const { setVisible } = context;
+                setVisible(collectionTargetRows(context).length > 0);
+            }),
+            menus: buildCollectionMenuItems(collectionActions),
+        }],
+    });
+    if (collectionKey) registeredKeys.push(collectionKey);
+
+    // --- Note export (any note, whoever wrote it) ---
+    const noteExportKey = MenuManager.registerMenu({
+        menuID: NOTE_EXPORT_MENU_ID,
+        pluginID: PLUGIN_ID,
+        target: 'main/library/item',
+        menus: [{
+            menuType: 'submenu' as const,
+            l10nID: 'astermargin-note-export-submenu',
+            onShowing: safeOnShowing('note-export-submenu', (_event: any, context: any) => {
+                context.setVisible(singleSelectedNote(context) !== null);
+            }),
+            menus: NOTE_EXPORT_FORMATS.map(({ format, name }) => ({
+                menuType: 'menuitem' as const,
+                l10nID: 'astermargin-note-export-format',
+                l10nArgs: JSON.stringify({ format: name }),
+                onCommand: (event: any, context: any) => {
+                    const note = singleSelectedNote(context);
+                    const win = event?.target?.ownerDocument?.defaultView ?? context?.window;
+                    if (note && win) void exportNoteWithProgress(note, null, format, name, win, 'item_menu');
+                },
+            })),
+        }],
+    });
+    if (noteExportKey) registeredKeys.push(noteExportKey);
+
+    // --- File ▸ New AsterMargin Table, below New Note. An empty table, filed
+    // like a new note in the selected library and collection ---
+    const fileKey = MenuManager.registerMenu({
+        menuID: NEW_TABLE_FILE_MENU_ID,
+        pluginID: PLUGIN_ID,
+        target: 'main/menubar/file',
+        menus: [{
+            menuType: 'menuitem' as const,
+            l10nID: 'astermargin-new-table',
+            onShowing: safeOnShowing('new-table', (_event: any, context: any) => {
+                placeAfter(context?.menuElem, '#menu_noteAdd');
+                // Like New Note, a library-tab command.
+                context.setVisible(context?.tabType === 'library');
+                const libraryID = getSelectedLibraryId(paneOf(context));
+                context.setEnabled(libraryID !== null && canCreateTableIn(libraryID));
+            }),
+            onCommand: (_event: any, context: any) => {
+                const pane = paneOf(context);
+                const win = context?.menuElem?.ownerDocument?.defaultView;
+                const libraryID = getSelectedLibraryId(pane);
+                if (!win || libraryID === null) return;
+                const collection = getSelectedCollection(pane);
+                void createAndOpenTable(win, {
+                    libraryID,
+                    ...(collection ? { collectionID: collection.id } : {}),
+                    scopes: [],
+                    title: 'New table',
+                });
+            },
+        }],
+    });
+    if (fileKey) registeredKeys.push(fileKey);
+
+    // --- Collection menu ▸ Create AsterMargin Table, below Generate Report.
+    // Rows come from the selected collections and saved searches ---
+    const collectionTableKey = MenuManager.registerMenu({
+        menuID: NEW_TABLE_COLLECTION_MENU_ID,
+        pluginID: PLUGIN_ID,
+        target: 'main/library/collection',
+        menus: [newTableFromSelectionItem()],
+    });
+    if (collectionTableKey) registeredKeys.push(collectionTableKey);
+
+    ztoolkit.log(`zoteroContextMenu: Registered menus (${itemActions.length} item actions, ${collectionActions.length} collection actions)`);
+}
+
+/**
+ * Moves a plugin menu item to just after one of Zotero's own entries.
+ * MenuManager appends plugin items to the end of a menu (below the plugin
+ * separator) every time it opens and then runs onShowing, so onShowing calls
+ * this on each opening. Without the anchor (a menu MenuManager folded into its
+ * overflow submenu, or a Zotero version without that entry) the item stays put.
+ */
+function placeAfter(menuElem: Element | null | undefined, anchorSelector: string): void {
+    try {
+        const anchor = menuElem?.parentElement?.querySelector(`:scope > ${anchorSelector}`);
+        if (menuElem && anchor && anchor !== menuElem && anchor.nextElementSibling !== menuElem) {
+            anchor.after(menuElem);
+        }
+    } catch { /* placement is cosmetic */ }
+}
+
+/** The library pane of the window a menu opened in. */
+function paneOf(context: any): any {
+    return context?.menuElem?.ownerDocument?.defaultView?.ZoteroPane ?? null;
+}
+
+/**
+ * The collections and saved searches a collection-menu "Create AsterMargin Table"
+ * starts from: every selected row, all of them collections or saved searches
+ * in one library. Null for any other selection.
+ */
+function newTableSelection(context: any): { libraryID: number; scopes: LibraryScope[]; collectionID?: number } | null {
+    const rows = readCollectionTreeRows(context);
+    const found = rows.map(newTableScope);
+    if (!found.length || found.some((entry) => !entry)) return null;
+    const libraryID = found[0]!.libraryID;
+    if (found.some((entry) => entry!.libraryID !== libraryID)) return null;
+    // A table from one collection is filed in it.
+    const single = rows.length === 1 && rows[0].isCollection?.() ? rows[0].ref : null;
+    return { libraryID, scopes: found.map((entry) => entry!.scope), ...(single ? { collectionID: single.id } : {}) };
+}
+
+/** The selected note when the selection is exactly one note. */
+function singleSelectedNote(context: any): Zotero.Item | null {
+    const items: any[] = context?.items ?? [];
+    if (items.length !== 1) return null;
+    try {
+        return items[0]?.isNote?.() ? items[0] : null;
+    } catch {
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Menu item builders
+// ---------------------------------------------------------------------------
+
+function buildItemMenuItems(itemActions: Action[]): any[] {
+    const menus: any[] = [];
+
+    // Disabled context header — only visible when some selected items are
+    // filtered out (mixed types, trashed, notes, etc.)
+    menus.push({
+        menuType: 'menuitem' as const,
+        l10nID: 'astermargin-context-menu-context-header',
+        l10nArgs: JSON.stringify({ context: '' }),
+        onShowing: safeOnShowing('context-header', (_event: any, context: any) => {
+            const { items, setVisible, setEnabled, setL10nArgs } = context;
+            const totalSelected = items?.length ?? 0;
+            if (selectionComposition && compositionTotal(selectionComposition) < totalSelected) {
+                setL10nArgs(JSON.stringify({ context: compositionLabel(selectionComposition) }));
+                setEnabled(false);
+                setVisible(true);
+            } else {
+                setVisible(false);
+            }
+        }),
+    });
+
+    // Action items
+    for (const action of itemActions) {
+        menus.push({
+            menuType: 'menuitem' as const,
+            l10nID: 'astermargin-context-menu-action',
+            l10nArgs: JSON.stringify({ title: action.title }),
+            onShowing: safeOnShowing(`item-action:${action.id}`, (_event: any, context: any) => {
+                filterItemAction(action, context);
+            }),
+            onCommand: (_event: any, context: any) => {
+                void dispatchAction(action, context, 'item', _event?.target?.ownerDocument?.defaultView).catch(Zotero.logError);
+            },
+        });
+    }
+
+    if (itemActions.length > 0) {
+        menus.push({ menuType: 'separator' as const });
+    }
+
+    menus.push({
+        menuType: 'menuitem' as const,
+        l10nID: 'astermargin-context-menu-add-action',
+        onCommand: (event: any) => {
+            openPreferencesWindow('actions', undefined, undefined, event?.target?.ownerDocument?.defaultView);
+        },
+    });
+
+    return menus;
+}
+
+function buildCollectionMenuItems(collectionActions: Action[]): any[] {
+    const items: any[] = collectionActions.map(action => ({
+        menuType: 'menuitem' as const,
+        l10nID: 'astermargin-context-menu-action',
+        l10nArgs: JSON.stringify({ title: action.title }),
+        onShowing: safeOnShowing(`collection-action:${action.id}`, (_event: any, context: any) => {
+            filterCollectionAction(action, context);
+        }),
+        onCommand: (_event: any, context: any) => {
+            void dispatchAction(action, context, 'collection', _event?.target?.ownerDocument?.defaultView).catch(Zotero.logError);
+        },
+    }));
+
+    if (items.length > 0) {
+        items.push({ menuType: 'separator' as const });
+    }
+
+    items.push({
+        menuType: 'menuitem' as const,
+        l10nID: 'astermargin-context-menu-add-action',
+        onCommand: (event: any) => {
+            openPreferencesWindow('actions', undefined, undefined, event?.target?.ownerDocument?.defaultView);
+        },
+    });
+
+    return items;
+}
+
+/** "Create AsterMargin Table", shown for collections and saved searches next to Generate Report. */
+function newTableFromSelectionItem(): any {
+    return {
+        menuType: 'menuitem' as const,
+        l10nID: 'astermargin-create-table',
+        icon: TABLE_ICON,
+        onShowing: safeOnShowing('create-table', (_event: any, context: any) => {
+            placeAfter(context?.menuElem, '.zotero-menuitem-create-report');
+            const selection = newTableSelection(context);
+            context.setVisible(!!selection);
+            if (selection) context.setEnabled(canCreateTableIn(selection.libraryID));
+        }),
+        onCommand: (event: any, context: any) => {
+            const selection = newTableSelection(context);
+            const win = event?.target?.ownerDocument?.defaultView ?? context?.menuElem?.ownerDocument?.defaultView;
+            if (!selection || !win) return;
+            void createAndOpenTable(win, { ...selection, title: newTableTitle(selection.scopes) });
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Action visibility (onShowing filters)
+// ---------------------------------------------------------------------------
+
+function filterItemAction(action: Action, context: any): void {
+    const { items, setVisible } = context;
+    if (!items || items.length === 0 || !selectionComposition) {
+        setVisible(false);
+        return;
+    }
+
+    // Show when the selection contains at least one item the action accepts
+    setVisible(hasEligibleItems(action, selectionComposition));
+}
+
+function filterCollectionAction(_action: Action, context: any): void {
+    const { setVisible } = context;
+    setVisible(collectionTargetRows(context).length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Event dispatch (onCommand handler)
+// ---------------------------------------------------------------------------
+
+/**
+ * `menu` is the context menu the command came from. The item menu's context
+ * also carries the collections-tree selection, so only a collection-menu
+ * command binds to the selected collections and views.
+ */
+async function dispatchAction(action: Action, context: any, menu: 'item' | 'collection', origin?: Window): Promise<void> {
+    const win = await resolveChatWindow(origin ?? context.window);
+    const eventBus = win?.__astermarginEventBus;
+    if (!eventBus) return;
+
+    // Attach the union of eligible items (kinds the action targets) and drop
+    // the rest of the selection — never send mismatched items
+    const allItems: any[] = context.items ?? [];
+    const isKindEligible = (i: any): boolean => {
+        if (safeIsInTrash(i)) return false;
+        if (i.isRegularItem()) return action.targets.includes('items');
+        if (i.isAttachment?.()) return action.targets.includes('attachment') && isAgentSupportedItem(i);
+        if (i.isNote?.()) return action.targets.includes('note');
+        return false;
+    };
+    // (Collection-menu dispatches have no selected items; filtering the empty
+    // list is a no-op and the collections ride on `collections`.)
+    const filteredItems = allItems.filter(isKindEligible);
+
+    const itemIds: number[] = filteredItems.map((i: any) => i.id);
+
+    // Carry each row's library alongside it: the receiver gates on library
+    // exclusion, and both are already in hand here.
+    const targetRows = menu === 'collection' ? collectionTargetRows(context) : [];
+    const collections = targetRows
+        .filter((row: any) => row?.type === 'collection')
+        .map((row: any) => ({ libraryId: row?.ref?.libraryID, collectionId: row?.ref?.id }))
+        .filter((c: any) => typeof c.libraryId === 'number' && typeof c.collectionId === 'number');
+    const views = targetRows
+        .filter((row: any) => isCollectionTargetViewType(row?.type))
+        .map((row: any) => ({
+            libraryId: row?.ref?.libraryID,
+            type: row.type,
+            name: readRowName(row),
+            ...(row.type === 'search' && typeof row.ref?.key === 'string' ? { key: row.ref.key } : {}),
+        }))
+        .filter((v: any) => typeof v.libraryId === 'number');
+
+    // Resolve the single wire target type. A collection-menu command binds to
+    // the selected collections and views; an item-menu command binds to the
+    // first item-menu kind the action accepts that is actually present in
+    // what we attach. Actions such as `fix-metadata` reach both menus, so the
+    // menu, not the action's targets, decides.
+    const resolvedTarget = ((collections.length > 0 || views.length > 0) && action.targets.includes('collection'))
+        ? 'collection'
+        : ITEM_MENU_KINDS.find(t =>
+            action.targets.includes(t) && filteredItems.some((i: any) =>
+                t === 'items' ? i.isRegularItem() : t === 'attachment' ? i.isAttachment?.() : i.isNote?.()
+            )
+        ) ?? action.targets[0];
+
+    eventBus.dispatchEvent(new win.CustomEvent('contextMenuAction', {
+        detail: {
+            actionId: action.id,
+            actionTitle: action.title,
+            targetType: resolvedTarget,
+            itemIds,
+            collections,
+            views,
+        },
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// DOM cleanup (workaround for Zotero MenuManager _key vs mainKey mismatch)
+// ---------------------------------------------------------------------------
+
+const CUSTOM_MENU_CLASS = 'zotero-custom-menu-item';
+
+function removeStaleMenuDOM(): void {
+    // Scoped to AsterMargin's own l10n IDs so we never wipe other plugins' menu
+    // items (they share CUSTOM_MENU_CLASS via Zotero's MenuManager).
+    try {
+        for (const win of Zotero.getMainWindows()) {
+            if (!win?.document || win.closed) continue;
+
+            const selector = ['astermargin-context-menu-', 'astermargin-note-export-']
+                .map((prefix) => `.${CUSTOM_MENU_CLASS}[data-l10n-id^="${prefix}"]`)
+                .join(', ');
+            for (const popupId of ['zotero-itemmenu', 'zotero-collectionmenu']) {
+                const popup = win.document.getElementById(popupId);
+                if (!popup) continue;
+                const stale = popup.querySelectorAll(selector);
+                if (stale.length > 0) {
+                    stale.forEach((el: Element) => el.remove());
+                }
+            }
+        }
+    } catch (_e) {
+        // Best-effort — popup may not exist
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pref observer — re-registers menus when actions change
+// ---------------------------------------------------------------------------
+
+function startPrefObserver(): void {
+    if (prefObserverSymbol) return;
+    prefObserverSymbol = Zotero.Prefs.registerObserver(
+        'extensions.zotero.astermargin.actions',
+        () => {
+            ztoolkit.log('zoteroContextMenu: Actions pref changed, re-registering menus');
+            registerMenus();
+        },
+        true, // global pref name
+    );
+}
+
+function stopPrefObserver(): void {
+    if (prefObserverSymbol) {
+        Zotero.Prefs.unregisterObserver(prefObserverSymbol);
+        prefObserverSymbol = null;
+    }
+}

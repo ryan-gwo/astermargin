@@ -1,0 +1,1327 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { mockSupabase } = vi.hoisted(() => ({
+    mockSupabase: {
+        auth: {
+            getSession: vi.fn(),
+            refreshSession: vi.fn(),
+        },
+    },
+}));
+
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: mockSupabase,
+}));
+
+vi.mock('@astermargin/agent-core/platform/logger', () => ({
+    logger: vi.fn(),
+}));
+
+vi.mock('../../../src/services/agentDataProvider', () => ({
+    handleZoteroDataRequest: vi.fn(),
+    handleExternalReferenceCheckRequest: vi.fn(),
+    handleZoteroDocumentRequest: vi.fn(),
+    handleZoteroAttachmentPageImagesRequest: vi.fn(),
+    handleZoteroAttachmentImageRequest: vi.fn(),
+    handleZoteroViewImagesRequest: vi.fn(),
+    handleZoteroAttachmentSearchRequest: vi.fn(),
+    handleItemSearchByMetadataRequest: vi.fn(),
+    handleItemSearchByTopicRequest: vi.fn(),
+    handleResolveSearchFiltersRequest: vi.fn(),
+    handleZoteroSearchRequest: vi.fn(),
+    handleListItemsRequest: vi.fn(),
+    handleListCollectionsRequest: vi.fn(),
+    handleListTagsRequest: vi.fn(),
+    handleListLibrariesRequest: vi.fn(),
+    handleGetMetadataRequest: vi.fn(),
+    handleGetAnnotationsRequest: vi.fn(),
+    handleFindAnnotationsRequest: vi.fn(),
+    handleAgentActionValidateRequest: vi.fn(),
+    handleAgentActionExecuteRequest: vi.fn(),
+    handleReadNoteRequest: vi.fn(),
+}));
+
+vi.mock('../../../react/agents/agentActions', () => ({
+    toAgentAction: vi.fn((action) => action),
+}));
+
+import {
+    AgentConnectionError,
+    AgentService,
+    AgentRunService,
+    ConnectTimeoutError,
+    HEARTBEAT_INTERVAL_MS,
+    HEARTBEAT_TIMEOUT_CLOSE_CODE,
+    HEARTBEAT_TIMEOUT_MS,
+    HEARTBEAT_UPLOAD_TIMEOUT_MS,
+} from '@astermargin/agent-core/transport/agentService';
+import { setTransportConfig } from '@astermargin/agent-core/transport/config';
+import { ApiError } from '@astermargin/agent-core/types/apiErrors';
+import type { AgentRunRequest, WSCallbacks } from '@astermargin/agent-core/protocol/agentProtocol';
+import { getWSAuthToken } from '@astermargin/agent-core/transport/agentService';
+import {
+    BackendAccessBlockedError,
+    resetBackendAccessPolicyForTesting,
+    setBackendAccessPolicy,
+} from '@astermargin/agent-core/transport/backendAccessPolicy';
+
+beforeEach(() => {
+    resetBackendAccessPolicyForTesting();
+});
+
+describe('WebSocket auth token backend access policy', () => {
+    it('refuses before reading the session when backend access is blocked', async () => {
+        mockSupabase.auth.getSession.mockReset();
+        setBackendAccessPolicy(() => false);
+
+        const token = getWSAuthToken();
+
+        await expect(token).rejects.toBeInstanceOf(BackendAccessBlockedError);
+        await expect(token).rejects.toMatchObject({ surface: 'ws.auth' });
+        expect(mockSupabase.auth.getSession).not.toHaveBeenCalled();
+    });
+
+    it('refuses an agent connect before any callback fires when backend access is blocked', async () => {
+        mockSupabase.auth.getSession.mockReset();
+        setBackendAccessPolicy(() => false);
+        const callbacks = { onError: vi.fn(), onClose: vi.fn() } as unknown as WSCallbacks;
+
+        await expect(
+            new AgentService('wss://api.example.com').connect({} as AgentRunRequest, callbacks),
+        ).rejects.toMatchObject({ surface: 'agentService.connect' });
+        expect(mockSupabase.auth.getSession).not.toHaveBeenCalled();
+        expect((callbacks as any).onError).not.toHaveBeenCalled();
+    });
+});
+
+class MockWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    static instances: MockWebSocket[] = [];
+
+    readonly url: string;
+    readyState = MockWebSocket.CONNECTING;
+    bufferedAmount = 0;
+    onopen: ((event: Event) => void) | null = null;
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    onclose: ((event: CloseEvent) => void) | null = null;
+    send = vi.fn();
+    close = vi.fn((code?: number, reason?: string) => {
+        this.readyState = MockWebSocket.CLOSING;
+        this.closeCode = code;
+        this.closeReason = reason;
+    });
+    closeCode?: number;
+    closeReason?: string;
+
+    constructor(url: string) {
+        this.url = url;
+        MockWebSocket.instances.push(this);
+    }
+
+    emitOpen(): void {
+        this.readyState = MockWebSocket.OPEN;
+        this.onopen?.(new Event('open'));
+    }
+
+    emitMessage(data: unknown): void {
+        this.onmessage?.({
+            data: JSON.stringify(data),
+        } as MessageEvent);
+    }
+
+    emitClose(init: { code?: number; reason?: string; wasClean?: boolean } = {}): void {
+        this.readyState = MockWebSocket.CLOSED;
+        this.onclose?.({
+            code: init.code ?? 1000,
+            reason: init.reason ?? '',
+            wasClean: init.wasClean ?? true,
+        } as CloseEvent);
+    }
+}
+
+function createCallbacks(): WSCallbacks {
+    return {
+        onReady: vi.fn(),
+        onRequestAck: vi.fn(),
+        onPart: vi.fn().mockResolvedValue(undefined),
+        onToolReturn: vi.fn().mockResolvedValue(undefined),
+        onToolCallProgress: vi.fn(),
+        onToolCallArgsStream: vi.fn(),
+        onRunComplete: vi.fn().mockResolvedValue(undefined),
+        onStreamingDone: vi.fn(),
+        onDone: vi.fn(),
+        onThread: vi.fn(),
+        onThreadName: vi.fn(),
+        onError: vi.fn(),
+        onWarning: vi.fn(),
+        onAgentActions: vi.fn().mockResolvedValue(undefined),
+        onRetry: vi.fn(),
+        onMissingZoteroData: vi.fn(),
+        onDeferredApprovalRequest: vi.fn(),
+        onOpen: vi.fn(),
+        onClose: vi.fn(),
+    };
+}
+
+async function flushMicrotasks(ticks = 10): Promise<void> {
+    for (let i = 0; i < ticks; i++) {
+        await Promise.resolve();
+    }
+}
+
+async function completeConnect(
+    service: AgentService,
+    callbacks: WSCallbacks,
+    request: AgentRunRequest,
+    frontendVersion?: string,
+): Promise<MockWebSocket> {
+    const initialCount = MockWebSocket.instances.length;
+    const connectPromise = service.connect(request, callbacks, frontendVersion);
+
+    // connect() awaits getAuthToken() (which awaits the mocked supabase
+    // session) before `new WebSocket(...)` runs, so we need to flush the
+    // microtask queue before the new socket instance appears.
+    for (let i = 0; i < 20 && MockWebSocket.instances.length === initialCount; i++) {
+        await Promise.resolve();
+    }
+
+    const socket = MockWebSocket.instances[initialCount];
+    if (!socket) {
+        throw new Error('Expected AgentService.connect() to create a WebSocket');
+    }
+
+    socket.emitOpen();
+    await vi.advanceTimersByTimeAsync(50);
+    socket.emitMessage({
+        event: 'ready',
+        subscription_status: 'active',
+        processing_mode: 'fast',
+        indexing_complete: true,
+    });
+    await connectPromise;
+
+    return socket;
+}
+
+describe('AgentService reconnect handling', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+        MockWebSocket.instances = [];
+        vi.stubGlobal('WebSocket', MockWebSocket);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.refreshSession.mockReset();
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+
+    it.each([undefined, 1])(
+        "requires admission v1 before sending a tail-asserting chat (server: %s)",
+        async (version) => {
+            const service = new AgentService("http://localhost:8000");
+            const callbacks = createCallbacks();
+            const request = {
+                type: "chat",
+                run_id: "run",
+                thread_id: null,
+                expected_tail_run_id: null,
+                user_prompt: { content: "hello" },
+            } as AgentRunRequest;
+            const pending = service.connect(request, callbacks);
+            const outcome = pending.catch((error) => error);
+            await flushMicrotasks();
+            const socket = MockWebSocket.instances[0];
+            socket.emitOpen();
+            socket.emitMessage({
+                event: "ready",
+                thread_admission_version: version,
+                subscription_status: "active",
+                processing_mode: "fast",
+                indexing_complete: true,
+            });
+            await outcome;
+            const sent = socket.send.mock.calls.map(([payload]) =>
+                JSON.parse(payload),
+            );
+            expect(sent.some((payload) => payload.type === "chat")).toBe(
+                version === 1,
+            );
+            if (version !== 1)
+                expect(callbacks.onError).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        type: "thread_admission_unavailable",
+                    }),
+                );
+            service.close();
+        },
+    );
+
+    // The exported singleton is constructed with no URL, so its socket address
+    // comes from the transport config at connect time.
+    it('derives the socket URL from config registered after construction', () => {
+        const service = new AgentService();
+        setTransportConfig({
+            apiBaseUrl: 'https://api.example.com',
+            supabaseUrl: 'https://p.supabase.co',
+            supabaseAnonKey: 'anon',
+        });
+
+        expect((service as any).getWebSocketUrl()).toBe('wss://api.example.com/api/v1/agents/astermargin/run');
+    });
+
+    it('silently supersedes the old socket on reconnect and ignores its later close event', async () => {
+        const service = new AgentService('https://api.example.com');
+        const firstCallbacks = createCallbacks();
+        const secondCallbacks = createCallbacks();
+        const firstRequest = { type: 'first' } as AgentRunRequest;
+        const secondRequest = { type: 'second' } as AgentRunRequest;
+
+        const firstSocket = await completeConnect(service, firstCallbacks, firstRequest);
+        const secondSocket = await completeConnect(service, secondCallbacks, secondRequest);
+
+        expect(firstSocket.close).toHaveBeenCalledTimes(1);
+        expect(firstSocket.close).toHaveBeenCalledWith(1000, 'Client closing');
+        expect(firstCallbacks.onClose).not.toHaveBeenCalled();
+
+        firstSocket.emitClose({
+            code: 1011,
+            reason: 'stale socket',
+            wasClean: false,
+        });
+
+        secondSocket.emitMessage({
+            event: 'part',
+            run_id: 'run-2',
+            message_index: 0,
+            part_index: 0,
+            part: { type: 'text', text: 'still streaming' },
+        });
+        await flushMicrotasks();
+
+        expect(firstCallbacks.onClose).not.toHaveBeenCalled();
+        expect(secondCallbacks.onClose).not.toHaveBeenCalled();
+        expect(secondCallbacks.onPart).toHaveBeenCalledTimes(1);
+    });
+
+    it('notifies close once for an explicit client close and ignores the later socket event', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const request = { type: 'close-test' } as AgentRunRequest;
+
+        const socket = await completeConnect(service, callbacks, request);
+
+        service.close(1000, 'User cancelled');
+        socket.emitClose({
+            code: 1000,
+            reason: 'User cancelled',
+            wasClean: true,
+        });
+
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        expect(callbacks.onClose).toHaveBeenCalledWith(1000, 'User cancelled', true);
+    });
+
+    it('notifies onClose for an unexpected transport close on the active socket', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const request = { type: 'close-test' } as AgentRunRequest;
+
+        const socket = await completeConnect(service, callbacks, request);
+
+        socket.emitClose({
+            code: 1011,
+            reason: 'transport lost',
+            wasClean: false,
+        });
+
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        expect(callbacks.onClose).toHaveBeenCalledWith(
+            1011,
+            'transport lost',
+            false,
+            expect.objectContaining({
+                stage: 'mid_run',
+                socketOpened: true,
+                readyReceived: true,
+                closeCode: 1011,
+                // The socket opened and received the ready message, so both
+                // timing measurements are available for diagnostics.
+                wsUptimeMs: expect.any(Number),
+                msSinceLastWsMessageMs: expect.any(Number),
+            }),
+        );
+    });
+
+    it('rejects connect() and notifies onClose when the socket closes before ready', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const request = { type: 'pre-ready-close-test' } as AgentRunRequest;
+
+        const initialCount = MockWebSocket.instances.length;
+        const connectPromise = service.connect(request, callbacks);
+        // Attach a handler immediately so the eventual rejection (triggered
+        // further down, once the mock socket exists) is never left unhandled.
+        const connectOutcome = connectPromise.then(
+            () => ({ ok: true as const }),
+            (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        for (let i = 0; i < 20 && MockWebSocket.instances.length === initialCount; i++) {
+            await Promise.resolve();
+        }
+        const socket = MockWebSocket.instances[initialCount];
+        if (!socket) {
+            throw new Error('Expected AgentService.connect() to create a WebSocket');
+        }
+
+        // The transport opens (so auth is sent) but the server rejects the
+        // connection before the "ready" event — e.g. an invalid/expired token.
+        socket.emitOpen();
+        await vi.advanceTimersByTimeAsync(50);
+        socket.emitClose({ code: 1008, reason: 'invalid token', wasClean: false });
+
+        const outcome = await connectOutcome;
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) {
+            expect(outcome.error).toBeInstanceOf(Error);
+            expect((outcome.error as Error).message).toContain('invalid token');
+        }
+
+        // The close details reach callers through onClose, not the rejection.
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        expect(callbacks.onClose).toHaveBeenCalledWith(
+            1008,
+            'invalid token',
+            false,
+            expect.objectContaining({
+                stage: 'awaiting_ready',
+                socketOpened: true,
+                readyReceived: false,
+                closeCode: 1008,
+            }),
+        );
+    });
+
+    it('distinguishes a 1006 opening failure from a socket that opened', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const initialCount = MockWebSocket.instances.length;
+        const outcomePromise = service.connect(
+            { type: 'refused-connection-test' } as AgentRunRequest,
+            callbacks,
+        ).then(
+            () => ({ ok: true as const }),
+            (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        await flushMicrotasks();
+        const socket = MockWebSocket.instances[initialCount];
+        expect(socket).toBeDefined();
+        socket.emitClose({ code: 1006, reason: '', wasClean: false });
+
+        const outcome = await outcomePromise;
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) {
+            expect(outcome.error).toBeInstanceOf(AgentConnectionError);
+            expect((outcome.error as AgentConnectionError).evidence).toMatchObject({
+                stage: 'opening',
+                socketOpened: false,
+                readyReceived: false,
+                closeCode: 1006,
+                // Never opened, never received a message — no timing evidence.
+                wsUptimeMs: null,
+                msSinceLastWsMessageMs: null,
+            });
+        }
+    });
+
+    it('resolves a canceled pre-ready connect and allows the next run to connect', async () => {
+        const service = new AgentService('https://api.example.com');
+        const firstCallbacks = createCallbacks();
+        const request = { type: 'cancel-handshake-test' } as AgentRunRequest;
+
+        const initialCount = MockWebSocket.instances.length;
+        const firstConnect = service.connect(request, firstCallbacks);
+        const firstOutcome = firstConnect.then(
+            () => ({ ok: true as const }),
+            (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        for (let i = 0; i < 20 && MockWebSocket.instances.length === initialCount; i++) {
+            await Promise.resolve();
+        }
+        const firstSocket = MockWebSocket.instances[initialCount];
+        if (!firstSocket) {
+            throw new Error('Expected AgentService.connect() to create a WebSocket');
+        }
+
+        // The transport is open and auth was sent, but the backend has not
+        // emitted ready yet — cancelling in this handshake window must settle
+        // the pending connect() instead of leaving it hanging.
+        firstSocket.emitOpen();
+        await vi.advanceTimersByTimeAsync(50);
+        const cancelPromise = service.cancel(0);
+        await vi.advanceTimersByTimeAsync(0);
+        await cancelPromise;
+
+        // An intentional client close is not a transport failure: the
+        // pending connect resolves quietly.
+        const outcome = await firstOutcome;
+        expect(outcome.ok).toBe(true);
+
+        const secondCallbacks = createCallbacks();
+        const secondSocket = await completeConnect(service, secondCallbacks, request);
+        expect(secondSocket).not.toBe(firstSocket);
+        expect(secondCallbacks.onReady).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores a deferred cancel close when a newer connection has taken over', async () => {
+        const service = new AgentService('https://api.example.com');
+        const firstCallbacks = createCallbacks();
+        const firstRequest = { type: 'first' } as AgentRunRequest;
+
+        const firstSocket = await completeConnect(service, firstCallbacks, firstRequest);
+
+        // cancel() sends the cancel message, then waits before closing.
+        const cancelPromise = service.cancel(250);
+
+        // A new run connects during that wait and supersedes the first
+        // connection (bumping the connection generation).
+        const secondCallbacks = createCallbacks();
+        const secondRequest = { type: 'second' } as AgentRunRequest;
+        const secondSocket = await completeConnect(service, secondCallbacks, secondRequest);
+        expect(secondSocket).not.toBe(firstSocket);
+
+        // When the deferred close finally fires, it must not tear down the
+        // newer connection.
+        await vi.advanceTimersByTimeAsync(300);
+        await cancelPromise;
+
+        expect(secondSocket.close).not.toHaveBeenCalled();
+        expect(secondCallbacks.onClose).not.toHaveBeenCalled();
+
+        // The newer connection is still fully functional.
+        secondSocket.emitMessage({
+            event: 'part',
+            run_id: 'run-2',
+            message_index: 0,
+            part_index: 0,
+            part: { type: 'text', text: 'still streaming' },
+        });
+        await flushMicrotasks();
+        expect(secondCallbacks.onPart).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails a connect attempt that never reaches ready via the backstop timeout', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const request = { type: 'timeout-test' } as AgentRunRequest;
+
+        const initialCount = MockWebSocket.instances.length;
+        const connectPromise = service.connect(request, callbacks);
+        const connectOutcome = connectPromise.then(
+            () => ({ ok: true as const }),
+            (error: unknown) => ({ ok: false as const, error }),
+        );
+
+        for (let i = 0; i < 20 && MockWebSocket.instances.length === initialCount; i++) {
+            await Promise.resolve();
+        }
+        const socket = MockWebSocket.instances[initialCount];
+        if (!socket) {
+            throw new Error('Expected AgentService.connect() to create a WebSocket');
+        }
+
+        // The transport opens and auth is sent, but the server never responds
+        // with ready, an error event, or a close.
+        socket.emitOpen();
+        await vi.advanceTimersByTimeAsync(50);
+        await vi.advanceTimersByTimeAsync(20_000);
+
+        const outcome = await connectOutcome;
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) {
+            // The error type is the only signal a timeout leaves behind: the
+            // attempt is torn down with close code 1000, so callers cannot
+            // tell it apart from a network outage by close code alone.
+            expect(outcome.error).toBeInstanceOf(ConnectTimeoutError);
+            expect((outcome.error as Error).message).toContain('timed out');
+        }
+        expect(callbacks.onClose).toHaveBeenCalledWith(1000, 'Connection attempt timed out', true);
+
+        // The service recovered its state: a new connect succeeds.
+        const secondCallbacks = createCallbacks();
+        const secondSocket = await completeConnect(service, secondCallbacks, request);
+        expect(secondSocket).not.toBe(socket);
+        expect(secondCallbacks.onReady).toHaveBeenCalledTimes(1);
+    });
+
+    it('identifies a timeout that occurs while checking the auth session', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const request = { type: 'auth-timeout-test' } as AgentRunRequest;
+        mockSupabase.auth.getSession.mockReturnValueOnce(new Promise(() => {}));
+
+        const outcomePromise = service.connect(request, callbacks).then(
+            () => ({ ok: true as const }),
+            (error: unknown) => ({ ok: false as const, error }),
+        );
+        await vi.advanceTimersByTimeAsync(20_000);
+
+        const outcome = await outcomePromise;
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) {
+            expect(outcome.error).toBeInstanceOf(ConnectTimeoutError);
+            expect((outcome.error as ConnectTimeoutError).evidence).toMatchObject({
+                stage: 'auth',
+                socketOpened: false,
+                readyReceived: false,
+                timedOut: true,
+            });
+        }
+    });
+
+    it('drops a queued done when the socket closes while run_complete is processing', async () => {
+        const service = new AgentService('https://api.example.com');
+        const callbacks = createCallbacks();
+        const request = { type: 'queued-done-test' } as AgentRunRequest;
+
+        // Hold the run_complete handler open so the queued `done` message
+        // stays behind it in the message queue.
+        let releaseRunComplete: () => void = () => {};
+        const runCompleteGate = new Promise<void>((resolve) => {
+            releaseRunComplete = resolve;
+        });
+        (callbacks.onRunComplete as ReturnType<typeof vi.fn>).mockImplementation(() => runCompleteGate);
+
+        const socket = await completeConnect(service, callbacks, request);
+
+        socket.emitMessage({
+            event: 'run_complete',
+            run_id: 'run-1',
+            usage: null,
+            cost: null,
+            citations: null,
+            agent_actions: null,
+        });
+        socket.emitMessage({ event: 'done' });
+        await flushMicrotasks();
+
+        // run_complete's handler is suspended awaiting onRunComplete, so the
+        // queued `done` has not been dispatched yet.
+        expect(callbacks.onRunComplete).toHaveBeenCalledTimes(1);
+        expect(callbacks.onDone).not.toHaveBeenCalled();
+
+        // The socket closes while that handler is still suspended. This
+        // bumps the connection id via resetConnectionState().
+        socket.emitClose({ code: 1000, reason: '', wasClean: true });
+
+        // Now let the suspended run_complete handler resume. The queued
+        // `done` handler runs next, but its stale-connection-id guard makes
+        // it a no-op because the id no longer matches.
+        releaseRunComplete();
+        await flushMicrotasks();
+
+        expect(callbacks.onRunComplete).toHaveBeenCalledTimes(1);
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        // A `done` that was queued behind a still-processing run_complete is
+        // silently dropped once the socket has closed in the meantime. The
+        // React layer's onClose handler finalizes the run itself and relies
+        // on this behavior rather than expecting a late `done` event.
+        expect(callbacks.onDone).not.toHaveBeenCalled();
+    });
+
+    it('includes close evidence only for a real socket close, not a client-initiated one', async () => {
+        // A real transport close carries a `ConnectionFailureEvidence` object
+        // as the 4th onClose argument.
+        const serverCloseService = new AgentService('https://api.example.com');
+        const serverCloseCallbacks = createCallbacks();
+        await completeConnect(
+            serverCloseService,
+            serverCloseCallbacks,
+            { type: 'server-close-test' } as AgentRunRequest,
+        );
+        const serverSocket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+        serverSocket.emitClose({ code: 1011, reason: 'transport lost', wasClean: false });
+
+        expect(serverCloseCallbacks.onClose).toHaveBeenCalledTimes(1);
+        const serverCloseArgs = (serverCloseCallbacks.onClose as ReturnType<typeof vi.fn>).mock.calls[0];
+        expect(serverCloseArgs).toHaveLength(4);
+        expect(serverCloseArgs[3]).toEqual(expect.objectContaining({ closeCode: 1011 }));
+
+        // A client-initiated close (service.close(), including the deferred
+        // close inside cancel()) reports wasClean=true unconditionally and
+        // omits the evidence argument entirely, since there is no transport
+        // failure to characterize. This is the contract the React layer's
+        // onClose guard uses to tell a server close from a client close.
+        const clientCloseService = new AgentService('https://api.example.com');
+        const clientCloseCallbacks = createCallbacks();
+        await completeConnect(
+            clientCloseService,
+            clientCloseCallbacks,
+            { type: 'client-close-test' } as AgentRunRequest,
+        );
+        clientCloseService.close(1000, 'User cancelled');
+
+        expect(clientCloseCallbacks.onClose).toHaveBeenCalledTimes(1);
+        const clientCloseArgs = (clientCloseCallbacks.onClose as ReturnType<typeof vi.fn>).mock.calls[0];
+        expect(clientCloseArgs).toHaveLength(3);
+        expect(clientCloseArgs[2]).toBe(true);
+        expect(clientCloseArgs[3]).toBeUndefined();
+    });
+
+    it('does not let a stale backstop timeout tear down a newer connection', async () => {
+        const service = new AgentService('https://api.example.com');
+        const firstCallbacks = createCallbacks();
+        const request = { type: 'stale-timeout-test' } as AgentRunRequest;
+
+        // The first attempt's auth-token lookup hangs indefinitely.
+        mockSupabase.auth.getSession.mockReturnValueOnce(new Promise(() => {}));
+        const initialCount = MockWebSocket.instances.length;
+        const firstConnect = service.connect(request, firstCallbacks);
+        const firstOutcome = firstConnect.then(
+            () => ({ ok: true as const }),
+            (error: unknown) => ({ ok: false as const, error }),
+        );
+        await flushMicrotasks();
+        expect(MockWebSocket.instances.length).toBe(initialCount);
+
+        // The user cancels while the token lookup is pending, then starts a
+        // new run that connects normally.
+        const cancelPromise = service.cancel(0);
+        await vi.advanceTimersByTimeAsync(0);
+        await cancelPromise;
+
+        const secondCallbacks = createCallbacks();
+        const secondSocket = await completeConnect(service, secondCallbacks, request);
+
+        // When the abandoned attempt's backstop fires, it must not close the
+        // newer connection or reject anything.
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(secondSocket.close).not.toHaveBeenCalled();
+        expect(secondCallbacks.onClose).not.toHaveBeenCalled();
+
+        // The abandoned attempt settles quietly rather than as a failure.
+        const outcome = await firstOutcome;
+        expect(outcome.ok).toBe(true);
+    });
+});
+
+describe('AgentService unknown data-request events', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+        MockWebSocket.instances = [];
+        vi.stubGlobal('WebSocket', MockWebSocket);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.refreshSession.mockReset();
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+
+    it('replies with an error for an unmatched *_request so the backend does not time out', async () => {
+        const service = new AgentService('https://api.example.com', {});
+        const socket = await completeConnect(
+            service,
+            createCallbacks(),
+            { type: 'unknown-event' } as AgentRunRequest,
+        );
+
+        socket.emitMessage({
+            event: 'resolve_population_request',
+            request_id: 'req-1',
+        });
+        await flushMicrotasks();
+
+        const sent = socket.send.mock.calls.map(([raw]) => JSON.parse(raw as string));
+        expect(sent).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'resolve_population',
+                request_id: 'req-1',
+                error: 'Unknown event type: resolve_population_request. Do not try this operation again.',
+                error_code: 'internal_error',
+            }),
+        ]));
+    });
+
+    it('does not reply when the unknown event is not a request/response exchange', async () => {
+        const service = new AgentService('https://api.example.com', {});
+        const socket = await completeConnect(
+            service,
+            createCallbacks(),
+            { type: 'unknown-event' } as AgentRunRequest,
+        );
+        const sentBefore = socket.send.mock.calls.length;
+
+        socket.emitMessage({ event: 'some_new_notification' });
+        await flushMicrotasks();
+
+        expect(socket.send.mock.calls.length).toBe(sentBefore);
+    });
+});
+
+describe('AgentService request acks and keepalives', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+        MockWebSocket.instances = [];
+        vi.stubGlobal('WebSocket', MockWebSocket);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.refreshSession.mockReset();
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+
+    /** Connect against a backend that advertises acks and (optionally) keepalives. */
+    async function connectWithFlags(
+        service: AgentService,
+        callbacks: WSCallbacks,
+        flags: { supports_request_acks?: boolean; supports_request_keepalive?: boolean },
+    ): Promise<MockWebSocket> {
+        const initialCount = MockWebSocket.instances.length;
+        const connectPromise = service.connect({ type: 'unknown-event' } as AgentRunRequest, callbacks);
+        for (let i = 0; i < 20 && MockWebSocket.instances.length === initialCount; i++) {
+            await Promise.resolve();
+        }
+        const socket = MockWebSocket.instances[initialCount];
+        if (!socket) throw new Error('Expected AgentService.connect() to create a WebSocket');
+        socket.emitOpen();
+        await vi.advanceTimersByTimeAsync(50);
+        socket.emitMessage({
+            event: 'ready',
+            subscription_status: 'active',
+            processing_mode: 'fast',
+            indexing_complete: true,
+            ...flags,
+        });
+        await connectPromise;
+        return socket;
+    }
+
+    const sentMessages = (socket: MockWebSocket) =>
+        socket.send.mock.calls.map(([raw]) => JSON.parse(raw as string));
+
+    it('acks a request on arrival even while the message queue is blocked on a callback', async () => {
+        const callbacks = createCallbacks();
+        // A streamed part whose UI callback never settles blocks the serialized
+        // message queue, the way an item load stuck behind a Zotero transaction does.
+        callbacks.onPart = vi.fn(() => new Promise<void>(() => {}));
+        const service = new AgentService('https://api.example.com', {});
+        const socket = await connectWithFlags(service, callbacks, { supports_request_acks: true });
+
+        socket.emitMessage({ event: 'part', run_id: 'run-1', part: {} });
+        await flushMicrotasks();
+        socket.emitMessage({ event: 'zotero_data_request', request_id: 'req-1' });
+        await flushMicrotasks();
+
+        const acks = sentMessages(socket).filter((m) => m.type === 'request_received');
+        expect(acks).toHaveLength(1);
+        expect(acks[0].request_id).toBe('req-1');
+        // One message (the stuck part) is queued ahead of this request
+        expect(acks[0].busy.queue_depth).toBe(1);
+        expect(acks[0].busy.queue_oldest_ms).toBeGreaterThanOrEqual(0);
+        expect(acks[0].busy.dispatch_lag_ms).toBeGreaterThanOrEqual(0);
+    });
+
+    it('sends keepalives every 5s while a request runs and stops once it is answered', async () => {
+        let resolveHandler: (value: Record<string, any>) => void = () => {};
+        const provider = {
+            zotero_data_request: {
+                handle: vi.fn(() => new Promise<Record<string, any>>((resolve) => { resolveHandler = resolve; })),
+                errorResponse: () => ({ type: 'zotero_data', request_id: 'req-1', error: 'x' }),
+            },
+        };
+        const service = new AgentService('https://api.example.com', provider);
+        const socket = await connectWithFlags(service, createCallbacks(), {
+            supports_request_acks: true,
+            supports_request_keepalive: true,
+        });
+
+        socket.emitMessage({ event: 'zotero_data_request', request_id: 'req-1' });
+        await flushMicrotasks();
+        expect(provider.zotero_data_request.handle).toHaveBeenCalledTimes(1);
+        // The handler receives the transport context
+        const [, context] = provider.zotero_data_request.handle.mock.calls[0] as any[];
+        expect(typeof context.receivedAt).toBe('number');
+        expect(typeof context.reportPhase).toBe('function');
+
+        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(5_000);
+        let keepalives = sentMessages(socket).filter((m) => m.type === 'request_keepalive');
+        expect(keepalives).toHaveLength(2);
+        expect(keepalives[0]).toMatchObject({ request_id: 'req-1', phase: 'running' });
+        expect(keepalives[0].elapsed_ms).toBeGreaterThanOrEqual(5_000);
+        expect(keepalives[0].busy.queue_depth).toBe(0);
+
+        // A handler-reported phase shows up in the next keepalive
+        context.reportPhase('saving');
+        await vi.advanceTimersByTimeAsync(5_000);
+        keepalives = sentMessages(socket).filter((m) => m.type === 'request_keepalive');
+        expect(keepalives[2].phase).toBe('saving');
+
+        resolveHandler({ type: 'zotero_data', request_id: 'req-1', items: [] });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(15_000);
+        keepalives = sentMessages(socket).filter((m) => m.type === 'request_keepalive');
+        expect(keepalives).toHaveLength(3);
+        // The response itself carries no keepalive/ack timing pollution
+        const response = sentMessages(socket).find((m) => m.type === 'zotero_data');
+        expect(response.request_id).toBe('req-1');
+    });
+
+    it('reports a serialized execute as queued until the one ahead of it finishes', async () => {
+        const pending: Array<(value: Record<string, any>) => void> = [];
+        const provider = {
+            agent_action_execute: {
+                serialize: true,
+                handle: vi.fn((event: any) => new Promise<Record<string, any>>((resolve) => {
+                    pending.push(() => resolve({ type: 'agent_action_execute_response', request_id: event.request_id, success: true }));
+                })),
+                errorResponse: (event: any) => ({ type: 'agent_action_execute_response', request_id: event.request_id, success: false }),
+            },
+        };
+        const service = new AgentService('https://api.example.com', provider);
+        const socket = await connectWithFlags(service, createCallbacks(), {
+            supports_request_acks: true,
+            supports_request_keepalive: true,
+        });
+
+        socket.emitMessage({ event: 'agent_action_execute', request_id: 'exec-1' });
+        socket.emitMessage({ event: 'agent_action_execute', request_id: 'exec-2' });
+        await flushMicrotasks();
+        expect(provider.agent_action_execute.handle).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(5_000);
+        const phases = (id: string) =>
+            sentMessages(socket).filter((m) => m.type === 'request_keepalive' && m.request_id === id).map((m) => m.phase);
+        expect(phases('exec-1')).toEqual(['running']);
+        expect(phases('exec-2')).toEqual(['queued']);
+
+        pending[0]();
+        await flushMicrotasks();
+        expect(provider.agent_action_execute.handle).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(phases('exec-1')).toEqual(['running']);
+        expect(phases('exec-2')).toEqual(['queued', 'running']);
+
+        pending[1]();
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(phases('exec-2')).toEqual(['queued', 'running']);
+    });
+
+    it('keeps a request alive with the queued phase while the message queue is blocked', async () => {
+        const callbacks = createCallbacks();
+        callbacks.onPart = vi.fn(() => new Promise<void>(() => {}));
+        const provider = {
+            zotero_data_request: {
+                handle: vi.fn(async () => ({ type: 'zotero_data', request_id: 'req-1', items: [] })),
+                errorResponse: () => ({ type: 'zotero_data', request_id: 'req-1', error: 'x' }),
+            },
+        };
+        const service = new AgentService('https://api.example.com', provider);
+        const socket = await connectWithFlags(service, callbacks, {
+            supports_request_acks: true,
+            supports_request_keepalive: true,
+        });
+
+        socket.emitMessage({ event: 'part', run_id: 'run-1', part: {} });
+        await flushMicrotasks();
+        socket.emitMessage({ event: 'zotero_data_request', request_id: 'req-1' });
+        await flushMicrotasks();
+        // The handler never runs: the queue is stuck behind the part.
+        expect(provider.zotero_data_request.handle).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        const keepalives = sentMessages(socket).filter((m) => m.type === 'request_keepalive');
+        expect(keepalives.map((m) => m.phase)).toEqual(['queued', 'queued']);
+        expect(keepalives[0].busy.queue_depth).toBe(2);
+    });
+
+    it('stops keepalives when the connection is closed and ignores frames from the old socket', async () => {
+        let resolveHandler: (value: Record<string, any>) => void = () => {};
+        const provider = {
+            zotero_data_request: {
+                handle: vi.fn(() => new Promise<Record<string, any>>((resolve) => { resolveHandler = resolve; })),
+                errorResponse: () => ({ type: 'zotero_data', request_id: 'req-1', error: 'x' }),
+            },
+        };
+        const service = new AgentService('https://api.example.com', provider);
+        const oldSocket = await connectWithFlags(service, createCallbacks(), {
+            supports_request_acks: true,
+            supports_request_keepalive: true,
+        });
+        oldSocket.emitMessage({ event: 'zotero_data_request', request_id: 'req-1' });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(sentMessages(oldSocket).filter((m) => m.type === 'request_keepalive')).toHaveLength(1);
+
+        service.close();
+        const newSocket = await connectWithFlags(service, createCallbacks(), {
+            supports_request_acks: true,
+            supports_request_keepalive: true,
+        });
+
+        // The hung handler's keepalive must not reach the replacement socket.
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(sentMessages(newSocket).filter((m) => m.type === 'request_keepalive')).toHaveLength(0);
+
+        // A frame buffered on the closed socket is neither acked nor queued.
+        oldSocket.emitMessage({ event: 'zotero_data_request', request_id: 'req-stale' });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(5_000);
+        const onNewSocket = sentMessages(newSocket);
+        expect(onNewSocket.find((m) => m.request_id === 'req-stale')).toBeUndefined();
+        const newAck = onNewSocket.filter((m) => m.type === 'request_received');
+        expect(newAck).toHaveLength(0);
+
+        resolveHandler({ type: 'zotero_data', request_id: 'req-1', items: [] });
+        await flushMicrotasks();
+    });
+
+    it('does not let a handler from a reset connection shift the new queue accounting', async () => {
+        let resolveOld: (value: Record<string, any>) => void = () => {};
+        const provider = {
+            zotero_data_request: {
+                handle: vi.fn(() => new Promise<Record<string, any>>((resolve) => { resolveOld = resolve; })),
+                errorResponse: () => ({ type: 'zotero_data', request_id: 'x', error: 'x' }),
+            },
+        };
+        const service = new AgentService('https://api.example.com', provider);
+        const oldSocket = await connectWithFlags(service, createCallbacks(), { supports_request_acks: true });
+        oldSocket.emitMessage({ event: 'zotero_data_request', request_id: 'old-1' });
+        await flushMicrotasks();
+
+        service.close();
+        const callbacks = createCallbacks();
+        callbacks.onPart = vi.fn(() => new Promise<void>(() => {}));
+        const newSocket = await connectWithFlags(service, callbacks, { supports_request_acks: true });
+
+        // New connection: a stuck part, then a request whose ack sees depth 1.
+        newSocket.emitMessage({ event: 'part', run_id: 'run-2', part: {} });
+        await flushMicrotasks();
+        newSocket.emitMessage({ event: 'zotero_data_request', request_id: 'new-1' });
+        await flushMicrotasks();
+
+        // The old connection's handler settles now; it must shift only its own array.
+        resolveOld({ type: 'zotero_data', request_id: 'old-1', items: [] });
+        await flushMicrotasks();
+
+        newSocket.emitMessage({ event: 'zotero_data_request', request_id: 'new-2' });
+        await flushMicrotasks();
+
+        const acks = sentMessages(newSocket).filter((m) => m.type === 'request_received');
+        expect(acks.map((m) => [m.request_id, m.busy.queue_depth])).toEqual([
+            ['new-1', 1],
+            ['new-2', 2],
+        ]);
+    });
+
+    it('does not send keepalives to a backend that does not advertise them', async () => {
+        let resolveHandler: (value: Record<string, any>) => void = () => {};
+        const provider = {
+            zotero_data_request: {
+                handle: vi.fn(() => new Promise<Record<string, any>>((resolve) => { resolveHandler = resolve; })),
+                errorResponse: () => ({ type: 'zotero_data', request_id: 'req-1', error: 'x' }),
+            },
+        };
+        const service = new AgentService('https://api.example.com', provider);
+        const socket = await connectWithFlags(service, createCallbacks(), { supports_request_acks: true });
+
+        socket.emitMessage({ event: 'zotero_data_request', request_id: 'req-1' });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(sentMessages(socket).filter((m) => m.type === 'request_keepalive')).toHaveLength(0);
+        expect(sentMessages(socket).filter((m) => m.type === 'request_received')).toHaveLength(1);
+
+        resolveHandler({ type: 'zotero_data', request_id: 'req-1', items: [] });
+        await flushMicrotasks();
+    });
+});
+
+it("keeps admission metadata across the history REST adapter", async () => {
+    const service = new AgentRunService("http://localhost:8000");
+    vi.spyOn(service as any, "get").mockResolvedValue({
+        runs: [],
+        agent_actions: null,
+        tail_run_id: "hidden-tail",
+        activity: { state: "active", run_id: "reserved" },
+    });
+    expect(await service.getThreadRuns("thread", true)).toEqual({
+        runs: [],
+        agent_actions: null,
+        tail_run_id: "hidden-tail",
+        activity: { state: "active", run_id: "reserved" },
+    });
+});
+
+describe("AgentRunService.getThreadActivity", () => {
+    const busy = { tail_run_id: "tail", activity: { state: "active", run_id: "reserved" } };
+
+    it("reads the activity endpoint without loading history", async () => {
+        const service = new AgentRunService("http://localhost:8000");
+        const get = vi.spyOn(service as any, "get").mockResolvedValue(busy);
+        expect(await service.getThreadActivity("thread")).toEqual(busy);
+        expect(get).toHaveBeenCalledOnce();
+        expect(get.mock.calls[0][0]).toBe("/api/v1/agents/astermargin/threads/thread/activity");
+    });
+
+    it("falls back to the history endpoint once a server answers 404", async () => {
+        const service = new AgentRunService("http://localhost:8000");
+        const get = vi.spyOn(service as any, "get").mockImplementation(async (endpoint: any) => {
+            if (endpoint.endsWith("/activity")) throw new ApiError(404, "Not Found");
+            return { runs: [{ id: "tail" }], agent_actions: null, ...busy };
+        });
+        expect(await service.getThreadActivity("thread")).toEqual(busy);
+        expect(await service.getThreadActivity("thread")).toEqual(busy);
+        expect(get.mock.calls.map(([endpoint]) => endpoint)).toEqual([
+            "/api/v1/agents/astermargin/threads/thread/activity",
+            "/api/v1/agents/astermargin/threads/thread/runs",
+            "/api/v1/agents/astermargin/threads/thread/runs",
+        ]);
+    });
+
+    it.each([
+        ["a server error", new ApiError(500, "Internal Server Error")],
+        ["a network failure", new Error("offline")],
+    ])("propagates %s without falling back", async (_label, error) => {
+        const service = new AgentRunService("http://localhost:8000");
+        const get = vi.spyOn(service as any, "get").mockRejectedValue(error);
+        await expect(service.getThreadActivity("thread")).rejects.toBe(error);
+        expect(get).toHaveBeenCalledOnce();
+    });
+});
+
+describe('AgentService connection heartbeat', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+        MockWebSocket.instances = [];
+        vi.stubGlobal('WebSocket', MockWebSocket);
+
+        mockSupabase.auth.getSession.mockReset();
+        mockSupabase.auth.refreshSession.mockReset();
+        mockSupabase.auth.getSession.mockResolvedValue({
+            data: {
+                session: {
+                    access_token: 'token',
+                    expires_at: Math.floor(Date.now() / 1000) + 3600,
+                },
+            },
+            error: null,
+        });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+
+    async function connect(
+        service: AgentService,
+        callbacks: WSCallbacks,
+        supportsHeartbeat: boolean,
+    ): Promise<MockWebSocket> {
+        const initialCount = MockWebSocket.instances.length;
+        const connectPromise = service.connect({ type: 'chat' } as AgentRunRequest, callbacks);
+        for (let i = 0; i < 20 && MockWebSocket.instances.length === initialCount; i++) {
+            await Promise.resolve();
+        }
+        const socket = MockWebSocket.instances[initialCount];
+        if (!socket) throw new Error('Expected AgentService.connect() to create a WebSocket');
+        socket.emitOpen();
+        await vi.advanceTimersByTimeAsync(50);
+        socket.emitMessage({
+            event: 'ready',
+            subscription_status: 'active',
+            processing_mode: 'fast',
+            indexing_complete: true,
+            ...(supportsHeartbeat ? { supports_heartbeat: true } : {}),
+        });
+        await connectPromise;
+        return socket;
+    }
+
+    const pings = (socket: MockWebSocket) =>
+        socket.send.mock.calls
+            .map(([raw]) => JSON.parse(raw as string))
+            .filter((m) => m.type === 'ping');
+
+    it('sends no pings and never times out against a backend without heartbeat support', async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, false);
+
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+        expect(pings(socket)).toHaveLength(0);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+        expect(socket.close).not.toHaveBeenCalled();
+    });
+
+    it('keeps a quiet connection open while the server answers its pings', async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, true);
+
+        // An approval card waits for minutes with no run traffic; only pongs arrive.
+        for (let i = 0; i < 20; i++) {
+            await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+            socket.emitMessage({ event: 'pong' });
+            await flushMicrotasks();
+        }
+
+        expect(pings(socket)).toHaveLength(20);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+        expect(callbacks.onError).not.toHaveBeenCalled();
+    });
+
+    it('reports a lost connection once the server stops answering, without waiting for the browser', async () => {
+        const callbacks = createCallbacks();
+        const service = new AgentService('https://api.example.com', {});
+        const socket = await connect(service, callbacks, true);
+
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_TIMEOUT_MS - 1);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        const [code, reason, wasClean, evidence] = vi.mocked(callbacks.onClose!).mock.calls[0];
+        expect(code).toBe(1006);
+        expect(reason).toBe('heartbeat_timeout');
+        expect(wasClean).toBe(false);
+        expect(evidence).toMatchObject({ stage: 'mid_run', readyReceived: true, closeCode: 1006 });
+        expect(evidence?.msSinceLastWsMessageMs).toBeGreaterThanOrEqual(HEARTBEAT_TIMEOUT_MS);
+        expect(socket.close).toHaveBeenCalledTimes(1);
+        expect(socket.close).toHaveBeenCalledWith(HEARTBEAT_TIMEOUT_CLOSE_CODE, 'Heartbeat timeout');
+        expect(service.isConnected()).toBe(false);
+
+        // The browser's own close event, when it finally fires, is not reported twice.
+        socket.emitClose({ code: 1006, wasClean: false });
+        const pingCount = pings(socket).length;
+        await vi.advanceTimersByTimeAsync(5 * HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        expect(pings(socket)).toHaveLength(pingCount);
+    });
+
+    it('waits longer while a large outbound message is still uploading', async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, true);
+
+        socket.bufferedAmount = 8 * 1024 * 1024;
+        await vi.advanceTimersByTimeAsync(2 * HEARTBEAT_TIMEOUT_MS);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+
+        // Once the upload drains, the server gets a full timeout to answer.
+        socket.bufferedAmount = 0;
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_TIMEOUT_MS - HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(2 * HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a lost connection when queued outbound data stops draining', async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, true);
+
+        socket.bufferedAmount = 8 * 1024 * 1024;
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_UPLOAD_TIMEOUT_MS - HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(2 * HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(callbacks.onClose!).mock.calls[0][1]).toBe('heartbeat_timeout');
+    });
+
+    it('keeps a connection open while queued messages keep finishing', async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, true);
+
+        // Several large responses written back to back, one finishing per window.
+        socket.bufferedAmount = 64 * 1024 * 1024;
+        for (let i = 0; i < 2 * HEARTBEAT_UPLOAD_TIMEOUT_MS / HEARTBEAT_INTERVAL_MS; i++) {
+            await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+            socket.bufferedAmount -= 1024 * 1024;
+        }
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+    });
+
+    it("does not count its own ping draining as upload progress", async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, true);
+        // Each ping sits in the buffer briefly and has drained by the next tick.
+        socket.send.mockImplementation(() => { socket.bufferedAmount = 16; });
+        const drain = setInterval(() => { socket.bufferedAmount = 0; }, 1_000);
+
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_TIMEOUT_MS + HEARTBEAT_INTERVAL_MS);
+        clearInterval(drain);
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives pongs a full timeout after the timers were starved', async () => {
+        const callbacks = createCallbacks();
+        const socket = await connect(new AgentService('https://api.example.com', {}), callbacks, true);
+
+        // A blocked main thread or system sleep: the clock moves, timers do not.
+        vi.setSystemTime(Date.now() + 5 * 60_000);
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+
+        socket.emitMessage({ event: 'pong' });
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(callbacks.onClose).not.toHaveBeenCalled();
+    });
+
+    it('stops pinging once the client closes the connection', async () => {
+        const callbacks = createCallbacks();
+        const service = new AgentService('https://api.example.com', {});
+        const socket = await connect(service, callbacks, true);
+
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+        expect(pings(socket)).toHaveLength(1);
+
+        service.close();
+        await vi.advanceTimersByTimeAsync(5 * HEARTBEAT_TIMEOUT_MS);
+        expect(pings(socket)).toHaveLength(1);
+        // Only the client's own close notification, never a heartbeat loss.
+        expect(callbacks.onClose).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(callbacks.onClose!).mock.calls[0][0]).toBe(1000);
+    });
+});

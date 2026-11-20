@@ -1,0 +1,266 @@
+/**
+ * Node-side AsterMarginExtract API.
+ *
+ * Thin wrappers around the worker ops in `../worker/ops.ts`. Each
+ * function pre-initializes the runtime via `ensureExtractionRuntime`
+ * (MuPDF + sentencex) and returns the `result` field of the op reply.
+ *
+ * Imports ops directly from `../worker/ops` — never from
+ * `../index` (the barrel), which would pull `MuPDFWorkerClient` into the
+ * Node graph and try to spawn a Web Worker.
+ *
+ * Concurrency: every op call is funneled through the worker `enqueue`
+ * FIFO. The shared WASM heap state (`_wasm_string`, `_wasm_matrix`,
+ * `createBuffer` allocations, `_wasm_drop_document`) is not safe across
+ * concurrent ops, and Node callers can absolutely race them via
+ * `Promise.all` (the `info` command does exactly that). The worker
+ * dispatcher uses the same queue, so this matches the worker contract.
+ */
+import { ensureExtractionRuntime, resetMuPDFNode } from "./bootstrap";
+import {
+    opAnalyzeLayout,
+    opAnalyzeOCRNeeds,
+    opExtract,
+    opExtractRawPageDetailed,
+    opGetMetadata,
+    opGetPageCount,
+    opItemsExport,
+    opRegionsExport,
+    opReferenceInputs,
+    opRenderPages,
+    opStructuredExtractWithDebug,
+} from "../worker/ops";
+import { enqueue } from "../worker/opQueue";
+import { opDetectRegions, type RegionDetectionResult } from "../worker/regionOps";
+import {
+    ExtractionError,
+    ExtractionErrorCode,
+    type ExtractionSettings,
+    type LayoutAnalysisResult,
+    type OCRDetectionOptions,
+    type OCRDetectionResult,
+    type PageImageOptions,
+    type PageImageResult,
+    type PDFMetadata,
+    type RawPageDataDetailed,
+} from "@astermargin/agent-core/extract/types";
+import type {
+    AsterMarginExtractResult,
+    StructuredExtractWithDebugResult,
+} from "../schema";
+import type { ParagraphDetectionSettings } from "../ParagraphDetector";
+import type { PresetOverrides } from "../schema/presets";
+import type { SentenceSplitterConfig } from "../sentenceTypes";
+
+export type PdfBytes = Uint8Array | ArrayBuffer;
+
+export interface PageRange {
+    startIndex: number;
+    endIndex?: number;
+    maxPages?: number;
+}
+
+export interface ExtractInput {
+    pdfData: PdfBytes;
+    mode?: "markdown" | "structured";
+    markdown?: { engine?: "block" | "paragraph" };
+    structured?: { splitterConfig?: SentenceSplitterConfig; bboxPrecision?: number };
+    settings?: ExtractionSettings;
+    paragraphSettings?: ParagraphDetectionSettings;
+    pageIndices?: number[];
+    pageRange?: PageRange;
+    analysisWindow?: number;
+    /** Attach the opt-in `diagnostics` block */
+    includeDiagnostics?: boolean;
+    /** PDF schema version to produce (its extraction preset); default current. */
+    schemaVersion?: string;
+    /** Development only (CLI): switches of the schema's preset to override. */
+    presetOverrides?: PresetOverrides;
+}
+
+export interface AnalyzeLayoutInput {
+    pdfData: PdfBytes;
+    settings?: ExtractionSettings;
+    pageIndices?: number[];
+    pageRange?: PageRange;
+    analysisWindow?: number;
+}
+
+export interface StructuredTraceInput extends ExtractInput {
+    mode: "structured";
+    capturePages: number[];
+    debugMode?: "triage" | "full";
+}
+
+export interface RenderPagesInput {
+    pdfData: PdfBytes;
+    pageIndices?: number[];
+    pageRange?: PageRange;
+    options?: PageImageOptions;
+}
+
+export interface RenderPagesResult {
+    pageCount: number;
+    pageLabels: Record<number, string>;
+    pages: PageImageResult[];
+}
+
+export async function getPageCount(
+    pdfData: PdfBytes,
+): Promise<{ count: number }> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opGetPageCount({ pdfData }));
+    return reply.result;
+}
+
+export async function getMetadata(pdfData: PdfBytes): Promise<PDFMetadata> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opGetMetadata({ pdfData }));
+    return reply.result;
+}
+
+export async function extractPdf(input: ExtractInput): Promise<AsterMarginExtractResult> {
+    if (
+        input.mode === "structured" &&
+        ((input.pageIndices?.length ?? 0) > 0 || input.pageRange)
+    ) {
+        throw new ExtractionError(
+            ExtractionErrorCode.STRUCTURED_PAGE_SELECTION_REJECTED,
+            "Structured extraction is full-document only; pageIndices and pageRange are only supported for markdown extraction.",
+        );
+    }
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opExtract(input));
+    return reply.result;
+}
+
+export async function structuredExtractWithDebug(
+    input: StructuredTraceInput,
+): Promise<StructuredExtractWithDebugResult> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opStructuredExtractWithDebug(input));
+    return reply.result;
+}
+
+/**
+ * Full-document structured extraction returning the reference line model's
+ * per-page inputs, before any item pass (training export).
+ */
+export async function referenceInputs(
+    input: Pick<ExtractInput, "pdfData" | "settings" | "paragraphSettings" | "analysisWindow" | "schemaVersion">,
+): Promise<Awaited<ReturnType<typeof opReferenceInputs>>["result"]> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opReferenceInputs(input));
+    return reply.result;
+}
+
+/**
+ * Full-document structured extraction returning the `items export` row of a
+ * model task (training export; see `pipeline/itemsExport.ts`). It runs with
+ * the plugin's extraction settings: the defaults, which the plugin uses too,
+ * so features see what they will see at runtime.
+ */
+export async function itemsExport(
+    input: Pick<ExtractInput, "pdfData" | "schemaVersion" | "presetOverrides"> & {
+        task: string;
+        bboxPrecision?: number;
+    },
+): Promise<Awaited<ReturnType<typeof opItemsExport>>["result"]> {
+    await ensureExtractionRuntime();
+    const { bboxPrecision, ...args } = input;
+    const reply = await enqueue(() => opItemsExport({ ...args, structured: { bboxPrecision } }));
+    return reply.result;
+}
+
+/**
+ * Full-document structured extraction returning the `regions-v2` export row
+ * (training export of the region model; see `pipeline/regionsExport.ts`),
+ * with the plugin's extraction settings. `pages` limits the pages written.
+ */
+export async function regionsExport(
+    input: Pick<ExtractInput, "pdfData" | "schemaVersion" | "presetOverrides"> & {
+        bboxPrecision?: number;
+        pages?: number[];
+    },
+): Promise<Awaited<ReturnType<typeof opRegionsExport>>["result"]> {
+    await ensureExtractionRuntime();
+    const { bboxPrecision, ...args } = input;
+    const reply = await enqueue(() => opRegionsExport({ ...args, structured: { bboxPrecision } }));
+    return reply.result;
+}
+
+/**
+ * Replace the MuPDF runtime after a fatal WASM error (trap or heap
+ * exhaustion) so the next operation starts on a fresh instance. Batch
+ * callers use it between documents; the next op re-initializes lazily.
+ */
+export function resetExtractionRuntime(): void {
+    resetMuPDFNode();
+}
+
+export async function analyzeLayout(
+    input: AnalyzeLayoutInput,
+): Promise<LayoutAnalysisResult> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opAnalyzeLayout(input));
+    return reply.result;
+}
+
+export async function renderPages(
+    input: RenderPagesInput,
+): Promise<RenderPagesResult> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opRenderPages(input));
+    return reply.result;
+}
+
+export async function extractRawPageDetailed(
+    pdfData: PdfBytes,
+    pageIndex: number,
+    includeImages = false,
+): Promise<RawPageDataDetailed> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() =>
+        opExtractRawPageDetailed({ pdfData, pageIndex, includeImages }),
+    );
+    return reply.result;
+}
+
+export async function analyzeOCRNeeds(
+    pdfData: PdfBytes,
+    options?: OCRDetectionOptions,
+): Promise<OCRDetectionResult> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() => opAnalyzeOCRNeeds({ pdfData, options }));
+    return reply.result;
+}
+
+export interface DetectRegionsInput {
+    pdfData: PdfBytes;
+    pageIndices: number[];
+    /** Extra pages (graphics summary only) used for document context. */
+    contextPages?: number;
+    /** false: return unclassified candidates (training-data export). */
+    classify?: boolean;
+    /** Also return each page's text lines with routing flags. */
+    includeLines?: boolean;
+    /** Also propose grid candidates (`PdfExtractionPreset.gridTableCandidates`). */
+    gridCandidates?: boolean;
+}
+
+/** Region candidates per page with features and classes (debugging and training export). */
+export async function detectRegions(input: DetectRegionsInput): Promise<RegionDetectionResult> {
+    await ensureExtractionRuntime();
+    const reply = await enqueue(() =>
+        opDetectRegions({
+            pdfData: input.pdfData instanceof Uint8Array ? input.pdfData : new Uint8Array(input.pdfData),
+            pageIndices: input.pageIndices,
+            contextPages: input.contextPages,
+            classify: input.classify,
+            includeLines: input.includeLines,
+            gridCandidates: input.gridCandidates,
+        }),
+    );
+    return reply.result;
+}
+

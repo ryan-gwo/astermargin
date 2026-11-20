@@ -1,0 +1,72 @@
+import { FeatureStep, VersionAlsoNew, VersionShowcaseId, VersionUpdateAction } from "../constants/versionUpdateMessages";
+import { ButtonVariant } from "@astermargin/agent-ui/primitives/Button";
+import type { FeatureTipId } from "../constants/featureTips";
+import type { FileExportFormat } from "@astermargin/agent-ui/host/types";
+
+export const POPUP_MESSAGE_DURATION = 4000; // 4 seconds
+
+export type PopupMessageType = 'info' | 'warning' | 'error' | 'version_update' | 'items_summary' | 'welcome_onboarding' | 'reader_tip' | 'note_tip' | 'citation_tip' | 'feature_tip' | 'cloud_consent' | 'file_export';
+
+export interface PopupMessageFeature {
+    title: string;
+    description?: string;
+}
+
+export interface PopupMessageButton {
+    text: string;
+    onClick: () => void;
+    icon?: React.ComponentType<React.SVGProps<SVGSVGElement>>;
+    rightIcon?: React.ComponentType<React.SVGProps<SVGSVGElement>> | React.ReactElement;
+    variant?: ButtonVariant;
+}
+
+/** A finished file export, shown by `file_export` messages. */
+export interface FileExportPopupData {
+    format: FileExportFormat;
+    fileName: string;
+    /** The folder it was saved in. */
+    folderName: string;
+    /** Files written beside it (a LaTeX export's .bib file). */
+    companionFileNames: string[];
+    warnings: string[];
+    onReveal?: () => Promise<void>;
+    onOpen?: () => Promise<void>;
+}
+
+export interface PopupMessage {
+    id: string;
+    /** Which tip a `feature_tip` message shows — see `react/constants/featureTips.tsx`. */
+    tipId?: FeatureTipId;
+    cancelable?: boolean; // Defaults to true
+    type: PopupMessageType;
+    /** Release version shown by version update messages. */
+    version?: string;
+    title?: string;
+    text?: string;
+    customContent?: React.ReactNode;
+    icon?: React.ReactNode;
+    rightIcon?: React.ReactElement;
+    expire?: boolean; // Defaults to true
+    buttonIcon?: React.ComponentType<React.SVGProps<SVGSVGElement>>;
+    buttonOnClick?: () => void
+    /** The exported file a `file_export` message reports. */
+    fileExport?: FileExportPopupData;
+    count?: number;   // Count message occurrences
+    duration?: number; // Duration in milliseconds, defaults to POPUP_MESSAGE_DURATION
+    /** Optional action button displayed at the bottom of the message */
+    button?: PopupMessageButton;
+    /** @deprecated Use steps for new version messages */
+    featureList?: PopupMessageFeature[];
+    learnMoreUrl?: string;
+    learnMoreLabel?: string;
+    footer?: string;
+    /** Feature steps for guided tour (new format for version updates) */
+    steps?: FeatureStep[];
+    /** Subtitle shown below the title in step-based tours */
+    subtitle?: string;
+    /** The visual a version update message carries — see `react/constants/versionShowcases.ts`. */
+    showcase?: VersionShowcaseId;
+    /** A second feature under the showcase — see `VersionAlsoNew`. */
+    alsoNew?: VersionAlsoNew;
+    primaryAction?: VersionUpdateAction;
+}

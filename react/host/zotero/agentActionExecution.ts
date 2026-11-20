@@ -1,0 +1,550 @@
+import { mergeItemsChoicesAtom, withMergeChoices } from '../../atoms/mergeItemsChoices';
+import { executeMergeItemsAction, refreshMergeItemsProposal, undoMergeItemsAction } from '../../utils/mergeItemsActions';
+import { atom, Getter, Setter } from 'jotai';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { itemActionExternalId } from '@astermargin/agent-core/agents/agentActionTypes';
+import {
+    AgentAction,
+    ackAgentActionsAtom,
+    rejectAgentActionAtom,
+    setAgentActionsToErrorAtom,
+    undoAgentActionAtom,
+    updateAgentActionsAtom,
+    withoutActionsAppliedElsewhereAtom,
+} from '../../agents/agentActions';
+import { markExternalReferenceImportedAtom, markExternalReferenceDeletedAtom } from '../../atoms/externalReferences';
+import { activeRunAtom, currentThreadIdAtom, threadRunsAtom } from '@astermargin/agent-core/run-state/atoms';
+import type { ManualApplyOptions } from '../../../src/services/manualActions/staleProposal';
+import { executeEditMetadataAction, undoEditMetadataAction, UndoResult } from '../../utils/editMetadataActions';
+import { executeCreateCollectionAction, undoCreateCollectionAction } from '../../utils/createCollectionActions';
+import { executeOrganizeItemsAction, undoOrganizeItemsAction } from '../../utils/organizeItemsActions';
+import { executeCreateItemActions, undoCreateItemActions } from '../../utils/createItemActions';
+import { executeImportItemActions, undoImportItemActions } from '../../utils/importItemActions';
+import { executeCreateNoteAction, undoCreateNoteAction } from '../../utils/createNoteActions';
+import { executeManageTagsAction, undoManageTagsAction } from '../../utils/manageTagsActions';
+import { executeManageCollectionsAction, undoManageCollectionsAction } from '../../utils/manageCollectionsActions';
+import {
+    executeCreateHighlightAnnotationsAction,
+    executeCreateNoteAnnotationsAction,
+    undoCreateAnnotationsAction,
+} from '../../utils/createAnnotationsActions';
+import { executeEditAnnotationsAction, undoEditAnnotationsAction } from '../../utils/editAnnotationsActions';
+import { executeEditNoteOrBatchAction, undoEditNoteOrBatchAction } from '../../utils/editNoteActions';
+import { getUserFacingErrorMessage } from '../../../src/utils/userFacingError';
+import { confirmOverwriteManualChanges } from './components/agentActionViewHelpers';
+import { isUnconfirmedAction } from './components/reviewChangeRows';
+import { isStaleMergeProposal } from './components/mergeItemsErrors';
+import { dismissActiveEditNotePreview } from './editNotePreviewLifecycle';
+
+/**
+ * Apply / undo / reject for stored agent actions, as write atoms so any
+ * surface can drive them: the in-stream card, and anything that only has the
+ * action records themselves.
+ */
+
+export interface AgentActionFailure {
+    actionId: string;
+    error: string;
+    errorDetails?: Record<string, any>;
+}
+
+export interface ApplyAgentActionsResult {
+    applied: string[];
+    failed: AgentActionFailure[];
+    /** Set only when the operation threw as a whole, not per action. */
+    fatalError?: string;
+}
+
+export interface UndoAgentActionsResult {
+    undone: string[];
+    failed: AgentActionFailure[];
+    fatalError?: string;
+}
+
+/**
+ * Dispatch on the action type, not the tool name. Three tool names differ from
+ * the action type they store, and callers may hold either.
+ */
+function normalizeActionType(actionType: string): string {
+    if (actionType === 'create_items') return 'create_item';
+    if (actionType === 'edit_item') return 'edit_metadata';
+    // A deletion is an edit_annotations action with proposed_data.operation
+    // 'delete'; both route to the same executor.
+    if (actionType === 'delete_annotations') return 'edit_annotations';
+    return actionType;
+}
+
+/**
+ * The thread that owns `runId`, from this window's run records. Import paths,
+ * attachment routing and provenance are scoped to it, so it must be the
+ * action's own thread rather than whichever thread is in view when the write
+ * starts. A run without a thread id yet belongs to the thread open here.
+ * Undefined when this window does not hold the run.
+ */
+export function getThreadIdForRun(get: Getter, runId: string): string | undefined {
+    const activeRun = get(activeRunAtom);
+    const run = activeRun?.id === runId
+        ? activeRun
+        : get(threadRunsAtom).find((candidate) => candidate.id === runId);
+    if (!run) return undefined;
+    return run.thread_id ?? get(currentThreadIdAtom) ?? undefined;
+}
+
+/**
+ * Options for one apply: the user's "Apply anyway", and the thread that owns
+ * the action's run (resolved at the click).
+ */
+type ApplyOptions = ManualApplyOptions & { threadId?: string };
+
+/** Action types applied by one call whose result is acked as-is. */
+const APPLY_EXECUTORS = new Map<string, (action: AgentAction, runId: string, options: ApplyOptions) => Promise<any>>([
+    ['edit_metadata', (action, _runId, { skipStaleCheck }) => executeEditMetadataAction(action, { skipStaleCheck })],
+    ['edit_note', (action, _runId, options) => executeEditNoteOrBatchAction(action, options)],
+    ['edit_note_batch', (action, _runId, options) => executeEditNoteOrBatchAction(action, options)],
+    ['create_collection', (action) => executeCreateCollectionAction(action)],
+    ['organize_items', (action) => executeOrganizeItemsAction(action)],
+    ['merge_items', (action) => executeMergeItemsAction(action)],
+    ['manage_tags', (action, _runId, { skipStaleCheck }) => executeManageTagsAction(action, { skipStaleCheck })],
+    ['manage_collections', (action, _runId, { skipStaleCheck }) => executeManageCollectionsAction(action, { skipStaleCheck })],
+    ['create_note', (action, runId, { threadId }) => executeCreateNoteAction(action, runId, threadId)],
+    ['create_highlight_annotations', (action) => executeCreateHighlightAnnotationsAction(action)],
+    ['create_note_annotations', (action) => executeCreateNoteAnnotationsAction(action)],
+    ['edit_annotations', (action, _runId, { skipStaleCheck }) => executeEditAnnotationsAction(action, { skipStaleCheck })],
+]);
+
+/** Action types undone by one call with no confirmation step. */
+const UNDO_EXECUTORS = new Map<string, (action: AgentAction) => Promise<void>>([
+    ['edit_note', undoEditNoteOrBatchAction],
+    ['edit_note_batch', undoEditNoteOrBatchAction],
+    ['create_collection', undoCreateCollectionAction],
+    ['organize_items', undoOrganizeItemsAction],
+    ['merge_items', undoMergeItemsAction],
+    ['manage_tags', undoManageTagsAction],
+    ['manage_collections', undoManageCollectionsAction],
+    ['create_note', undoCreateNoteAction],
+    ['create_highlight_annotations', undoCreateAnnotationsAction],
+    ['create_note_annotations', undoCreateAnnotationsAction],
+]);
+
+/**
+ * Undo for the action types that can hit fields the user edited afterwards:
+ * re-runs with forceRevert once the user confirms the overwrite.
+ */
+async function undoWithOverwriteConfirmation(
+    action: AgentAction,
+    undoAction: (action: AgentAction, forceRevert: boolean) => Promise<UndoResult>,
+    fieldLabel: string,
+    window?: Window,
+): Promise<UndoResult> {
+    let result = await undoAction(action, false);
+    if (result.needsConfirmation && result.manuallyModified.length > 0) {
+        if (confirmOverwriteManualChanges(result.manuallyModified, window)) {
+            result = await undoAction(action, true);
+            logger(`agentActionExecution: Force-reverted ${result.fieldsReverted} ${fieldLabel} after user confirmation`, 1);
+        } else {
+            logger(`agentActionExecution: User declined to overwrite ${result.manuallyModified.length} manually modified ${fieldLabel}`, 1);
+        }
+    }
+    if (result.alreadyReverted.length > 0) {
+        logger(`agentActionExecution: ${fieldLabel} already at original value: ${result.alreadyReverted.join(', ')}`, 1);
+    }
+    return result;
+}
+
+/**
+ * Whether an action still has a change in Zotero that an undo can reverse.
+ *
+ * `applied` is the ordinary case. An `error` that kept its `result_data` is a
+ * failed undo — the change is still in the library, and the surfaces offer
+ * "Retry Undo" for it, so it has to survive the filter that a retry passes
+ * through. A failed *apply* clears `result_data` and is correctly excluded.
+ */
+function isUndoable(action: AgentAction): boolean {
+    return action.status === 'applied'
+        || (action.status === 'error' && action.result_data != null);
+}
+
+function toFailures(actions: AgentAction[], error: string, errorDetails?: Record<string, any>): AgentActionFailure[] {
+    return actions.map((action) => ({ actionId: action.id, error, errorDetails }));
+}
+
+/**
+ * Action ids with a Zotero write in flight, claimed here rather than by any one
+ * surface.
+ *
+ * A terminal run's pending action is offered by every surface that can reach it —
+ * the in-stream card and the changes card both show Apply — and an action stays
+ * `pending` until its write finishes and the ack lands. Surfaces each guarding
+ * only their own buttons therefore let a second click through: two applies
+ * duplicate the mutation, and a reject lands on an action whose write is still
+ * running, so the ack flips it straight back to `applied` and the user's "no" is
+ * lost. Claiming here covers every caller, including ones added later.
+ *
+ * An atom rather than a plain Set because the claim is the only thing that knows
+ * a write is running — the action's status says `pending` throughout — so
+ * surfaces need to observe it to disable their controls.
+ */
+export const inFlightAgentActionIdsAtom = atom<ReadonlySet<string>>(new Set<string>());
+
+/** The actions not already being written; empty when another surface holds them all. */
+function claimActions(get: Getter, set: Setter, actions: AgentAction[]): AgentAction[] {
+    const inFlight = get(inFlightAgentActionIdsAtom);
+    const claimed = actions.filter((action) => !inFlight.has(action.id));
+    if (claimed.length > 0) {
+        const next = new Set(inFlight);
+        for (const action of claimed) next.add(action.id);
+        set(inFlightAgentActionIdsAtom, next);
+    }
+    return claimed;
+}
+
+function releaseActions(get: Getter, set: Setter, actions: AgentAction[]): void {
+    const next = new Set(get(inFlightAgentActionIdsAtom));
+    for (const action of actions) next.delete(action.id);
+    set(inFlightAgentActionIdsAtom, next);
+}
+
+/**
+ * Report an action type this executor cannot handle. The legacy per-annotation
+ * types still apply through their own surfaces.
+ *
+ * Reported as per-action failures rather than an empty success, so a caller that
+ * hands over a wider set of actions than the in-stream card can tell "applied
+ * nothing" from "nothing to apply". The action records are left alone: nothing
+ * was attempted, so nothing failed in Zotero. `fatalError` stays unset on
+ * purpose — the in-stream card reads it to switch Retry over to undo, and this
+ * is not a failed attempt it could retry.
+ */
+function unsupportedActionTypeFailures(
+    actions: AgentAction[],
+    actionType: string,
+    operation: 'apply' | 'undo',
+): AgentActionFailure[] {
+    const message = `No ${operation} executor for action type '${actionType}'`;
+    logger(`agentActionExecution: ${message}`, 1);
+    return toFailures(actions, message);
+}
+
+/**
+ * Apply a tool call's actions. Single-action types apply `actions[0]`; only
+ * create_item and import_item are batches. An action type this executor does not handle comes
+ * back as a per-action failure, never as an empty success.
+ *
+ * An action already applied elsewhere (another window or device) is not
+ * written again: it is left out before the write and shown as the server has
+ * it, and the acknowledgement never replaces a result the server already
+ * holds. `skipStaleCheck` is the user's "Apply anyway" for a proposal the
+ * library has moved away from.
+ */
+export const applyAgentActionsAtom = atom(
+    null,
+    async (
+        get,
+        set,
+        { actions, runId, skipStaleCheck = false }: { actions: AgentAction[]; runId: string; skipStaleCheck?: boolean },
+    ): Promise<ApplyAgentActionsResult> => {
+        if (actions.length === 0) return { applied: [], failed: [] };
+
+        const claimed = claimActions(get, set, actions);
+        if (claimed.length === 0) {
+            logger('agentActionExecution: apply skipped, another surface is already writing these actions', 1);
+            return { applied: [], failed: [] };
+        }
+        // Resolved at the click, before any await can let the view move on.
+        const threadId = getThreadIdForRun(get, runId);
+        try {
+            const current = await set(withoutActionsAppliedElsewhereAtom, runId, claimed);
+            if (current.length === 0) return { applied: [], failed: [] };
+            return await applyClaimedActions(get, set, current, runId, { threadId, skipStaleCheck });
+        } finally {
+            releaseActions(get, set, claimed);
+        }
+    }
+);
+
+/** The ids an acknowledgement recorded, leaving out the ones the server already had a result for. */
+function recordedIds(actionIds: string[], response: { skipped?: Array<{ action_id: string }> } | undefined): string[] {
+    const skipped = new Set((response?.skipped ?? []).map((entry) => entry.action_id));
+    return actionIds.filter((id) => !skipped.has(id));
+}
+
+async function applyClaimedActions(
+    get: Getter,
+    set: Setter,
+    claimed: AgentAction[],
+    runId: string,
+    { threadId, skipStaleCheck }: { threadId: string | undefined; skipStaleCheck: boolean },
+): Promise<ApplyAgentActionsResult> {
+    const applied: string[] = [];
+    const failed: AgentActionFailure[] = [];
+    let actions = claimed;
+    // The actions a failure is recorded on: a batch leaves some alone.
+    let attempted = claimed;
+    const actionType = normalizeActionType(actions[0].action_type);
+    try {
+        // The reviewed merge choices replace the proposal the backend sent.
+        // Folding them in here, inside the try, reports an inconsistent record
+        // on the action card instead of throwing through the caller's click
+        // handler.
+        actions = actions.map((candidate) => withMergeChoices(candidate, get(mergeItemsChoicesAtom)[candidate.id]));
+        attempted = actions;
+        const action = actions[0];
+        if (actionType === 'edit_note' || actionType === 'edit_note_batch') {
+            await dismissActiveEditNotePreview();
+        }
+        if (actionType === 'create_item' || actionType === 'import_item') {
+            // An unconfirmed action may already be in the library, so a batch
+            // applied around it leaves it alone.
+            const actionsToApply = actions.filter(
+                (candidate) => candidate.status !== 'applied' && !isUnconfirmedAction(candidate),
+            );
+            if (actionsToApply.length === 0) return { applied, failed };
+            attempted = actionsToApply;
+
+            const options = { runId, threadId };
+            const batchResult = actionType === 'import_item'
+                ? await executeImportItemActions(actionsToApply, options)
+                : await executeCreateItemActions(actionsToApply, options);
+            if (batchResult.successes.length > 0) {
+                const response = await set(ackAgentActionsAtom, runId, batchResult.successes.map((success) => ({
+                    action_id: success.action.id,
+                    result_data: success.result,
+                })));
+                logger(`agentActionExecution: Applied ${batchResult.successes.length} ${actionType} actions`, 1);
+
+                const recorded = new Set(recordedIds(batchResult.successes.map((success) => success.action.id), response));
+                for (const success of batchResult.successes) {
+                    if (!recorded.has(success.action.id)) continue;
+                    applied.push(success.action.id);
+                    const externalId = itemActionExternalId(success.action);
+                    if (externalId) {
+                        set(markExternalReferenceImportedAtom, externalId, {
+                            library_id: success.result.library_id,
+                            zotero_key: success.result.zotero_key,
+                            library_ref: success.result.library_ref,
+                        });
+                    }
+                }
+            }
+
+            for (const failure of batchResult.failures) {
+                set(setAgentActionsToErrorAtom, [failure.action.id], failure.error, failure.errorDetails);
+                failed.push({ actionId: failure.action.id, error: failure.error, errorDetails: failure.errorDetails });
+            }
+            if (batchResult.failures.length > 0) {
+                logger(`agentActionExecution: Failed to apply ${batchResult.failures.length} ${actionType} actions`, 1);
+            }
+        } else {
+            const executeAction = APPLY_EXECUTORS.get(actionType);
+            if (!executeAction) {
+                return { applied, failed: unsupportedActionTypeFailures(actions, actionType, 'apply') };
+            }
+
+            const result = await executeAction(action, runId, { skipStaleCheck, threadId });
+            const response = await set(ackAgentActionsAtom, runId, [{ action_id: action.id, result_data: result }]);
+            applied.push(...recordedIds([action.id], response));
+            logger(`agentActionExecution: Applied ${actionType} action ${action.id}`, 1);
+        }
+    } catch (error: any) {
+        const errorMessage = getUserFacingErrorMessage(error, 'Failed to apply action');
+        const stackTrace = error?.stack || '';
+        logger(`agentActionExecution: Failed to apply actions: ${errorMessage}\nStack trace:\n${stackTrace}`, 1);
+        const errorDetails = {
+            // A merge reports what changed since its proposal, by name only.
+            ...(error?.name === 'DuplicateError' && error.details ? error.details : {}),
+            stack_trace: stackTrace,
+            error_name: error?.name,
+            ...(error?.code ? { error_code: error.code } : {}),
+        };
+        set(setAgentActionsToErrorAtom, attempted.map((candidate) => candidate.id), errorMessage, errorDetails);
+        return { applied: [], failed: toFailures(attempted, errorMessage, errorDetails), fatalError: errorMessage };
+    }
+
+    return { applied, failed };
+}
+
+/**
+ * Undo a tool call's actions. Single-action types undo `actions[0]`; only
+ * create_item and import_item are batches. An action type this executor does not handle comes
+ * back as a per-action failure, never as an empty success.
+ */
+export const undoAgentActionsAtom = atom(
+    null,
+    async (get, set, { actions, window }: { actions: AgentAction[]; window?: Window }): Promise<UndoAgentActionsResult> => {
+        if (actions.length === 0) return { undone: [], failed: [] };
+
+        const claimed = claimActions(get, set, actions);
+        if (claimed.length === 0) {
+            logger('agentActionExecution: undo skipped, another surface is already writing these actions', 1);
+            return { undone: [], failed: [] };
+        }
+        try {
+            return await undoClaimedActions(set, claimed, window);
+        } finally {
+            releaseActions(get, set, claimed);
+        }
+    }
+);
+
+async function undoClaimedActions(set: Setter, actions: AgentAction[], window?: Window): Promise<UndoAgentActionsResult> {
+    const undone: string[] = [];
+    const failed: AgentActionFailure[] = [];
+    const action = actions[0];
+    const actionType = normalizeActionType(action.action_type);
+    try {
+        if (actionType === 'edit_note' || actionType === 'edit_note_batch') {
+            await dismissActiveEditNotePreview();
+        }
+        if (actionType === 'create_item' || actionType === 'import_item') {
+            // Includes the actions whose undo failed earlier: a retry of a
+            // partially undone batch has nothing else left to work on.
+            const actionsToUndo = actions.filter(isUndoable);
+            if (actionsToUndo.length === 0) return { undone, failed };
+
+            const batchResult = actionType === 'import_item'
+                ? await undoImportItemActions(actionsToUndo)
+                : await undoCreateItemActions(actionsToUndo);
+            for (const actionId of batchResult.successes) {
+                set(undoAgentActionAtom, actionId);
+                undone.push(actionId);
+                const undoneAction = actionsToUndo.find((candidate) => candidate.id === actionId);
+                const externalId = undoneAction ? itemActionExternalId(undoneAction) : undefined;
+                if (externalId) {
+                    set(markExternalReferenceDeletedAtom, externalId);
+                }
+            }
+            for (const failure of batchResult.failures) {
+                set(setAgentActionsToErrorAtom, [failure.actionId], failure.error, failure.errorDetails);
+                failed.push({ actionId: failure.actionId, error: failure.error, errorDetails: failure.errorDetails });
+            }
+            logger(`agentActionExecution: Undone ${batchResult.successes.length} ${actionType} actions`, 1);
+            if (batchResult.failures.length > 0) {
+                logger(`agentActionExecution: Failed to undo ${batchResult.failures.length} ${actionType} actions`, 1);
+            }
+        } else if (actionType === 'edit_metadata' || actionType === 'edit_annotations') {
+            const isMetadata = actionType === 'edit_metadata';
+            const result = await undoWithOverwriteConfirmation(
+                action,
+                isMetadata ? undoEditMetadataAction : undoEditAnnotationsAction,
+                isMetadata ? 'fields' : 'annotation fields',
+                window,
+            );
+            // Also reached when the user declined the overwrite: the fields
+            // they kept are theirs, but the action is no longer applied.
+            set(undoAgentActionAtom, action.id);
+            undone.push(action.id);
+            logger(`agentActionExecution: Undone ${actionType} action ${action.id} (${result.fieldsReverted} fields reverted)`, 1);
+        } else {
+            const undoAction = UNDO_EXECUTORS.get(actionType);
+            if (!undoAction) {
+                return { undone, failed: unsupportedActionTypeFailures(actions, actionType, 'undo') };
+            }
+
+            await undoAction(action);
+            set(undoAgentActionAtom, action.id);
+            undone.push(action.id);
+            logger(`agentActionExecution: Undone ${actionType} action ${action.id}`, 1);
+        }
+    } catch (error: any) {
+        const errorMessage = getUserFacingErrorMessage(
+            error,
+            actionType === 'edit_note' || actionType === 'edit_note_batch' ? 'Failed to undo note edit' : 'Failed to undo action',
+        );
+        const stackTrace = error?.stack || '';
+        logger(`agentActionExecution: Failed to undo actions: ${errorMessage}\nStack trace:\n${stackTrace}`, 1);
+
+        const errorDetails = {
+            stack_trace: stackTrace,
+            error_name: error?.name,
+            ...(error?.code ? { error_code: error.code } : {}),
+        };
+        const undoableActions = actions.filter(isUndoable);
+        if (undoableActions.length > 0) {
+            set(setAgentActionsToErrorAtom, undoableActions.map((candidate) => candidate.id), errorMessage, errorDetails);
+        }
+        // Only a thrown failure sets fatalError — callers use it to point
+        // Retry back at undo instead of re-applying. Per-action batch
+        // failures above must not set it.
+        return { undone: [], failed: toFailures(actions, errorMessage, errorDetails), fatalError: errorMessage };
+    }
+
+    return { undone, failed };
+}
+
+/**
+ * Reject the given agent actions, skipping any whose write is already running.
+ *
+ * Rejecting mid-write cannot stop the write, and its ack would overwrite the
+ * `rejected` status with `applied` — the rejection silently lost while the
+ * change stayed in the library. Skipping leaves the action to settle into its
+ * applied state, where Undo reverses it in one more click.
+ */
+export const rejectAgentActionsAtom = atom(
+    null,
+    (get, set, { actions }: { actions: AgentAction[] }): void => {
+        const inFlight = get(inFlightAgentActionIdsAtom);
+        for (const action of actions) {
+            if (inFlight.has(action.id)) {
+                logger(`agentActionExecution: reject skipped for ${action.id}, its write is already running`, 1);
+                continue;
+            }
+            if (action.action_type === 'edit_note' || action.action_type === 'edit_note_batch') {
+                void dismissActiveEditNotePreview();
+            }
+            set(rejectAgentActionAtom, action.id);
+        }
+    }
+);
+
+export interface RefreshMergeProposalsResult {
+    refreshed: string[];
+    failed: AgentActionFailure[];
+}
+
+/**
+ * Propose stale merges again: the same members and reviewed choices, with the
+ * current preview and snapshot, so the user reviews what is in the library now
+ * before applying. Each refreshed action returns to `pending` with its new
+ * proposal.
+ *
+ * The refreshed proposal is held in this window's state only, since the
+ * server keeps the proposal it stored. A reload shows the merge as stale again,
+ * and Refresh works the same way from there. Applying records the result on
+ * the server as usual, and undo reads only that result.
+ */
+export const refreshMergeProposalsAtom = atom(
+    null,
+    async (get, set, { actions }: { actions: AgentAction[] }): Promise<RefreshMergeProposalsResult> => {
+        const claimed = claimActions(get, set, actions.filter(isStaleMergeProposal));
+        const refreshed: string[] = [];
+        const failed: AgentActionFailure[] = [];
+        try {
+            for (const action of claimed) {
+                try {
+                    const reviewed = withMergeChoices(action, get(mergeItemsChoicesAtom)[action.id]);
+                    const proposal = await refreshMergeItemsProposal(reviewed.proposed_data as any);
+                    set(updateAgentActionsAtom, [{
+                        id: action.id,
+                        status: 'pending',
+                        proposed_data: proposal,
+                        error_message: undefined,
+                        error_details: undefined,
+                    }]);
+                    refreshed.push(action.id);
+                } catch (error: any) {
+                    const message = error?.message || 'Failed to refresh the merge';
+                    const errorDetails = {
+                        error_name: error?.name,
+                        ...(error?.code ? { error_code: error.code } : {}),
+                    };
+                    logger(`agentActionExecution: Failed to refresh merge ${action.id}: ${message}`, 1);
+                    set(setAgentActionsToErrorAtom, [action.id], message, errorDetails);
+                    failed.push({ actionId: action.id, error: message, errorDetails });
+                }
+            }
+        } finally {
+            releaseActions(get, set, claimed);
+        }
+        return { refreshed, failed };
+    }
+);

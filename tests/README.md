@@ -1,0 +1,416 @@
+# Tests
+
+Unit, live, and integration tests for the AsterMargin Zotero plugin, using [Vitest](https://vitest.dev/).
+
+## Running tests
+
+```bash
+npm test                                        # unit tests (no Zotero needed)
+npm run test:watch                              # unit tests in watch mode
+npm run test:live                               # live tests (requires running Zotero)
+npm run test:integration                        # integration tests (requires running Zotero)
+npm run test:all                                # all three tiers sequentially
+npx vitest run tests/unit/notes/editNote.test.ts   # single file
+npx vitest run -t "returns empty"               # tests matching name pattern
+```
+
+## Three test tiers
+
+| Tier | Dir | File pattern | Zotero required? | Vitest config | Timeout |
+|------|-----|-------------|-------------------|---------------|---------|
+| **Unit** | `tests/unit/` | `*.test.ts` | No | `vitest.config.ts` | 10 s |
+| **Live** | `tests/live/` | `*.live.test.ts` | Yes | `vitest.live.config.ts` | 15 s |
+| **Integration** | `tests/integration/` | `*.integration.test.ts` | Yes | `vitest.integration.config.ts` | 30 s |
+
+- **Unit tests** run entirely in Node with mocked Zotero globals. Fast, CI-friendly, and the default for `npm test`.
+- **Live tests** hit a single AsterMargin HTTP endpoint against a running Zotero instance. Use these to verify individual handlers produce correct results with real data. Tests skip gracefully when Zotero is unavailable.
+- **Integration tests** exercise multi-step pipelines (e.g., HTTP request -> PDF extraction -> cache write -> cache read). Sequential execution, longer timeout.
+
+## Shared state on the live instance
+
+Live and integration tests all drive **one** Zotero instance, so anything a test
+changes there outlives the test file. Two pieces of that state have bitten whole
+suites at once; both are handled for you, but new tests need to respect them.
+
+### Excluded libraries
+
+AsterMargin's excluded-libraries set is a **user preference stored on the account
+profile**, so every instance that logs in inherits it — including a freshly
+cloned worktree profile. The fixtures assume every local library is readable, so
+an exclusion set in AsterMargin Preferences shows up as a spray of `library_excluded`
+failures in unrelated suites (group-library tests, or every note test when the
+user library is excluded). A suite that excludes a library and then fails before
+its own teardown poisons every file after it in the same way.
+
+`vitest.live.config.ts` and `vitest.integration.config.ts` therefore wire two
+hooks (see `helpers/liveExclusions.ts`):
+
+- **`globalSetup`** (`helpers/liveGlobalSetup.ts`) captures the excluded set once
+  per run, clears it, and restores it in teardown. It prints a `[live-setup]`
+  notice naming what it re-enabled.
+- **`setupFiles`** (`helpers/liveSetupFile.ts`) re-clears at the start of every
+  test file, so a leak stays contained to the file that produced it.
+
+Both write through `/astermargin/test/excluded-libraries`, which mutates the
+in-memory profile only — nothing reaches the backend, and a run that dies before
+teardown is undone by restarting Zotero. A suite that tests exclusion behavior
+(`libraryExclusion`, `readerContextTracking`) still captures and restores its own
+set; it just starts from a normalized one.
+
+### The background queue's idle gate
+
+`BackgroundExtractor` claims jobs at or above priority 100 — **the enqueue
+default** — only once the OS has been idle for 30 seconds. A test that enqueues
+at the default and asserts the job drains therefore passes or fails depending on
+whether someone is at the keyboard, and the symptom is confusing: `processOnce`
+returns `reason: "empty"` while `/astermargin/test/background-stats` reports
+`available: 1`.
+
+Any test that needs a deterministic drain must enqueue **below** 100 (the
+suites use `DRAIN_PRIORITY = 10`, which is also what production uses for
+hot-path timeout retries). Tests that only assert queue bookkeeping — ordering,
+dedup, stats, the `priority` default itself — can use any priority.
+
+### Suites that rewrite local processing state
+
+`backgroundProcessing.live.test.ts` clears the `attachment_processing_state`
+ledger, the per-library scan cursors and the job queue for **every** library,
+and flips `backgroundProcessingEnabled`, `backgroundExtractorEnabled` and
+`accessRemoteFiles`. All of it is derived data
+that the next reconcile rebuilds, and `afterAll` restores the prefs — but an
+interrupted run leaves the instance with an empty ledger and the prefs it was
+last given. Re-run the suite, or turn background processing off in Preferences.
+
+It also keeps `backgroundExtractorEnabled` off while asserting producer output:
+a whole-library reconcile queues hundreds of jobs, and on an idle machine the
+dispatcher would start extracting real PDFs mid-assertion.
+
+## Directory structure
+
+```
+tests/
+├── setup.ts                        # Global setup — stubs Zotero/Mozilla globals (unit only)
+├── mocks/
+│   └── mockDBConnection.ts         # In-memory SQLite mock of Zotero.DBConnection
+├── helpers/
+│   ├── factories.ts                # Mock Zotero object factories (createMockItem, etc.)
+│   ├── fixtures.ts                 # Attachment fixture definitions + Zotero port config
+│   ├── zoteroHttpClient.ts         # HTTP client for AsterMargin endpoints
+│   ├── zoteroAvailability.ts       # isZoteroAvailable() + skipIfNoZotero()
+│   ├── cacheInspector.ts           # Cache inspection/cleanup via /astermargin/test/* endpoints
+│   └── processingInspector.ts      # Ledger/reconciler driving via /astermargin/test/processing-*
+├── unit/
+│   ├── services/                   # Service layer tests (cache, DB, API)
+│   ├── notes/                      # Note editing, HTML processing, read handlers
+│   ├── handlers/                   # agentDataProvider handler tests
+│   └── utils/                      # Utility function tests
+├── live/                           # Single-handler tests against live Zotero
+│   └── *.live.test.ts
+└── integration/                    # Multi-step pipeline tests against live Zotero
+    └── *.integration.test.ts
+```
+
+## Writing a new unit test
+
+### 1. Create the file
+
+Place it in the appropriate subdirectory under `tests/unit/`:
+
+| Testing... | Directory |
+|-----------|-----------|
+| A service (`src/services/*`) | `tests/unit/services/` |
+| Note editing / HTML processing | `tests/unit/notes/` |
+| An agentDataProvider handler | `tests/unit/handlers/` |
+| A utility function | `tests/unit/utils/` |
+
+File name: `<module-name>.test.ts`. Vitest picks up `tests/unit/**/*.test.ts`.
+
+### 2. Choose your mocking strategy
+
+**Testing database/SQL logic** — use `MockDBConnection` with real SQLite:
+
+```ts
+import { MockDBConnection } from '../../mocks/mockDBConnection';
+import { AsterMarginDB } from '../../../src/services/database';
+
+let conn: MockDBConnection;
+let db: AsterMarginDB;
+
+beforeEach(async () => {
+  conn = new MockDBConnection();
+  db = new AsterMarginDB(conn as any);
+  await db.initDatabase('0.99.0');
+});
+
+afterEach(async () => {
+  await conn.closeDatabase();
+});
+```
+
+**Testing code that uses filesystem APIs** — override the IOUtils/PathUtils stubs from `setup.ts`:
+
+```ts
+const mockIOUtils = (globalThis as any).IOUtils as {
+  exists: ReturnType<typeof vi.fn>;
+  stat: ReturnType<typeof vi.fn>;
+  readUTF8: ReturnType<typeof vi.fn>;
+  writeUTF8: ReturnType<typeof vi.fn>;
+  remove: ReturnType<typeof vi.fn>;
+  getChildren: ReturnType<typeof vi.fn>;
+  makeDirectory: ReturnType<typeof vi.fn>;
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+```
+
+Then configure per-test:
+
+```ts
+mockIOUtils.exists.mockResolvedValue(true);
+mockIOUtils.stat.mockResolvedValue({ lastModified: 170000000000, size: 12345 });
+```
+
+**Using shared factories** for mock Zotero items:
+
+```ts
+import { createMockItem, createMockNote, createMockAttachment } from '../../helpers/factories';
+
+const item = createMockItem({ id: 42, fields: { title: 'My Paper' } });
+item.getField('title'); // 'My Paper'
+
+const note = createMockNote({ noteHTML: '<div>content</div>' });
+const pdf = createMockAttachment({ contentType: 'application/pdf' });
+```
+
+**Mocking transitive dependencies**: Code under `src/services/agentDataProvider/` transitively imports Supabase, auth atoms, and other React/store modules. If your test imports from this area, you'll need to mock these:
+
+Mock a module at the path it actually lives at. Modules that moved into
+`@astermargin/agent-core` must be mocked by their package specifier: mocking the
+old `src/` path only replaces the re-export shim, so anything importing the
+module from inside the package still gets the real one.
+
+```ts
+vi.mock('@astermargin/agent-core/transport/supabaseClient', () => ({
+    supabase: { auth: { getSession: vi.fn() } },
+}));
+vi.mock('../../../src/utils/zoteroUtils', () => ({
+    getZoteroUserIdentifier: vi.fn(() => ({ userID: '123', localUserKey: 'abc' })),
+    createCitationHTML: vi.fn(),
+}));
+vi.mock('../../../react/atoms/profile', () => ({ userIdentifierAtom: {} }));
+vi.mock('../../../react/store', () => ({
+    store: { get: vi.fn(), set: vi.fn(), sub: vi.fn() },
+}));
+```
+
+See `editNote.test.ts` for a comprehensive example.
+
+### 3. Structure your tests
+
+```ts
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+describe('ModuleName', () => {
+  // setup in beforeEach/afterEach
+
+  describe('methodName', () => {
+    it('does X when Y', async () => {
+      // arrange
+      // act
+      // assert
+    });
+  });
+});
+```
+
+### 4. Key patterns
+
+- **SQLite booleans**: DB stores as INTEGER (0/1), `AsterMarginDB` converts to boolean. Test both levels.
+- **`onRow` callback**: `MockDBConnection` supports the `onRow` + `getResultByIndex(n)` pattern.
+- **Clearing mocks**: Always `vi.clearAllMocks()` in `beforeEach`. Stubs in `setup.ts` provide safe defaults.
+- **Private field access**: `(instance as any).fieldName` for testing internals.
+- **Async errors**: `.mockRejectedValue()` + `expect(...).resolves.toBeUndefined()`.
+
+## Writing a new live test
+
+Live tests verify individual handlers against a running Zotero instance.
+
+### 1. Create the file
+
+Place it at `tests/live/<name>.live.test.ts`.
+
+### 2. Use the skip pattern
+
+```ts
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { isZoteroAvailable, skipIfNoZotero } from '../helpers/zoteroAvailability';
+import { post } from '../helpers/zoteroHttpClient';
+
+let available: boolean;
+
+beforeAll(async () => {
+  available = await isZoteroAvailable();
+  if (!available) {
+    console.warn('\n⚠  Zotero not available — live tests will be skipped.\n');
+  }
+});
+
+describe('handler name', () => {
+  beforeEach((ctx) => { skipIfNoZotero(ctx, available); });
+
+  it('returns expected data', async () => {
+    const res = await post('/astermargin/some-endpoint', { ... });
+    expect(res).toMatchObject({ ... });
+  });
+});
+```
+
+### 3. Use shared fixtures and HTTP client
+
+```ts
+import { NORMAL_PDF } from '../helpers/fixtures';
+import { fetchPages } from '../helpers/zoteroHttpClient';
+
+const res = await fetchPages(NORMAL_PDF, { start_page: 1, end_page: 3 });
+```
+
+## Integration tests
+
+Integration tests exercise full pipelines. Same prerequisites as live tests plus specific test attachments.
+
+### Prerequisites
+
+- Zotero running with AsterMargin plugin loaded and authenticated
+- Test attachments present (see `helpers/fixtures.ts`)
+- Set `ZOTERO_HTTP_PORT` if not 23119: `ZOTERO_HTTP_PORT=23124 npm run test:integration`
+
+`ZOTERO_HTTP_PORT` **pins** the run to that instance — there is no fallback to
+23119/23124, because several Zotero instances often run side by side and the
+fixtures exist in all of them, so a fallback would run the suite against the
+wrong library without saying so. A run whose named instance does not answer
+`/astermargin/test/ping` **fails** rather than skipping every test; without the env
+var, suites still skip gracefully when no Zotero is running.
+
+Read the `Tests` line before calling a run green: every live suite skips itself
+when the instance is unreachable, so `530 skipped` and exit 0 means nothing ran.
+The usual cause is AsterMargin being logged out — `/astermargin/test/*` is registered by
+the React bundle only once the plugin is authenticated, so the port answers
+`/connector/ping` while every dev endpoint returns `No endpoint found`.
+
+### Test-only endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /astermargin/test/ping` | Verify Zotero + cache + DB are available |
+| `POST /astermargin/test/cache-metadata` | Get raw cache metadata |
+| `POST /astermargin/test/cache-invalidate` | Invalidate cache for a specific item |
+| `POST /astermargin/test/resolve-item` | Resolve library_id + zotero_key to item_id |
+| `POST /astermargin/test/note-create` | Create a Zotero note (optionally wrapped with schema-version) — used by `editNote.live.test.ts` |
+| `POST /astermargin/test/note-delete` | Erase a note by library_id + zotero_key |
+| `POST /astermargin/test/note-read` | Return `{saved_html, live_html, in_editor}` for a note |
+| `POST /astermargin/test/note-open-editor` | Open a note in the Zotero editor (tab or window) |
+| `POST /astermargin/test/note-close-editor` | Close all editor instances for a note |
+| `POST /astermargin/test/note-undo` | Invoke `undoEditNoteAction()` given an AgentAction payload |
+
+### edit_note live tests
+
+`tests/live/editNote.live.test.ts` needs the note-related test endpoints above and:
+
+- library_id 1 (user library) must be marked "searchable" in AsterMargin preferences.
+- Override with `ZOTERO_TEST_LIBRARY_ID=<id>` if you want to target a different library.
+- Run: `npm run test:live` (or target just this file: `npx vitest run --config vitest.live.config.ts tests/live/editNote.live.test.ts`).
+- Each test seeds and deletes its own notes — no manual fixture setup required.
+
+### AsterMarginExtract regression fixtures
+
+`tests/smoke/extractFixtures.smoke.test.ts` runs every fixture under `tests/fixtures/pdfs/extract-public/` (committed) plus the private corpus pointed at by `$ASTERMARGIN_EXTRACT_FIXTURES_DIR` (the separate `astermargin-extract-fixtures` repo; falls back to the legacy in-tree `tests/fixtures/pdfs/extract/` when the env var is unset). Each fixture re-runs the structured-mode extract pipeline and diffs against the captured `expected` snapshot.
+
+Current extraction fixtures use snapshot schema `2`, which records `items` (`DocItem` projection), flattened `sentences` (`SentenceItem` projection), `BoundingBox` objects with `origin`, and `degradedItems`. Older paragraph/sentence-bbox fixture files are intentionally rejected at load time; regenerate them with the CLI before evaluating.
+
+Capture, evaluate, and rebaseline via the `astermargin-extract` CLI:
+
+```bash
+npm run astermargin-extract -- fixture capture <pdf> --pages 0 --id <id>
+npm run astermargin-extract -- fixture evaluate <id>
+npm run astermargin-extract -- fixture update <id>
+npm run test:cli-smoke
+```
+
+The reader's dev menu has a "Copy Fixture Capture Command" item that builds the right `astermargin-extract fixture capture --update` invocation for the active page and copies it to the clipboard.
+
+## Conventions
+
+- **File placement**: One file per logical module/concern, in the appropriate subdirectory.
+- **File naming**: `<module>.test.ts` (unit), `<name>.live.test.ts` (live), `<name>.integration.test.ts` (integration).
+- **Test names**: Describe behavior — `"returns null when content file does not exist"`, not `"test cache miss"`.
+- **Shared factories**: Use `helpers/factories.ts` for mock Zotero items. File-local helpers (`makeRecord`, etc.) go at the top of the test file.
+- **Cleanup**: Close DB connections in `afterEach`. Call `vi.clearAllMocks()` in `beforeEach`.
+- **Fixture updates**: Fixtures in `helpers/fixtures.ts` reference real items by `library_id + zotero_key`. Update keys to match your library.
+- **Don't pipe a live run through `tail`/`head`**: the pipe buffers everything until vitest exits, so a multi-minute run shows no progress and an interrupted one shows nothing at all. Redirect to a file (`npm run test:live > run.log 2>&1`) and read that instead.
+
+### Window runtime checks
+
+`tests/unit/runtime/` evaluates independent renderer module graphs and verifies store/atom
+isolation, targeted buses, window-specific UI cleanup, late loads and root teardown order.
+For the live draft-isolation check, open two main Zotero windows in an isolated profile:
+
+```bash
+ASTERMARGIN_MULTI_WINDOW_TEST=1 ZOTERO_HTTP_PORT=<port> npm run test:live -- windowRuntime sidebarWidthHandler
+```
+
+The `/astermargin/test/window-runtime` endpoint accepts `{command: "list"}` to enumerate runtime
+ids. Other requests take `windowId` and inspect that renderer, or use
+`{command: "draft", windowId, draft}` to stage text without sending it. Missing or closing
+ids return `window_unavailable`. These diagnostics share the existing development/auth gates;
+endpoint ownership is still window-managed.
+
+**Every other live suite assumes exactly one main window.** Dev endpoints are owned by the
+window that registered last, while several handlers still resolve their window with
+`Zotero.getMainWindow()` — the two disagree as soon as a second window exists, so a handler
+can drive one window and read another window's atoms. That fails as a plausible wrong value
+(a stale attachment, an unchanged tab), not as an error, and it points at the code under test
+rather than at the window count. `globalSetup` therefore refuses to start a run when it sees
+more than one main window, unless `ASTERMARGIN_MULTI_WINDOW_TEST=1` is set. Close the extra window
+rather than working around the guard. The underlying call sites belong to a later PR; see
+`tasks/multiple-windows/getMainWindow-audit.md`.
+
+## Testing on Zotero 11
+
+Zotero 11 (Firefox 153) is available as dev-channel builds only. Run it in a worktree with
+its own cloned profile and data dir, never against your everyday profile.
+
+1. **Install beside the stable app.** Download
+   `https://www.zotero.org/download/client/dl?channel=dev&platform=mac` and copy its
+   `Zotero.app` to `/Applications/Zotero 11 Dev.app`. Don't replace `/Applications/Zotero.app`:
+   the main dev instance and the worktree tooling default to it.
+2. **Set up the worktree with that binary.** `ZOTERO_BIN` is written to the worktree's `.env`
+   as `ZOTERO_PLUGIN_ZOTERO_BIN_PATH`, which `npm start` and `worktree-zotero.sh` launch:
+
+   ```bash
+   ZOTERO_BIN="/Applications/Zotero 11 Dev.app/Contents/MacOS/zotero" \
+     scripts/worktree/setup-worktree.sh [--zotero11-hardening] <branch>
+   scripts/worktree/worktree-zotero.sh reload
+   ```
+
+   To switch an existing worktree, edit `ZOTERO_PLUGIN_ZOTERO_BIN_PATH` in its `.env`.
+3. **Schema upgrade.** Zotero 11 upgrades the schema of the data dir it opens, so only point
+   it at a cloned data dir; setup clones one. Once Zotero 11 has opened a clone, keep that
+   worktree on Zotero 11, or delete and re-clone the data dir to go back to Zotero 10.
+4. **Hardening prefs.** Zotero 11 temporarily overrides two Firefox security prefs so older
+   plugins keep working, and plans to drop both overrides:
+   - `security.allow_unsafe_subscript_loads`: Zotero ships `true`; Firefox's value `false`
+     makes `loadSubScript` of `jar:` / `file:` URIs fail.
+   - `security.chrome_baseline_csp.enabled`: Zotero ships `false`; Firefox's value `true`
+     blocks inline scripts and `on*` handlers in chrome documents.
+
+   `--zotero11-hardening` (at setup), or `worktree-zotero.sh hardening on|off` (Zotero
+   stopped), writes or removes the Firefox values in the profile's `user.js`. Zotero's own
+   Preferences window breaks under the CSP, so judge only AsterMargin surfaces with it on.
+5. **Check what you're running.** `worktree-zotero.sh status` prints the binary version and,
+   when the instance is up, the running Zotero version, `platformMajorVersion` (140 on
+   Zotero 10, 153 on Zotero 11) and the hardening prefs. `/astermargin/test/ping` returns the same
+   under `platform`, so a live test can branch or skip on it.
+
+A Zotero 11 run doesn't replace a Zotero 10 run. Verify platform changes on both.

@@ -1,0 +1,1031 @@
+/**
+ * Unit tests for `astermargin-extract fixture …`.
+ *
+ * Runs `runCli` in-process with mocked Node API + a real temp directory
+ * for filesystem effects. We don't mock `fs` — the fixture command's
+ * write-temp/rename flow is part of the contract and worth exercising.
+ *
+ * Coverage targets from the plan:
+ *   1. capture refuses to overwrite without --update
+ *   2. update preserves capturedAt and bumps updatedAt
+ *   3. repeated update is a no-op (true idempotence — file mtime unchanged)
+ *   4. missing _shared/<sha>.pdf produces a clear error
+ *   5. malformed fixture.json produces a targeted format error
+ *   6. default --root resolves to the public corpus
+ */
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { Writable } from 'node:stream';
+import {
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+
+import { runCli } from '../../../src/astermargin-extract/node/runCli';
+import {
+    FIXTURE_SCHEMA_VERSION,
+    validateFixture,
+} from '../../../src/astermargin-extract/cli/fixture/fixtureSchema';
+import type { CliDeps } from '../../../src/astermargin-extract/cli/runCliTypes';
+import type * as NodeApi from '../../../src/astermargin-extract/node/api';
+
+// ---------------------------------------------------------------------------
+// Test harness
+// ---------------------------------------------------------------------------
+
+class StringSink extends Writable {
+    chunks: string[] = [];
+    _write(chunk: Buffer | string, _enc: string, cb: () => void): void {
+        this.chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+        cb();
+    }
+    text(): string {
+        return this.chunks.join('');
+    }
+}
+
+interface DepFakes {
+    stdout: StringSink;
+    stderr: StringSink;
+    deps: CliDeps;
+    api: { [K in keyof typeof NodeApi]: ReturnType<typeof vi.fn> };
+}
+
+const FAKE_PDF_BYTES = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34]); // %PDF-1.4
+const FAKE_PDF_SHA = createHash('sha256').update(FAKE_PDF_BYTES).digest('hex');
+
+function pageWithSentences(): any {
+    return {
+        index: 0,
+        width: 595,
+        height: 842,
+        viewBox: [0, 0, 595, 842],
+        rotation: 0,
+        content: 'Hello.',
+        columns: [],
+        items: [
+            {
+                kind: 'text',
+                id: 'p0:i0',
+                pageIndex: 0,
+                index: 0,
+                bbox: { l: 10, t: 10, r: 90, b: 22, origin: 'top-left' },
+                columnIndex: 0,
+                text: 'Hello.',
+                lines: [
+                    { text: 'Hello.', bbox: { l: 10, t: 10, r: 90, b: 22, origin: 'top-left' } },
+                ],
+                sentences: [],
+            },
+        ],
+        sentences: [
+            {
+                parentId: 'p0:i0',
+                index: 0,
+                text: 'Hello.',
+                bboxes: [{ l: 10, t: 10, r: 90, b: 22, origin: 'top-left' }],
+            },
+        ],
+    };
+}
+
+function structuredResult(page = pageWithSentences()): unknown {
+    const item = page.items[0];
+    const sentence = page.sentences[0];
+    const text = page.content ?? item.text;
+    return {
+        mode: 'structured',
+        schemaVersion: '4',
+        document: {
+            pageCount: 1,
+            bboxOrigin: 'top-left',
+            bboxPrecision: 1,
+            pages: [
+                {
+                    index: page.index,
+                    width: page.width,
+                    height: page.height,
+                    viewBox: page.viewBox,
+                    rotation: page.rotation,
+                    items: [
+                        {
+                            id: item.id,
+                            kind: item.kind,
+                            pageIndex: item.pageIndex,
+                            order: item.index,
+                            bbox: [item.bbox.l, item.bbox.t, item.bbox.r, item.bbox.b],
+                            text,
+                            sentences: [
+                                {
+                                    id: 's1',
+                                    order: sentence.index,
+                                    text: sentence.text,
+                                    bboxes: sentence.bboxes.map((bbox: any) => [
+                                        bbox.l,
+                                        bbox.t,
+                                        bbox.r,
+                                        bbox.b,
+                                    ]),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+            citationIndex: {
+                [item.id]: {
+                    id: item.id,
+                    kind: 'item',
+                    pageIndex: page.index,
+                    itemId: item.id,
+                },
+                s1: {
+                    id: 's1',
+                    kind: 'sentence',
+                    pageIndex: page.index,
+                    itemId: item.id,
+                    sentenceId: 's1',
+                },
+            },
+        },
+    };
+}
+
+function markdownResult(page = pageWithSentences()): unknown {
+    return {
+        mode: 'markdown',
+        schemaVersion: '4',
+        document: {
+            pageCount: 1,
+            pageLabels: {},
+            pages: [
+                {
+                    index: page.index,
+                    width: page.width,
+                    height: page.height,
+                    viewBox: page.viewBox,
+                    rotation: page.rotation,
+                    markdown: page.content ?? 'Hello.',
+                },
+            ],
+        },
+    };
+}
+
+function extractPdfMock(): ReturnType<typeof vi.fn> {
+    return vi.fn().mockImplementation((input: { mode?: string }) => {
+        if (input.mode === 'markdown') return Promise.resolve(markdownResult());
+        return Promise.resolve(structuredResult());
+    });
+}
+
+function extractPdfMockForPage(page: any): ReturnType<typeof vi.fn> {
+    return vi.fn().mockImplementation((input: { mode?: string }) => {
+        if (input.mode === 'markdown') return Promise.resolve(markdownResult(page));
+        return Promise.resolve(structuredResult(page));
+    });
+}
+
+function makeDeps(api: Partial<DepFakes['api']> = {}): DepFakes {
+    const stdout = new StringSink();
+    const stderr = new StringSink();
+    const fakeApi = {
+        getPageCount: vi.fn(),
+        getMetadata: vi.fn(),
+        extractPdf: extractPdfMock(),
+        analyzeLayout: vi.fn(),
+        renderPages: vi.fn(),
+        extractRawPageDetailed: vi.fn(),
+        analyzeOCRNeeds: vi.fn().mockResolvedValue({
+            needsOCR: false,
+            primaryReason: "text_layer",
+            pageAnalyses: [],
+            issueBreakdown: {},
+        }),
+        ...api,
+    };
+    const deps: CliDeps = {
+        api: fakeApi as unknown as typeof NodeApi,
+        drawOverlay: vi.fn().mockResolvedValue(new Uint8Array()),
+        loadPdf: vi.fn().mockResolvedValue(FAKE_PDF_BYTES),
+        writePngFile: vi.fn().mockResolvedValue(undefined),
+        writeJsonFile: vi.fn().mockResolvedValue(undefined),
+        stdout,
+        stderr,
+    };
+    return { stdout, stderr, deps, api: fakeApi as DepFakes['api'] };
+}
+
+let tmpRoot = '';
+
+beforeEach(() => {
+    process.exitCode = undefined;
+    tmpRoot = mkdtempSync(join(tmpdir(), 'astermargin-fixture-'));
+});
+
+afterEach(() => {
+    if (tmpRoot && existsSync(tmpRoot)) {
+        rmSync(tmpRoot, { recursive: true, force: true });
+    }
+    tmpRoot = '';
+});
+
+function readFixtureJson(id: string): {
+    schema: number;
+    id: string;
+    capturedAt: string;
+    updatedAt: string;
+    pdfSha256: string;
+    config: { pageIndices: number[]; analysisScope: unknown };
+    expected: {
+        structured: { pages: unknown[] };
+        markdown: { pages: unknown[] };
+    };
+} {
+    return JSON.parse(readFileSync(join(tmpRoot, id, 'fixture.json'), 'utf8'));
+}
+
+// ---------------------------------------------------------------------------
+// 1. capture creates a fresh fixture; refuses overwrite without --update
+// ---------------------------------------------------------------------------
+
+describe('fixture capture', () => {
+    it('writes a fresh fixture and shared PDF with sane metadata', async () => {
+        const { deps, stdout } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'synth__p0',
+                '--pages',
+                '0',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code, `stdout=${stdout.text()}`).toBe(0);
+
+        const fix = readFixtureJson('synth__p0');
+        expect(fix.schema).toBe(FIXTURE_SCHEMA_VERSION);
+        expect(fix.id).toBe('synth__p0');
+        expect(fix.pdfSha256).toBe(FAKE_PDF_SHA);
+        expect(fix.config.pageIndices).toEqual([0]);
+        expect(fix.config.analysisScope).toBe('document'); // default
+        expect(fix.capturedAt).toBe(fix.updatedAt); // first capture
+        expect(fix.expected.structured.pages).toHaveLength(1);
+        expect(fix.expected.markdown.pages).toHaveLength(1);
+        expect(fix.expected.structured.pages.map((p: any) => p.index)).toEqual(
+            fix.config.pageIndices,
+        );
+        expect(fix.expected.markdown.pages.map((p: any) => p.index)).toEqual(
+            fix.config.pageIndices,
+        );
+
+        // Shared PDF was written.
+        expect(existsSync(join(tmpRoot, '_shared', `${FAKE_PDF_SHA}.pdf`))).toBe(true);
+    });
+
+    it('stores --graphics-layer-mode in captured fixture settings', async () => {
+        const { deps } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'graphics__p0',
+                '--pages',
+                '0',
+                '--graphics-layer-mode',
+                'on',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(0);
+
+        const fix = JSON.parse(readFileSync(join(tmpRoot, 'graphics__p0', 'fixture.json'), 'utf8')) as {
+            config: { settings: { graphicsLayerMode?: string } };
+        };
+        expect(fix.config.settings.graphicsLayerMode).toBe('on');
+    });
+
+    it('captures under the requested PDF schema version and stores it in the config', async () => {
+        const { deps, api } = makeDeps();
+        const capture = (id: string, extra: string[]) => runCli(
+            ['fixture', 'capture', 'fake.pdf', '--root', tmpRoot, '--id', id, '--pages', '0', ...extra, '--json'],
+            deps,
+        );
+
+        expect(await capture('current__p0', [])).toBe(0);
+        expect(await capture('v4__p0', ['--schema-version', '4'])).toBe(0);
+        process.exitCode = undefined;
+        expect(await capture('v3__p0', ['--schema-version', '3'])).toBe(1);
+
+        const read = (id: string) => JSON.parse(readFileSync(join(tmpRoot, id, 'fixture.json'), 'utf8'));
+        expect(read('current__p0').config.schemaVersion).toBe('5');
+        expect(read('v4__p0').config.schemaVersion).toBe('4');
+        expect(existsSync(join(tmpRoot, 'v3__p0', 'fixture.json'))).toBe(false);
+        const versions = api.extractPdf.mock.calls.map(([input]: any[]) => input.schemaVersion);
+        expect(versions).toEqual(['5', '5', '4', '4']);
+    });
+
+    it('refuses to overwrite an existing fixture without --update', async () => {
+        const { deps } = makeDeps();
+        const args = (extra: string[] = []) => [
+            'fixture',
+            'capture',
+            'fake.pdf',
+            '--root',
+            tmpRoot,
+            '--id',
+            'synth__p0',
+            '--pages',
+            '0',
+            '--json',
+            ...extra,
+        ];
+
+        // First capture succeeds.
+        expect(await runCli(args(), deps)).toBe(0);
+
+        // Second capture without --update fails.
+        const { deps: deps2, stderr: stderr2 } = makeDeps();
+        const code = await runCli(args(), deps2);
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr2.text()) as { ok: boolean; error: { message: string } };
+        expect(env.ok).toBe(false);
+        expect(env.error.message).toMatch(/--update/);
+    });
+
+    it('rejects mutually exclusive --analysis-scope + --analysis-window', async () => {
+        const { deps, stderr } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'x',
+                '--pages',
+                '0',
+                '--analysis-scope',
+                'document',
+                '--analysis-window',
+                '5',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr.text()) as { error: { message: string } };
+        expect(env.error.message).toMatch(/mutually exclusive/);
+    });
+
+    it('rejects duplicate --pages entries', async () => {
+        const { deps, stderr } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'dupe-pages',
+                '--pages',
+                '0,0,1',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr.text()) as { error: { message: string } };
+        expect(env.error.message).toMatch(/duplicate page index/);
+    });
+
+    it('reports wrote=true when --update actually rewrites a changed fixture', async () => {
+        // Regression: previously `wrote` was recomputed by re-reading the
+        // just-written file and comparing to itself, so existing-and-changed
+        // captures always reported wrote=false.
+        const { deps: capDeps } = makeDeps();
+        const baseArgs = [
+            'fixture',
+            'capture',
+            'fake.pdf',
+            '--root',
+            tmpRoot,
+            '--id',
+            'wrote__p0',
+            '--pages',
+            '0',
+            '--json',
+        ];
+        expect(await runCli(baseArgs, capDeps)).toBe(0);
+
+        // Re-capture with --update and a mutated extract result.
+        const mutated = pageWithSentences() as Record<string, unknown>;
+        const sentences = (mutated.sentences as Record<string, unknown>[]).slice();
+        sentences[0] = { ...sentences[0], text: 'Mutated sentence.' };
+        mutated.sentences = sentences;
+        mutated.content = 'Mutated content.';
+
+        const { deps: updateDeps, stdout } = makeDeps({
+            extractPdf: extractPdfMockForPage(mutated),
+        });
+        const code = await runCli([...baseArgs, '--update'], updateDeps);
+        expect(code).toBe(0);
+        const env = JSON.parse(stdout.text()) as {
+            ok: boolean;
+            result: { wrote: boolean; capturedAt: string; updatedAt: string };
+        };
+        expect(env.ok).toBe(true);
+        expect(env.result.wrote).toBe(true);
+        expect(env.result.updatedAt).not.toBe(env.result.capturedAt);
+    });
+
+    it('reports wrote=false when --update on an unchanged fixture is a true no-op', async () => {
+        const { deps: capDeps } = makeDeps();
+        const baseArgs = [
+            'fixture',
+            'capture',
+            'fake.pdf',
+            '--root',
+            tmpRoot,
+            '--id',
+            'noop__p0',
+            '--pages',
+            '0',
+            '--json',
+        ];
+        expect(await runCli(baseArgs, capDeps)).toBe(0);
+
+        const { deps: updateDeps, stdout } = makeDeps();
+        const code = await runCli([...baseArgs, '--update'], updateDeps);
+        expect(code).toBe(0);
+        const env = JSON.parse(stdout.text()) as {
+            ok: boolean;
+            result: { wrote: boolean };
+        };
+        expect(env.result.wrote).toBe(false);
+    });
+
+    it('stores --analysis-window N as { window: N } in the fixture config', async () => {
+        const { deps } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'win5',
+                '--pages',
+                '0',
+                '--analysis-window',
+                '5',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(0);
+        const fix = readFixtureJson('win5');
+        expect(fix.config.analysisScope).toEqual({ window: 5 });
+    });
+
+    it('renders preview-p<n>.png for each captured page when --preview is set', async () => {
+        const { deps, api } = makeDeps();
+        api.renderPages.mockResolvedValue({
+            pageCount: 1,
+            pageLabels: {},
+            pages: [
+                {
+                    pageIndex: 0,
+                    data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+                    width: 800,
+                    height: 1200,
+                    format: 'png',
+                    scale: 1.5,
+                    dpi: 108,
+                },
+            ],
+        });
+
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'preview__p0',
+                '--pages',
+                '0',
+                '--preview',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(0);
+        expect(api.renderPages).toHaveBeenCalledTimes(1);
+        expect(api.renderPages.mock.calls[0][0]).toMatchObject({
+            pageIndices: [0],
+            options: { scale: 1.5, format: 'png' },
+        });
+        expect(deps.drawOverlay).toHaveBeenCalledTimes(1);
+        expect(deps.writePngFile).toHaveBeenCalledWith(
+            join(tmpRoot, 'preview__p0', 'preview-p0.png'),
+            expect.any(Uint8Array),
+        );
+    });
+
+    it('does NOT render preview by default (off without --preview)', async () => {
+        const { deps, api } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'no-preview__p0',
+                '--pages',
+                '0',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(0);
+        expect(api.renderPages).not.toHaveBeenCalled();
+        expect(deps.drawOverlay).not.toHaveBeenCalled();
+        expect(deps.writePngFile).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 2 + 3. update preserves capturedAt; repeated update is a true no-op
+// ---------------------------------------------------------------------------
+
+describe('fixture update', () => {
+    async function captureBaseline(): Promise<string> {
+        const { deps } = makeDeps();
+        const code = await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'rebase__p0',
+                '--pages',
+                '0',
+                '--json',
+            ],
+            deps,
+        );
+        expect(code).toBe(0);
+        return readFixtureJson('rebase__p0').capturedAt;
+    }
+
+    it('preserves capturedAt and the fixture file is bytewise unchanged on a true no-op', async () => {
+        const capturedAt = await captureBaseline();
+        const fixturePath = join(tmpRoot, 'rebase__p0', 'fixture.json');
+        const before = readFileSync(fixturePath);
+        const beforeMtime = statSync(fixturePath).mtimeMs;
+
+        // Wait a tick so any rewrite would yield a different mtime.
+        await new Promise((r) => setTimeout(r, 10));
+
+        const { deps } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'update', 'rebase__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(0);
+
+        const after = readFileSync(fixturePath);
+        expect(after.equals(before)).toBe(true);
+        expect(statSync(fixturePath).mtimeMs).toBe(beforeMtime);
+
+        // capturedAt is preserved
+        expect(readFixtureJson('rebase__p0').capturedAt).toBe(capturedAt);
+    });
+
+    it('extracts legacy fixtures without a schema version under schema 4', async () => {
+        await captureBaseline();
+        const fixturePath = join(tmpRoot, 'rebase__p0', 'fixture.json');
+        const stored = JSON.parse(readFileSync(fixturePath, 'utf8'));
+        delete stored.config.schemaVersion;
+        writeFileSync(fixturePath, JSON.stringify(stored, null, 2));
+
+        const { deps, api } = makeDeps();
+        expect(await runCli(['fixture', 'evaluate', 'rebase__p0', '--root', tmpRoot, '--json'], deps)).toBe(0);
+        expect(api.extractPdf.mock.calls.map(([input]: any[]) => input.schemaVersion)).toEqual(['4', '4']);
+    });
+
+    it('re-extracts under --schema-version and stores it in the config', async () => {
+        await captureBaseline();
+        const { deps, api } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'update', 'rebase__p0', '--root', tmpRoot, '--schema-version', '5', '--json'],
+            deps,
+        );
+        expect(code).toBe(0);
+        expect(api.extractPdf.mock.calls.map(([input]: any[]) => input.schemaVersion)).toEqual(['5', '5']);
+        expect(JSON.parse(readFileSync(join(tmpRoot, 'rebase__p0', 'fixture.json'), 'utf8')).config.schemaVersion)
+            .toBe('5');
+    });
+
+    it('rewrites and bumps updatedAt when extractPdf returns a different snapshot', async () => {
+        const capturedAt = await captureBaseline();
+
+        // Mutate the API mock to return a different snapshot.
+        const mutated = pageWithSentences() as Record<string, unknown>;
+        const sentences = (mutated.sentences as Record<string, unknown>[]).slice();
+        sentences[0] = { ...sentences[0], text: 'Different sentence text.' };
+        mutated.sentences = sentences;
+        mutated.content = 'Different content.';
+
+        const { deps } = makeDeps({
+            extractPdf: extractPdfMockForPage(mutated),
+        });
+
+        const code = await runCli(
+            ['fixture', 'update', 'rebase__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(0);
+
+        const fix = readFixtureJson('rebase__p0');
+        expect(fix.capturedAt).toBe(capturedAt); // preserved
+        expect(fix.updatedAt).not.toBe(capturedAt); // bumped
+        expect(fix.expected.structured.pages).toHaveLength(1);
+        expect(fix.expected.markdown.pages).toHaveLength(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 4. evaluate surfaces missing shared-PDF errors clearly
+// ---------------------------------------------------------------------------
+
+describe('fixture evaluate', () => {
+    it('errors clearly when the shared PDF is missing', async () => {
+        // Hand-write a fixture pointing at a sha that has no matching PDF.
+        const fakeSha = 'a'.repeat(64);
+        mkdirSync(join(tmpRoot, 'orphan__p0'), { recursive: true });
+        writeFileSync(
+            join(tmpRoot, 'orphan__p0', 'fixture.json'),
+            JSON.stringify(buildSyntheticFixture(fakeSha), null, 2),
+        );
+
+        const { deps, stderr } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'evaluate', 'orphan__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr.text()) as { error: { message: string } };
+        expect(env.error.message).toMatch(/shared PDF missing/);
+        expect(env.error.message).toContain(fakeSha);
+    });
+
+    it('exits 0 when the snapshot matches', async () => {
+        // Capture, then evaluate with the SAME mock — should succeed.
+        const { deps: capDeps } = makeDeps();
+        await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'eval__p0',
+                '--pages',
+                '0',
+                '--json',
+            ],
+            capDeps,
+        );
+
+        const { deps: evalDeps } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'evaluate', 'eval__p0', '--root', tmpRoot, '--json'],
+            evalDeps,
+        );
+        expect(code).toBe(0);
+    });
+
+    it('exits 1 with a structured envelope when the snapshot drifts', async () => {
+        const { deps: capDeps } = makeDeps();
+        await runCli(
+            [
+                'fixture',
+                'capture',
+                'fake.pdf',
+                '--root',
+                tmpRoot,
+                '--id',
+                'drift__p0',
+                '--pages',
+                '0',
+                '--json',
+            ],
+            capDeps,
+        );
+
+        const mutated = pageWithSentences() as Record<string, unknown>;
+        const sentences = (mutated.sentences as Record<string, unknown>[]).slice();
+        sentences[0] = { ...sentences[0], text: 'Drifted sentence.' };
+        mutated.sentences = sentences;
+
+        const { deps: evalDeps, stdout } = makeDeps({
+            extractPdf: extractPdfMockForPage(mutated),
+        });
+
+        const code = await runCli(
+            ['fixture', 'evaluate', 'drift__p0', '--root', tmpRoot, '--json'],
+            evalDeps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stdout.text()) as {
+            ok: boolean;
+            result: { diffCount: number };
+        };
+        expect(env.ok).toBe(false);
+        expect(env.result.diffCount).toBeGreaterThan(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 5. malformed fixture.json — targeted format error
+// ---------------------------------------------------------------------------
+
+describe('fixture loader validation', () => {
+    it('produces a path-prefixed error for an invalid analysisScope', async () => {
+        mkdirSync(join(tmpRoot, '_shared'), { recursive: true });
+        writeFileSync(join(tmpRoot, '_shared', `${FAKE_PDF_SHA}.pdf`), Buffer.from(FAKE_PDF_BYTES));
+
+        const malformed = buildSyntheticFixture(FAKE_PDF_SHA);
+        (malformed.config as Record<string, unknown>).analysisScope = 42 as unknown;
+
+        mkdirSync(join(tmpRoot, 'bad__p0'), { recursive: true });
+        writeFileSync(
+            join(tmpRoot, 'bad__p0', 'fixture.json'),
+            JSON.stringify(malformed, null, 2),
+        );
+
+        const { deps, stderr } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'evaluate', 'bad__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr.text()) as { error: { message: string } };
+        expect(env.error.message).toMatch(/analysisScope/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 6. schema migration
+// ---------------------------------------------------------------------------
+
+describe('fixture migrate', () => {
+    function writeSharedPdf(): void {
+        mkdirSync(join(tmpRoot, '_shared'), { recursive: true });
+        writeFileSync(
+            join(tmpRoot, '_shared', `${FAKE_PDF_SHA}.pdf`),
+            Buffer.from(FAKE_PDF_BYTES),
+        );
+    }
+
+    function writeRawFixture(id: string, fixture: Record<string, unknown>): void {
+        mkdirSync(join(tmpRoot, id), { recursive: true });
+        writeFileSync(
+            join(tmpRoot, id, 'fixture.json'),
+            JSON.stringify(fixture, null, 2),
+        );
+    }
+
+    it('migrates a synthetic v4 fixture to schema 5', async () => {
+        writeSharedPdf();
+        writeRawFixture('legacy__p0', buildLegacyFixture('legacy__p0', FAKE_PDF_SHA));
+
+        const { deps, stdout } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'migrate', 'legacy__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(0);
+        const env = JSON.parse(stdout.text()) as {
+            result: { fromSchema: number; toSchema: number; wrote: boolean };
+        };
+        expect(env.result).toMatchObject({
+            fromSchema: 4,
+            toSchema: FIXTURE_SCHEMA_VERSION,
+            wrote: true,
+        });
+        const parsed = JSON.parse(
+            readFileSync(join(tmpRoot, 'legacy__p0', 'fixture.json'), 'utf8'),
+        );
+        const migrated = validateFixture(parsed);
+        expect(migrated.schema).toBe(FIXTURE_SCHEMA_VERSION);
+        expect(migrated.expected.structured.pages.map((p) => p.index)).toEqual([0]);
+        expect(migrated.expected.markdown.pages.map((p) => p.index)).toEqual([0]);
+    });
+
+    it('reports wrote=false when re-run on an unchanged schema-5 fixture', async () => {
+        const { deps: capDeps } = makeDeps();
+        expect(
+            await runCli(
+                [
+                    'fixture',
+                    'capture',
+                    'fake.pdf',
+                    '--root',
+                    tmpRoot,
+                    '--id',
+                    'current__p0',
+                    '--pages',
+                    '0',
+                    '--json',
+                ],
+                capDeps,
+            ),
+        ).toBe(0);
+
+        const { deps, stdout } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'migrate', 'current__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(0);
+        const env = JSON.parse(stdout.text()) as { result: { wrote: boolean } };
+        expect(env.result.wrote).toBe(false);
+    });
+
+    it('fails when the folder id and fixture id differ', async () => {
+        writeSharedPdf();
+        writeRawFixture('folder__p0', buildLegacyFixture('other__p0', FAKE_PDF_SHA));
+
+        const { deps, stderr } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'migrate', 'folder__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr.text()) as { error: { message: string } };
+        expect(env.error.message).toMatch(/expected "folder__p0", got "other__p0"/);
+    });
+
+    it('surfaces malformed legacy config as a validation error', async () => {
+        writeSharedPdf();
+        const fixture = buildLegacyFixture('bad-config__p0', FAKE_PDF_SHA);
+        (fixture.config as Record<string, unknown>).analysisScope = 42;
+        writeRawFixture('bad-config__p0', fixture);
+
+        const { deps, stderr } = makeDeps();
+        const code = await runCli(
+            ['fixture', 'migrate', 'bad-config__p0', '--root', tmpRoot, '--json'],
+            deps,
+        );
+        expect(code).toBe(1);
+        const env = JSON.parse(stderr.text()) as {
+            error: { name: string; message: string };
+        };
+        expect(env.error.name).toBe('FixtureValidationError');
+        expect(env.error.message).toMatch(/config\.analysisScope/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Synthetic fixture builder used by the malformed/orphan tests
+// ---------------------------------------------------------------------------
+
+function buildSyntheticFixture(sha: string): Record<string, unknown> {
+    return {
+        schema: FIXTURE_SCHEMA_VERSION,
+        id: 'synthetic',
+        capturedAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        pdfSha256: sha,
+        pdfBytes: 8,
+        config: {
+            pageIndices: [0],
+            analysisScope: 'document',
+            splitterConfig: { type: 'sentencex' },
+            settings: {},
+            paragraphSettings: {},
+        },
+        fingerprints: {
+            extractorGitSha: null,
+            extractorVersion: null,
+            mupdfWasmSha256: '0'.repeat(64),
+            sentencexWasmSha256: '0'.repeat(64),
+        },
+        tolerance: { bboxAbsPt: 0.5 },
+        expected: {
+            structured: { pages: [baseStructuredPage()] },
+            markdown: { pages: [baseMarkdownPage()] },
+        },
+    };
+}
+
+function buildLegacyFixture(id: string, sha: string): Record<string, unknown> {
+    return {
+        schema: 4,
+        id,
+        capturedAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        pdfSha256: sha,
+        pdfBytes: 8,
+        config: {
+            pageIndices: [0],
+            analysisScope: 'document',
+            splitterConfig: { type: 'sentencex' },
+            settings: {},
+            paragraphSettings: {},
+        },
+        fingerprints: {
+            extractorGitSha: null,
+            extractorVersion: null,
+            mupdfWasmSha256: '0'.repeat(64),
+            sentencexWasmSha256: '0'.repeat(64),
+        },
+        tolerance: { bboxAbsPt: 0.5 },
+        expected: {
+            perPage: [
+                {
+                    pageIndex: 0,
+                    pageWidth: 595,
+                    pageHeight: 842,
+                    content: 'Hello.',
+                    itemCount: 1,
+                    sentenceCount: 1,
+                    degradedItems: 0,
+                    items: [],
+                    sentences: [],
+                },
+            ],
+            totals: { itemCount: 1, sentenceCount: 1, degradedItems: 0 },
+        },
+    };
+}
+
+function baseStructuredPage(): Record<string, unknown> {
+    return {
+        index: 0,
+        width: 595,
+        height: 842,
+        viewBox: [0, 0, 595, 842],
+        rotation: 0,
+        items: [
+            {
+                id: 'p0:i0',
+                kind: 'text',
+                pageIndex: 0,
+                order: 0,
+                bbox: [10, 10, 90, 22],
+                text: 'Hello.',
+                sentences: [
+                    {
+                        id: 's1',
+                        order: 0,
+                        text: 'Hello.',
+                        bboxes: [[10, 10, 90, 22]],
+                    },
+                ],
+            },
+        ],
+    };
+}
+
+function baseMarkdownPage(): Record<string, unknown> {
+    return {
+        index: 0,
+        width: 595,
+        height: 842,
+        viewBox: [0, 0, 595, 842],
+        rotation: 0,
+        markdown: 'Hello.',
+    };
+}

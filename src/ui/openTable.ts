@@ -1,0 +1,253 @@
+/**
+ * Putting a stored table on screen: the AsterMargin tab, or a table window.
+ *
+ * Every product path that opens a table — chat cards, request chips, a reader
+ * replaced by the table, "Open in New Window", a restored window — comes
+ * through {@link openTable}, so the surface, the window choice, the open
+ * repair and the warnings are decided once.
+ *
+ * The surface: `openIn: 'window'` opens the table in its own window
+ * (`tableWindow.ts`), or brings forward the one already showing it. Otherwise
+ * a table already in a window is brought forward there, as Zotero brings
+ * forward a reader window rather than opening the item again; and with no
+ * window, it opens in a tab. `openIn: 'tab'` always means the tab.
+ *
+ * Three rules shape the file:
+ *
+ * 1. **Nothing throws.** Every caller is a UI path that must degrade, so
+ *    failures come back as `{ error }`.
+ * 2. **The tab opens before the repair.** The tab renders the committed
+ *    `table.json`, which is current whatever state the snapshot is in, so it
+ *    does not wait for the store's open repair — which takes the table's lock
+ *    and so can sit behind a write in progress. The repair runs afterwards,
+ *    and what it reports is shown in the tab and returned.
+ * 3. **The tab opens where the user is.** The caller passes the window the
+ *    interaction came from; the tab opens in that window's main window (the
+ *    standalone AsterMargin window's, or a table window's, is the main window it
+ *    follows). Only an
+ *    originless command — or a standalone window with no main window left —
+ *    falls back to the most recent main window, opening one if none is open.
+ *
+ * This module is compiled into the **esbuild** bundle, so it may not import
+ * `react/*` or anything that reaches it. That is why the item is resolved
+ * through `tableItemIdentity` rather than through `tableStore.ts`, which
+ * imports the library-exclusion check and with it the whole React graph.
+ *
+ * Opening is not gated on library exclusion. Exclusion governs writes, indexing
+ * and what leaves the machine; a table already in the user's library is theirs
+ * to look at.
+ */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { snapshotIsCurrent } from '../services/artifacts/tableRenderer';
+import {
+    readTableItemSpec,
+    resolveTableItem,
+    TABLE_REPAIR_SKIPPED,
+    tableFilesDownloadable,
+    tableReadProblem,
+    tableRepairAllowed,
+    type TableRef,
+} from '../services/artifacts/tableItemIdentity';
+import { contextMainWindow, resolveNavigationWindow, WindowUnavailableError } from '../runtime/navigation';
+import { canHostTableTab, openTableTab, setTableTabWarning } from './tableTab';
+import { findTableWindow, openTableWindow, setTableWindowWarning } from './tableWindow';
+import type { TableFocusTarget, TableTabRequest } from './tableTabTypes';
+
+export type OpenTableOutcome =
+    /**
+     * `focus` answers a focus request: `missing` when the table no longer
+     * has that row or column, and then nothing is focused. `tabID` names the
+     * tab when the table opened in one; a table window has none.
+     */
+    | {
+          ok: true;
+          surface: 'tab' | 'window';
+          tabID?: string;
+          reused: boolean;
+          warning?: string;
+          focus?: 'found' | 'missing';
+      }
+    | { error: string };
+
+export interface OpenTableOptions {
+    /**
+     * The window the interaction came from — the clicked element's
+     * `ownerDocument.defaultView`. Omit only for a command with no origin.
+     */
+    window?: Window | null;
+    /** Open behind the selected tab (a reader replaced in the background). */
+    background?: boolean;
+    /** Tab position, for reopening a closed tab where it was. */
+    index?: number;
+    /** Called when the table's files have to be downloaded before it opens. */
+    onDownload?: () => void;
+    /** A row (and a cell, with a column) to bring into view: a citation's target. */
+    focus?: TableFocusTarget;
+    /** A fill's failed rows for the tab to show. */
+    request?: TableTabRequest;
+    /**
+     * `window`: the table's own window. `tab`: a AsterMargin tab even when a
+     * window already shows the table. Absent: the window showing it, if
+     * any, else a tab.
+     */
+    openIn?: 'tab' | 'window';
+}
+
+/** How long to wait for a main window's AsterMargin renderer to come up. */
+const TAB_HOST_TIMEOUT_MS = 15000;
+
+// Every open checks and repairs the table again, so closing and reopening
+// the tab is the retry.
+const BOOKKEEPING_PENDING =
+    'Your table is saved, but AsterMargin could not update its version history. Close and reopen the table to try again.';
+const BOOKKEEPING_UNCHECKED =
+    'AsterMargin could not finish checking this table while opening it. Close and reopen the table to try again.';
+const SNAPSHOT_BEHIND =
+    'The copy of this table that Zotero shows without AsterMargin could not be updated, so it shows an earlier version. Close and reopen the table to try again.';
+
+/**
+ * The main window that hosts the tab: the origin's own (see rule 3), once its
+ * AsterMargin renderer is up.
+ */
+async function tableTabWindow(origin: Window | null | undefined): Promise<Window> {
+    const local = origin ? contextMainWindow(origin) : null;
+    // A closed or closing origin is not an originless command: never open the
+    // table somewhere else on its behalf.
+    if (origin && !local && (origin.closed || origin.__astermarginRuntime?.status === 'closing')) {
+        throw new WindowUnavailableError();
+    }
+    const win: Window = await resolveNavigationWindow(local ?? undefined);
+    const deadline = Date.now() + TAB_HOST_TIMEOUT_MS;
+    while (!canHostTableTab(win) || win.__astermarginRuntime?.status !== 'ready') {
+        if (win.closed || win.__astermarginRuntime?.status === 'closing' || Date.now() >= deadline) {
+            throw new WindowUnavailableError();
+        }
+        await Zotero.Promise.delay(50);
+    }
+    return win;
+}
+
+/**
+ * The store's open repair — re-rendering a stale snapshot, rebuilding a
+ * missing `table.json` — and the warning to show for what it could not do.
+ */
+async function repairOnOpen(item: Zotero.Item, ref: TableRef): Promise<string | undefined> {
+    let sha256: string | undefined;
+    try {
+        const current = await Zotero.AsterMargin.libraryOperations.run('table_openTable', [ref]);
+        sha256 = current.sha256;
+        if (current.recovered.some((entry) => entry.kind === 'bookkeeping_pending'))
+            return tableRepairAllowed(ref.libraryID) ? BOOKKEEPING_PENDING : TABLE_REPAIR_SKIPPED;
+    } catch {
+        return BOOKKEEPING_UNCHECKED;
+    }
+    // A render that failed leaves the previous snapshot in place.
+    if (sha256 && !(await snapshotIsCurrent(item, sha256)))
+        return tableRepairAllowed(ref.libraryID) ? SNAPSHOT_BEHIND : TABLE_REPAIR_SKIPPED;
+    return undefined;
+}
+
+/** Downloads in flight, so a second click waits for the first one's download. */
+const downloads = new Map<string, Promise<boolean>>();
+
+/**
+ * Downloads a table synced on demand, whose files are not on this device yet,
+ * as Zotero does before opening any attachment. False when the download did
+ * not run or failed.
+ */
+function downloadTableFiles(item: Zotero.Item): Promise<boolean> {
+    const id = `${item.libraryID}/${item.key}`;
+    let download = downloads.get(id);
+    if (!download) {
+        download = (async () => {
+            try {
+                // False, without throwing, when Zotero is offline, not signed
+                // in, or cannot verify the library's file storage.
+                if (await Zotero.Sync.Runner.downloadFile(item)) return true;
+                logger(`openTable: download of table ${item.key} did not run`, 2);
+            } catch (error) {
+                logger(`openTable: could not download table ${item.key}: ${String(error)}`, 2);
+            }
+            return false;
+        })().finally(() => downloads.delete(id));
+        downloads.set(id, download);
+    }
+    return download;
+}
+
+/**
+ * Shows a stored table in the AsterMargin tab, or selects the tab already showing
+ * it, then runs the store's open repair.
+ *
+ * Resolves `{ ok, tabID, reused, warning? }` once the repair has settled; the
+ * tab itself is on screen before that. Never throws.
+ */
+export async function openTable(ref: TableRef, options: OpenTableOptions = {}): Promise<OpenTableOutcome> {
+    try {
+        const item = await resolveTableItem(ref);
+        // Read before choosing a window: a table whose files have not reached
+        // this device and cannot be downloaded, or that cannot be read at all,
+        // opens nothing.
+        let read = await readTableItemSpec(item);
+        const download = !read.ok && read.code === 'no_file' && tableFilesDownloadable(item);
+        if (download) {
+            options.onDownload?.();
+            if (await downloadTableFiles(item)) {
+                read = await readTableItemSpec(item);
+                if (!read.ok && read.code === 'no_file')
+                    logger(`openTable: table ${item.key} still has no file after its download`, 2);
+            }
+        }
+        if (!read.ok) {
+            logger(`openTable: ${read.message}`, 2);
+            const title = String(item.getField('title') || '') || 'this table';
+            const problem = read.code === 'no_file' && download
+                ? "Its file couldn't be downloaded to this device."
+                : tableReadProblem(read.code) ?? read.message;
+            return { error: `Couldn't open “${title}”. ${problem}` };
+        }
+        const target = options.focus;
+        const found = target
+            && read.spec.rows.some((row) => row.id === target.rowId)
+            && (!target.columnId || read.spec.columns.some((column) => column.id === target.columnId));
+        const shown = {
+            initial: { spec: read.spec, version: read.spec.version ?? 0 },
+            ...(found ? { focus: target } : {}),
+            ...(options.request ? { request: options.request } : {}),
+        };
+        const focusOutcome = target ? { focus: found ? ('found' as const) : ('missing' as const) } : {};
+
+        if (options.openIn === 'window' || (options.openIn !== 'tab' && findTableWindow(ref))) {
+            const { win, reused } = openTableWindow(item, ref, shown);
+            const warning = await repairOnOpen(item, ref);
+            setTableWindowWarning(win, warning ?? null);
+            return { ok: true, surface: 'window', reused, ...(warning ? { warning } : {}), ...focusOutcome };
+        }
+
+        const win = await tableTabWindow(options.window);
+        const { tabID, reused } = openTableTab(win, item, ref, {
+            ...shown,
+            background: options.background,
+            index: options.index,
+        });
+        const warning = await repairOnOpen(item, ref);
+        setTableTabWarning(tabID, warning ?? null);
+        return {
+            ok: true,
+            surface: 'tab',
+            tabID,
+            reused,
+            ...(warning ? { warning } : {}),
+            ...focusOutcome,
+        };
+    } catch (error) {
+        if (error instanceof WindowUnavailableError) {
+            return { error: `Could not open table ${ref.key} — no Zotero window is available to show it.` };
+        }
+        // No trailing period: the thrown message usually carries its own, and
+        // `... in library 1..` reads like a typo in the log.
+        const message = String((error as Error)?.message ?? error);
+        return { error: `Could not open table ${ref.key} — ${message}` };
+    }
+}

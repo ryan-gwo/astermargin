@@ -1,0 +1,273 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createMockAttachment, createMockItem } from '../../helpers/factories';
+import type {
+    AnnotationAttachment,
+    ItemMetadataAttachment,
+    MessageAttachment,
+    NoteAttachment,
+    SourceAttachment,
+} from '@astermargin/agent-core/types/attachments/apiTypes';
+import {
+    messageAttachmentIdentity,
+    messageAttachmentKey,
+    messageAttachmentLookupKeys,
+    messageAttachmentsHaveSameIdentity,
+    zoteroReferenceKey,
+    zoteroReferenceLookupKeys,
+} from '@astermargin/agent-core/types/attachments/apiTypes';
+
+vi.mock('../../../src/utils/zoteroSerializers', () => ({
+    safeStub: vi.fn((build: () => unknown) => {
+        try {
+            return build();
+        } catch {
+            return undefined;
+        }
+    }),
+    serializeItemStub: vi.fn((item: any) => ({
+        item_id: `${item.libraryID}-${item.key}`,
+        item_type: item.itemType,
+        title: item.getField?.('title') || null,
+        creators: null,
+        year: null,
+    })),
+    serializeAttachmentStub: vi.fn((item: any) => ({
+        attachment_id: `${item.libraryID}-${item.key}`,
+        parent_item_id: item.parentKey ? `${item.libraryID}-${item.parentKey}` : null,
+        title: item.getField?.('title') || null,
+        filename: item.attachmentFilename || null,
+        content_kind: item.attachmentContentType === 'application/epub+zip' ? 'epub' : 'pdf',
+    })),
+}));
+
+import { enrichMessageAttachmentStub } from '../../../react/types/attachments/converters';
+import { serializeAttachmentStub, serializeItemStub } from '../../../src/utils/zoteroSerializers';
+
+type MockZoteroItem = Parameters<typeof enrichMessageAttachmentStub>[1];
+
+describe('attachment identity keys', () => {
+    it('prefers portable library_ref over the device-local library_id', () => {
+        expect(zoteroReferenceKey({
+            library_id: 5,
+            library_ref: 'g123',
+            zotero_key: 'SOURCE12',
+        })).toBe('g123-SOURCE12');
+        expect(zoteroReferenceKey({
+            library_id: 8,
+            library_ref: 'g123',
+            zotero_key: 'SOURCE12',
+        })).toBe('g123-SOURCE12');
+    });
+
+    it('exposes a numeric alias so new references match legacy persisted attachments', () => {
+        const legacyKeys = new Set(messageAttachmentLookupKeys({
+            type: 'source',
+            library_id: 1,
+            zotero_key: 'SOURCE12',
+            include: 'fulltext',
+        }));
+        const currentKeys = zoteroReferenceLookupKeys({
+            library_id: 1,
+            library_ref: 'u',
+            zotero_key: 'SOURCE12',
+        });
+
+        expect(currentKeys).toEqual(['u-SOURCE12', '1-SOURCE12']);
+        expect(currentKeys.some(key => legacyKeys.has(key))).toBe(true);
+    });
+
+    it('does not collapse distinct portable libraries that share a numeric id and item key', () => {
+        const first: SourceAttachment = {
+            type: 'source',
+            library_id: 5,
+            library_ref: 'g42',
+            zotero_key: 'SOURCE12',
+            include: 'fulltext',
+        };
+        const second: SourceAttachment = {
+            ...first,
+            library_ref: 'g99',
+        };
+
+        expect(messageAttachmentsHaveSameIdentity(first, second)).toBe(false);
+    });
+
+    it('falls back to the legacy local library_id and preserves external-file keys', () => {
+        expect(messageAttachmentKey({
+            type: 'item',
+            library_id: 5,
+            zotero_key: 'ITEM1234',
+        })).toBe('5-ITEM1234');
+        expect(messageAttachmentKey({
+            type: 'external_file',
+            ext_key: 'FILE1234',
+            filename: 'paper.pdf',
+            content_kind: 'pdf',
+            mime_type: 'application/pdf',
+            file_size: 123,
+        })).toBe('ext-FILE1234');
+    });
+
+    it('keys built-in views by library and view type, with a numeric alias', () => {
+        const unfiled: MessageAttachment = {
+            type: 'special_collection',
+            special_collection: 'unfiled',
+            library_id: 1,
+            library_ref: 'u',
+            name: 'Unfiled Items',
+        };
+        expect(messageAttachmentKey(unfiled)).toBe('u-unfiled');
+        expect(messageAttachmentLookupKeys(unfiled)).toEqual(['u-unfiled', '1-unfiled']);
+        expect(messageAttachmentsHaveSameIdentity(unfiled, { ...unfiled, library_ref: undefined })).toBe(true);
+        expect(messageAttachmentsHaveSameIdentity(unfiled, { ...unfiled, special_collection: 'publications' })).toBe(false);
+        expect(messageAttachmentsHaveSameIdentity(unfiled, { ...unfiled, library_ref: 'g42' })).toBe(false);
+    });
+
+    it('does not treat a saved search as an item or collection sharing its key', () => {
+        const search: MessageAttachment = {
+            type: 'saved_search', library_ref: 'u', zotero_key: 'KEY12345', name: 'AsterMargin',
+        };
+        const item: MessageAttachment = { type: 'item', library_id: 1, library_ref: 'u', zotero_key: 'KEY12345' };
+        expect(messageAttachmentKey(search)).toBe('u-KEY12345');
+        expect(messageAttachmentsHaveSameIdentity(search, item)).toBe(false);
+        expect(messageAttachmentIdentity(search)).not.toBe(messageAttachmentIdentity(item));
+        expect(messageAttachmentsHaveSameIdentity(search, { ...search, name: 'Renamed' })).toBe(true);
+        // Identified by its portable library alone: no local-id alias.
+        expect(messageAttachmentLookupKeys(search)).toEqual(['u-KEY12345']);
+        expect(messageAttachmentsHaveSameIdentity(search, { ...search, library_ref: 'g42' })).toBe(false);
+    });
+});
+
+describe('enrichMessageAttachmentStub', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('adds an item stub to legacy item attachments', () => {
+        const item = createMockItem({
+            key: 'ITEM1234',
+            fields: { title: 'Display Title' },
+            itemType: 'book',
+        }) as unknown as MockZoteroItem;
+        const attachment: ItemMetadataAttachment = {
+            type: 'item',
+            library_id: 1,
+            zotero_key: 'ITEM1234',
+        };
+
+        enrichMessageAttachmentStub(attachment, item);
+
+        expect(attachment.item).toEqual({
+            item_id: '1-ITEM1234',
+            item_type: 'book',
+            title: 'Display Title',
+            creators: null,
+            year: null,
+        });
+        expect(serializeItemStub).toHaveBeenCalledWith(item);
+    });
+
+    it('adds attachment and parent item stubs to legacy source attachments', () => {
+        const parent = createMockItem({
+            key: 'PARENT12',
+            fields: { title: 'Parent Item' },
+            itemType: 'journalArticle',
+        });
+        const item = createMockAttachment({
+            key: 'SOURCE12',
+            contentType: 'application/epub+zip',
+        }) as any;
+        item.parentItem = parent;
+        item.parentKey = parent.key;
+        const attachment: SourceAttachment = {
+            type: 'source',
+            library_id: 1,
+            zotero_key: 'SOURCE12',
+            include: 'fulltext',
+        };
+
+        enrichMessageAttachmentStub(attachment, item as MockZoteroItem);
+
+        expect(attachment.attachment).toEqual({
+            attachment_id: '1-SOURCE12',
+            parent_item_id: '1-PARENT12',
+            title: null,
+            filename: null,
+            content_kind: 'epub',
+        });
+        expect(attachment.parent_item).toEqual({
+            item_id: '1-PARENT12',
+            item_type: 'journalArticle',
+            title: 'Parent Item',
+            creators: null,
+            year: null,
+        });
+        expect(serializeAttachmentStub).toHaveBeenCalledWith(item);
+        expect(serializeItemStub).toHaveBeenCalledWith(parent);
+    });
+
+    it('leaves already-stubbed attachments unchanged', () => {
+        const item = createMockAttachment({ key: 'SOURCE12' }) as unknown as MockZoteroItem;
+        const attachment: SourceAttachment = {
+            type: 'source',
+            library_id: 1,
+            zotero_key: 'SOURCE12',
+            include: 'fulltext',
+            attachment: {
+                attachment_id: 'existing-attachment',
+                parent_item_id: null,
+                title: 'Existing Attachment',
+                filename: null,
+                content_kind: 'pdf',
+            },
+            parent_item: {
+                item_id: 'existing-parent',
+                item_type: 'book',
+                title: 'Existing Parent',
+                creators: 'Author',
+                year: 2024,
+            },
+        };
+        const originalAttachmentStub = attachment.attachment;
+        const originalParentStub = attachment.parent_item;
+
+        enrichMessageAttachmentStub(attachment, item);
+
+        expect(attachment.attachment).toBe(originalAttachmentStub);
+        expect(attachment.parent_item).toBe(originalParentStub);
+        expect(serializeAttachmentStub).not.toHaveBeenCalled();
+        expect(serializeItemStub).not.toHaveBeenCalled();
+    });
+
+    it('does not modify attachment types that carry inline metadata', () => {
+        const item = createMockItem({ key: 'ITEM1234' }) as unknown as MockZoteroItem;
+        const annotation: AnnotationAttachment = {
+            type: 'annotation',
+            library_id: 1,
+            zotero_key: 'ANNO1234',
+            parent_key: 'SOURCE12',
+            annotation_type: 'highlight',
+            text: 'Highlighted text',
+            color: '#ffd400',
+            page_label: '1',
+            position: { page_index: 0, rects: [] },
+            date_modified: '2024-01-01T00:00:00Z',
+        };
+        const note: NoteAttachment = {
+            type: 'note',
+            library_id: 1,
+            zotero_key: 'NOTE1234',
+            title: 'Note',
+        };
+        const attachments: MessageAttachment[] = [annotation, note];
+        const snapshots = attachments.map((att) => ({ ...att }));
+
+        for (const attachment of attachments) {
+            enrichMessageAttachmentStub(attachment, item);
+        }
+
+        expect(attachments).toEqual(snapshots);
+        expect(serializeAttachmentStub).not.toHaveBeenCalled();
+        expect(serializeItemStub).not.toHaveBeenCalled();
+    });
+});

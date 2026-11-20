@@ -1,0 +1,518 @@
+import React, { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
+import InputArea from "./input/InputArea"
+import AskUserQuestionPanel from "./input/AskUserQuestionPanel"
+import BatchApprovalPanel from "./input/BatchApprovalPanel"
+import CreditConfirmationPanel from "./input/CreditConfirmationPanel"
+import TableCardPanel from "./tables/card/TableCardPanel"
+import { pendingApprovalsAtom } from '../agents/agentActions';
+import { pendingQuestionsAtom } from '@astermargin/agent-core/run-state/pendingQuestions';
+import { isThreadParkedAtom, setAsideParkedCardsAtom } from '../atoms/parkedRuns';
+import { pendingBatchApprovalsAtom } from '@astermargin/agent-core/run-state/pendingBatchApprovals';
+import { pendingCreditConfirmationsAtom } from '@astermargin/agent-core/run-state/pendingCreditConfirmations';
+import { pendingTableCardsAtom } from '@astermargin/agent-core/run-state/pendingTableCards';
+import { selectComposerTakeover } from '@astermargin/agent-ui/chat/composerTakeover';
+import Header from "./Header"
+import { useEventSubscription } from '../hooks/useEventSubscription';
+import { ThreadView } from "./agentRuns";
+import { isFirstRunThreadAtom, runsCountAtom } from '@astermargin/agent-core/run-state/atoms';
+import { useAtomValue, useSetAtom } from 'jotai';
+import { ScrollDownButton } from './ui/buttons/ScrollDownButton';
+import { scrollToBottom } from '../utils/scrollToBottom';
+import { scrollAtoms, publishScrollPosition } from '../utils/scrollPosition';
+import { isThreadListViewAtom } from '../atoms/ui';
+import HomePage from './pages/HomePage';
+import LoginPage from './pages/LoginPage';
+import ProfileLoadingPage from './pages/ProfileLoadingPage';
+import SessionRestorePage from './pages/SessionRestorePage';
+import FreeOnboardingPage from './pages/FreeOnboardingPage';
+import DragDropWrapper from './input/DragDropWrapper';
+import DialogContainer from './dialog/DialogContainer';
+import ThreadListView from './ThreadListView';
+import CreditInfoBar from './input/CreditInfoBar';
+import DowngradeAcknowledgmentPage from './pages/DowngradeAcknowledgmentPage';
+import { store } from '../store';
+import { chatAccessGateAtom } from '../atoms/chatAccess';
+import { Spinner } from './icons/icons';
+import { threadWarningsAtom } from '../atoms/warnings';
+import PopupOverlayContainer from './PopupOverlayContainer';
+import {
+    isMigratingDataAtom,
+    profileWithPlanAtom,
+} from '../atoms/profile';
+import UpdateRequiredPage from './pages/UpdateRequiredPage';
+import FirstRunPage from './pages/FirstRunPage';
+import { firstRunReturnRequestedAtom, isFirstRunVisibleAtom } from '../atoms/firstRun';
+import WhereToStartPage from './pages/WhereToStartPage';
+import { whereToStartVisibleAtom } from '../atoms/whereToStart';
+import ScreenReaderRunAnnouncer from './agentRuns/ScreenReaderRunAnnouncer';
+import { getFirstRunSelectionVariant } from '../utils/firstRunSelection';
+import { FindQueryProvider } from '@astermargin/agent-ui/chat/findContext';
+import { FindInChatControlsProvider, useFindInChat } from '../hooks/useFindInChat';
+import FindBar from './ui/FindBar';
+import { chatLineSpacingAtom, CHAT_LINE_SPACING } from '../atoms/preferences';
+
+interface SidebarProps {
+    location: 'library' | 'reader';
+    isWindow?: boolean;
+    /**
+     * Replaces the default header. Rendered inside the sidebar's providers, so
+     * a header's chat actions (find in chat, …) keep working.
+     */
+    header?: ReactNode;
+}
+
+interface SidebarShellProps {
+    children: ReactNode;
+    className?: string;
+    id?: string;
+    isWindow: boolean;
+    /** Opens the find bar on ⌘F / Ctrl+F. Omitted where there is no thread to search. */
+    onFind?: () => void;
+}
+
+/**
+ * Provides a named AsterMargin landmark for screen reader navigation.
+ */
+const FOCUSABLE_SELECTOR = [
+    'a[href]',
+    'area[href]',
+    'button:not([disabled])',
+    'input:not([disabled]):not([type="hidden"])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[contenteditable="true"]',
+    '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+/**
+ * Returns visible, sequentially focusable elements inside AsterMargin.
+ */
+const getFocusableElements = (root: HTMLElement): HTMLElement[] => {
+    const win = root.ownerDocument.defaultView;
+    if (!win) return [];
+
+    const elements: HTMLElement[] = [];
+    root.querySelectorAll(FOCUSABLE_SELECTOR).forEach((node) => {
+        if (!(node instanceof win.HTMLElement)) return;
+        if (node.tabIndex < 0) return;
+        if ('disabled' in node && Boolean(node.disabled)) return;
+        if (node.closest('[hidden],[aria-hidden="true"],[inert]')) return;
+
+        const style = win.getComputedStyle(node);
+        if (!style || style.display === 'none' || style.visibility === 'hidden') return;
+        if (node.getClientRects().length === 0) return;
+
+        elements.push(node);
+    });
+
+    return elements;
+};
+
+/**
+ * The cards of `cards` the user has not set aside. Only a parked run's cards
+ * can be set aside; a live run's always take the composer.
+ */
+function withoutSetAside<T>(
+    cards: ReadonlyMap<string, T>,
+    toolCallIdOf: (card: T) => string,
+    isThreadParked: boolean,
+    setAside: ReadonlySet<string>,
+): ReadonlyMap<string, T> {
+    if (!isThreadParked || setAside.size === 0) return cards;
+    return new Map([...cards].filter(([, card]) => !setAside.has(toolCallIdOf(card))));
+}
+
+const SidebarShell = ({
+    children,
+    className = "bg-sidepane h-full w-full display-flex flex-col min-w-0 relative",
+    id,
+    isWindow,
+    onFind,
+}: SidebarShellProps) => {
+    const lineSpacing = useAtomValue(chatLineSpacingAtom);
+    const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (event.defaultPrevented) {
+            return;
+        }
+
+        // ⌘F / Ctrl+F while focus is anywhere inside AsterMargin. The main Zotero
+        // window binds the same chord to its quick-search box (key_find →
+        // cmd_find), so the default has to be suppressed or focus leaves AsterMargin
+        // the moment the bar opens.
+        if (
+            onFind
+            && (event.key === 'f' || event.key === 'F')
+            && !event.altKey
+            && !event.shiftKey
+            && (Zotero.isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)
+        ) {
+            event.preventDefault();
+            onFind();
+            return;
+        }
+
+        if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey) {
+            return;
+        }
+
+        const root = event.currentTarget;
+        const activeElement = root.ownerDocument.activeElement;
+        const win = root.ownerDocument.defaultView;
+        if (!win || !(activeElement instanceof win.HTMLElement) || !root.contains(activeElement)) {
+            return;
+        }
+
+        const focusableElements = getFocusableElements(root);
+        const activeIndex = focusableElements.indexOf(activeElement);
+        if (activeIndex === -1) {
+            return;
+        }
+
+        const nextIndex = activeIndex + (event.shiftKey ? -1 : 1);
+        if (nextIndex < 0 || nextIndex >= focusableElements.length) {
+            return;
+        }
+
+        event.preventDefault();
+        focusableElements[nextIndex].focus();
+    };
+
+    return (
+        <div
+            id={id}
+            className={className}
+            style={{ '--astermargin-chat-line-height': CHAT_LINE_SPACING[lineSpacing].lineHeight } as React.CSSProperties}
+            role={isWindow ? "main" : "region"}
+            aria-label="AsterMargin"
+            onKeyDown={handleKeyDown}
+        >
+            {children}
+        </div>
+    );
+};
+
+const Sidebar = ({ location, isWindow = false, header: headerOverride }: SidebarProps) => {
+    // Input element is now a contenteditable div (Lexical editor) rather than
+    // a textarea. Typed as HTMLElement so `.focus()` keeps working.
+    const inputRef = useRef<HTMLElement | null>(null);
+    const loginEmailRef = useRef<HTMLInputElement>(null);
+    const header = headerOverride ?? <Header isWindow={isWindow} />;
+    // Two booleans rather than the runs behind them: subscribing to the runs
+    // re-renders the whole shell on every frame of a streaming response.
+    const runsCount = useAtomValue(runsCountAtom);
+    const isFirstRunThread = useAtomValue(isFirstRunThreadAtom);
+    const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+    // The same element as the ref, held in state so find-in-chat can re-read the
+    // thread when the container is replaced — a thread load unmounts it, and a
+    // ref assignment notifies nobody.
+    const [messagesContainer, setMessagesContainer] = useState<HTMLDivElement | null>(null);
+    const setMessagesContainerRef = useCallback((node: HTMLDivElement | null) => {
+        messagesContainerRef.current = node;
+        setMessagesContainer(node);
+    }, []);
+    const chatAccessGate = useAtomValue(chatAccessGateAtom);
+    const isMigratingData = useAtomValue(isMigratingDataAtom);
+    const isThreadListView = useAtomValue(isThreadListViewAtom);
+    const setIsThreadListView = useSetAtom(isThreadListViewAtom);
+
+    const allWarnings = useAtomValue(threadWarningsAtom);
+    const creditInfoWarning = allWarnings.findLast((w) => w.type === 'credit_info');
+    const isFirstRunVisible = useAtomValue(isFirstRunVisibleAtom);
+    const isFirstRunReturnRequested = useAtomValue(firstRunReturnRequestedAtom);
+    const isWhereToStartVisible = useAtomValue(whereToStartVisibleAtom);
+    const profile = useAtomValue(profileWithPlanAtom);
+    const shouldAssignFirstRunVariant = isFirstRunVisible
+        && !isFirstRunReturnRequested
+        && !!profile?.user_id;
+    const firstRunVariant = useMemo(() => {
+        return shouldAssignFirstRunVariant && profile?.user_id
+            ? getFirstRunSelectionVariant(profile.user_id)
+            : 'first_run';
+    }, [profile?.user_id, shouldAssignFirstRunVariant]);
+
+    // Composer takeover: while the run blocks on a batch approval, a question
+    // or a credit confirmation, that panel replaces the composer entirely (the
+    // draft message atom is untouched, so the composer restores it afterwards).
+    // selectComposerTakeover is shared across clients and owns the precedence
+    // between the blocking states; this client reports all four of them.
+    const pendingApprovalsMap = useAtomValue(pendingApprovalsAtom);
+    const pendingQuestionsMap = useAtomValue(pendingQuestionsAtom);
+    const pendingBatchApprovalsMap = useAtomValue(pendingBatchApprovalsAtom);
+    const pendingCreditConfirmationsMap = useAtomValue(pendingCreditConfirmationsAtom);
+    const pendingTableCardsMap = useAtomValue(pendingTableCardsAtom);
+    // A parked run's card the user set aside to write a message instead
+    // gives the composer back.
+    const setAsideParkedCards = useAtomValue(setAsideParkedCardsAtom);
+    const isThreadParked = useAtomValue(isThreadParkedAtom);
+    const composerTakeover = selectComposerTakeover({
+        pendingApprovalCount: pendingApprovalsMap.size,
+        batchApprovals: withoutSetAside(pendingBatchApprovalsMap, (approval) => approval.toolcallId, isThreadParked, setAsideParkedCards),
+        tableCards: withoutSetAside(pendingTableCardsMap, (card) => card.toolcall_id, isThreadParked, setAsideParkedCards),
+        creditConfirmations: pendingCreditConfirmationsMap,
+        questions: withoutSetAside(pendingQuestionsMap, (question) => question.toolcallId, isThreadParked, setAsideParkedCards),
+    });
+
+    // Find in chat. Component state, not an atom: one Jotai store is shared by
+    // the sidebars and the separate AsterMargin window, so an atom would put every
+    // surface on the same query and the same current match.
+    const find = useFindInChat({ container: messagesContainer });
+
+    // Focus textarea when focusInput event is dispatched (e.g. reader "Ask..." button)
+    useEventSubscription('focusInput', () => {
+        setTimeout(() => inputRef.current?.focus(), 50);
+    });
+
+    // Select the correct atoms based on whether we're in the separate window
+
+    const scrolledAtom = scrollAtoms.userScrolled;
+    const scrollPositionAtom = scrollAtoms.position;
+
+    // Determine if we're in the run view (has runs) or home view (no runs)
+    const isThreadView = runsCount > 0;
+
+    const handleScrollToBottom = () => {
+        if (messagesContainerRef.current) {
+            store.set(scrolledAtom, false);
+            // Clear stored scroll position to let natural scroll-to-bottom take over
+            store.set(scrollPositionAtom, null);
+            // Animated: this is a discrete request to be taken to the end of a
+            // thread the reader had deliberately scrolled away from, and the
+            // motion is what shows them how far they came.
+            scrollToBottom(messagesContainerRef);
+            publishScrollPosition(messagesContainerRef.current, scrollAtoms);
+        }
+    };
+
+    // The screens that stand before a chat, in the order the shared gate
+    // resolves them. The quick prompt reads the same atom, so the two surfaces
+    // cannot disagree about whether a chat may start.
+    if (chatAccessGate === 'loading') {
+        return (
+            <SidebarShell
+                id="thread-loading"
+                className="display-flex flex-col flex-1 w-full"
+                isWindow={isWindow}
+            >
+                {header}
+                <div className="display-flex flex-1 items-center justify-center">
+                    <div className="display-flex flex-col items-center gap-3">
+                        <Spinner size={22}/>
+                        <span className="font-color-tertiary">
+                            {isMigratingData ? "Upgrading your data..." : "Loading..."}
+                        </span>
+                    </div>
+                </div>
+            </SidebarShell>
+        );
+    }
+
+    {/* Saved sign-in still being restored: AsterMargin does not know yet whether
+        the user is signed out, so the sign-in form must not show. */}
+    if (chatAccessGate === 'restoring') {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <SessionRestorePage />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* Login page — only when there is no session at all. */}
+    if (chatAccessGate === 'signed-out') {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <LoginPage emailInputRef={loginEmailRef} />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* Profile loading / connecting / offline / fatal-error page.
+        Authenticated but profile not yet loaded — renders before LoginPage was the bug
+        cause when a transient network failure cleared isProfileLoaded. */}
+    if (chatAccessGate === 'connecting') {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <ProfileLoadingPage />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* Update required page - blocks access until user updates */}
+    if (chatAccessGate === 'update-required') {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <UpdateRequiredPage />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* Plan transition: Downgrade acknowledgment page (Pro → Free) */}
+    if (chatAccessGate === 'downgrade-ack') {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <DowngradeAcknowledgmentPage />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* Onboarding page: shown until the account has authorized access. */}
+    if (chatAccessGate === 'onboarding') {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <FreeOnboardingPage />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* First-run suggestions page (see isFirstRunVisibleAtom in firstRun.ts):
+        - explicit "Try another starting point" return (session atom), or
+        - Free user, device authorized, never completed first-run on this account. */}
+    if (isFirstRunVisible) {
+        const showWhereToStart = !isFirstRunReturnRequested
+            && firstRunVariant === 'where_to_start';
+        return (
+            <SidebarShell isWindow={isWindow}>
+                <ScreenReaderRunAnnouncer inputRef={inputRef} surface={isWindow ? 'window' : 'sidebar'} />
+                {header}
+                {showWhereToStart ? (
+                    <WhereToStartPage />
+                ) : (
+                    <FirstRunPage isWindow={isWindow} inputRef={inputRef} />
+                )}
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    {/* "Where should we start?" launcher shown outside the first-run gate:
+        reopened via "Back to starting points" after a launcher follow-up, or
+        from the Dev Tools menu. */}
+    if (isWhereToStartVisible) {
+        return (
+            <SidebarShell isWindow={isWindow}>
+                {header}
+                <WhereToStartPage />
+                <DialogContainer />
+            </SidebarShell>
+        );
+    }
+
+    const handleCloseThreadList = () => {
+        setIsThreadListView(false);
+    };
+
+    // First-run threads use a follow-up-specific composer placeholder.
+    const inputPlaceholder = isFirstRunThread ? 'Ask a follow-up question' : undefined;
+
+    {/* Main page */}
+    return (
+        <FindInChatControlsProvider value={find.controls}>
+            <SidebarShell isWindow={isWindow} onFind={isThreadView ? find.open : undefined}>
+                <ScreenReaderRunAnnouncer inputRef={inputRef} surface={isWindow ? 'window' : 'sidebar'} />
+
+                {/* Header */}
+                {header}
+
+                {/* Content area - relative container for overlay positioning */}
+                <div className="flex-1 min-h-0 display-flex flex-col relative overflow-hidden">
+                    {/* Find bar - overlays the top of the thread area */}
+                    {isThreadView && find.isOpen && (
+                        <FindBar
+                            query={find.query}
+                            isQueryActive={find.isQueryActive}
+                            matchCount={find.matchCount}
+                            currentIndex={find.currentIndex}
+                            focusToken={find.focusToken}
+                            onQueryChange={find.setQuery}
+                            onNext={find.next}
+                            onPrevious={find.previous}
+                            onClose={find.close}
+                        />
+                    )}
+
+                    {/* Thread view with agent runs. The find query reaches the
+                        message renderers from here, and is empty whenever the bar is
+                        closed — a closed bar leaves the thread rendering exactly as
+                        it does without find-in-chat. */}
+                    {isThreadView ? (
+                        <FindQueryProvider query={find.activeQuery}>
+                            <ThreadView ref={setMessagesContainerRef} />
+                        </FindQueryProvider>
+                    ) : (
+                        <HomePage isWindow={isWindow} inputRef={inputRef} />
+                    )}
+
+                    {/* Prompt area (footer) - only in thread view */}
+                    {isThreadView && (
+                        <div id="astermargin-prompt" className="flex-none px-3 pb-3 relative astermargin-content-column">
+                            <PopupOverlayContainer />
+                            <ScrollDownButton onClick={handleScrollToBottom} />
+                            {composerTakeover.kind === 'batch-approval' ? (
+                                // key resets local decision state per approval request
+                                <BatchApprovalPanel
+                                    key={composerTakeover.approval.approvalId}
+                                    approval={composerTakeover.approval}
+                                />
+                            ) : composerTakeover.kind === 'table-card' ? (
+                                // key resets the card's draft per request
+                                <TableCardPanel
+                                    key={composerTakeover.card.card_id}
+                                    card={composerTakeover.card}
+                                />
+                            ) : composerTakeover.kind === 'credit-confirmation' ? (
+                                // key resets local decision state per confirmation
+                                <CreditConfirmationPanel
+                                    key={composerTakeover.confirmation.confirmationId}
+                                    confirmation={composerTakeover.confirmation}
+                                />
+                            ) : composerTakeover.kind === 'question' ? (
+                                // key resets local answer state per question request
+                                <AskUserQuestionPanel
+                                    key={composerTakeover.question.questionId}
+                                    pendingQuestion={composerTakeover.question}
+                                />
+                            ) : (
+                                <DragDropWrapper>
+                                    <InputArea inputRef={inputRef} placeholder={inputPlaceholder} />
+                                </DragDropWrapper>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Thread list overlay */}
+                    {isThreadListView && (
+                        <div className="thread-overlay-container">
+                            <div className="thread-overlay-backdrop" onClick={handleCloseThreadList} />
+                            <div className="thread-overlay-panel">
+                                <ThreadListView isWindow={isWindow} />
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* Credit info bar - always visible at bottom */}
+                {creditInfoWarning && (
+                    <div className="flex-none px-2 pb-1 -mt-3">
+                        <CreditInfoBar warning={creditInfoWarning} />
+                    </div>
+                )}
+
+                {/* Dialog Container */}
+                <DialogContainer />
+            </SidebarShell>
+        </FindInChatControlsProvider>
+    );
+};
+
+export default Sidebar;

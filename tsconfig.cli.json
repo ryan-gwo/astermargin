@@ -1,0 +1,27 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": ["ES2022", "WebWorker", "DOM"],
+    "types": [],
+    "noEmit": true
+  },
+  "include": [
+    "src/astermargin-extract/node",
+    "src/astermargin-extract/cli",
+    "src/astermargin-extract/worker",
+    "src/astermargin-extract/debug",
+    "tests/unit/pdf/cliEnvelope.test.ts",
+    "tests/unit/pdf/cliFixtureCommand.test.ts",
+    "tests/unit/pdf/cliItemsCommand.test.ts",
+    "tests/unit/pdf/cliReferencesCommand.test.ts",
+    "tests/unit/pdf/debugOverlayBuilders.test.ts",
+    "tests/unit/pdf/nodeApiSerialization.test.ts",
+    "tests/unit/pdf/overlaySvg.test.ts",
+    "tests/helpers/extractFixtureLoader.ts",
+    "tests/smoke"
+  ],
+  "exclude": ["build", "addon", "node_modules"]
+}

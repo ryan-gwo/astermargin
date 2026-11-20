@@ -1,0 +1,548 @@
+import type { ActionExecuteRequest, ActionValidateRequest } from '../operationContext';
+/**
+ * Validate and execute library-wide tag operations (manage_tags).
+ *
+ * Supports two actions:
+ *   - 'rename': renames a tag. If the new name already exists in the library,
+ *     Zotero atomically merges the two tags (via UPDATE OR REPLACE itemTags +
+ *     purge). The merge is flagged via `is_merge` for UI and undo awareness.
+ *   - 'delete': removes the tag from every item in the library.
+ *
+ * Both operations snapshot the affected item IDs and the tag's color at
+ * validation time so destructive operations (delete, merge-on-rename) can be
+ * undone by the user.
+ *
+ * The source tag `name` is matched exactly first (Zotero tags are
+ * case-sensitive); if absent, a unique case/format-insensitive match in the
+ * target library is auto-resolved (see canonicalTagForm) and reported back
+ * via normalized_action_data. `new_name` is never auto-resolved — renaming
+ * to a different casing or merging into an existing tag are legitimate.
+ */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    WSAgentActionExecuteResponse,
+    WSAgentActionValidateResponse
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import type { ManageTagsProposedData, ManageTagsResultData } from '@astermargin/agent-core/types/agentActions/base';
+import { libraryRefForLibraryID, modelObjectId, resolveWriteTargetLibrary, writeTargetLibraryError } from '../../../utils/libraryIdentity';
+import { removeTagFromLibrary } from '../../../utils/zoteroTags';
+import { checkAborted, TimeoutContext } from '../timeout';
+import { getDeferredToolPreference, validateLibraryAccess } from '../utils';
+import { actionError, resolveActionWriteLibrary, toExecuteResponse } from './actionExecution';
+
+// Safety cap: if a tag is on more than this many items, refuse to snapshot the
+// set so we don't balloon proposed_data. The agent can still perform the op
+// but must confirm with the user via a different flow.
+const MAX_SNAPSHOT_ITEMS = 5000;
+
+// Cap on the "Did you mean" suggestion list surfaced when a tag name can't
+// be auto-resolved, keeping the hint short and human-scannable.
+const MAX_TAG_SUGGESTIONS = 3;
+
+
+/**
+ * Convert Zotero numeric item IDs to device-portable model-facing IDs.
+ */
+async function itemIdsToKeys(libraryID: number, itemIDs: number[]): Promise<string[]> {
+    if (itemIDs.length === 0) return [];
+    const items = await Zotero.Items.getAsync(itemIDs);
+    const valid = items.filter((i): i is Zotero.Item => i !== null);
+    if (valid.length > 0) {
+        await Zotero.Items.loadDataTypes(valid, ['primaryData']);
+    }
+    return valid.map((item) => modelObjectId(libraryID, item.key));
+}
+
+
+/**
+ * Result of resolving a user/agent-supplied tag name against Zotero.
+ *
+ * 'cache'         — found via Zotero.Tags.getID (in-memory map, fast path)
+ * 'cache_rebuilt' — initial getID miss, but a fresh Zotero.Tags.init() then
+ *                   found the tag. Signals a transient cache desync; caller
+ *                   should log this.
+ * 'normalized'    — exact lookup missed, but exactly one tag in the target
+ *                   library matches under canonicalTagForm (case/whitespace/
+ *                   apostrophe variants). `resolvedName` is the actual tag.
+ * null tagID      — not found. `suggestions` holds up to 3 near-matches the
+ *                   agent could retry with.
+ *
+ * `resolvedName` is always the actual tag name to operate on; callers must
+ * use it (not the raw input) for everything downstream.
+ */
+type TagResolution =
+    | { tagID: number; source: 'cache' | 'cache_rebuilt' | 'normalized'; resolvedName: string }
+    | { tagID: null; suggestions: string[] };
+
+
+/**
+ * Canonical form used for unambiguous auto-resolution. Differences at this
+ * tier — letter case, whitespace runs, curly vs straight apostrophes/quotes,
+ * Unicode normalization form — are treated as "the same tag, typed
+ * differently". Deliberately does NOT strip diacritics: names differing only
+ * by an accent may be genuinely different tags.
+ */
+export function canonicalTagForm(name: string): string {
+    return name
+        .normalize('NFC')
+        .replace(/[‘’‚‛′]/g, "'")
+        .replace(/[“”„‟″]/g, '"')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+
+/**
+ * Looser form used only for "Did you mean" suggestions: additionally strips
+ * diacritics so accent mismatches still surface a hint. Never used for
+ * auto-resolution.
+ */
+export function suggestionTagForm(name: string): string {
+    return canonicalTagForm(name).normalize('NFD').replace(/\p{M}/gu, '');
+}
+
+
+// Shared in-flight rebuild promise. If multiple concurrent callers miss the
+// cache at once (e.g. 10 parallel manage_tags calls), they all await the same
+// Zotero.Tags.init() rather than queuing N sequential rebuilds.
+let _pendingCacheRebuild: Promise<void> | null = null;
+
+function rebuildTagCache(): Promise<void> {
+    if (!_pendingCacheRebuild) {
+        _pendingCacheRebuild = Zotero.Tags.init()
+            .finally(() => {
+                _pendingCacheRebuild = null;
+            });
+    }
+    return _pendingCacheRebuild;
+}
+
+
+/**
+ * Resolve a tag name to its tagID. `libraryID` scopes the "Did you mean"
+ * suggestion probe so we don't cross-pollinate from other libraries
+ * (Zotero.Tags and the `tags` table are global; itemTags is what scopes a
+ * tag to a library).
+ */
+async function resolveTagByName(name: string, libraryID: number): Promise<TagResolution> {
+    const cacheID = Zotero.Tags.getID(name);
+    if (cacheID !== false && cacheID != null) {
+        return { tagID: cacheID, source: 'cache', resolvedName: name };
+    }
+
+    // Cache miss → rebuild (shared across concurrent callers) and retry.
+    await rebuildTagCache();
+    const retryID = Zotero.Tags.getID(name);
+    if (retryID !== false && retryID != null) {
+        return { tagID: retryID, source: 'cache_rebuilt', resolvedName: name };
+    }
+
+    // Still missing — the exact name provably does not exist. Probe the target
+    // library's tag names for near-matches. Scope via itemTags (Zotero.Tags
+    // and the `tags` table are global; itemTags is what scopes a tag to a
+    // library). Normalization happens in JS, not SQL: SQLite's LOWER() only
+    // folds ASCII and can't bridge apostrophe or Unicode-form variants. A
+    // library can hold tens of thousands of distinct tags, so matching is
+    // done inside the row callback rather than materializing every name into
+    // an array — memory stays bounded to the handful of near-matches found.
+    const canonical = canonicalTagForm(name);
+    const suggestionTarget = suggestionTagForm(name);
+    let canonicalMatchCount = 0;
+    const canonicalSuggestions: string[] = [];
+    const diacriticSuggestions: string[] = [];
+
+    await Zotero.DB.queryAsync(
+        'SELECT DISTINCT t.name FROM tags t '
+            + 'JOIN itemTags it USING (tagID) '
+            + 'JOIN items i USING (itemID) '
+            + 'WHERE i.libraryID = ?',
+        [libraryID],
+        {
+            onRow: (row: any) => {
+                const tagName = row.getResultByIndex(0) as string;
+                if (canonicalTagForm(tagName) === canonical) {
+                    canonicalMatchCount++;
+                    if (canonicalSuggestions.length < MAX_TAG_SUGGESTIONS) {
+                        canonicalSuggestions.push(tagName);
+                    }
+                } else if (
+                    diacriticSuggestions.length < MAX_TAG_SUGGESTIONS
+                    && suggestionTagForm(tagName) === suggestionTarget
+                ) {
+                    diacriticSuggestions.push(tagName);
+                }
+            },
+        },
+    );
+
+    // Auto-resolve when exactly one library tag matches under the canonical
+    // form. Tags are case-sensitive in Zotero, but since the exact-cased name
+    // does not exist, a unique match cannot shadow a legitimately different
+    // tag; multiple matches (coexisting case variants) stay an error below.
+    if (canonicalMatchCount === 1) {
+        const resolvedID = Zotero.Tags.getID(canonicalSuggestions[0]);
+        if (resolvedID !== false && resolvedID != null) {
+            return { tagID: resolvedID, source: 'normalized', resolvedName: canonicalSuggestions[0] };
+        }
+    }
+
+    // Ambiguous or no canonical match: surface the canonical near-matches
+    // found, falling back to the diacritic-insensitive matches so accent
+    // mismatches still produce a hint.
+    const suggestions = canonicalSuggestions.length > 0 ? canonicalSuggestions : diacriticSuggestions;
+    return { tagID: null, suggestions };
+}
+
+
+/**
+ * Format a "Did you mean" suggestion list for inclusion in an error string.
+ * Returns empty string if no suggestions.
+ */
+function formatSuggestions(suggestions: string[]): string {
+    if (suggestions.length === 0) return '';
+    if (suggestions.length === 1) return ` Did you mean: '${suggestions[0]}'?`;
+    return ` Did you mean: ${suggestions.map((s) => `'${s}'`).join(', ')}?`;
+}
+
+
+export async function validateManageTagsAction(
+    request: ActionValidateRequest
+): Promise<WSAgentActionValidateResponse> {
+    const { action, name: rawName, new_name: rawNewName, library_id: rawLibraryId, library_ref, library_name } = request.action_data as {
+        action: 'rename' | 'delete';
+        name: string;
+        new_name?: string | null;
+        library_id?: number | null;
+        library_ref?: string | null;
+        library_name?: string | null;
+    };
+
+    const name = (rawName ?? '').trim();
+    if (!name) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: 'Tag name cannot be empty',
+            error_code: 'invalid_name',
+            preference: 'always_ask',
+        };
+    }
+
+    // Resolve library (int / name / default). We use the generic helper so the
+    // behavior matches other handlers. A present library_ref is authoritative:
+    // resolve it strictly (exactly as executeManageTagsAction does) so validate
+    // fails a malformed/unavailable ref instead of silently falling back to a
+    // stale library_id and validating against the wrong library.
+    let refLibraryId: number | undefined;
+    if (library_ref) {
+        const resolution = resolveWriteTargetLibrary({ library_ref, library_id: rawLibraryId });
+        if (!resolution.ok) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                ...writeTargetLibraryError(resolution),
+                preference: 'always_ask',
+            };
+        }
+        refLibraryId = resolution.libraryID;
+    }
+    const libIdentifier =
+        refLibraryId != null
+            ? refLibraryId
+            : (typeof rawLibraryId === 'number' && rawLibraryId > 0
+                ? rawLibraryId
+                : (library_name ?? null));
+    const libValidation = validateLibraryAccess(libIdentifier);
+    if (!libValidation.valid) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: libValidation.error,
+            error_code: libValidation.error_code,
+            preference: 'always_ask',
+        };
+    }
+    const library = libValidation.library!;
+    const libraryID = library.libraryID;
+
+    if (!library.editable) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Library '${library.name}' is read-only and cannot be modified`,
+            error_code: 'library_not_editable',
+            preference: 'always_ask',
+        };
+    }
+
+    // Resolve tag ID for the source tag (must exist). On a cache miss we
+    // rebuild Zotero.Tags' in-memory map — getID can return false for tags
+    // the DB has (list_tags SQL shows them, but _idsByTag is out of sync).
+    // The resolver is async and touches DB; guard it so an unexpected
+    // rejection (e.g. DB lock during init) still yields a structured
+    // validation response instead of breaking the caller contract.
+    let resolution: TagResolution;
+    try {
+        resolution = await resolveTagByName(name, libraryID);
+    } catch (e) {
+        logger(`validateManageTagsAction: resolveTagByName threw: ${e}`, 1);
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Failed to resolve tag '${name}' in library '${library.name}': ${String(e)}`,
+            error_code: 'validation_failed',
+            preference: 'always_ask',
+        };
+    }
+    if (resolution.tagID === null) {
+        const hint = formatSuggestions(resolution.suggestions);
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Tag not found in library '${library.name}': '${name}'.${hint}`,
+            error_code: 'tag_not_found',
+            preference: 'always_ask',
+        };
+    }
+    const tagID = resolution.tagID;
+    const resolvedName = resolution.resolvedName;
+    if (resolution.source === 'cache_rebuilt') {
+        logger(`manage_tags: cache desync repaired for '${name}' in library ${libraryID} (Zotero.Tags.init rebuilt, tagID=${tagID})`, 1);
+    } else if (resolution.source === 'normalized') {
+        logger(`manage_tags: auto-resolved tag '${name}' → '${resolvedName}' (unique normalized match) in library ${libraryID} (tagID=${tagID})`, 1);
+    }
+
+    // Validate action-specific fields
+    let newName: string | null = null;
+    let isMerge = false;
+    if (action === 'rename') {
+        newName = (rawNewName ?? '').trim();
+        if (!newName) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: "action='rename' requires a non-empty new_name",
+                error_code: 'invalid_new_name',
+                preference: 'always_ask',
+            };
+        }
+        if (newName === resolvedName) {
+            // When auto-resolution collapsed the source onto the requested
+            // target (e.g. rename 'Academic identity' → 'academic identity'
+            // and only the lowercase tag exists), the desired end state
+            // already holds — tell the model to move on rather than surfacing
+            // a confusing "must be different" error.
+            const alreadyNamed = resolvedName !== name;
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: alreadyNamed
+                    ? `Tag is already named '${resolvedName}' in library '${library.name}'; nothing to rename.`
+                    : 'new_name must be different from the current name',
+                error_code: alreadyNamed ? 'rename_noop' : 'invalid_new_name',
+                preference: 'always_ask',
+            };
+        }
+        // Merge detection: does new_name already exist in this library?
+        const existingTarget = Zotero.Tags.getID(newName);
+        isMerge = existingTarget !== false && existingTarget != null;
+    } else if (action === 'delete') {
+        newName = null;
+    } else {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Unsupported action: '${action}'. Use 'rename' or 'delete'.`,
+            error_code: 'invalid_action',
+            preference: 'always_ask',
+        };
+    }
+
+    // Count (preview only). The authoritative snapshot for undo is captured
+    // at execute time — NOT here — so a re-apply after manual library edits
+    // produces a fresh snapshot.
+    let itemCount = 0;
+    let itemCountKnown = false;
+    try {
+        const ids = await Zotero.Tags.getTagItems(libraryID, tagID);
+        itemCount = ids.length;
+        itemCountKnown = true;
+    } catch (e) {
+        logger(`validateManageTagsAction: getTagItems failed: ${e}`, 1);
+    }
+
+    // The tagID lookup is global, so the name may only exist in another
+    // library. A tag is in this library if an item carries it or the library
+    // assigns it a color (which keeps it in the tag selector).
+    if (itemCountKnown && itemCount === 0 && !Zotero.Tags.getColor(libraryID, resolvedName)) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Tag not found in library '${library.name}': '${name}'.`,
+            error_code: 'tag_not_found',
+            preference: 'always_ask',
+        };
+    }
+
+    if (itemCount > MAX_SNAPSHOT_ITEMS) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Tag '${name}' is used on ${itemCount} items (over the ${MAX_SNAPSHOT_ITEMS} safety cap). Ask the user to perform this operation in Zotero directly.`,
+            error_code: 'too_many_items',
+            preference: 'always_ask',
+        };
+    }
+
+    const preference = getDeferredToolPreference('manage_tags', undefined, request.operation);
+
+    return {
+        type: 'agent_action_validate_response',
+        request_id: request.request_id,
+        valid: true,
+        current_value: {
+            library_id: libraryID,
+            library_ref: libraryRefForLibraryID(libraryID) ?? undefined,
+            library_name: library.name,
+            action,
+            name: resolvedName,
+            new_name: newName,
+            is_merge: isMerge,
+            // Omitted when the lookup failed: it is also the drift baseline,
+            // and a guessed 0 would read as a change on a later apply.
+            ...(itemCountKnown ? { item_count: itemCount } : {}),
+        },
+        // Only resolved scalars go into normalized_action_data. Snapshots are
+        // captured at execute time. `name` carries the auto-resolved tag name
+        // so execute and the approval card operate on the actual tag.
+        normalized_action_data: {
+            library_id: libraryID,
+            library_ref: libraryRefForLibraryID(libraryID) ?? undefined,
+            name: resolvedName,
+        },
+        preference,
+    };
+}
+
+
+/**
+ * Called with the resolved tag (null when it is not in the library) right
+ * before the write; throws to refuse it.
+ */
+export interface ManageTagsApplyHooks {
+    assertUnchanged?: (libraryID: number, tagID: number | null) => Promise<void>;
+}
+
+/**
+ * Rename or delete a tag across a library and return its `result_data`, with
+ * the items that had the tag, its color and whether a rename merges captured
+ * right before the write for undo.
+ */
+export async function applyManageTags(
+    data: ManageTagsProposedData,
+    ctx: TimeoutContext,
+    hooks: ManageTagsApplyHooks = {},
+): Promise<ManageTagsResultData> {
+    const { action, name, new_name } = data;
+    const resolvedLibraryId = resolveActionWriteLibrary(data);
+
+    // Re-snapshot the authoritative pre-apply state at execute time.
+    // This ensures a re-apply after manual library edits produces a fresh
+    // snapshot that the next undo can correctly reverse.
+    const resolution = await resolveTagByName(name, resolvedLibraryId);
+    const tagID = resolution.tagID;
+    const resolvedName = resolution.tagID !== null ? resolution.resolvedName : name;
+    if (resolution.tagID !== null && resolution.source === 'cache_rebuilt') {
+        logger(`applyManageTags: cache desync repaired for '${name}' in library ${resolvedLibraryId} (Zotero.Tags.init rebuilt, tagID=${tagID})`, 1);
+    } else if (resolution.tagID !== null && resolution.source === 'normalized') {
+        logger(`applyManageTags: auto-resolved tag '${name}' → '${resolvedName}' in library ${resolvedLibraryId} (tagID=${tagID})`, 1);
+    }
+    await hooks.assertUnchanged?.(resolvedLibraryId, tagID);
+
+    let affectedItemIds: string[] = [];
+    if (tagID !== null) {
+        // A failed lookup leaves the snapshot empty rather than blocking the
+        // change; the cap below is a refusal, never swallowed.
+        let ids: number[] | null = null;
+        try {
+            ids = await Zotero.Tags.getTagItems(resolvedLibraryId, tagID);
+        } catch (e) {
+            logger(`applyManageTags: getTagItems snapshot failed: ${e}`, 1);
+        }
+        if (ids && ids.length > MAX_SNAPSHOT_ITEMS) {
+            throw actionError('too_many_items', `Tag '${name}' is used on ${ids.length} items (over the ${MAX_SNAPSHOT_ITEMS} safety cap).`);
+        }
+        if (ids) {
+            try {
+                affectedItemIds = await itemIdsToKeys(resolvedLibraryId, ids);
+            } catch (e) {
+                logger(`applyManageTags: snapshot key lookup failed: ${e}`, 1);
+            }
+        }
+    }
+    const rawColor = Zotero.Tags.getColor(resolvedLibraryId, resolvedName);
+    const oldColor = rawColor && typeof rawColor === 'object'
+        ? { color: (rawColor as any).color, position: (rawColor as any).position }
+        : null;
+
+    let isMerge: boolean | null = null;
+
+    if (action === 'rename') {
+        const target = (new_name ?? '').trim();
+        if (!target) throw actionError('invalid_new_name', 'new_name required for rename');
+        // Re-check merge status at execute time (the tag state may have
+        // shifted since validation if the user edited tags manually).
+        const existingTarget = Zotero.Tags.getID(target);
+        isMerge = existingTarget !== false && existingTarget != null;
+
+        checkAborted(ctx, 'manage_tags:before_rename');
+        await Zotero.Tags.rename(resolvedLibraryId, resolvedName, target);
+        logger(`applyManageTags: Renamed tag '${resolvedName}' → '${target}' in library ${resolvedLibraryId}`, 1);
+    } else if (action === 'delete') {
+        if (tagID === null) {
+            // Already gone — treat as success with 0 affected items
+            logger(`applyManageTags: Tag '${name}' not found in library ${resolvedLibraryId}; treating as already deleted`, 1);
+        } else {
+            checkAborted(ctx, 'manage_tags:before_delete');
+            const removed = await removeTagFromLibrary(resolvedLibraryId, tagID, resolvedName);
+            logger(removed
+                ? `applyManageTags: Deleted tag '${resolvedName}' from library ${resolvedLibraryId}`
+                : `applyManageTags: Tag '${resolvedName}' has no items in library ${resolvedLibraryId}; nothing to delete`, 1);
+        }
+    } else {
+        throw actionError('invalid_action', `Unsupported action: '${action}'`);
+    }
+
+    return {
+        library_id: resolvedLibraryId,
+        library_ref: libraryRefForLibraryID(resolvedLibraryId) ?? undefined,
+        action,
+        name: resolvedName,
+        new_name: new_name ?? null,
+        items_affected: affectedItemIds.length,
+        affected_item_ids: affectedItemIds,
+        old_color: oldColor,
+        is_merge: isMerge,
+    };
+}
+
+export async function executeManageTagsAction(
+    request: ActionExecuteRequest,
+    ctx: TimeoutContext,
+): Promise<WSAgentActionExecuteResponse> {
+    return toExecuteResponse(request.request_id, 'executeManageTagsAction',
+        () => applyManageTags(request.action_data as ManageTagsProposedData, ctx));
+}

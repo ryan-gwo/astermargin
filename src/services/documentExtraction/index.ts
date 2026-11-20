@@ -1,0 +1,50 @@
+export {
+    resolveToReadableAttachment,
+    resolveToPdfAttachment,
+    resolveToImageAttachment,
+} from './attachmentResolution';
+export type {
+    ReadableAttachmentResolveResult,
+    PdfAttachmentResolveResult,
+    ImageAttachmentResolveResult,
+} from './attachmentResolution';
+
+export {
+    checkRemotePdfSize,
+    isRemoteAccessAvailable,
+    loadPdfData,
+} from './pdfData';
+
+export {
+    checkAttachmentDataSize,
+    fileAccessDeniedMessage,
+    isFileAccessDeniedError,
+    isLocalFileReadDenied,
+    loadAttachmentData,
+    resolveAttachmentFileSource,
+} from './attachmentSource';
+export type {
+    AttachmentDataResult,
+    AttachmentFileSource,
+    AttachmentSourceFailureCode,
+    AttachmentSourceResult,
+    LocalSizeStrategy,
+} from './attachmentSource';
+
+export {
+    preflightCachedPdfMeta,
+} from './preflight';
+export type {
+    PreflightErrorCode,
+    PreflightFailure,
+    PreflightOptions,
+} from './preflight';
+
+export {
+    validateZoteroItemReference,
+} from './referenceValidation';
+
+export { extractTextDocument, TEXT_SCHEMA_VERSION } from './text/extractTextDocument';
+export type {
+    ZoteroItemReferenceInput,
+} from './referenceValidation';

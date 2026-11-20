@@ -1,0 +1,453 @@
+/**
+ * Tests for page label resolution helpers.
+ *
+ * Covers the pure `resolvePageValue` exhaustively (numeric + string inputs,
+ * label-aware + strict modes, error paths), plus light coverage of
+ * `ensurePageLabelsForResolution` (the cache + eager-load path with mocked
+ * AsterMarginExtractor + IOUtils).
+ */
+
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import {
+    resolvePageValue,
+    InvalidPageValueError,
+    ensurePageLabelsForResolution,
+} from '../../../src/services/agentDataProvider/pageLabelResolution';
+import type { DocumentCacheMetadata } from '../../../src/services/documentCache';
+import { WorkerDeadlineError } from '../../../src/astermargin-extract';
+
+// Mock the logger to keep test output clean
+vi.mock('@astermargin/agent-core/platform/logger', () => ({
+    logger: vi.fn(),
+}));
+
+// Cast IOUtils for type-safe mock access (stub from tests/setup.ts)
+const mockIOUtils = (globalThis as any).IOUtils as {
+    read: ReturnType<typeof vi.fn>;
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Only declared labels, as documents without printed labels have. */
+function declared(labels: Record<number, string> | null) {
+    return { printed: null, declared: labels };
+}
+
+function makeCachedMeta(
+    overrides: Partial<DocumentCacheMetadata> = {}
+): DocumentCacheMetadata {
+    return {
+        id: 1,
+        libraryId: 1,
+        zoteroKey: 'ABCD1234',
+        filePath: '/data/test.pdf',
+        fileSignature: { mtime_ms: 1700000000000, size_bytes: 100000 },
+        sourceSizeBytes: 100000,
+        contentType: 'application/pdf',
+        pageCount: 10,
+        pageLabels: null,
+        errorCode: null,
+        extractionSchemaVersion: '1',
+        metadataFormatVersion: 1,
+        createdAt: '2025-01-01T00:00:00Z',
+        updatedAt: '2025-01-01T00:00:00Z',
+        lastAccessedAt: null,
+        ...overrides,
+    };
+}
+
+/** Minimal mock AsterMarginExtractor — only `getMetadata` is exercised here. */
+function makeMockExtractor(result: { pageCount: number; pageLabels: Record<number, string> } | Error) {
+    return {
+        getMetadata: vi.fn().mockImplementation(async () => {
+            if (result instanceof Error) throw result;
+            return result;
+        }),
+    } as any;
+}
+
+// ---------------------------------------------------------------------------
+// resolvePageValue — numeric input
+// ---------------------------------------------------------------------------
+
+describe('resolvePageValue (numeric input)', () => {
+    describe('preferPageLabels=false (strict numeric mode)', () => {
+        it('returns the input unchanged when labels are null', () => {
+            expect(resolvePageValue(5, declared(null), false)).toBe(5);
+            expect(resolvePageValue(1, declared(null), false)).toBe(1);
+            expect(resolvePageValue(999, declared(null), false)).toBe(999);
+        });
+
+        it('ignores labels even when they match (strict mode)', () => {
+            // prefer_page_labels=false means the number is always a physical index
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii', 3: 'iv', 4: '1', 5: '2' };
+            expect(resolvePageValue(1, declared(labels), false)).toBe(1); // NOT 5
+            expect(resolvePageValue(2, declared(labels), false)).toBe(2); // NOT 6
+        });
+    });
+
+    describe('preferPageLabels=true (label-aware mode)', () => {
+        it('falls through to input when labels are null', () => {
+            expect(resolvePageValue(5, declared(null), true)).toBe(5);
+        });
+
+        it('is a no-op when labels are sequential and match 1-based indices', () => {
+            const labels = { 0: '1', 1: '2', 2: '3', 3: '4', 4: '5' };
+            expect(resolvePageValue(1, declared(labels), true)).toBe(1);
+            expect(resolvePageValue(3, declared(labels), true)).toBe(3);
+            expect(resolvePageValue(5, declared(labels), true)).toBe(5);
+        });
+
+        it('resolves label "1" to the correct 1-based index with front-matter offset', () => {
+            const labels = {
+                0: 'i', 1: 'ii', 2: 'iii', 3: 'iv',
+                4: '1', 5: '2', 6: '3',
+            };
+            expect(resolvePageValue(1, declared(labels), true)).toBe(5); // label "1" → index 5
+            expect(resolvePageValue(2, declared(labels), true)).toBe(6);
+            expect(resolvePageValue(3, declared(labels), true)).toBe(7);
+        });
+
+        it('falls through to numeric index when the value does not match any label', () => {
+            // Roman labels — numeric "4" doesn't match "iv", falls through
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii', 3: 'iv' };
+            expect(resolvePageValue(4, declared(labels), true)).toBe(4);
+        });
+
+        it('resolves duplicate labels to the page in the longest Arabic run', () => {
+            const labels = { 0: '1', 1: '1', 2: '2' };
+            expect(resolvePageValue(1, declared(labels), true)).toBe(2);
+        });
+
+        it('resolves duplicate labels to the first page when no run is longer', () => {
+            const labels = { 0: 'A', 1: 'A' };
+            expect(resolvePageValue('A', declared(labels), true)).toBe(1);
+        });
+
+        it('handles non-contiguous label keys correctly', () => {
+            const labels = { 0: 'cover', 5: '1', 6: '2' };
+            expect(resolvePageValue(1, declared(labels), true)).toBe(6); // index 5 → 1-based 6
+            expect(resolvePageValue(2, declared(labels), true)).toBe(7);
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePageValue — string input
+// ---------------------------------------------------------------------------
+
+describe('resolvePageValue (printed and declared labels)', () => {
+    it('matches printed labels before the labels the PDF declares', () => {
+        const labels = {
+            printed: { 0: '1201', 1: '1202', 2: '1203' },
+            declared: { 0: '1', 1: '2', 2: '1202' },
+        };
+        expect(resolvePageValue('1202', labels, true)).toBe(2);
+    });
+
+    it('falls back to declared labels, then to the physical page', () => {
+        const labels = { printed: { 2: '1203' }, declared: { 0: 'i', 1: 'ii' } };
+        expect(resolvePageValue('ii', labels, true)).toBe(2);
+        expect(resolvePageValue('3', labels, true)).toBe(3);
+    });
+
+    it('prefers the main-body page when a printed label repeats', () => {
+        // A cover sheet printed "5" ahead of a body run 1..6.
+        const printed = { 0: '5', 1: '1', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6' };
+        expect(resolvePageValue('5', { printed, declared: null }, true)).toBe(6);
+    });
+
+    it('names printed labels in the miss message when there are any', () => {
+        const labels = { printed: { 0: '1201' }, declared: { 0: '1' } };
+        try {
+            resolvePageValue('xyz', labels, true);
+            expect.unreachable();
+        } catch (error) {
+            expect((error as InvalidPageValueError).knownLabels).toEqual(['1201']);
+        }
+    });
+});
+
+describe('resolvePageValue (string input)', () => {
+    describe('preferPageLabels=true (label-aware mode)', () => {
+        it('resolves a label string to its physical index', () => {
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii', 3: 'iv', 4: '1' };
+            expect(resolvePageValue('iv', declared(labels), true)).toBe(4);
+            expect(resolvePageValue('i', declared(labels), true)).toBe(1);
+            expect(resolvePageValue('1', declared(labels), true)).toBe(5);
+        });
+
+        it('resolves non-numeric labels like "A-3" or "S12"', () => {
+            const labels = { 0: '1', 1: '2', 2: 'A-1', 3: 'A-2', 4: 'S12' };
+            expect(resolvePageValue('A-1', declared(labels), true)).toBe(3);
+            expect(resolvePageValue('A-2', declared(labels), true)).toBe(4);
+            expect(resolvePageValue('S12', declared(labels), true)).toBe(5);
+        });
+
+        it('falls back to numeric parse when label not found but string parses as int', () => {
+            // "38" misses label lookup (labels are roman), falls through to numeric 38
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii' };
+            expect(resolvePageValue('38', declared(labels), true)).toBe(38);
+        });
+
+        it('throws InvalidPageValueError when label missing and not numeric', () => {
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii' };
+            expect(() => resolvePageValue('nonexistent', declared(labels), true))
+                .toThrow(InvalidPageValueError);
+        });
+
+        it('error payload includes a sample of known labels', () => {
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii', 3: 'iv' };
+            try {
+                resolvePageValue('fig-2', declared(labels), true);
+                expect.fail('expected throw');
+            } catch (error) {
+                expect(error).toBeInstanceOf(InvalidPageValueError);
+                const err = error as InvalidPageValueError;
+                expect(err.knownLabels).toEqual(['i', 'ii', 'iii', 'iv']);
+                expect(err.message).toContain('fig-2');
+                expect(err.message).toContain('i, ii, iii, iv');
+            }
+        });
+
+        it('error payload caps sample at 10 labels', () => {
+            const labels: Record<number, string> = {};
+            for (let i = 0; i < 20; i++) labels[i] = `label-${i}`;
+            try {
+                resolvePageValue('bogus', declared(labels), true);
+                expect.fail('expected throw');
+            } catch (error) {
+                const err = error as InvalidPageValueError;
+                expect(err.knownLabels?.length).toBe(10);
+                expect(err.message).toContain('…'); // truncation marker
+            }
+        });
+
+        it('error payload has no knownLabels when labels is null', () => {
+            try {
+                resolvePageValue('iv', declared(null), true);
+                expect.fail('expected throw');
+            } catch (error) {
+                const err = error as InvalidPageValueError;
+                expect(err.knownLabels).toBeUndefined();
+                expect(err.message).toContain('no page labels are available');
+            }
+        });
+
+        it('handles whitespace in numeric fallback', () => {
+            expect(resolvePageValue('  38  ', declared(null), true)).toBe(38);
+        });
+    });
+
+    describe('preferPageLabels=false (strict numeric mode)', () => {
+        it('parses a numeric string as a physical index', () => {
+            expect(resolvePageValue('38', declared(null), false)).toBe(38);
+            expect(resolvePageValue('1', declared(null), false)).toBe(1);
+        });
+
+        it('parses a numeric string even when labels exist (ignores labels)', () => {
+            const labels = { 0: 'i', 1: 'ii', 2: 'iii', 3: 'iv', 4: '1' };
+            // "1" would match labels[4] in label-aware mode, but strict mode
+            // treats it purely as numeric → physical index 1.
+            expect(resolvePageValue('1', declared(labels), false)).toBe(1);
+        });
+
+        it('throws InvalidPageValueError on non-parseable string', () => {
+            expect(() => resolvePageValue('iv', declared(null), false))
+                .toThrow(InvalidPageValueError);
+            expect(() => resolvePageValue('A-3', declared(null), false))
+                .toThrow(InvalidPageValueError);
+        });
+
+        it('error message mentions prefer_page_labels gating', () => {
+            try {
+                resolvePageValue('iv', declared(null), false);
+                expect.fail('expected throw');
+            } catch (error) {
+                expect((error as Error).message).toMatch(/read_note/);
+            }
+        });
+
+        it('rejects zero and negative as invalid positive integers', () => {
+            expect(() => resolvePageValue('0', declared(null), false))
+                .toThrow(InvalidPageValueError);
+            expect(() => resolvePageValue('-5', declared(null), false))
+                .toThrow(InvalidPageValueError);
+        });
+
+        it('rejects decimals', () => {
+            expect(() => resolvePageValue('3.14', declared(null), false))
+                .toThrow(InvalidPageValueError);
+        });
+
+        it('handles leading/trailing whitespace', () => {
+            expect(resolvePageValue('  38  ', declared(null), false)).toBe(38);
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// ensurePageLabelsForResolution
+// ---------------------------------------------------------------------------
+
+describe('ensurePageLabelsForResolution', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('returns labels from cache when cachedMeta has populated page_labels', async () => {
+        const cachedMeta = makeCachedMeta({
+            pageLabels: { 0: 'i', 1: 'ii', 2: '1' },
+            pageCount: 3,
+        });
+        const extractor = makeMockExtractor({ pageCount: 999, pageLabels: { 0: 'wrong' } });
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', cachedMeta, extractor);
+
+        expect(result.labels).toEqual({ 0: 'i', 1: 'ii', 2: '1' });
+        expect(result.pageCount).toBe(3);
+        expect(result.pdfData).toBeNull();
+        // Should NOT call the extractor when cache has labels
+        expect(extractor.getMetadata).not.toHaveBeenCalled();
+        expect(mockIOUtils.read).not.toHaveBeenCalled();
+    });
+
+    it('normalises empty labels object from cache to null', async () => {
+        // pageLabels: {} means "already checked, no custom labels" —
+        // resolver should see null so it falls through to numeric.
+        const cachedMeta = makeCachedMeta({
+            pageLabels: {},
+            pageCount: 5,
+        });
+        const extractor = makeMockExtractor({ pageCount: 999, pageLabels: { 0: 'wrong' } });
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', cachedMeta, extractor);
+
+        expect(result.labels).toBeNull();
+        expect(result.pageCount).toBe(5);
+        expect(result.pdfData).toBeNull();
+        expect(extractor.getMetadata).not.toHaveBeenCalled();
+    });
+
+    it('does an eager load when cachedMeta is null', async () => {
+        const pdfBytes = new Uint8Array([1, 2, 3]);
+        mockIOUtils.read.mockResolvedValueOnce(pdfBytes);
+        const extractor = makeMockExtractor({
+            pageCount: 42,
+            pageLabels: { 0: 'i', 1: 'ii', 2: '1' },
+        });
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', null, extractor);
+
+        expect(result.labels).toEqual({ 0: 'i', 1: 'ii', 2: '1' });
+        expect(result.pageCount).toBe(42);
+        expect(result.pdfData).toBe(pdfBytes);
+        expect(mockIOUtils.read).toHaveBeenCalledWith('/data/test.pdf');
+        expect(extractor.getMetadata).toHaveBeenCalledWith(pdfBytes, undefined);
+    });
+
+    it('reports dispatch only when the eager metadata worker call is reached', async () => {
+        const onWorkerDispatch = vi.fn();
+        const pdfBytes = new Uint8Array([1, 2, 3]);
+        mockIOUtils.read.mockResolvedValueOnce(pdfBytes);
+        const extractor = makeMockExtractor({ pageCount: 3, pageLabels: { 0: '1' } });
+
+        await ensurePageLabelsForResolution(
+            '/data/test.pdf',
+            null,
+            extractor,
+            undefined,
+            onWorkerDispatch,
+        );
+
+        expect(onWorkerDispatch).toHaveBeenCalledOnce();
+        expect(onWorkerDispatch).toHaveBeenCalledBefore(vi.mocked(extractor.getMetadata));
+
+        onWorkerDispatch.mockClear();
+        mockIOUtils.read.mockRejectedValueOnce(new Error('disk error'));
+        await ensurePageLabelsForResolution(
+            '/data/test.pdf',
+            null,
+            extractor,
+            undefined,
+            onWorkerDispatch,
+        );
+        expect(onWorkerDispatch).not.toHaveBeenCalled();
+    });
+
+    it('does an eager load when cachedMeta has null page_labels (never checked)', async () => {
+        const cachedMeta = makeCachedMeta({ pageLabels: null, pageCount: null });
+        const pdfBytes = new Uint8Array([1, 2, 3]);
+        mockIOUtils.read.mockResolvedValueOnce(pdfBytes);
+        const extractor = makeMockExtractor({
+            pageCount: 10,
+            pageLabels: { 0: '1' },
+        });
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', cachedMeta, extractor);
+
+        expect(result.labels).toEqual({ 0: '1' });
+        expect(result.pageCount).toBe(10);
+        expect(result.pdfData).toBe(pdfBytes);
+        expect(extractor.getMetadata).toHaveBeenCalledOnce();
+    });
+
+    it('normalises empty labels from eager load to null', async () => {
+        mockIOUtils.read.mockResolvedValueOnce(new Uint8Array([1]));
+        const extractor = makeMockExtractor({ pageCount: 5, pageLabels: {} });
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', null, extractor);
+
+        expect(result.labels).toBeNull();
+        expect(result.pageCount).toBe(5);
+        expect(result.pdfData).toBeInstanceOf(Uint8Array);
+    });
+
+    it('returns null labels gracefully when eager load fails', async () => {
+        mockIOUtils.read.mockRejectedValueOnce(new Error('disk error'));
+        const extractor = makeMockExtractor(new Error('should not reach'));
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', null, extractor);
+
+        expect(result.labels).toBeNull();
+        expect(result.pageCount).toBeNull();
+        expect(result.pdfData).toBeNull();
+    });
+
+    it('returns null labels gracefully when extractor fails', async () => {
+        mockIOUtils.read.mockResolvedValueOnce(new Uint8Array([1]));
+        const extractor = makeMockExtractor(new Error('malformed PDF'));
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', null, extractor);
+
+        expect(result.labels).toBeNull();
+        expect(result.pageCount).toBeNull();
+        expect(result.pdfData).toBeNull();
+    });
+
+    it('rethrows worker deadline errors from the eager load', async () => {
+        mockIOUtils.read.mockResolvedValueOnce(new Uint8Array([1]));
+        const deadlineError = new WorkerDeadlineError('worker busy-age lease exceeded');
+        const extractor = makeMockExtractor(deadlineError);
+
+        await expect(
+            ensurePageLabelsForResolution('/data/test.pdf', null, extractor),
+        ).rejects.toBe(deadlineError);
+    });
+
+    it('still swallows a stale-worker error to the null fallback', async () => {
+        mockIOUtils.read.mockResolvedValueOnce(new Uint8Array([1]));
+        const staleError = Object.assign(new Error('stale worker: configured worker changed'), {
+            name: 'StaleWorkerError',
+        });
+        const extractor = makeMockExtractor(staleError);
+
+        const result = await ensurePageLabelsForResolution('/data/test.pdf', null, extractor);
+
+        expect(result.labels).toBeNull();
+        expect(result.pageCount).toBeNull();
+        expect(result.pdfData).toBeNull();
+    });
+});

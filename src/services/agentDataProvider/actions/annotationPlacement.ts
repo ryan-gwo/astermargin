@@ -1,0 +1,194 @@
+import type {
+    AnnotationRelocation,
+    RelocationPageLocation,
+} from "@astermargin/agent-core/types/agentActions/editAnnotations";
+import type { BoundingBox } from "@astermargin/agent-core/types/citations";
+import {
+    buildDomPlacement,
+    buildHighlightPlacement,
+    buildNotePlacement,
+    getPageGeometryForAttachment,
+    HighlightPageSpanError,
+    highlightPageSpan,
+    prepareEpubAnnotationTarget,
+    prepareSnapshotAnnotationTarget,
+    type AnnotationPlacement,
+} from "../../annotations/createAnnotation";
+import { getReadableContentKind } from "../../documentExtraction/attachmentResolution";
+import { modelObjectId, modelObjectIdFromReference, resolveLibraryRef } from "../../../utils/libraryIdentity";
+
+/** Annotation types a move can reposition. */
+export type RelocatableAnnotationType = "highlight" | "note";
+
+/**
+ * Why a resolved destination cannot be applied to a particular annotation.
+ *
+ * These are model-facing skip reasons, so they name the mismatch rather than
+ * the internals: the destination was resolved against a document before it
+ * reached this client, and the only thing checked here is whether it fits the
+ * annotation actually being moved.
+ */
+export class RelocationMismatchError extends Error {}
+
+/**
+ * Confirm the annotation belongs to the attachment its destination was
+ * resolved against.
+ *
+ * An annotation cannot move between documents, and a destination resolved
+ * against a different one would write coordinates from the wrong page frame.
+ */
+function assertSameAttachment(
+    relocation: AnnotationRelocation,
+    attachment: Zotero.Item,
+): void {
+    const targetLibraryId = resolveLibraryRef(relocation.attachment_ref);
+    const matches =
+        targetLibraryId === attachment.libraryID &&
+        relocation.attachment_ref.zotero_key === attachment.key;
+    if (!matches) {
+        // Name the attachment portably: an unresolvable ref leaves
+        // `targetLibraryId` null, and the request's own numeric id may be the
+        // unresolved sentinel, neither of which means anything to the model.
+        const label = targetLibraryId !== null
+            ? modelObjectId(targetLibraryId, relocation.attachment_ref.zotero_key)
+            : modelObjectIdFromReference(relocation.attachment_ref);
+        throw new RelocationMismatchError(
+            `is not on attachment ${label}; an annotation cannot move to a different document`,
+        );
+    }
+}
+
+function toBoundingBoxes(location: Pick<RelocationPageLocation, "boxes"> | { boxes?: BoundingBox[] }): BoundingBox[] {
+    return (location.boxes ?? []) as BoundingBox[];
+}
+
+/**
+ * Turn a resolved destination into the placement to write onto an annotation.
+ *
+ * Everything expensive — reading the attachment, parsing an EPUB zip or a
+ * snapshot's HTML, running a PDF page analysis on a geometry cache miss — is
+ * done HERE, outside any transaction. Applying the returned placement is then
+ * pure assignment, so the caller's write holds Zotero's global lock only for
+ * as long as the save itself takes.
+ */
+export async function prepareRelocation(
+    attachment: Zotero.Item,
+    annotationType: RelocatableAnnotationType,
+    relocation: AnnotationRelocation,
+): Promise<AnnotationPlacement> {
+    assertSameAttachment(relocation, attachment);
+
+    const contentKind = getReadableContentKind(attachment);
+    if (contentKind !== relocation.content_kind) {
+        throw new RelocationMismatchError(
+            `could not be moved because the attachment is not ${relocation.content_kind}`,
+        );
+    }
+
+    if (contentKind === "pdf") {
+        if (annotationType === "highlight") {
+            if (!relocation.page_locations?.length) {
+                // The only destination that resolves for a note but not a
+                // highlight is a page locator, so name that rather than the
+                // absent field.
+                throw new RelocationMismatchError(
+                    "cannot be moved to a whole page; a highlight needs a locator naming text",
+                );
+            }
+            let span;
+            try {
+                span = highlightPageSpan(relocation.page_locations);
+            } catch (error) {
+                if (error instanceof HighlightPageSpanError) {
+                    throw new RelocationMismatchError(
+                        "cannot be moved there; a highlight covers one page or two consecutive pages",
+                    );
+                }
+                throw error;
+            }
+            if (!relocation.text?.trim()) {
+                throw new RelocationMismatchError(
+                    "cannot be moved there; the destination has no text to highlight",
+                );
+            }
+            const { first, next } = span;
+            const geometry = await getPageGeometryForAttachment(
+                attachment,
+                first.page_idx,
+            );
+            const nextPageGeometry = next
+                ? await getPageGeometryForAttachment(attachment, next.page_idx)
+                : null;
+            // The placement is built from scratch, so a one-page destination
+            // drops any `nextPageRects` the annotation had before the move.
+            return buildHighlightPlacement(
+                {
+                    pageIndex: first.page_idx,
+                    boxes: toBoundingBoxes(first),
+                    nextPageBoxes: next ? toBoundingBoxes(next) : null,
+                    text: relocation.text,
+                    pageLabel: first.page_label ?? relocation.page_label,
+                    readingOrderOffset:
+                        first.reading_order_offset ??
+                        relocation.reading_order_offset,
+                },
+                geometry,
+                nextPageGeometry,
+            );
+        }
+        if (!relocation.note_position) {
+            // A passage continuing on the next page resolves for highlights
+            // only, so name that rather than the absent note position.
+            if (/[,;]/.test(relocation.loc_raw ?? "")) {
+                throw new RelocationMismatchError(
+                    "cannot be moved there; a sticky note takes a single locator, and a comma-separated passage is for highlights only",
+                );
+            }
+            throw new RelocationMismatchError(
+                "cannot be moved there; the destination has no position for a note",
+            );
+        }
+        const geometry = await getPageGeometryForAttachment(
+            attachment,
+            relocation.note_position.page_index,
+        );
+        return buildNotePlacement(
+            {
+                notePosition: relocation.note_position,
+                pageLabel: relocation.page_label,
+                readingOrderOffset: relocation.reading_order_offset,
+            },
+            geometry,
+        );
+    }
+
+    const isHighlight = annotationType === "highlight";
+    const anchorText = relocation.text ?? "";
+    if (isHighlight && !anchorText) {
+        throw new RelocationMismatchError(
+            "cannot be moved there; the destination has no text to highlight",
+        );
+    }
+
+    const resolved =
+        contentKind === "epub"
+            ? await prepareEpubAnnotationTarget(attachment, {
+                  sectionHref: relocation.section_href ?? undefined,
+                  sectionOrdinal: relocation.section_ordinal ?? undefined,
+                  anchorId: relocation.anchor_id ?? undefined,
+                  text: anchorText,
+                  // A note renders as a margin icon beside its block, matching
+                  // a note added in the reader; a highlight covers the run.
+                  ...(isHighlight ? {} : { anchorToBlock: true }),
+              })
+            : await prepareSnapshotAnnotationTarget(attachment, {
+                  anchorId: relocation.anchor_id ?? undefined,
+                  text: anchorText,
+                  ...(isHighlight ? {} : { anchorToBlock: true }),
+              });
+
+    return buildDomPlacement(resolved, {
+        isHighlight,
+        pageLabel: relocation.page_label,
+    });
+}

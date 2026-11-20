@@ -1,0 +1,270 @@
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    setSyncPauseResumeHandler,
+} from '@astermargin/agent-core/transport/agentDataDispatch';
+
+export const RELEASE_DEBOUNCE_MS = 1000;
+/** An owner's pause lapses this long after its most recent pause call. */
+export const SAFETY_IDLE_MS = 600_000;
+/** No continuous hold outlives this, however often its owners renew. */
+export const MAX_HOLD_MS = 1_800_000;
+
+/**
+ * Seconds Zotero waits after an edit before auto-syncing (mirrors Zotero's
+ * AutoSyncListener edit timeout). Used to schedule a single post-run sync so the
+ * run's edits are pushed promptly once suppression is lifted.
+ */
+const AUTO_SYNC_EDIT_TIMEOUT_SECONDS = 3;
+
+type ResumeSync = () => void;
+export type SyncPauseOwner = string;
+
+interface SyncRunner {
+    delayIndefinite?: () => ResumeSync;
+    delaySync?: (ms: number) => void;
+    clearSyncTimeout?: () => void;
+    setSyncTimeout?: (timeout: number, recurring: boolean, options?: object) => void;
+}
+
+export function createSyncPauseService() {
+    let resumeSync: ResumeSync | null = null;
+    let holdStartedAt: number | null = null;
+    let leaseTimer: ReturnType<typeof setTimeout> | null = null;
+    const releaseDebounceTimers = new Map<SyncPauseOwner, ReturnType<typeof setTimeout>>();
+    /** Owner -> time its lease expires. Renewed by every pause from that owner. */
+    const activeOwners = new Map<SyncPauseOwner, number>();
+
+    /** The live Zotero sync runner, or null when Zotero is unavailable. */
+    function getRunner(): SyncRunner | null {
+        return typeof Zotero !== 'undefined' ? ((Zotero as any).Sync?.Runner ?? null) : null;
+    }
+
+    /**
+     * Keep Zotero's auto-sync from animating the sync indicator mid-run.
+     *
+     * `delayIndefinite()` alone is not enough: Zotero's auto-sync timer fires a few
+     * seconds after an edit and calls `sync()`, which animates the sync icon BEFORE
+     * it consults the indefinite-delay set. So the spinner shows even though no data
+     * is actually pushed. Cancelling the pending auto-sync timer and pushing the
+     * auto-sync "do not start" window (`delaySync`) forward instead makes the timer
+     * callback wait BEFORE it animates the icon, so edits made during the run never
+     * spin the indicator. Re-applied on every mutating action so long runs and
+     * freshly-armed timers stay covered.
+     */
+    function suppressAutoSync(runner: SyncRunner): void {
+        if (typeof runner.clearSyncTimeout === 'function') {
+            runner.clearSyncTimeout();
+        }
+        if (typeof runner.delaySync === 'function') {
+            runner.delaySync(SAFETY_IDLE_MS);
+        }
+    }
+
+    /**
+     * Restore normal auto-sync after a run. Always drops the suppression window so
+     * future syncs are not held off; when `reschedule` is set (a real run finished),
+     * also arms a single auto-sync so the run's edits are pushed promptly.
+     */
+    function restoreAutoSync(runner: SyncRunner, reschedule: boolean): void {
+        if (typeof runner.delaySync === 'function') {
+            // A past instant clears the window without leaving it null (matches how
+            // Zotero itself only ever sets this to concrete dates).
+            runner.delaySync(0);
+        }
+        if (reschedule && typeof runner.setSyncTimeout === 'function') {
+            runner.setSyncTimeout(AUTO_SYNC_EDIT_TIMEOUT_SECONDS, false);
+        }
+    }
+
+    /** Clear the pending debounced release, if one is armed. */
+    function clearReleaseDebounce(owner: SyncPauseOwner): void {
+        const timer = releaseDebounceTimers.get(owner);
+        if (timer) {
+            clearTimeout(timer);
+            releaseDebounceTimers.delete(owner);
+        }
+    }
+
+    /** Clear all pending debounced releases. */
+    function clearAllReleaseDebounces(): void {
+        for (const timer of releaseDebounceTimers.values()) {
+            clearTimeout(timer);
+        }
+        releaseDebounceTimers.clear();
+    }
+
+    function clearLeaseTimer(): void {
+        if (leaseTimer !== null) {
+            clearTimeout(leaseTimer);
+            leaseTimer = null;
+        }
+    }
+
+    /**
+     * Arm one timer for the earliest deadline: the soonest owner lease or the
+     * hold cap. This backstop is what guarantees the pause ends even when an
+     * owner never settles — a write stuck inside Zotero, or a run whose window
+     * died before releasing it.
+     */
+    function armLeaseTimer(): void {
+        clearLeaseTimer();
+        if (holdStartedAt === null || activeOwners.size === 0) return;
+        const deadline = Math.min(...activeOwners.values(), holdStartedAt + MAX_HOLD_MS);
+        leaseTimer = setTimeout(expireLeases, Math.max(0, deadline - Date.now()));
+    }
+
+    function expireLeases(): void {
+        leaseTimer = null;
+        const now = Date.now();
+        if (holdStartedAt !== null && now >= holdStartedAt + MAX_HOLD_MS) {
+            logger(`syncPause: sync held for ${now - holdStartedAt}ms, forcing release`, 1);
+            // Push whatever the held run wrote; a still-active run re-acquires
+            // on its next write with a fresh hold.
+            resumeSyncNow(true);
+            return;
+        }
+        for (const [owner, expiresAt] of activeOwners) {
+            if (now >= expiresAt) {
+                logger(`syncPause: lease expired for ${owner}, releasing it`, 1);
+                clearReleaseDebounce(owner);
+                activeOwners.delete(owner);
+            }
+        }
+        if (activeOwners.size === 0) {
+            // A lapsed lease is abnormal; let the next edit/idle trigger a sync.
+            resumeSyncNow(false);
+            return;
+        }
+        armLeaseTimer();
+    }
+
+    /** Pause Zotero sync before a mutating agent action can schedule auto-sync. */
+    function pauseSyncForMutatingRun(owner: SyncPauseOwner = 'diagnostic'): void {
+        try {
+            const runner = getRunner();
+            if (typeof runner?.delayIndefinite !== 'function') {
+                return;
+            }
+
+            clearReleaseDebounce(owner);
+            activeOwners.set(owner, Date.now() + SAFETY_IDLE_MS);
+
+            // Suppress the visible auto-sync spinner for edits made during the run.
+            suppressAutoSync(runner);
+
+            if (resumeSync === null) {
+                // Hard guarantee that even a manual/in-flight sync can't push data
+                // mid-run; released once the run settles or its lease lapses.
+                resumeSync = runner.delayIndefinite();
+                holdStartedAt = Date.now();
+                logger('syncPause: paused Zotero sync for mutating run', 3);
+            }
+            armLeaseTimer();
+        } catch (err) {
+            logger('Zotero sync pause failed', { error: String(err) }, 1);
+        }
+    }
+
+    /** Schedule sync to resume after the run has stayed inactive past the debounce. */
+    function scheduleResumeAfterRun(owner: SyncPauseOwner = 'diagnostic'): void {
+        clearReleaseDebounce(owner);
+        releaseDebounceTimers.set(owner, setTimeout(() => {
+            // Normal completion: push the run's edits with one batched auto-sync.
+            releaseOwner(owner, true);
+        }, RELEASE_DEBOUNCE_MS));
+        logger(`syncPause: scheduled resume in ${RELEASE_DEBOUNCE_MS}ms`, 3);
+    }
+
+    /** Cancel a pending debounced resume when a run becomes active again. */
+    function cancelScheduledResume(owner: SyncPauseOwner = 'diagnostic'): void {
+        if (releaseDebounceTimers.has(owner)) {
+            logger('syncPause: cancelled scheduled resume (run active again)', 3);
+        }
+        clearReleaseDebounce(owner);
+    }
+
+    /** Release one owner and resume Zotero sync only when no other owner remains. */
+    function releaseOwner(owner: SyncPauseOwner, reschedule: boolean): void {
+        clearReleaseDebounce(owner);
+        activeOwners.delete(owner);
+        if (activeOwners.size > 0) {
+            armLeaseTimer();
+            return;
+        }
+        resumeSyncNow(reschedule);
+    }
+
+    /**
+     * Resume Zotero sync immediately. Safe to call repeatedly.
+     *
+     * @param reschedule When true, schedule a single auto-sync so the run's edits
+     *   are pushed promptly. Left false for the test/unload paths, which only need
+     *   to restore normal auto-sync behavior.
+     */
+    function resumeSyncNow(reschedule = false): void {
+        clearAllReleaseDebounces();
+        clearLeaseTimer();
+        activeOwners.clear();
+        holdStartedAt = null;
+
+        const resume = resumeSync;
+        resumeSync = null;
+        if (!resume) {
+            return;
+        }
+
+        try {
+            resume();
+            logger('syncPause: resumed Zotero sync', 3);
+        } catch (err) {
+            logger('Zotero sync resume failed', { error: String(err) }, 1);
+        }
+
+        try {
+            const runner = getRunner();
+            if (runner) {
+                restoreAutoSync(runner, reschedule);
+            }
+        } catch (err) {
+            logger('Zotero sync restore failed', { error: String(err) }, 1);
+        }
+    }
+
+    /** Whether a Zotero sync pause is currently held by this module. */
+    function isSyncPaused(): boolean {
+        return resumeSync !== null;
+    }
+
+
+    function releaseWindow(windowId: string): void {
+        for (const owner of activeOwners.keys()) {
+            if (owner.startsWith(`chat:${windowId}:`)) scheduleResumeAfterRun(owner);
+        }
+    }
+
+    return { releaseWindow, pauseSyncForMutatingRun, scheduleResumeAfterRun, cancelScheduledResume, resumeSyncNow, isSyncPaused };
+}
+
+export function pauseSyncForMutatingRun(...args: Parameters<ReturnType<typeof createSyncPauseService>["pauseSyncForMutatingRun"]>): ReturnType<ReturnType<typeof createSyncPauseService>["pauseSyncForMutatingRun"]> {
+    return Zotero.AsterMargin.syncPause.pauseSyncForMutatingRun(...args);
+}
+
+export function scheduleResumeAfterRun(...args: Parameters<ReturnType<typeof createSyncPauseService>["scheduleResumeAfterRun"]>): ReturnType<ReturnType<typeof createSyncPauseService>["scheduleResumeAfterRun"]> {
+    return Zotero.AsterMargin.syncPause.scheduleResumeAfterRun(...args);
+}
+
+export function cancelScheduledResume(...args: Parameters<ReturnType<typeof createSyncPauseService>["cancelScheduledResume"]>): ReturnType<ReturnType<typeof createSyncPauseService>["cancelScheduledResume"]> {
+    return Zotero.AsterMargin.syncPause.cancelScheduledResume(...args);
+}
+
+export function resumeSyncNow(...args: Parameters<ReturnType<typeof createSyncPauseService>["resumeSyncNow"]>): ReturnType<ReturnType<typeof createSyncPauseService>["resumeSyncNow"]> {
+    return Zotero.AsterMargin.syncPause.resumeSyncNow(...args);
+}
+
+export function isSyncPaused(...args: Parameters<ReturnType<typeof createSyncPauseService>["isSyncPaused"]>): ReturnType<ReturnType<typeof createSyncPauseService>["isSyncPaused"]> {
+    return Zotero.AsterMargin.syncPause.isSyncPaused(...args);
+}
+
+export function registerZoteroSyncPause(): void {
+    setSyncPauseResumeHandler(scheduleResumeAfterRun);
+}

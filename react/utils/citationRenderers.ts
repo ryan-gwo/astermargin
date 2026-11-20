@@ -1,0 +1,364 @@
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { Provider, createStore } from 'jotai';
+import { store } from '../store';
+import MarkdownRenderer from '../components/messages/MarkdownRenderer';
+import { Citation } from '../../src/services/CitationService';
+import { citationsAtom, citationByKeyAtom, citationKeyToMarkerAtom, compactCitationMarkers, getCitationMarkerBaseKeys, pageLabelsByAttachmentIdAtom, externalFileLocalPathsAtom, type PageLabelsByAttachmentId } from '@astermargin/agent-core/citations/atoms';
+import { externalReferenceItemMappingAtom, externalReferenceMappingAtom } from '@astermargin/agent-core/citations/externalReferences';
+import { Citation as AsterMarginCitation } from '@astermargin/agent-core/types/citations';
+import { CITATION_TAG_PATTERN } from '../utils/citationPreprocessing';
+import { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { ExternalReference } from '@astermargin/agent-core/types/externalReferences';
+import { formatExternalCitation } from '@astermargin/agent-core/citations/externalReferences';
+import { UNRESOLVED_LIBRARY_ID, libraryRefForLibraryID } from '../../src/utils/libraryIdentity';
+import { hydrateItemLinkLibraryRefs } from '@astermargin/agent-core/identity/itemLinks';
+import { loadCitedLibraries } from './citationRenderContext';
+import { unwrapLegacyNoteTags } from './legacyNoteTags';
+import {
+    baseCitationKey,
+    getPageLocator,
+    normalizeCitationTag,
+    parseRawCitationAttributes,
+    requestedCitationKey,
+} from '@astermargin/agent-core/citations/citationGrammar';
+
+// Regex for citation syntax - matches self-closing (/>) and non-self-closing (>) with or without closing tag
+const citationRegex = /<citation(?:\s+([^>]*?))?\s*(\/>|>(?:.*?<\/citation>)?)/g;
+function getEarliestExistingMarker(markerMap: Record<string, string>, keys: string[]): string | undefined {
+    const markers = keys
+        .map((key) => markerMap[key])
+        .filter((marker): marker is string => !!marker);
+    if (markers.length === 0) return undefined;
+
+    const numericMarkers = markers
+        .map((marker) => parseInt(marker, 10))
+        .filter((marker) => Number.isFinite(marker));
+    if (numericMarkers.length === 0) return markers[0];
+
+    return Math.min(...numericMarkers).toString();
+}
+
+/**
+ * Replace the legacy `<note>` sections of older threads with headers and
+ * separators, so a saved or copied response carries their body rather than the
+ * markup. Note creation itself moved to the `create_note` tool.
+ * @param text Raw markdown text that may contain legacy note tags
+ * @returns Processed markdown with note tags replaced by headers/lines
+ */
+export function preprocessNoteContent(text: string): string {
+    // Clean up backticks around complete citations (handles both /> and > endings)
+    return unwrapLegacyNoteTags(text.replace(/`(<citation[^>]*\/?>)`/g, '$1'));
+}
+
+/** Citation state the Markdown renderer reads from the current thread. */
+interface MarkdownCitationState {
+    citations: AsterMarginCitation[];
+    citationByKey: Record<string, AsterMarginCitation>;
+    externalReferenceMapping: Record<string, ExternalReference>;
+    externalItemMapping: Record<string, ZoteroItemReference | null>;
+}
+
+function readMarkdownCitationState(): MarkdownCitationState {
+    return {
+        citations: store.get(citationsAtom),
+        citationByKey: store.get(citationByKeyAtom),
+        externalReferenceMapping: store.get(externalReferenceMappingAtom),
+        externalItemMapping: store.get(externalReferenceItemMappingAtom),
+    };
+}
+
+/**
+ * Converts markdown content to plain text
+ * @param text Text to format
+ * @param cslEngine CSL engine
+ * @returns Formatted text
+ */
+export function renderToMarkdown(
+    text: string,
+    citationState: MarkdownCitationState = readMarkdownCitationState(),
+) : string {
+
+    const { externalReferenceMapping, externalItemMapping, citationByKey } = citationState;
+
+    // Array of cited items
+    const citedItems: Zotero.Item[] = [];
+    const externalReferences: ExternalReference[] = [];
+
+    // Preprocess note tags and clean up backticks
+    text = preprocessNoteContent(text);
+
+    // Format references
+    const formattedContent = text.replace(citationRegex, (match: string, attrString: string = ''): string => {
+        const attrs = parseRawCitationAttributes(attrString);
+        const normalized = normalizeCitationTag(attrs);
+        if (!normalized.ok) {
+            logger(`renderToMarkdown: Citation tag missing valid reference: ${match}`);
+            return '';
+        }
+
+        let ref = normalized.ref;
+        const externalId = ref.kind === 'external' ? ref.external_id : undefined;
+        const isExternalReference = ref.kind === 'external';
+        const isExternalReferenceMappedToZoteroItem = !!externalId && !!externalItemMapping[externalId];
+
+        // 1. External reference (not mapped to Zotero) ---------------------------------------------------
+        if (isExternalReference && !isExternalReferenceMappedToZoteroItem) {
+            // Look up external reference data
+            const externalRef = externalReferenceMapping[externalId!];
+            if (!externalRef) {
+                logger(`renderToMarkdown: No external reference found for external_id: ${externalId}`);
+                return '';
+            }
+            externalReferences.push(externalRef);
+            // Use author_year from external reference
+            const authorYear = formatExternalCitation(externalRef);
+            return authorYear ? `(${authorYear})` : '';
+        }
+
+        // 2. External reference mapped to Zotero item ---------------------------------------------------
+        if (isExternalReferenceMappedToZoteroItem) {
+            const mappedZoteroItem = externalItemMapping[externalId!];
+            if (!mappedZoteroItem) {
+                logger(`renderToMarkdown: No Zotero item found for external_id: ${externalId}`);
+                return '';
+            }
+            ref = {
+                kind: 'zotero',
+                library_id: mappedZoteroItem.library_id,
+                zotero_key: mappedZoteroItem.zotero_key,
+                library_ref: mappedZoteroItem.library_ref,
+                loc: ref.loc,
+            };
+        }
+
+        // 2b. External file (user-attached, non-Zotero) — no Zotero item or
+        // bibliography entry; render the filename (+ page) inline so the
+        // citation isn't silently dropped from copied Markdown/text.
+        if (ref.kind === 'external_file') {
+            const meta = citationByKey[requestedCitationKey(ref)] ?? citationByKey[baseCitationKey(ref)];
+            const name = meta?.display_name || `ext-${ref.ext_key}`;
+            const page = getPageLocator(ref);
+            return page ? ` (${name}, p. ${page})` : ` (${name})`;
+        }
+
+        // 2c. A table's cell or row: the row's paper, as the chip shows it.
+        // The table item is not a source to list.
+        if (ref.loc?.kind === 'cell' || ref.loc?.kind === 'row') {
+            const label = citationByKey[requestedCitationKey(ref)]?.display_name;
+            return label ? ` (${label})` : '';
+        }
+
+        // 3. Zotero item ---------------------------------------------------
+        if (ref.kind !== 'zotero') {
+            // Unknown/future ref kind (e.g. another connected app's resource):
+            // fall back to the cited display name rather than dropping it.
+            const meta = citationByKey[requestedCitationKey(ref)] ?? citationByKey[baseCitationKey(ref)];
+            const name = meta?.display_name;
+            if (name) return ` (${name})`;
+            logger(`renderToMarkdown: Citation tag missing item reference: ${match}`);
+            return '';
+        }
+        
+        const { library_id: libraryID, zotero_key: itemKey } = ref;
+
+        // A portable ref whose library isn't on this device can't be looked
+        // up (and would throw) — nothing to cite.
+        if (libraryID === UNRESOLVED_LIBRARY_ID) {
+            logger(`renderToMarkdown: Library unavailable for libraryID: ${libraryID}, itemKey: ${itemKey}`);
+            return '';
+        }
+
+        // Get the Zotero item
+        try {
+            const item = Zotero.Items.getByLibraryAndKey(libraryID, itemKey);
+            if (!item) {
+                logger(`renderToMarkdown: No Zotero item found for libraryID: ${libraryID}, itemKey: ${itemKey}`);
+                return '';
+            }
+            
+            // Item to cite
+            const parent = item.parentItem;
+            const itemToCite = item.isNote() ? item : (parent || item);
+
+            // Add the item to the array of cited items
+            citedItems.push(itemToCite);
+
+            // Get the citation data
+            let citation = '';
+            if (itemToCite.isRegularItem()) {
+                const citationObject: Citation = {id: itemToCite.id};
+                const rawPage = getPageLocator(ref);
+                if (rawPage) {
+                    citationObject.locator = rawPage;
+                    citationObject.label = 'p.';
+                }
+                citation = Zotero.AsterMargin?.citationService?.formatCitation([citationObject]) ?? '';
+            } else if (itemToCite.isNote()) {
+                citation = '(Note)';
+            } else if (itemToCite.isAttachment()) {
+                citation = '(File)';
+            }
+      
+            // Format the citation with page locator if provided
+            // return attrs.pages ? `${citation}, p. ${attrs.pages}` : citation; 
+            return ' ' + citation;
+        } catch (e) {
+            logger(`renderToMarkdown: Item not loaded for libraryID: ${libraryID}, itemKey: ${itemKey}`);
+            return '';
+        } 
+    }).replace('  (', ' (');
+
+    // Format the bibliography
+    let bibliography = (Zotero.AsterMargin?.citationService?.formatBibliography(citedItems) ?? '').replace(/\n/g, '\n\n');
+    if (externalReferences.length > 0) {
+        bibliography += externalReferences.map(reference => `${formatExternalCitation(reference)} (external reference)`).join('\n\n');
+    }
+
+    // Return the formatted content
+    return citedItems.length > 0 || externalReferences.length > 0
+        ? `${formattedContent.trim()}\n\n## Sources\n\n${bibliography}`
+        : formattedContent;
+}
+
+/**
+ * {@link renderToMarkdown} after loading the libraries of the cited items, so
+ * citations to items in a library Zotero has not loaded yet are formatted
+ * rather than dropped. Prefer this from async callers.
+ */
+export async function renderToMarkdownAsync(text: string): Promise<string> {
+    // Snapshot before awaiting: switching chats meanwhile replaces the
+    // citation state this text was written against.
+    const citationState = readMarkdownCitationState();
+    await loadCitedLibraries(text, citationState.citations, citationState.externalItemMapping);
+    return renderToMarkdown(text, citationState);
+}
+
+export interface RenderContextData {
+    citationDataMap?: Record<string, AsterMarginCitation>;
+    externalMapping?: Record<string, ZoteroItemReference | null>;
+    externalReferencesMap?: Record<string, ExternalReference>;
+    pageLabelsByAttachmentId?: PageLabelsByAttachmentId;
+    /** Absolute local paths for external-file citations present on this computer, keyed by ext key. */
+    externalFileLocalPaths?: Record<string, string>;
+}
+
+/**
+ * Assign the thread-scoped citation markers a static render needs up front.
+ *
+ * The live path assigns markers from effects, which never run under
+ * `renderToStaticMarkup`, so the numbers are computed here instead: in tag
+ * order first, then merged across the identities that name one source. The
+ * alias groups come from `getCitationMarkerBaseKeys`, the same grouping the
+ * live path assigns by, so a source cited by one name in the text and carrying
+ * another in its metadata is numbered once in either path. Merging frees the
+ * numbers the folded-in aliases held, so the result is compacted back to a
+ * contiguous 1..N.
+ */
+export function computeStaticCitationMarkers(
+    content: string,
+    citationDataMap?: Record<string, AsterMarginCitation>,
+): Record<string, string> {
+    const markerMap: Record<string, string> = {};
+    let markerCount = 0;
+
+    // Use the same regex as preprocessCitations to find citations in order
+    const pattern = new RegExp(CITATION_TAG_PATTERN);
+
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+        const attributesStr = match[1] || '';
+        const normalized = normalizeCitationTag(parseRawCitationAttributes(attributesStr));
+        const citationKey = normalized.ok ? baseCitationKey(normalized.ref) : '';
+
+        if (citationKey && !markerMap[citationKey]) {
+            markerCount++;
+            markerMap[citationKey] = markerCount.toString();
+        }
+    }
+
+    if (!citationDataMap) return markerMap;
+
+    const aliasGroups: string[][] = [];
+    for (const citation of Object.values(citationDataMap)) {
+        const uniqueKeys = getCitationMarkerBaseKeys(citation);
+        if (uniqueKeys.length > 1) aliasGroups.push(uniqueKeys);
+    }
+    for (const keys of aliasGroups) {
+        const existing = getEarliestExistingMarker(markerMap, keys);
+        if (!existing) continue;
+        for (const key of keys) markerMap[key] = existing;
+    }
+
+    return compactCitationMarkers(markerMap);
+}
+
+/**
+ * Converts markdown content to HTML string using the MarkdownRenderer component
+ * @param content Markdown content to convert
+ * @param className Optional class name to apply to the markdown (defaults to "markdown")
+ * @param contextData Optional context data (citations, mappings) to populate store for static render
+ * @returns HTML string representation of the markdown
+ */
+export function renderToHTML(
+    content: string,
+    className: string = "markdown",
+    contextData?: RenderContextData
+): string {
+    let renderStore = store;
+
+    // Data boundary for the export render: legacy device-local item links in
+    // older history become portable here, so the renderer can write them as
+    // note links without consulting library state itself.
+    content = hydrateItemLinkLibraryRefs(content, libraryRefForLibraryID);
+
+    // Pre-calculate citation markers for static render to avoid React state updates during render.
+    // This must happen before the render since effects don't run during renderToStaticMarkup.
+    const markerMap = computeStaticCitationMarkers(content, contextData?.citationDataMap);
+
+    // If context data is provided, we create a temporary store to ensure the data 
+    // is available during the synchronous static render.
+    if (contextData) {
+        renderStore = createStore();
+        
+        if (contextData.citationDataMap) {
+            renderStore.set(citationsAtom, Object.values(contextData.citationDataMap));
+        }
+        
+        if (contextData.externalMapping) {
+            renderStore.set(externalReferenceItemMappingAtom, contextData.externalMapping);
+        }
+        
+        if (contextData.externalReferencesMap) {
+            renderStore.set(externalReferenceMappingAtom, contextData.externalReferencesMap);
+        }
+
+        if (contextData.pageLabelsByAttachmentId) {
+            renderStore.set(pageLabelsByAttachmentIdAtom, contextData.pageLabelsByAttachmentId);
+        }
+
+        if (contextData.externalFileLocalPaths) {
+            renderStore.set(externalFileLocalPathsAtom, contextData.externalFileLocalPaths);
+        }
+    }
+
+    // Set pre-calculated markers in the store (either ambient or isolated)
+    if (Object.keys(markerMap).length > 0) {
+        renderStore.set(citationKeyToMarkerAtom, markerMap);
+    }
+
+    // Create a React element using the existing MarkdownRenderer component
+    // @ts-ignore createElement exists in React
+    const markdownElement = React.createElement(MarkdownRenderer, {
+        content,
+        className,
+        exportRendering: true,
+    });
+
+    // Wrap in Jotai Provider to share state
+    const wrappedElement = React.createElement(Provider, { store: renderStore }, markdownElement);
+
+    // Render the React element to an HTML string
+    return renderToStaticMarkup(wrappedElement);
+}

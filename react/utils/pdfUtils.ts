@@ -1,0 +1,144 @@
+import { ZoteroReader } from "./annotationUtils";
+import { BoundingBox } from "@astermargin/agent-core/types/citations";
+
+/**
+ * Transform bounding box coordinates to account for page rotation.
+ * PDF processing (PyMuPDF) uses remove_rotation(), so coordinates are in unrotated space.
+ * Zotero's PDF.js viewer respects original rotation, so we need to transform coordinates.
+ * 
+ * @param bbox - Bounding box in unrotated coordinate system (bottom-left origin)
+ * @param rotation - Page rotation in degrees (0, 90, 180, 270) - counter-clockwise
+ * @param rotatedWidth - Page width as reported by PDF.js (may be rotated)
+ * @param rotatedHeight - Page height as reported by PDF.js (may be rotated)
+ * @returns Transformed bounding box
+ */
+export function applyRotationToBoundingBox(
+    bbox: BoundingBox,
+    rotation: number,
+    rotatedWidth: number,
+    rotatedHeight: number
+): BoundingBox {
+    // Normalize rotation to 0-360 range
+    rotation = ((rotation % 360) + 360) % 360;
+    
+    if (rotation === 0) {
+        return bbox;
+    }
+    
+    // For 90° and 270° rotations, dimensions are swapped by PDF.js
+    // We need to get the unrotated dimensions for the transformation
+    let unrotatedWidth: number, unrotatedHeight: number;
+    if (rotation === 90 || rotation === 270) {
+        unrotatedWidth = rotatedHeight;
+        unrotatedHeight = rotatedWidth;
+    } else {
+        unrotatedWidth = rotatedWidth;
+        unrotatedHeight = rotatedHeight;
+    }
+    
+    // Apply counter-clockwise rotation transformation using unrotated dimensions
+    // Coordinates are in bottom-left origin system
+    let l: number, b: number, r: number, t: number;
+    
+    switch (rotation) {
+        case 90:
+            // 90° counter-clockwise: (x, y) -> (height - y, x)
+            l = unrotatedHeight - bbox.t;
+            b = bbox.l;
+            r = unrotatedHeight - bbox.b;
+            t = bbox.r;
+            break;
+        case 180:
+            // 180°: (x, y) -> (width - x, height - y)
+            l = unrotatedWidth - bbox.r;
+            b = unrotatedHeight - bbox.t;
+            r = unrotatedWidth - bbox.l;
+            t = unrotatedHeight - bbox.b;
+            break;
+        case 270:
+            // 270° counter-clockwise (= 90° clockwise): (x, y) -> (y, width - x)
+            l = bbox.b;
+            b = unrotatedWidth - bbox.r;
+            r = bbox.t;
+            t = unrotatedWidth - bbox.l;
+            break;
+        default:
+            return bbox;
+    }
+    
+    return {
+        l,
+        b,
+        r,
+        t,
+        coord_origin: bbox.coord_origin
+    };
+}
+
+/**
+ * Get page viewport information directly from PDF document
+ * This works even if the page hasn't been rendered in the viewer yet
+ */
+export async function getPageViewportInfo(
+    reader: ZoteroReader,
+    pageIndex: number
+): Promise<{ viewBox: number[]; height: number; width: number; rotation: number }> {
+    const iframeWindow = (reader as any)?._internalReader?._primaryView?._iframeWindow;
+    const pdfDocument = iframeWindow?.PDFViewerApplication?.pdfDocument;
+    
+    if (!pdfDocument) {
+        throw new Error('PDF document not available - reader may be closed or PDF not loaded');
+    }
+    
+    // Get page directly from document (1-based index)
+    const page = await pdfDocument.getPage(pageIndex + 1);
+    
+    // Extract viewport info from _pageInfo
+    const view = page._pageInfo.view;
+    const viewBox = [view[0], view[1], view[2], view[3]];
+    
+    // Calculate dimensions from viewBox
+    const width = view[2] - view[0];
+    const height = view[3] - view[1];
+    
+    // Get rotation (0, 90, 180, or 270 degrees)
+    const rotation = page._pageInfo.rotate || 0;
+    
+    return { viewBox, height, width, rotation };
+}
+
+/**
+ * Check if PDF document is available in reader
+ */
+export function isPDFDocumentAvailable(reader: ZoteroReader): boolean {
+    try {
+        const iframeWindow = (reader as any)?._internalReader?._primaryView?._iframeWindow;
+        const pdfDocument = iframeWindow?.PDFViewerApplication?.pdfDocument;
+        return Boolean(pdfDocument);
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Wait for PDF document to become available in reader
+ * @param reader The reader to check
+ * @param timeoutMs Maximum time to wait in milliseconds (default 5000ms)
+ * @returns Promise that resolves to true if PDF becomes available, false if timeout
+ */
+export async function waitForPDFDocument(reader: ZoteroReader, timeoutMs: number = 5000): Promise<boolean> {
+    const startTime = Date.now();
+    const checkInterval = 100; // Check every 100ms
+    
+    while (Date.now() - startTime < timeoutMs) {
+        if (isPDFDocumentAvailable(reader)) {
+            return true;
+        }
+        // Wait before checking again
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+    }
+    
+    return false;
+}
+
+

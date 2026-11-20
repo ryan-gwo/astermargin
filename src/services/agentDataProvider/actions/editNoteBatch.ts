@@ -1,0 +1,953 @@
+import type { PageLabelsByAttachmentId } from '@astermargin/agent-core/citations/atoms';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    WSAgentActionExecuteResponse,
+    WSAgentActionValidateResponse,
+    type EditValidationError,
+    type ErrorCandidate
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import type { EditNoteOperation } from '@astermargin/agent-core/types/agentActions/editNote';
+import type {
+    EditNoteBatchAppliedEdit,
+    EditNoteBatchEditItem,
+    EditNoteBatchProposedData,
+    EditNoteBatchResultData,
+    EditNoteBatchUndoRecord,
+} from '@astermargin/agent-core/types/agentActions/editNoteBatch';
+import {
+    applyResolvedEdits,
+    captureUndoContexts,
+    detectOverlaps,
+    resolveBatchEdits,
+    type BatchEditFailure,
+    type BatchEditSpec,
+    type BatchUndoDraft,
+    type ResolveBatchContext,
+    type ResolvedBatchEdit,
+} from '../../../utils/editNoteBatchCore';
+import {
+    applyOldStringEnrichment,
+    checkDuplicateCitations,
+    checkNewCitationItemsExist,
+    validateNewString,
+} from '../../../utils/editNoteValidation';
+import {
+    libraryRefForLibraryID,
+    modelObjectIdFromReference,
+    resolveItemReference,
+    resolveLibraryRef,
+} from '../../../utils/libraryIdentity';
+import {
+    buildUnresolvedLocatorWarning,
+    expandToRawHtml,
+    preloadNotePageLabels,
+    preloadPageLabelsForNewCitations,
+    preloadStructuralLocatorPages,
+    type ExternalRefContext,
+    type ResolvedLocatorPages,
+} from '../../../utils/noteCitationExpand';
+import { addOrUpdateEditFooter, getAsterMarginFooterAppendPoint } from '../../../utils/noteEditFooter';
+import {
+    clearNoteEditorSelection,
+    flushLiveEditorToDB,
+    getLatestNoteHtml,
+    waitForNoteSaveStabilization,
+} from '../../../utils/noteEditorIO';
+import {
+    getOrSimplify,
+    invalidateSimplificationCache,
+    normalizeNoteHtml,
+    type SimplificationMetadata,
+} from '../../../utils/noteHtmlSimplifier';
+import { assertNoPreviewMarkers, containsPreviewMarkers, stripPreviewMarkers } from '../../../utils/notePreviewGuard';
+import { assessNoteRewrite } from '../../../utils/noteRewriteRisk';
+import {
+    extractDataCitationItems,
+    hasSchemaVersionWrapper,
+    rebuildDataCitationItems,
+    stripDataCitationItems,
+} from '../../../utils/noteWrapper';
+import { dismissNotePreviews } from '../../notePreviews';
+import type { ActionExecuteRequest, ActionValidateRequest, OperationContext } from '../operationContext';
+import { checkAborted, TimeoutContext, TimeoutError } from '../timeout';
+import { checkLibraryExcluded, excludedLibraryMessage, getDeferredToolPreference } from '../utils';
+import { actionError, assertLibraryNotExcluded, assertLibraryRefNotExcluded, toExecuteResponse } from './actionExecution';
+import {
+    assertEditableNote,
+    buildMarkdownRenderFields,
+    getExternalRefContext,
+} from './editNote';
+import { sha256Hex } from '../../../utils/hash';
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
+
+function validateError(
+    requestId: string,
+    error: string,
+    error_code: string,
+): WSAgentActionValidateResponse {
+    return {
+        type: 'agent_action_validate_response',
+        request_id: requestId,
+        valid: false,
+        error,
+        error_code,
+        preference: 'always_ask',
+    };
+}
+
+/** Default operation, mirroring the single-edit handler. */
+function opOf(edit: EditNoteBatchEditItem): EditNoteOperation {
+    return edit.operation ?? 'str_replace';
+}
+
+/**
+ * Per-edit no-op guard. Insert operations preserve old_string and append/rewrite
+ * ignore it, so the identical-strings check applies only to str_replace family.
+ */
+function checkNoOp(
+    operation: EditNoteOperation,
+    oldString: string | undefined,
+    newString: string,
+): { error: string; errorCode: string } | null {
+    if (operation === 'rewrite') return null;
+    if (operation === 'append' || operation === 'insert_after' || operation === 'insert_before') {
+        if (!newString || (operation === 'append' && newString.trim() === '') || newString === '') {
+            return { error: 'new_string must not be empty.', errorCode: 'no_changes' };
+        }
+        return null;
+    }
+    if (oldString === newString) {
+        return { error: 'old_string and new_string are identical.', errorCode: 'no_changes' };
+    }
+    return null;
+}
+
+/**
+ * Run the three new_string pre-checks (tag validity, citation existence, dry-run
+ * expansion) for one edit, returning a per-edit error or null.
+ */
+function precheckEditNewString(
+    newString: string,
+    metadata: SimplificationMetadata,
+    externalRefContext: ExternalRefContext,
+    pageLabels: PageLabelsByAttachmentId,
+    resolvedLocatorPages: ResolvedLocatorPages,
+): { error: string; errorCode: string } | null {
+    const validationError = validateNewString(newString, metadata);
+    if (validationError) return { error: validationError, errorCode: 'invalid_new_string' };
+
+    const citationError = checkNewCitationItemsExist(newString, metadata);
+    if (citationError) return { error: citationError, errorCode: 'citation_item_not_found' };
+
+    try {
+        expandToRawHtml(newString, metadata, 'new', externalRefContext, pageLabels, resolvedLocatorPages);
+    } catch (e: any) {
+        return { error: e?.message || String(e), errorCode: 'expansion_failed' };
+    }
+    return null;
+}
+
+export interface PreloadedLabels {
+    pageLabels: PageLabelsByAttachmentId;
+    resolvedLocatorPages: ResolvedLocatorPages;
+    locatorWarnings: string[];
+}
+
+/**
+ * Separator inserted between edits' strings before they're concatenated for a
+ * single preload scan. The comment closes with `>`, which the citation-tag
+ * attribute capture cannot span, so a partial tag at the
+ * end of one fragment can never merge with content from the next fragment
+ * into a false citation match.
+ */
+const BATCH_LABEL_SEPARATOR = '\n<!-- /edit-boundary/ -->\n';
+
+/**
+ * Preload the union of page labels + structural locators across every edit.
+ *
+ * Both `preloadPageLabelsForNewCitations` and `preloadStructuralLocatorPages`
+ * scan an arbitrary string for citation tags and dedupe/cache their lookups
+ * per attachment internally, so each is called ONCE over the concatenation of
+ * every edit's relevant string rather than once per edit. This keeps
+ * resolution for a given attachment sequential within the call — a cache miss
+ * in `preloadPageLabelsForNewCitations` triggers a full PDF extraction, and
+ * concurrent duplicate extractions of the same attachment must be avoided —
+ * while cutting a batch of N edits down from up to 3N sequential lookups to
+ * two.
+ */
+export async function preloadBatchLabels(edits: EditNoteBatchEditItem[]): Promise<PreloadedLabels> {
+    const forPageLabels = edits
+        .map((edit) => `${edit.new_string}${BATCH_LABEL_SEPARATOR}${edit.old_string ?? ''}`)
+        .join(BATCH_LABEL_SEPARATOR);
+    const forStructuralLocators = edits.map((edit) => edit.new_string).join(BATCH_LABEL_SEPARATOR);
+
+    const [pageLabels, structural] = await Promise.all([
+        preloadPageLabelsForNewCitations(forPageLabels),
+        preloadStructuralLocatorPages(forStructuralLocators),
+    ]);
+
+    const locatorWarnings: string[] = [];
+    const warning = buildUnresolvedLocatorWarning(
+        structural.unresolved, structural.unavailable, structural.missing,
+    );
+    if (warning) locatorWarnings.push(warning);
+
+    return { pageLabels, resolvedLocatorPages: { ...structural.pages }, locatorWarnings };
+}
+
+/**
+ * Prepare per-edit specs for the core resolver: run the no-op guard + new_string
+ * precheck (collecting failures), enrich old_string, and pre-render the Markdown
+ * fallback. Edits that fail a pre-check are NOT added to `specs`, so the batch is
+ * still rejected but every edit's diagnostics are collected.
+ */
+export async function prepareSpecs(
+    edits: EditNoteBatchEditItem[],
+    metadata: SimplificationMetadata,
+    externalRefContext: ExternalRefContext,
+    labels: PreloadedLabels,
+    libraryId: number,
+    context?: OperationContext,
+): Promise<{ specs: BatchEditSpec[]; failures: BatchEditFailure[] }> {
+    const specs: BatchEditSpec[] = [];
+    const failures: BatchEditFailure[] = [];
+
+    for (const edit of edits) {
+        const operation = opOf(edit);
+
+        const noOp = checkNoOp(operation, edit.old_string, edit.new_string);
+        if (noOp) {
+            failures.push({ index: edit.index, error: noOp.error, errorCode: noOp.errorCode });
+            continue;
+        }
+
+        const pre = precheckEditNewString(
+            edit.new_string, metadata, externalRefContext, labels.pageLabels, labels.resolvedLocatorPages,
+        );
+        if (pre) {
+            failures.push({ index: edit.index, error: pre.error, errorCode: pre.errorCode });
+            continue;
+        }
+
+        const isStrReplaceFamily = operation !== 'rewrite' && operation !== 'append';
+        let oldString = edit.old_string ?? '';
+        let rendered: { renderedOldSimplified?: string; renderedNewSimplified?: string } = {};
+        if (isStrReplaceFamily) {
+            oldString = applyOldStringEnrichment(oldString, metadata, labels.pageLabels) ?? oldString;
+            rendered = await buildMarkdownRenderFields(oldString, edit.new_string, operation, libraryId, context);
+        }
+
+        specs.push({
+            index: edit.index,
+            client_item_id: edit.client_item_id,
+            operation,
+            oldString,
+            newString: edit.new_string,
+            targetBeforeContext: edit.target_before_context,
+            targetAfterContext: edit.target_after_context,
+            ...rendered,
+        });
+    }
+
+    return { specs, failures };
+}
+
+/**
+ * Build the batch `edit_errors[]` list from resolution/precheck failures and
+ * overlaps, plus the top-level error summary + error_code. Returns null when
+ * there is nothing to report.
+ */
+function buildEditErrors(
+    edits: EditNoteBatchEditItem[],
+    failures: BatchEditFailure[],
+    overlaps: ReturnType<typeof detectOverlaps>,
+): { editErrors: EditValidationError[]; topError: string; topCode: string } | null {
+    if (failures.length === 0 && overlaps.length === 0) return null;
+
+    const editErrors: EditValidationError[] = failures.map((f) => ({
+        index: f.index,
+        error: f.error,
+        error_code: f.errorCode,
+        ...(f.candidates && f.candidates.length > 0
+            ? { error_candidates: f.candidates as ErrorCandidate[] }
+            : {}),
+        ...(f.strategy ? { match_strategy: f.strategy } : {}),
+    }));
+    for (const f of failures) {
+        if (f.strategy) {
+            logger(`edit_note_batch: edit ${f.index} ${f.errorCode} (match strategy ${f.strategy})`, 1);
+        }
+    }
+
+    // One edit can overlap several siblings — collapse its pairs into a single
+    // edit_errors entry naming every conflicting partner, so indices are unique
+    // and the top-level count reflects edits, not pairs.
+    const overlapPartners = new Map<number, Set<number>>();
+    for (const overlap of overlaps) {
+        if (!overlapPartners.has(overlap.secondIndex)) overlapPartners.set(overlap.secondIndex, new Set());
+        overlapPartners.get(overlap.secondIndex)!.add(overlap.firstIndex);
+    }
+    for (const [index, partners] of overlapPartners) {
+        const partnerList = [...partners].sort((a, b) => a - b).join(', ');
+        editErrors.push({
+            index,
+            error: `Edit ${index} overlaps edit(s) ${partnerList}: their target ranges `
+                + 'intersect, so they cannot be applied together. Re-issue them so each edit targets a '
+                + 'distinct region of the note.',
+            error_code: 'overlapping_edits',
+        });
+    }
+
+    editErrors.sort((a, b) => a.index - b.index);
+
+    const hasNotFound = editErrors.some((e) => e.error_code === 'old_string_not_found');
+    const onlyOverlaps = failures.length === 0 && overlaps.length > 0;
+    const topCode = hasNotFound
+        ? 'old_string_not_found'
+        : onlyOverlaps
+            ? 'overlapping_edits'
+            : (editErrors[0].error_code ?? 'edit_failed');
+    const failedCount = new Set(editErrors.map((e) => e.index)).size;
+    const topError = `${failedCount} of ${edits.length} edit(s) in the batch could not be applied.`;
+
+    return { editErrors, topError, topCode };
+}
+
+/**
+ * Build the normalized edit item for one resolved edit, echoing the request's
+ * `index`/`client_item_id` and carrying post-enrichment/matcher old_string,
+ * merged new_string, and captured context anchors.
+ */
+function buildNormalizedEdit(
+    original: EditNoteBatchEditItem,
+    resolved: ResolvedBatchEdit,
+): EditNoteBatchEditItem {
+    const item: EditNoteBatchEditItem = {
+        index: original.index,
+        client_item_id: original.client_item_id,
+        operation: original.operation,
+        old_string: resolved.normalizedOldString ?? original.old_string,
+        new_string: resolved.normalizedNewString ?? original.new_string,
+    };
+    const before = resolved.targetBeforeContext ?? original.target_before_context;
+    const after = resolved.targetAfterContext ?? original.target_after_context;
+    if (before !== undefined) item.target_before_context = before;
+    if (after !== undefined) item.target_after_context = after;
+    return item;
+}
+
+/** True when any field of the normalized edit differs from the request edit. */
+function normalizedEditDiffers(
+    original: EditNoteBatchEditItem,
+    normalized: EditNoteBatchEditItem,
+): boolean {
+    return (
+        (normalized.old_string ?? undefined) !== (original.old_string ?? undefined)
+        || normalized.new_string !== original.new_string
+        || (normalized.target_before_context ?? undefined) !== (original.target_before_context ?? undefined)
+        || (normalized.target_after_context ?? undefined) !== (original.target_after_context ?? undefined)
+    );
+}
+
+/**
+ * Structural batch validation shared by validate + execute. Besides requiring
+ * a non-empty batch and keeping rewrite as a sole edit, enforce the protocol's
+ * positional-index invariant. The core uses `index` to order same-position
+ * appends and group apply operations into undo records, so duplicate,
+ * out-of-order, fractional, or missing indices are not safe to accept.
+ */
+
+/**
+ * Local backstop on batch size for callers that do not go through the backend.
+ * Matches the upper bound of the backend's configurable per-call edit limit,
+ * so a batch the backend allows is never rejected here.
+ */
+export const MAX_BATCH_EDITS = 200;
+
+export function checkBatchShape(edits: EditNoteBatchEditItem[] | undefined): { error: string; errorCode: string } | null {
+    if (!Array.isArray(edits) || edits.length === 0) {
+        return { error: 'edit_note_batch requires at least one edit.', errorCode: 'no_edits' };
+    }
+    if (edits.length > MAX_BATCH_EDITS) {
+        return {
+            error: `edit_note_batch supports at most ${MAX_BATCH_EDITS} edits per call; received ${edits.length}. `
+                + 'Split the changes into multiple calls, or use a single rewrite edit for dense whole-note changes.',
+            errorCode: 'invalid_batch',
+        };
+    }
+    const invalidIndexPosition = edits.findIndex(
+        (edit, position) => !edit || !Number.isInteger(edit.index) || edit.index !== position,
+    );
+    if (invalidIndexPosition !== -1) {
+        const receivedIndex = edits[invalidIndexPosition]?.index;
+        return {
+            error: `Each edit index must match its zero-based position in edits[]. `
+                + `Expected index ${invalidIndexPosition} at position ${invalidIndexPosition}, `
+                + `received ${String(receivedIndex)}.`,
+            errorCode: 'invalid_batch',
+        };
+    }
+    const rewriteCount = edits.filter((e) => opOf(e) === 'rewrite').length;
+    if (rewriteCount > 0 && edits.length > 1) {
+        return {
+            error: 'A rewrite edit must be the only edit in the batch. Split the rewrite into a separate '
+                + 'edit_note_batch call, or express the changes as str_replace/insert edits.',
+            errorCode: 'invalid_batch',
+        };
+    }
+    return null;
+}
+
+// =============================================================================
+// Validate
+// =============================================================================
+
+/**
+ * Validate an edit_note_batch action. Resolves ALL edits against ONE note
+ * snapshot, checks for range overlaps, and fails closed with per-edit
+ * diagnostics if any edit cannot be resolved or two edits truly intersect.
+ */
+async function validateEditNoteBatchAction(
+    request: ActionValidateRequest,
+): Promise<WSAgentActionValidateResponse> {
+    const { library_id, library_ref, zotero_key, edits } = request.action_data as EditNoteBatchProposedData;
+
+    const shapeError = checkBatchShape(edits);
+    if (shapeError) return validateError(request.request_id, shapeError.error, shapeError.errorCode);
+
+    // Exclusion boundary BEFORE resolving/loading the note.
+    const targetLibraryId = resolveLibraryRef({ library_id, library_ref });
+    const excluded = targetLibraryId === null ? null : checkLibraryExcluded(targetLibraryId);
+    if (excluded) return validateError(request.request_id, excluded.message, 'library_not_searchable');
+
+    const resolved = await resolveItemReference({ library_id, library_ref, zotero_key });
+    if (resolved.status === 'library_unavailable') {
+        return validateError(request.request_id, `Library not available for note: ${library_ref || library_id}-${zotero_key}`, 'library_unavailable');
+    }
+    if (resolved.status === 'not_found') {
+        return validateError(request.request_id, `Item not found: ${modelObjectIdFromReference({ library_id, library_ref, zotero_key })}`, 'item_not_found');
+    }
+    const item = resolved.item;
+    const resolvedLibraryId = item.libraryID;
+
+    const library = Zotero.Libraries.get(resolvedLibraryId);
+    if (!library) {
+        return validateError(request.request_id, `Library not found: ${resolvedLibraryId}`, 'library_not_found');
+    }
+
+    const searchableIds = (Zotero.AsterMargin.libraryScopeInitialized ? (Zotero.AsterMargin.searchableLibraryIds ?? []) : []);
+    if (!searchableIds.includes(resolvedLibraryId)) {
+        return validateError(request.request_id, excludedLibraryMessage(resolvedLibraryId), 'library_not_searchable');
+    }
+
+    if (!item.isNote()) {
+        const itemId = modelObjectIdFromReference({ library_id: resolvedLibraryId, library_ref, zotero_key });
+        let error = `Item ${itemId} is not a note`;
+        if (item.isRegularItem()) {
+            error = `Item ${itemId} is a regular item and not a note. To create a new note attached to it, use create_note with parent_item_id="${itemId}".`;
+        } else if (item.isAttachment()) {
+            error = `Item ${itemId} is an attachment and not a note. To create a new note, use create_note. To edit a note, use edit_note with an existing note id.`;
+        } else if (item.isAnnotation()) {
+            error = `Item ${itemId} is an annotation and not a note. To create a new note, use create_note. To edit a note, use edit_note with an existing note id.`;
+        }
+        return validateError(request.request_id, error, 'not_a_note');
+    }
+
+    if (!library.editable) {
+        return validateError(request.request_id, `Library '${library.name}' is read-only and cannot be edited`, 'library_not_editable');
+    }
+
+    await item.loadDataType('note');
+    let rawHtml = getLatestNoteHtml(item);
+    if (containsPreviewMarkers(rawHtml)) {
+        logger(`validateEditNoteBatchAction: note ${resolvedLibraryId}-${zotero_key} contains persisted diff-preview markup; validating against stripped content`, 1);
+        rawHtml = stripPreviewMarkers(rawHtml);
+    }
+
+    if ((!rawHtml || rawHtml.trim() === '')
+        && edits.some(edit => edit.operation !== 'append' && edit.operation !== 'rewrite')) {
+        return validateError(request.request_id, `Note ${modelObjectIdFromReference({ library_id: resolvedLibraryId, library_ref, zotero_key })} is empty. Use operation="append" or "rewrite" with new_string and no old_string to add content to this note.`, 'empty_note');
+    }
+
+    // Simplify ONCE.
+    const noteId = `${resolvedLibraryId}-${zotero_key}`;
+    const pageLabelsByItemId = await preloadNotePageLabels(rawHtml, resolvedLibraryId, { extractOnCacheMiss: true });
+    const { simplified, metadata } = getOrSimplify(noteId, rawHtml, resolvedLibraryId, pageLabelsByItemId);
+
+    const externalRefContext = await getExternalRefContext(edits.map(edit => edit.new_string).join(BATCH_LABEL_SEPARATOR), request.operation);
+    const labels = await preloadBatchLabels(edits);
+
+    // Strip data-citation-items ONCE — the shared match/apply haystack.
+    const strippedHtml = stripDataCitationItems(normalizeNoteHtml(rawHtml));
+    const appendPoint = getAsterMarginFooterAppendPoint(strippedHtml);
+
+    const { specs, failures: prepFailures } = await prepareSpecs(
+        edits, metadata, externalRefContext, labels, resolvedLibraryId, request.operation,
+    );
+
+    const ctx: ResolveBatchContext = {
+        strippedHtml, simplified, metadata, externalRefContext,
+        pageLabels: labels.pageLabels,
+        resolvedLocatorPages: labels.resolvedLocatorPages,
+        appendPoint,
+        mode: 'validate',
+    };
+    const { resolved: resolvedEdits, failures: resolveFailures } = resolveBatchEdits(ctx, specs);
+    const overlaps = detectOverlaps(resolvedEdits);
+
+    const allFailures = [...prepFailures, ...resolveFailures];
+    const errorReport = buildEditErrors(edits, allFailures, overlaps);
+    if (errorReport) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: errorReport.topError,
+            error_code: errorReport.topCode,
+            edit_errors: errorReport.editErrors,
+            preference: 'always_ask',
+        };
+    }
+
+    // Success — build normalized_action_data (same order/length as request).
+    const resolvedByIndex = new Map<number, ResolvedBatchEdit>();
+    for (const r of resolvedEdits) resolvedByIndex.set(r.index, r);
+
+    const normalizedEdits: EditNoteBatchEditItem[] = [];
+    const warnings: string[] = [...labels.locatorWarnings, ...(externalRefContext.externalFileWarnings ?? [])];
+    let anyChanged = false;
+    for (const edit of edits) {
+        const r = resolvedByIndex.get(edit.index);
+        if (!r) {
+            // Should not happen on success, but keep the array aligned.
+            normalizedEdits.push(edit);
+            continue;
+        }
+        const normalized = buildNormalizedEdit(edit, r);
+        normalizedEdits.push(normalized);
+        if (normalizedEditDiffers(edit, normalized)) anyChanged = true;
+        for (const w of r.warnings) warnings.push(w);
+    }
+
+    const isSingleRewrite = edits.length === 1 && opOf(edits[0]) === 'rewrite';
+    const totalLines = simplified.trim() ? simplified.split('\n').length : 0;
+    const noteTitle = item.getNoteTitle() || '(untitled)';
+
+    // A rewrite that discards or replaces most of the note is the one note edit
+    // that can destroy a user's work in a single approval, so it asks even for
+    // users who let note edits apply automatically. Only validation can judge
+    // this: it is the sole step that holds both the live note and the payload.
+    const rewriteRisk = isSingleRewrite
+        ? assessNoteRewrite(simplified, edits[0].new_string ?? '')
+        : null;
+    const isDestructiveRewrite = rewriteRisk?.isDestructive === true;
+    if (isDestructiveRewrite && rewriteRisk) {
+        logger(
+            `handleEditNoteBatchValidate: destructive rewrite (${rewriteRisk.reason}) of `
+            + `${resolvedLibraryId}-${zotero_key} — removed=${rewriteRisk.removedFraction.toFixed(2)}, `
+            + `retained=${rewriteRisk.retainedFraction.toFixed(2)} — requiring approval`,
+            1,
+        );
+    }
+
+    const response: WSAgentActionValidateResponse = {
+        type: 'agent_action_validate_response',
+        request_id: request.request_id,
+        valid: true,
+        current_value: {
+            note_title: noteTitle,
+            total_lines: totalLines,
+            ...(isSingleRewrite ? { old_content: simplified } : {}),
+            // Stored with the proposal: a later apply of a batch with a rewrite
+            // or append checks the note is unchanged.
+            ...(edits.some((edit) => opOf(edit) === 'rewrite' || opOf(edit) === 'append')
+                ? { content_hash: await sha256Hex(rawHtml) }
+                : {}),
+        },
+        preference: getDeferredToolPreference(isDestructiveRewrite ? 'destructive_note_rewrite' : 'edit_note_batch',
+            { library_id: resolvedLibraryId, zotero_key }, request.operation),
+    };
+    // The classification must travel with the action, not just gate the
+    // preference: the approval request that follows still carries the
+    // `edit_note_batch` action type, so without this flag the approval layer
+    // would let an ordinary note-edit run grant authorize the rewrite.
+    if (anyChanged || isDestructiveRewrite) {
+        response.normalized_action_data = {
+            library_id,
+            zotero_key,
+            ...(library_ref !== undefined ? { library_ref } : {}),
+            ...(isDestructiveRewrite ? { destructive_rewrite: true } : {}),
+            edits: normalizedEdits,
+        };
+    }
+    if (warnings.length > 0) response.warnings = warnings;
+    return response;
+}
+
+// =============================================================================
+// Execute
+// =============================================================================
+
+export interface EditNoteBatchApplyHooks {
+    /**
+     * Called with the note after the live editor was flushed and any preview
+     * markup repaired, right before the edits resolve; throws to refuse them.
+     */
+    assertUnchanged?: (item: Zotero.Item) => Promise<void> | void;
+    /**
+     * The user approved this exact batch (Apply on a stored action), so a
+     * single rewrite is applied even if the note grew since validation.
+     */
+    userApproved?: boolean;
+}
+
+/**
+ * Apply an edit_note_batch action and return its `result_data`. Re-resolves
+ * ALL edits against the current note (defense-in-depth), re-checks overlaps,
+ * then applies every edit in ONE setNote + saveTx — all or nothing.
+ *
+ * Concurrency: relies on `AgentService.actionExecutionQueue` to serialize all
+ * agent action dispatches, so no per-note lock is taken here.
+ */
+export async function applyEditNoteBatch(
+    data: EditNoteBatchProposedData,
+    ctx: TimeoutContext,
+    operationContext: OperationContext | undefined,
+    hooks: EditNoteBatchApplyHooks = {},
+): Promise<EditNoteBatchResultData> {
+    const {
+        library_id, library_ref, zotero_key, edits, destructive_rewrite,
+    } = data;
+
+    const shapeError = checkBatchShape(edits);
+    if (shapeError) throw actionError(shapeError.errorCode, shapeError.error);
+
+    // TOCTOU exclusion guard BEFORE resolving/loading the note.
+    assertLibraryRefNotExcluded({ library_id, library_ref });
+
+    const resolved = await resolveItemReference({ library_id, library_ref, zotero_key });
+    if (resolved.status !== 'found') {
+        throw resolved.status === 'library_unavailable'
+            ? actionError('library_unavailable', `Library not available for note: ${library_ref || library_id}-${zotero_key}`)
+            : actionError('item_not_found', `Item not found: ${modelObjectIdFromReference({ library_id, library_ref, zotero_key })}`);
+    }
+    const item = resolved.item;
+    const resolvedLibraryId = item.libraryID;
+
+    assertLibraryNotExcluded(resolvedLibraryId);
+    // The target's type and its library's editability can change between
+    // validation and execution: fail cleanly instead of surfacing a raw save
+    // error from Zotero.
+    assertEditableNote(item, { library_ref, zotero_key });
+
+    // Load note + settle any in-flight diff preview / unsaved editor content.
+    await item.loadDataType('note');
+    await dismissNotePreviews(resolvedLibraryId, zotero_key);
+    await flushLiveEditorToDB(item);
+
+    // Repair persisted diff-preview markup (and save the repair even if the
+    // batch later fails, so a failed attempt still un-bricks the note).
+    {
+        const persistedHtml: string = item.getNote();
+        if (containsPreviewMarkers(persistedHtml)) {
+            const repaired = stripPreviewMarkers(persistedHtml);
+            if (!containsPreviewMarkers(repaired)) {
+                logger(`applyEditNoteBatch: repairing persisted diff-preview markup in ${resolvedLibraryId}-${zotero_key}`, 1);
+                item.setNote(repaired);
+                await item.saveTx();
+                await waitForNoteSaveStabilization(item, repaired);
+            } else {
+                logger(`applyEditNoteBatch: diff-preview markup in ${resolvedLibraryId}-${zotero_key} could not be fully stripped; save will be refused by the preview guard`, 1);
+            }
+        }
+    }
+
+    // The caller's drift check sees the note as the user does: after the
+    // live editor was flushed and any preview markup repaired.
+    await hooks.assertUnchanged?.(item);
+
+    // Preload page labels for ALL edits before the final note snapshot.
+    const externalRefContext = await getExternalRefContext(edits.map(edit => edit.new_string).join(BATCH_LABEL_SEPARATOR), operationContext);
+    const labels = await preloadBatchLabels(edits);
+
+    const preSeedHtml = item.getNote();
+    await preloadNotePageLabels(preSeedHtml, resolvedLibraryId, { extractOnCacheMiss: true });
+
+    // Snapshot the note. Avoid async between here and item.setNote() to keep atomicity.
+    const oldHtml: string = item.getNote();
+    const noteId = `${resolvedLibraryId}-${zotero_key}`;
+    const pageLabelsByItemId = await preloadNotePageLabels(oldHtml, resolvedLibraryId);
+    const { simplified, metadata } = getOrSimplify(noteId, oldHtml, resolvedLibraryId, pageLabelsByItemId);
+
+    const normalizedOldHtml = normalizeNoteHtml(oldHtml);
+    const existingCitationCache = extractDataCitationItems(normalizedOldHtml);
+    const strippedHtml = stripDataCitationItems(normalizedOldHtml);
+
+    const threadId = operationContext?.threadId ?? null;
+
+    // ── Single-rewrite batch: v1 rewrite tail semantics, batch envelope ──
+    if (edits.length === 1 && opOf(edits[0]) === 'rewrite') {
+        // Re-classify against the note as it stands NOW. Validation's verdict is
+        // what decided whether this rewrite needed its own approval, and the note
+        // can gain content in between (a concurrent action — validation is not
+        // serialized against execution — or the user typing), so a rewrite that
+        // was cleared as ordinary must not silently discard whatever arrived
+        // afterwards. Fail closed: re-issuing runs validation again, which
+        // classifies the rewrite against the current note and asks for approval.
+        if (destructive_rewrite !== true && !hooks.userApproved) {
+            const currentRisk = assessNoteRewrite(simplified, edits[0].new_string ?? '');
+            if (currentRisk.isDestructive) {
+                logger(
+                    `executeEditNoteBatchAction: rewrite of ${noteId} became destructive `
+                    + `(${currentRisk.reason}) after validation — removed=`
+                    + `${currentRisk.removedFraction.toFixed(2)}, retained=`
+                    + `${currentRisk.retainedFraction.toFixed(2)} — refusing unapproved rewrite`,
+                    1,
+                );
+                throw actionError(
+                    'note_changed',
+                    'The note changed after this rewrite was checked, and the rewrite would now discard '
+                    + 'most of its content. A rewrite that destructive needs the user\'s approval, so it '
+                    + 'was not applied. Read the note again and either re-issue the rewrite against its '
+                    + 'current content or express the change as targeted str_replace edits.',
+                );
+            }
+        }
+
+        return await applySingleRewrite(
+            ctx, item, edits[0], resolvedLibraryId, zotero_key,
+            oldHtml, strippedHtml, existingCitationCache, metadata, externalRefContext,
+            labels, threadId, noteId,
+        );
+    }
+
+    // ── General batch ──
+    const { specs, failures: prepFailures } = await prepareSpecs(
+        edits, metadata, externalRefContext, labels, resolvedLibraryId, operationContext,
+    );
+    // A pre-check failure at execute time means the note drifted since approval.
+    if (prepFailures.length > 0) {
+        const first = prepFailures[0];
+        throw actionError(
+            first.errorCode,
+            `Batch cannot be applied: ${prepFailures.length} edit(s) failed re-validation (edit ${first.index}: ${first.error})`,
+            { errorCandidates: first.candidates as ErrorCandidate[] | undefined },
+        );
+    }
+
+    const appendPoint = getAsterMarginFooterAppendPoint(strippedHtml);
+    const resolveCtx: ResolveBatchContext = {
+        strippedHtml, simplified, metadata, externalRefContext,
+        pageLabels: labels.pageLabels,
+        resolvedLocatorPages: labels.resolvedLocatorPages,
+        appendPoint,
+        mode: 'execute',
+    };
+    const { resolved: resolvedEdits, failures: resolveFailures } = resolveBatchEdits(resolveCtx, specs);
+
+    // Any resolution failure → whole batch fails BEFORE any write.
+    if (resolveFailures.length > 0) {
+        const first = resolveFailures[0];
+        throw actionError(
+            first.errorCode,
+            `Batch cannot be applied: ${resolveFailures.length} edit(s) no longer resolve against the current note `
+            + `(edit ${first.index}: ${first.error})`,
+            { errorCandidates: first.candidates as ErrorCandidate[] | undefined },
+        );
+    }
+
+    // Re-run the overlap gate — the note may have drifted since approval.
+    const overlaps = detectOverlaps(resolvedEdits);
+    if (overlaps.length > 0) {
+        const o = overlaps[0];
+        throw actionError(
+            'overlapping_edits',
+            `Batch cannot be applied: edits ${o.firstIndex} and ${o.secondIndex} now target overlapping regions of the note.`,
+        );
+    }
+
+    // Apply ALL edits in one pass.
+    const { newStrippedHtml, undoDrafts } = applyResolvedEdits(strippedHtml, resolvedEdits);
+
+    // Footer ONCE, then rebuild data-citation-items ONCE.
+    let newHtml = newStrippedHtml;
+    if (threadId) newHtml = addOrUpdateEditFooter(newHtml, threadId);
+    newHtml = rebuildDataCitationItems(newHtml, existingCitationCache);
+
+    const hadSchemaVersion = hasSchemaVersionWrapper(strippedHtml);
+    if (hadSchemaVersion && !hasSchemaVersionWrapper(newHtml)) {
+        throw actionError('wrapper_removed', 'The note wrapper <div data-schema-version="..."> must not be removed.');
+    }
+
+    checkAborted(ctx, 'edit_note_batch:before_save');
+
+    try {
+        assertNoPreviewMarkers(newHtml, 'editNoteBatch:apply');
+        item.setNote(newHtml);
+        await item.saveTx();
+        logger(`applyEditNoteBatch: Saved ${resolvedEdits.length} edit(s) to ${noteId}`, 1);
+    } catch (error) {
+        try {
+            assertNoPreviewMarkers(oldHtml, 'editNoteBatch:rollback');
+            item.setNote(oldHtml);
+        } catch (_) { /* best-effort */ }
+        if (error instanceof TimeoutError) throw error;
+        throw actionError('save_failed', `Failed to save note: ${error}`);
+    }
+
+    await waitForNoteSaveStabilization(item, newHtml);
+    clearNoteEditorSelection(resolvedLibraryId, zotero_key);
+    invalidateSimplificationCache(noteId);
+
+    // Refresh undo contexts against the final (post-footer, PM-normalized) HTML.
+    const finalStripped = stripDataCitationItems(getLatestNoteHtml(item));
+    captureUndoContexts(finalStripped, undoDrafts, newStrippedHtml);
+
+    // Warnings: per-edit duplicate-citation + batch locator warnings.
+    const warnings: string[] = [...labels.locatorWarnings, ...(externalRefContext.externalFileWarnings ?? [])];
+    for (const edit of edits) {
+        const dup = checkDuplicateCitations(edit.new_string, metadata, edit.old_string);
+        if (dup) warnings.push(dup);
+    }
+
+    const applied = buildAppliedList(resolvedEdits);
+    const undo = buildUndoList(undoDrafts);
+
+    return {
+        library_id: resolvedLibraryId,
+        zotero_key,
+        library_ref: libraryRefForLibraryID(resolvedLibraryId) ?? undefined,
+        applied,
+        ...(warnings.length > 0 ? { warnings } : {}),
+        undo,
+    };
+}
+
+/** Apply a note edit batch for the backend during a run. */
+async function executeEditNoteBatchAction(
+    request: ActionExecuteRequest,
+    ctx: TimeoutContext,
+): Promise<WSAgentActionExecuteResponse> {
+    return toExecuteResponse(request.request_id, 'executeEditNoteBatchAction',
+        () => applyEditNoteBatch(request.action_data as EditNoteBatchProposedData, ctx, request.operation));
+}
+
+
+
+export function buildAppliedList(resolvedEdits: ResolvedBatchEdit[]): EditNoteBatchAppliedEdit[] {
+    return resolvedEdits.map((r) => ({
+        index: r.index,
+        client_item_id: r.client_item_id,
+        occurrences_replaced: r.occurrencesReplaced,
+    }));
+}
+
+export function buildUndoList(drafts: BatchUndoDraft[]): EditNoteBatchUndoRecord[] {
+    return drafts.map((d) => ({
+        index: d.index,
+        client_item_id: d.client_item_id,
+        operation: d.operation,
+        undo_old_html: d.undo_old_html,
+        undo_new_html: d.undo_new_html,
+        ...(d.undo_before_context !== undefined ? { undo_before_context: d.undo_before_context } : {}),
+        ...(d.undo_after_context !== undefined ? { undo_after_context: d.undo_after_context } : {}),
+        ...(d.undo_occurrence_contexts !== undefined ? { undo_occurrence_contexts: d.undo_occurrence_contexts } : {}),
+    }));
+}
+
+/**
+ * Apply a single-rewrite batch using the same wrapper-preserving semantics as
+ * the single-edit rewrite path, wrapped in the batch result envelope. The undo
+ * record carries the FULL pre-edit stripped body in undo_old_html.
+ */
+async function applySingleRewrite(
+    ctx: TimeoutContext,
+    item: Zotero.Item,
+    edit: EditNoteBatchEditItem,
+    resolvedLibraryId: number,
+    zotero_key: string,
+    oldHtml: string,
+    strippedHtml: string,
+    existingCitationCache: ReturnType<typeof extractDataCitationItems>,
+    metadata: SimplificationMetadata,
+    externalRefContext: ExternalRefContext,
+    labels: PreloadedLabels,
+    threadId: string | null,
+    noteId: string,
+): Promise<EditNoteBatchResultData> {
+    let expandedNew: string;
+    try {
+        expandedNew = expandToRawHtml(
+            edit.new_string, metadata, 'new', externalRefContext,
+            labels.pageLabels, labels.resolvedLocatorPages,
+        );
+    } catch (e: any) {
+        throw actionError('expansion_failed', e?.message || String(e));
+    }
+
+    // Preserve wrapper div by slicing it off the stripped body.
+    const trimmed = strippedHtml.trim();
+    let wrapperOpen = '';
+    let wrapperClose = '';
+    if (trimmed.startsWith('<div') && trimmed.endsWith('</div>')) {
+        const closeAngle = trimmed.indexOf('>');
+        wrapperOpen = trimmed.substring(0, closeAngle + 1);
+        wrapperClose = '</div>';
+    }
+
+    let newHtml = wrapperOpen + expandedNew + wrapperClose;
+    if (threadId) newHtml = addOrUpdateEditFooter(newHtml, threadId);
+    newHtml = rebuildDataCitationItems(newHtml, existingCitationCache);
+
+    const hadSchemaVersion = hasSchemaVersionWrapper(strippedHtml);
+    if (hadSchemaVersion && !hasSchemaVersionWrapper(newHtml)) {
+        throw actionError('wrapper_removed', 'The note wrapper <div data-schema-version="..."> must not be removed.');
+    }
+
+    checkAborted(ctx, 'edit_note_batch:before_save');
+
+    try {
+        assertNoPreviewMarkers(newHtml, 'editNoteBatch:rewrite:apply');
+        item.setNote(newHtml);
+        await item.saveTx();
+        logger(`applyEditNoteBatch: Saved rewrite edit to ${noteId}`, 1);
+    } catch (error) {
+        try {
+            assertNoPreviewMarkers(oldHtml, 'editNoteBatch:rewrite:rollback');
+            item.setNote(oldHtml);
+        } catch (_) { /* best-effort */ }
+        if (error instanceof TimeoutError) throw error;
+        throw actionError('save_failed', `Failed to save note: ${error}`);
+    }
+
+    await waitForNoteSaveStabilization(item, newHtml);
+    clearNoteEditorSelection(resolvedLibraryId, zotero_key);
+    invalidateSimplificationCache(noteId);
+
+    const warnings: string[] = [...labels.locatorWarnings, ...(externalRefContext.externalFileWarnings ?? [])];
+    const dup = checkDuplicateCitations(edit.new_string, metadata);
+    if (dup) warnings.push(dup);
+
+    return {
+        library_id: resolvedLibraryId,
+        zotero_key,
+        library_ref: libraryRefForLibraryID(resolvedLibraryId) ?? undefined,
+        applied: [{
+            index: edit.index,
+            client_item_id: edit.client_item_id,
+            occurrences_replaced: 1,
+        }],
+        ...(warnings.length > 0 ? { warnings } : {}),
+        undo: [{
+            index: edit.index,
+            client_item_id: edit.client_item_id,
+            operation: 'rewrite',
+            undo_old_html: strippedHtml,
+        }],
+    };
+}
+
+export { executeEditNoteBatchAction, validateEditNoteBatchAction };

@@ -1,0 +1,462 @@
+import { readCollectionActionData } from '@astermargin/agent-core/identity/collectionActionData';
+import { CollectionResolutionError, resolveCollection, serializeCollectionIdentity, formatCollectionId } from '../../collections/collectionIdentity';
+import { collectionDeletedSinceValidationMessage, recheckCollection, recheckCollectionParent } from '../../collections/collectionMutations';
+import type { ActionExecuteRequest, ActionValidateRequest } from '../operationContext';
+/**
+ * Validate and execute library-wide collection operations (manage_collections).
+ *
+ * Supports three actions:
+ *   - 'rename': changes the collection name.
+ *   - 'move':   reparents the collection. new_parent_key=null means top-level.
+ *               Rejects cycles (moving into self or a descendant) and
+ *               cross-library moves (Zotero requires copy+delete).
+ *   - 'delete': soft-deletes the collection (collection.deleted = true; saveTx)
+ *               Refuses if the collection has direct subcollections.
+ *
+ * Snapshots (old_name, old_parent_key) are captured at execute time to
+ * support undo for rename/move. Delete undo is a plain restore-from-trash
+ * and doesn't need an item-level snapshot.
+ */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+import {
+    WSAgentActionExecuteResponse,
+    WSAgentActionValidateResponse
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import {
+    libraryRefForLibraryID,
+    parseItemReference,
+    resolveLibraryRef,
+    resolveWriteTargetLibrary,
+    writeTargetLibraryError,
+} from '../../../utils/libraryIdentity';
+import type { ManageCollectionsProposedData, ManageCollectionsResultData } from '@astermargin/agent-core/types/agentActions/base';
+import { checkAborted, TimeoutContext } from '../timeout';
+import { excludedLibraryMessage, getDeferredToolPreference, isLibrarySearchable } from '../utils';
+import { actionError, resolveActionWriteLibrary, toExecuteResponse } from './actionExecution';
+
+interface SubcollectionSummary {
+    key: string;
+    name: string;
+    item_count: number;
+}
+
+
+/**
+ * Summarize direct child collections of `collection` (not deep descendants —
+ * the agent should walk one level at a time so deletion stays explicit).
+ * Returns name, key and direct item count for each, excluding trashed.
+ */
+function summarizeChildCollections(collection: any): SubcollectionSummary[] {
+    const children: any[] = collection.getChildCollections(false, false);
+    return children.map((child) => ({
+        key: serializeCollectionIdentity(child).collection_id,
+        name: String(child.name),
+        item_count: (child.getChildItems(true, false) as number[]).length,
+    }));
+}
+
+
+function formatSubcollectionList(subs: SubcollectionSummary[]): string {
+    return subs
+        .map((s) => `  - '${s.name}' (key=${s.key}, ${s.item_count} item${s.item_count === 1 ? '' : 's'})`)
+        .join('\n');
+}
+
+
+/**
+ * When a collection lookup fails, check whether the key actually belongs to a
+ * library item so we can tell the agent it pointed a collection-only tool at
+ * the wrong object type. Returns a human-readable type label, or null if the
+ * key is not an item.
+ */
+async function classifyNonCollectionKey(
+    key: string,
+    libraryIdHint: number | undefined,
+): Promise<string | null> {
+    // Best-effort on an error path
+    try {
+        const libraryIds = libraryIdHint !== undefined
+            ? [libraryIdHint]
+            : (Zotero.Libraries.getAll() ?? []).map((lib: any) => lib.libraryID).filter(isLibrarySearchable);
+        for (const libraryID of libraryIds) {
+            const item = await Zotero.Items.getByLibraryAndKeyAsync(libraryID, key);
+            if (item) {
+                if (typeof (item as any).isAnnotation === 'function' && (item as any).isAnnotation()) return 'annotation';
+                if (item.isAttachment()) return 'attachment';
+                if (item.isNote()) return 'note';
+                if (item.isRegularItem()) return 'regular library item';
+                return 'library item';
+            }
+        }
+    } catch {
+        // Fall through to null — caller emits 'collection_not_found'.
+    }
+    return null;
+}
+
+
+export async function validateManageCollectionsAction(
+    request: ActionValidateRequest
+): Promise<WSAgentActionValidateResponse> {
+    const { action, collection_key: rawCollectionKey, new_name: rawNewName, new_parent_key: rawNewParentKey, library_id: rawLibraryId, library_ref } = readCollectionActionData(request.action_data) as {
+        action: 'rename' | 'move' | 'delete';
+        collection_key: string;
+        new_name?: string | null;
+        new_parent_key?: string | null;
+        library_id?: number | null;
+        library_ref?: string | null;
+    };
+
+    if (!rawCollectionKey || typeof rawCollectionKey !== 'string' || !rawCollectionKey.trim()) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: 'collection_key cannot be empty',
+            error_code: 'invalid_collection_key',
+            preference: 'always_ask',
+        };
+    }
+
+    const trimmedCollectionKey = rawCollectionKey.trim();
+    // A present library_ref is authoritative: resolve it strictly (exactly as
+    // executeManageCollectionsAction does) so validate fails a malformed or
+    // unavailable ref instead of falling back to a stale library_id and
+    // scoping the collection lookup to the wrong library.
+    let refLibraryId: number | undefined;
+    if (library_ref) {
+        const resolution = resolveWriteTargetLibrary({ library_ref, library_id: rawLibraryId });
+        if (!resolution.ok) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                ...writeTargetLibraryError(resolution),
+                preference: 'always_ask',
+            };
+        }
+        refLibraryId = resolution.libraryID;
+    }
+    const hintLibraryId = refLibraryId
+        ?? (typeof rawLibraryId === 'number' && rawLibraryId > 0 ? rawLibraryId : undefined);
+
+    let lookup;
+    try {
+        lookup = resolveCollection(trimmedCollectionKey, { libraryID: hintLibraryId });
+    } catch (error) {
+        if (!(error instanceof CollectionResolutionError) || error.code !== 'collection_not_found') throw error;
+        const parsed = parseItemReference(trimmedCollectionKey);
+        const libraryID = parsed ? resolveLibraryRef(parsed) ?? undefined : hintLibraryId;
+        const objectType = await classifyNonCollectionKey(parsed?.zotero_key ?? trimmedCollectionKey, libraryID);
+        if (objectType) {
+            return {
+                type: 'agent_action_validate_response', request_id: request.request_id,
+                valid: false, preference: 'always_ask', error_code: 'not_a_collection',
+                error: `The key '${rawCollectionKey}' refers to a ${objectType}, not a collection. manage_collections operates only on collections. Delete library items manually in Zotero.`,
+            };
+        }
+        throw error;
+    }
+
+    const collection = lookup.collection;
+    const libraryID = lookup.libraryID;
+    const library = Zotero.Libraries.get(libraryID);
+    if (!library) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Library not found for collection '${rawCollectionKey}'`,
+            error_code: 'library_not_found',
+            preference: 'always_ask',
+        };
+    }
+    if (!isLibrarySearchable(libraryID)) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: excludedLibraryMessage(libraryID),
+            error_code: 'library_not_searchable',
+            preference: 'always_ask',
+        };
+    }
+    if (!library.editable) {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Library '${library.name}' is read-only and cannot be modified`,
+            error_code: 'library_not_editable',
+            preference: 'always_ask',
+        };
+    }
+
+    const oldName: string = collection.name;
+    const oldParentKey: string | null = collection.parentKey ? String(collection.parentKey) : null;
+
+    // Action-specific validation
+    let newName: string | null = null;
+    let newParentKey: string | null = null;
+
+    if (action === 'rename') {
+        newName = (rawNewName ?? '').trim();
+        if (!newName) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: "action='rename' requires a non-empty new_name",
+                error_code: 'invalid_new_name',
+                preference: 'always_ask',
+            };
+        }
+        if (newName === oldName) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: 'new_name must be different from the current name',
+                error_code: 'invalid_new_name',
+                preference: 'always_ask',
+            };
+        }
+    } else if (action === 'move') {
+        const trimmedParent = rawNewParentKey ? rawNewParentKey.trim() || null : null;
+        if (trimmedParent) {
+            let parent;
+            try {
+                parent = resolveCollection(trimmedParent, { libraryID }).collection;
+            } catch (error) {
+                if (!(error instanceof CollectionResolutionError) || error.code !== 'collection_not_found') throw error;
+                return {
+                    type: 'agent_action_validate_response',
+                    request_id: request.request_id,
+                    valid: false,
+                    error: `Parent collection not found in library '${library.name}': ${trimmedParent}`,
+                    error_code: 'parent_not_found',
+                    preference: 'always_ask',
+                };
+            }
+            // Cannot move into self
+            if (parent.id === collection.id) {
+                return {
+                    type: 'agent_action_validate_response',
+                    request_id: request.request_id,
+                    valid: false,
+                    error: 'Cannot move a collection into itself',
+                    error_code: 'invalid_parent',
+                    preference: 'always_ask',
+                };
+            }
+            // Cannot move into a descendant (cycle)
+            const descendantIds = new Set(
+                collection.getDescendents(false, 'collection', false).map((d: any) => d.id)
+            );
+            if (descendantIds.has(parent.id)) {
+                return {
+                    type: 'agent_action_validate_response',
+                    request_id: request.request_id,
+                    valid: false,
+                    error: 'Cannot move a collection into one of its own descendants (cycle)',
+                    error_code: 'invalid_parent',
+                    preference: 'always_ask',
+                };
+            }
+            newParentKey = parent.key;
+        } else {
+            newParentKey = null;
+        }
+        // No-op move (same parent) — reject
+        const currentParentKey = oldParentKey;
+        if ((newParentKey ?? null) === currentParentKey) {
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error: `Collection is already at this location (parent: ${currentParentKey ?? 'top-level'})`,
+                error_code: 'no_change',
+                preference: 'always_ask',
+            };
+        }
+    } else if (action !== 'delete') {
+        return {
+            type: 'agent_action_validate_response',
+            request_id: request.request_id,
+            valid: false,
+            error: `Unsupported action: '${action}'. Use 'rename', 'move', or 'delete'.`,
+            error_code: 'invalid_action',
+            preference: 'always_ask',
+        };
+    }
+
+    // Preview-only counts (for the approval card). The authoritative
+    // snapshot is captured at execute time — NOT here — so a re-apply after
+    // manual library edits produces a fresh snapshot.
+    let oldItemCount: number | undefined;
+    if (action === 'delete') {
+        // Refuse delete when subcollections exist. Recursive delete would
+        // erase the whole subtree but undo can only restore the top-level
+        // collection (with a new key), losing structure silently. Force the
+        // agent to walk leaves first so the user sees and approves each level.
+        if (collection.hasChildCollections(false)) {
+            const subs = summarizeChildCollections(collection);
+            const list = formatSubcollectionList(subs);
+            return {
+                type: 'agent_action_validate_response',
+                request_id: request.request_id,
+                valid: false,
+                error:
+                    `Cannot delete collection '${collection.name}' because it contains ${subs.length} subcollection${subs.length === 1 ? '' : 's'}. ` +
+                    `Delete or move each subcollection first, then retry:\n${list}`,
+                error_code: 'has_subcollections',
+                preference: 'always_ask',
+            };
+        }
+        oldItemCount = (collection.getChildItems(true, false) as number[]).length;
+    }
+
+    const preference = getDeferredToolPreference('manage_collections', undefined, request.operation);
+
+    return {
+        type: 'agent_action_validate_response',
+        request_id: request.request_id,
+        valid: true,
+        current_value: {
+            library_id: libraryID,
+            library_ref: libraryRefForLibraryID(libraryID) ?? undefined,
+            library_name: library.name,
+            action,
+            collection_key: collection.key,
+            collection_id: lookup.collectionId,
+            collection_name: oldName,
+            old_name: oldName,
+            old_parent_key: oldParentKey,
+            old_item_count: oldItemCount,
+        },
+        // Normalize to plain scalars so execute, the persisted AgentAction, and
+        // the UI apply/undo path all see the resolved library_id + 8-char keys
+        // regardless of whether the agent sent a compound '<lib>-<key>' form.
+        // Snapshots are captured at execute time, not here.
+        normalized_action_data: {
+            library_id: libraryID,
+            library_ref: libraryRefForLibraryID(libraryID) ?? undefined,
+            collection_key: collection.key,
+            collection_id: lookup.collectionId,
+            ...(action === 'move' ? { new_parent_key: newParentKey, new_parent_collection_id: newParentKey ? formatCollectionId(libraryID, newParentKey) : null } : {}),
+        },
+        preference,
+    };
+}
+
+
+/** Called with the collection right before the write; throws to refuse it. */
+export interface ManageCollectionsApplyHooks {
+    assertUnchanged?: (collection: Zotero.Collection) => void;
+}
+
+/**
+ * Rename, move or trash a collection and return its `result_data`, with the
+ * pre-apply name and parent captured right before the write for undo.
+ */
+export async function applyManageCollections(
+    rawData: Record<string, any>,
+    ctx: TimeoutContext,
+    hooks: ManageCollectionsApplyHooks = {},
+): Promise<ManageCollectionsResultData> {
+    const data = readCollectionActionData(rawData) as ManageCollectionsProposedData;
+    const { action, collection_key, new_name, new_parent_key } = data;
+    const resolvedLibraryId = resolveActionWriteLibrary(data);
+
+    let lookup;
+    try {
+        lookup = recheckCollection(collection_key, resolvedLibraryId);
+    } catch (error) {
+        if (!(error instanceof CollectionResolutionError) || error.code !== 'collection_not_found') throw error;
+        throw actionError('collection_not_found', collectionDeletedSinceValidationMessage('Collection', collection_key),
+            { userMessage: `Collection not found: ${collection_key}` });
+    }
+    const collection = lookup.collection;
+    hooks.assertUnchanged?.(collection);
+
+    // Re-snapshot the authoritative pre-apply state at execute time.
+    // A re-apply after manual library edits produces a fresh snapshot
+    // that the next undo can correctly reverse.
+    const oldName: string = collection.name;
+    const oldParentKey: string | null = collection.parentKey ? String(collection.parentKey) : null;
+    let itemsAffected: number | null = null;
+    if (action === 'delete') {
+        // Refuse when subcollections exist, here as in validation: they may
+        // have been added since. A trashed subtree gives each descendant its
+        // own trash row, so restoring the parent alone would not bring them
+        // back, and undo promises a single collection with its items attached.
+        if (collection.hasChildCollections(false)) {
+            const subs = summarizeChildCollections(collection);
+            const list = formatSubcollectionList(subs);
+            throw actionError(
+                'has_subcollections',
+                `Cannot delete collection '${oldName}' because it now contains ${subs.length} subcollection${subs.length === 1 ? '' : 's'}. `
+                    + `Delete or move each subcollection first, then retry:\n${list}`,
+            );
+        }
+        itemsAffected = (collection.getChildItems(true, false) as number[]).length;
+    }
+
+    if (action === 'rename') {
+        const target = (new_name ?? '').trim();
+        if (!target) throw actionError('invalid_new_name', 'new_name required for rename');
+        checkAborted(ctx, 'manage_collections:before_rename');
+        collection.name = target;
+        await collection.saveTx();
+        logger(`applyManageCollections: Renamed collection ${resolvedLibraryId}-${collection_key} → '${target}'`, 1);
+    } else if (action === 'move') {
+        // Zotero uses `false` to signal top-level (see collection.js parentKey setter).
+        checkAborted(ctx, 'manage_collections:before_move');
+        try {
+            (collection as any).parentKey = recheckCollectionParent(collection, new_parent_key) || false;
+        } catch (error) {
+            if (!(error instanceof CollectionResolutionError) || error.code !== 'collection_not_found') throw error;
+            throw actionError('parent_not_found', collectionDeletedSinceValidationMessage('Parent collection', String(new_parent_key)),
+                { userMessage: `Parent collection not found: ${new_parent_key}` });
+        }
+        await collection.saveTx();
+        logger(`applyManageCollections: Moved collection ${resolvedLibraryId}-${collection_key} to parent ${new_parent_key ?? 'top-level'}`, 1);
+    } else if (action === 'delete') {
+        checkAborted(ctx, 'manage_collections:before_delete');
+        // Soft-delete (trash): collection is hidden from the library view,
+        // items stay attached via collectionItems. Reversible with
+        // `collection.deleted = false; saveTx()` until the user explicitly
+        // empties the trash — Zotero's `trashAutoEmptyDays` timer only
+        // auto-empties trashed items, not trashed collections
+        // (see Zotero.Items.startEmptyTrashTimer in items.js).
+        (collection as any).deleted = true;
+        await collection.saveTx();
+        logger(`applyManageCollections: Trashed collection ${resolvedLibraryId}-${collection_key}`, 1);
+    } else {
+        throw actionError('invalid_action', `Unsupported action: '${action}'`);
+    }
+
+    return {
+        library_id: resolvedLibraryId,
+        library_ref: libraryRefForLibraryID(resolvedLibraryId) ?? undefined,
+        action,
+        collection_key: collection.key,
+        collection_id: lookup.collectionId,
+        new_name: new_name ?? null,
+        new_parent_key: new_parent_key ? collection.parentKey || null : null,
+        new_parent_collection_id: new_parent_key && collection.parentKey ? formatCollectionId(resolvedLibraryId, collection.parentKey) : null,
+        items_affected: itemsAffected,
+        old_name: oldName,
+        old_parent_collection_id: oldParentKey ? formatCollectionId(resolvedLibraryId, oldParentKey) : null,
+        old_parent_key: oldParentKey,
+    };
+}
+
+export async function executeManageCollectionsAction(
+    request: ActionExecuteRequest,
+    ctx: TimeoutContext,
+): Promise<WSAgentActionExecuteResponse> {
+    return toExecuteResponse(request.request_id, 'executeManageCollectionsAction',
+        () => applyManageCollections(request.action_data, ctx));
+}

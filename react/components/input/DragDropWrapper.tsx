@@ -1,0 +1,671 @@
+import React, { useState, useRef } from 'react';
+import { getPref } from '../../../src/utils/prefs';
+import { ZoteroIcon, ZOTERO_ICONS } from '../icons/ZoteroIcon';
+import { CSSItemTypeIcon, CSSIcon } from '../icons/zotero';
+import { isValidAnnotationType, type ViewAttachment } from '@astermargin/agent-core/types/attachments/apiTypes';
+import { addItemToCurrentMessageItemsAtom, addItemsToCurrentMessageItemsAtom, addViewsToCurrentMessageAtom, currentMessageFiltersAtom } from '../../atoms/messageComposition';
+import { useSetAtom, useAtomValue } from 'jotai';
+import { searchableLibraryIdsAtom } from '../../atoms/profile';
+import { useAttachExternalFiles } from '../../hooks/useAttachExternalFiles';
+import { importActionAtom, stageActionPillAtom } from '../../atoms/actions';
+import { readActionFile, isActionFilePath } from '../../utils/actionShareFile';
+import { addPopupMessageAtom } from '../../utils/popupMessageUtils';
+import { getActionCommand } from '@astermargin/agent-ui/composer/slashCommands';
+import { getHost } from '@astermargin/agent-ui/host';
+import { SettingsIcon } from '../icons/icons';
+import { VIEW_ROW_DRAG_TYPE } from '../../../src/utils/zoteroSelection';
+import { viewToAttachment, type ViewSelection } from '../../utils/zoteroReferences';
+import { viewChipDisplay } from '../agentRuns/requestChips/RequestChipPrimitives';
+
+interface DragDropWrapperProps {
+    children: React.ReactNode;
+    overlayBorderRadius?: number;
+}
+
+/** True when the drag carries a saved search or a built-in view (Unfiled Items, …). */
+const isViewDrag = (dataTransfer: DataTransfer): boolean =>
+    dataTransfer.types.includes('zotero/search') || dataTransfer.types.includes(VIEW_ROW_DRAG_TYPE);
+
+/** True when the drag carries OS files (not Zotero objects). */
+const isFileDrag = (dataTransfer: DataTransfer): boolean =>
+    !dataTransfer.types.includes('zotero/item')
+    && !dataTransfer.types.includes('zotero/annotation')
+    && !dataTransfer.types.includes('zotero/collection')
+    && !isViewDrag(dataTransfer)
+    && (dataTransfer.types.includes('application/x-moz-file') || dataTransfer.types.includes('text/x-moz-url'));
+
+/** The saved searches or built-in views a drag carries, as the rows they came from. */
+const getDraggedViews = (dataTransfer: DataTransfer): ViewSelection[] => {
+    try {
+        if (dataTransfer.types.includes('zotero/search')) {
+            return dataTransfer.getData('zotero/search').split(',')
+                .map(id => Zotero.Searches.get(parseInt(id)) as Zotero.Search | false)
+                .filter((search): search is Zotero.Search => !!search)
+                .map(search => ({ type: 'search', libraryId: search.libraryID, key: search.key, name: search.name }));
+        }
+        const data = JSON.parse(dataTransfer.getData(VIEW_ROW_DRAG_TYPE) || 'null');
+        if (data && typeof data.libraryID === 'number' && typeof data.type === 'string') {
+            return [{ type: data.type, libraryId: data.libraryID, name: String(data.name ?? '') }];
+        }
+    } catch (error) {
+        console.error('Error reading dragged saved searches or views:', error);
+    }
+    return [];
+};
+
+/**
+ * Extract dropped OS files as nsIFile objects via Zotero's drag helper, which
+ * handles the macOS percent-escape quirk, excludes folders, and falls back to
+ * file URLs on Linux.
+ */
+const getDroppedFiles = (dataTransfer: DataTransfer): Array<{ path: string }> => {
+    try {
+        const dragData = (Zotero as any).DragDrop.getDataFromDataTransfer(dataTransfer);
+        if (dragData?.dataType === 'application/x-moz-file' && Array.isArray(dragData.data)) {
+            return dragData.data as Array<{ path: string }>;
+        }
+    } catch (error) {
+        console.error('Error extracting dropped files:', error);
+    }
+    return [];
+};
+
+const DragDropWrapper: React.FC<DragDropWrapperProps> = ({
+    children,
+    overlayBorderRadius = 6
+}) => {
+    // Drag and drop states
+    const [objectIcon, setObjectIcon] = useState<string | null>(null);
+    const [isDragging, setIsDragging] = useState(false);
+    const [dragError, setDragError] = useState<string | null>(null);
+    const [dragCount, setDragCount] = useState<number>(0);
+    const [dragType, setDragType] = useState<'item' | 'annotation' | 'collection' | 'view' | 'file' | null>(null);
+    // The first dragged saved search or view, for the overlay's icon and name.
+    const [draggedView, setDraggedView] = useState<ViewAttachment | null>(null);
+    const dragErrorTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const addItemsToCurrentMessageItems = useSetAtom(addItemsToCurrentMessageItemsAtom);
+    const addItemToCurrentMessageItems = useSetAtom(addItemToCurrentMessageItemsAtom);
+    const attachExternalFiles = useAttachExternalFiles();
+    const importAction = useSetAtom(importActionAtom);
+    const stageActionPill = useSetAtom(stageActionPillAtom);
+    const addPopupMessage = useSetAtom(addPopupMessageAtom);
+    const searchableLibraryIds = useAtomValue(searchableLibraryIdsAtom);
+    const setCurrentMessageFilters = useSetAtom(currentMessageFiltersAtom);
+    const addViewsToCurrentMessage = useSetAtom(addViewsToCurrentMessageAtom);
+
+    const maxAddAttachmentToMessage = getPref('maxAddAttachmentToMessage') as number || 10;
+
+    /**
+     * Validate if a collection can be added as a filter
+     * @param collection The collection to validate
+     * @returns Object with valid status and optional error message
+     */
+    const validateCollection = (collection: Zotero.Collection): { valid: boolean; error?: string } => {
+        // Check if collection is deleted
+        if (collection.deleted) {
+            return { valid: false, error: "Collection is deleted" };
+        }
+        // Check if collection is in a searchable library
+        if (!searchableLibraryIds.includes(collection.libraryID)) {
+            return { valid: false, error: "Collection is not in a synced library" };
+        }
+        return { valid: true };
+    };
+
+    /**
+     * The dragged saved searches and views that can be attached, plus an
+     * error for the overlay when none can. Excluded libraries are left out.
+     */
+    const resolveDraggedViews = (dataTransfer: DataTransfer): { views: ViewAttachment[]; error?: string } => {
+        const dragged = getDraggedViews(dataTransfer);
+        const searchable = dragged.filter(view => searchableLibraryIds.includes(view.libraryId));
+        const views = searchable
+            .map(viewToAttachment)
+            .filter((view): view is ViewAttachment => view !== null);
+        if (views.length > 0) return { views };
+        if (dragged.length > 0 && searchable.length === 0) {
+            return { views, error: dragged[0].type === 'search'
+                ? 'Saved search is not in a synced library'
+                : 'View is not in a synced library' };
+        }
+        return { views, error: 'Saved search or view not supported' };
+    };
+
+    /** Show the overlay for a saved search or view drag, or an error when none can be added. */
+    const showViewDrag = (e: React.DragEvent<HTMLDivElement>) => {
+        const { views, error } = resolveDraggedViews(e.dataTransfer);
+        if (views.length > 0) {
+            setObjectIcon(null);
+            setIsDragging(true);
+            setDragType('view');
+            setDragCount(views.length);
+            setDraggedView(views[0]);
+        } else {
+            showErrorMessage(error ?? 'Saved search or view not supported');
+            e.dataTransfer.dropEffect = 'none';
+        }
+    };
+
+    // Show error message temporarily
+    const showErrorMessage = (message: string) => {
+        setDragError(message);
+        
+        // Clear any existing timeout
+        if (dragErrorTimeoutRef.current) {
+            clearTimeout(dragErrorTimeoutRef.current);
+        }
+        
+        // Clear error message after 1 second
+        dragErrorTimeoutRef.current = setTimeout(() => {
+            setDragError(null);
+            dragErrorTimeoutRef.current = null;
+        }, 1000);
+    };
+
+    const getObjectIcon = (annotationType: string) => {
+        switch (annotationType) {
+            case 'highlight':
+                return ZOTERO_ICONS.ANNOTATE_HIGHLIGHT;
+            case 'underline':
+                return ZOTERO_ICONS.ANNOTATE_UNDERLINE;
+            case 'note':
+                return ZOTERO_ICONS.ANNOTATION;
+            case 'text':
+                return ZOTERO_ICONS.ANNOTATE_TEXT;
+            case 'image':
+                return ZOTERO_ICONS.ANNOTATE_AREA;
+            default:
+                return ZOTERO_ICONS.ANNOTATION;
+        }
+    }
+
+    // Handle drag events
+    const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const itemCount = e.dataTransfer.types.includes('zotero/item')
+            ? e.dataTransfer.getData('zotero/item').split(',').length
+            : e.dataTransfer.types.includes('zotero/annotation')
+            ? JSON.parse(e.dataTransfer.getData('zotero/annotation')).length
+            : 0;
+
+        if (itemCount > maxAddAttachmentToMessage) {
+            e.dataTransfer.dropEffect = 'none';
+            if (isDragging) setIsDragging(false);
+            showErrorMessage(`You can add up to ${maxAddAttachmentToMessage} items at a time.`);
+            return;
+        }
+        
+        // Set appropriate drop effect
+        if (
+            e.dataTransfer.types.includes('zotero/annotation') ||
+            e.dataTransfer.types.includes('zotero/item') ||
+            e.dataTransfer.types.includes('zotero/collection') ||
+            isViewDrag(e.dataTransfer) ||
+            isFileDrag(e.dataTransfer)
+        ) {
+            e.dataTransfer.dropEffect = 'copy';
+        }
+            
+        // Handle Zotero annotations
+        if (e.dataTransfer.types.includes('zotero/annotation')) {
+            try {
+                const annotationData = JSON.parse(e.dataTransfer.getData('zotero/annotation'));
+                if (annotationData && annotationData.length > 0) {
+                    const annotationType = annotationData[0].type;
+                    if(isValidAnnotationType(annotationType)) {
+                        setObjectIcon(getObjectIcon(annotationType));
+                        setIsDragging(true);
+                        setDragType('annotation');
+                        setDragCount(annotationData.length);
+                    }
+                    else {
+                        setObjectIcon(ZOTERO_ICONS.ANNOTATION);
+                        setDragError("Annotation type not supported");
+                    }
+                }
+            } catch (error) {
+                console.error("Error parsing annotation data:", error);
+            }
+        }
+        
+        // Handle Zotero collections
+        else if (e.dataTransfer.types.includes('zotero/collection')) {
+            try {
+                const collectionData = e.dataTransfer.getData('zotero/collection');
+                if (collectionData) {
+                    const ids = collectionData.split(',').map(id => parseInt(id));
+                    const validCollections = ids
+                        .map(id => Zotero.Collections.get(id))
+                        .filter((collection): collection is Zotero.Collection => {
+                            if (!collection) return false;
+                            const validation = validateCollection(collection);
+                            return validation.valid;
+                        });
+                    
+                    if (validCollections.length > 0) {
+                        setObjectIcon(null); // We'll use CSSIcon for collections
+                        setIsDragging(true);
+                        setDragType('collection');
+                        setDragCount(validCollections.length);
+                    } else {
+                        // All collections are invalid
+                        const firstCollection = ids.length > 0 ? Zotero.Collections.get(ids[0]) : null;
+                        if (firstCollection) {
+                            const validation = validateCollection(firstCollection);
+                            showErrorMessage(validation.error || "Collection not supported");
+                        } else {
+                            showErrorMessage("Collection not found");
+                        }
+                        e.dataTransfer.dropEffect = 'none';
+                    }
+                }
+            } catch (error) {
+                console.error("Error handling collection data:", error);
+            }
+        }
+        
+        // Handle saved searches and built-in views (Unfiled Items, …)
+        else if (isViewDrag(e.dataTransfer)) {
+            showViewDrag(e);
+        }
+
+        // Handle Zotero items
+        else if (e.dataTransfer.types.includes('zotero/item')) {
+            try {
+                const itemIDs = e.dataTransfer.getData('zotero/item');
+                if (itemIDs) {
+                    const ids = itemIDs.split(',').map(id => parseInt(id));
+                    setDragCount(ids.length);
+                    
+                    // Set icon based on first item
+                    if (ids.length > 0) {
+                        const item = Zotero.Items.get(ids[0]);
+                        if (item) {
+                            const iconName = item.getItemTypeIconName();
+                            setObjectIcon(iconName || ZOTERO_ICONS.ATTACHMENTS);
+                            setIsDragging(true);
+                            setDragType('item');
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error("Error handling item data:", error);
+            }
+        }
+
+        // Handle OS file drags (files from disk become external file attachments)
+        else if (isFileDrag(e.dataTransfer)) {
+            setObjectIcon(ZOTERO_ICONS.ATTACHMENTS);
+            setIsDragging(true);
+            setDragType('file');
+            setDragCount((e.dataTransfer as any).mozItemCount || 1);
+        }
+    };
+
+    const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const itemCount = e.dataTransfer.types.includes('zotero/item')
+            ? e.dataTransfer.getData('zotero/item').split(',').length
+            : e.dataTransfer.types.includes('zotero/annotation')
+            ? JSON.parse(e.dataTransfer.getData('zotero/annotation')).length
+            : 0;
+        
+        if (itemCount > maxAddAttachmentToMessage) {
+            e.dataTransfer.dropEffect = 'none';
+            if (isDragging) setIsDragging(false);
+            showErrorMessage(`You can add up to ${maxAddAttachmentToMessage} items at a time.`);
+            return;
+        }
+        
+        // Handle Zotero annotations
+        if (e.dataTransfer.types.includes('zotero/annotation')) {
+            try {
+                const annotationData = JSON.parse(e.dataTransfer.getData('zotero/annotation'));
+                if (annotationData && annotationData.length > 0) {
+                    const annotationType = annotationData[0].type;
+                    if(isValidAnnotationType(annotationType)) {
+                        setObjectIcon(getObjectIcon(annotationType));
+                        setIsDragging(true);
+                        setDragType('annotation');
+                        setDragCount(annotationData.length);
+                    }
+                    else {
+                        setObjectIcon(ZOTERO_ICONS.ANNOTATION);
+                        setDragError("Annotation type not supported");
+                    }
+                }
+            } catch (error) {
+                console.error("Error parsing annotation data:", error);
+            }
+        }
+        
+        // Handle Zotero collections
+        else if (e.dataTransfer.types.includes('zotero/collection')) {
+            try {
+                const collectionData = e.dataTransfer.getData('zotero/collection');
+                if (collectionData) {
+                    const ids = collectionData.split(',').map(id => parseInt(id));
+                    const validCollections = ids
+                        .map(id => Zotero.Collections.get(id))
+                        .filter((collection): collection is Zotero.Collection => {
+                            if (!collection) return false;
+                            const validation = validateCollection(collection);
+                            return validation.valid;
+                        });
+                    
+                    if (validCollections.length > 0) {
+                        setObjectIcon(null);
+                        setIsDragging(true);
+                        setDragType('collection');
+                        setDragCount(validCollections.length);
+                    } else {
+                        const firstCollection = ids.length > 0 ? Zotero.Collections.get(ids[0]) : null;
+                        if (firstCollection) {
+                            const validation = validateCollection(firstCollection);
+                            showErrorMessage(validation.error || "Collection not supported");
+                        } else {
+                            showErrorMessage("Collection not found");
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error("Error handling collection data:", error);
+            }
+        }
+        
+        // Handle saved searches and built-in views (Unfiled Items, …)
+        else if (isViewDrag(e.dataTransfer)) {
+            showViewDrag(e);
+        }
+
+        // Handle Zotero items
+        else if (e.dataTransfer.types.includes('zotero/item')) {
+            try {
+                const itemIDs = e.dataTransfer.getData('zotero/item');
+                if (itemIDs) {
+                    const ids = itemIDs.split(',').map(id => parseInt(id));
+                    setDragCount(ids.length);
+                    
+                    // Set icon based on first item
+                    if (ids.length > 0) {
+                        const item = Zotero.Items.get(ids[0]);
+                        if (item) {
+                            const iconName = item.getItemTypeIconName();
+                            setObjectIcon(iconName || ZOTERO_ICONS.ATTACHMENTS);
+                            setIsDragging(true);
+                            setDragType('item');
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error("Error handling item data:", error);
+            }
+        }
+
+        // Handle OS file drags (files from disk become external file attachments)
+        else if (isFileDrag(e.dataTransfer)) {
+            setObjectIcon(ZOTERO_ICONS.ATTACHMENTS);
+            setIsDragging(true);
+            setDragType('file');
+            setDragCount((e.dataTransfer as any).mozItemCount || 1);
+        }
+    };
+
+    const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        // Check if the drag is leaving the entire container
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setIsDragging(false);
+            setObjectIcon(null);
+            setDragError(null);
+            setDragType(null);
+            setDragCount(0);
+            setDraggedView(null);
+        }
+    };
+
+    /**
+     * Import dropped `.astermarginaction` files. Each is read, parsed, and added
+     * (resolving id/command conflicts); its /command is also staged as a pill in
+     * the chat input (in the window the file was dropped on) so the action is
+     * ready to run, and a popup confirms the action and links to its settings.
+     */
+    const importActionFiles = async (paths: string[], targetWindow?: Window) => {
+        for (const path of paths) {
+            const result = await readActionFile(path);
+            if (!result.ok) {
+                addPopupMessage({ type: 'error', title: 'Import failed', text: result.error, expire: true });
+                continue;
+            }
+            const { action, command, commandRenamed } = importAction(result.action);
+            // Stage the imported action's /command pill in the input area
+            stageActionPill({
+                actionId: action.id,
+                fallbackTitle: action.title,
+                targetWindow,
+            });
+            const renamedNote = commandRenamed
+                ? ` The /${getActionCommand(result.action)} command was taken, so it was added as /${command}.`
+                : '';
+            addPopupMessage({
+                type: 'info',
+                title: 'Action added',
+                text: `"${action.title}" was added to your message. Type /${command} to use it again.${renamedNote}`,
+                expire: false,
+                button: {
+                    text: 'Open in settings',
+                    icon: SettingsIcon,
+                    onClick: () => getHost().navigation?.openActionSettings?.(action.id),
+                },
+            });
+        }
+    };
+
+    const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+        setObjectIcon(null);
+        setDragError(null);
+        setDragType(null);
+        setDragCount(0);
+        setDraggedView(null);
+
+        // Do not proceed if the number of items is too large
+        const itemCount = e.dataTransfer.types.includes('zotero/item')
+            ? e.dataTransfer.getData('zotero/item').split(',').length
+            : e.dataTransfer.types.includes('zotero/annotation')
+            ? JSON.parse(e.dataTransfer.getData('zotero/annotation')).length
+            : 0;
+
+        if (itemCount > maxAddAttachmentToMessage) {
+            showErrorMessage(`You can add up to ${maxAddAttachmentToMessage} items at a time.`);
+            return;
+        }
+
+        // Handle Zotero items
+        if (e.dataTransfer.types.includes('zotero/item')) {
+            const itemIDs = e.dataTransfer.getData('zotero/item');
+            if (itemIDs) {
+                // Convert comma-separated IDs to an array of integers
+                const ids = itemIDs.split(',').map(id => parseInt(id));
+                const items = await Zotero.Items.getAsync(ids);
+                
+                // Add items to current message items
+                await addItemsToCurrentMessageItems(items);
+            }
+            return;
+        }
+
+        // Handle Zotero collections
+        if (e.dataTransfer.types.includes('zotero/collection')) {
+            const collectionData = e.dataTransfer.getData('zotero/collection');
+            if (collectionData) {
+                const ids = collectionData.split(',').map(id => parseInt(id));
+                const validCollections = ids
+                    .map(id => Zotero.Collections.get(id))
+                    .filter((collection): collection is Zotero.Collection => {
+                        if (!collection) return false;
+                        const validation = validateCollection(collection);
+                        return validation.valid;
+                    });
+                
+                if (validCollections.length === 0) {
+                    showErrorMessage("No valid collections to add");
+                    return;
+                }
+                
+                // Add valid collection IDs to the message filters
+                // Following the same pattern as AddSourcesMenu.handleSelectCollection
+                const validCollectionIds = validCollections.map(c => c.id);
+                setCurrentMessageFilters((prev) => ({
+                    ...prev,
+                    libraryIds: [],
+                    collectionIds: [...new Set([...prev.collectionIds, ...validCollectionIds])],
+                    tagSelections: []
+                }));
+            }
+            return;
+        }
+
+        // Handle saved searches and built-in views: attached to the message
+        // like a collection picked for an action, so the request is scoped to
+        // the items they match.
+        if (isViewDrag(e.dataTransfer)) {
+            const { views, error } = resolveDraggedViews(e.dataTransfer);
+            if (views.length === 0) {
+                showErrorMessage(error ?? 'Saved search or view not supported');
+                return;
+            }
+            addViewsToCurrentMessage(views);
+            return;
+        }
+
+        // Handle Zotero annotations
+        if (e.dataTransfer.types.includes("zotero/annotation")) {
+            const annotationData = JSON.parse(e.dataTransfer.getData('zotero/annotation'));
+            for (const data of annotationData) {
+                const attachment = Zotero.Items.get(data.attachmentItemID);
+                const item = await Zotero.Items.getByLibraryAndKeyAsync(attachment.libraryID, data.id);
+                // Skip if item is not an annotation or has an invalid annotation type
+                if(!item || !item.isAnnotation() || !isValidAnnotationType(item.annotationType)) return;
+                // Add the annotation to the current message items
+                await addItemToCurrentMessageItems(item);
+            }
+            return;
+        }
+        
+        // Handle OS file drops (files from disk become external file attachments)
+        if (isFileDrag(e.dataTransfer)) {
+            const files = getDroppedFiles(e.dataTransfer);
+            if (files.length === 0) {
+                showErrorMessage('No files found in drop');
+                return;
+            }
+
+            // Shareable action files (.astermarginaction) are imported as actions,
+            // not attached as message files. Any other dropped files continue
+            // through the external-file attach path below.
+            const actionFiles = files.filter(f => isActionFilePath(f.path));
+            const otherFiles = files.filter(f => !isActionFilePath(f.path));
+            if (actionFiles.length > 0) {
+                const targetWindow = e.currentTarget.ownerDocument.defaultView ?? undefined;
+                await importActionFiles(actionFiles.map(f => f.path), targetWindow);
+            }
+            if (otherFiles.length === 0) {
+                return;
+            }
+
+            // Rejections go to the drag overlay rather than a popup.
+            await attachExternalFiles(otherFiles, { onReject: showErrorMessage });
+            return;
+        }
+    };
+
+    return (
+        <div
+            onDragOver={handleDragOver}
+            onDragEnter={handleDragEnter}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className="relative"
+            style={{ width: '100%' }}
+        >
+            {/* Drag overlay - always render but control visibility with opacity/transform */}
+            <div
+                className="absolute inset-0 display-flex items-center justify-center z-10 bg-overlay border-popup"
+                style={{ 
+                    opacity: isDragging ? 0.8 : 0, 
+                    borderRadius: overlayBorderRadius,
+                    transition: 'opacity 0.3s ease',
+                    pointerEvents: isDragging ? 'auto' : 'none',
+                    visibility: isDragging ? 'visible' : 'hidden'
+                }}
+            >
+                <div className="display-flex flex-row items-start p-4 gap-4 ml-3">
+                    {dragType === 'item' && objectIcon ? (
+                        <div className="scale-12 mb-2">
+                            <CSSItemTypeIcon itemType={objectIcon} />
+                        </div>
+                    ) : dragType === 'collection' ? (
+                        <div className="scale-12 mb-2">
+                            <CSSIcon name="collection" className="icon-16" />
+                        </div>
+                    ) : dragType === 'view' && draggedView ? (
+                        <div className="scale-12 mb-2">
+                            <CSSIcon name={viewChipDisplay(draggedView).iconName} className="icon-16" />
+                        </div>
+                    ) : (
+                        <div>
+                            <ZoteroIcon 
+                                icon={objectIcon || ZOTERO_ICONS.ATTACHMENTS} 
+                                size={20}
+                                color="--fill-primary"
+                            />
+                        </div>
+                    )}
+                    <div className="text-lg">
+                        {dragType === 'annotation'
+                            ? `Drop here to add ${dragCount} annotation${dragCount !== 1 ? 's' : ''}`
+                            : dragType === 'collection'
+                            ? `Drop here to filter by ${dragCount} collection${dragCount !== 1 ? 's' : ''}`
+                            : dragType === 'view'
+                            ? (dragCount === 1 && draggedView
+                                ? `Drop here to add ${draggedView.name}`
+                                : `Drop here to add ${dragCount} saved searches`)
+                            : dragType === 'file'
+                            ? `Drop here to add ${dragCount} file${dragCount !== 1 ? 's' : ''}`
+                            : `Drop here to add ${dragCount} item${dragCount !== 1 ? 's' : ''}`}
+                    </div>
+                </div>
+            </div>
+
+            {/* Error message - also always render but control visibility */}
+            <div
+                className="absolute inset-0 display-flex items-center justify-center z-10"
+                style={{ 
+                    background: 'var(--color-background)', 
+                    opacity: dragError ? 0.6 : 0, 
+                    borderRadius: overlayBorderRadius,
+                    transition: 'opacity 0.3s ease',
+                    pointerEvents: dragError ? 'auto' : 'none',
+                    visibility: dragError ? 'visible' : 'hidden'
+                }}
+            >
+                <div className="text-center p-4 font-color-red">
+                    <div className="font-medium">{dragError || ''}</div>
+                </div>
+            </div>
+
+            {children}
+        </div>
+    );
+};
+
+export default DragDropWrapper;

@@ -1,0 +1,278 @@
+import { assertLibraryWritable, recheckCollection, recheckCollectionForUndo, recheckExistingCollections } from '../../../src/services/collections/collectionMutations';
+import { collectionToReference } from '../../../react/utils/zoteroReferences';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resolveCollection, resolveCollectionList, serializeCollectionAncestors, serializeCollectionIdentity, serializeCollectionReadIdentity, CollectionResolutionError, collectionLibrariesMismatchError } from '../../../src/services/collections/collectionIdentity';
+
+const personal = { id: 10, key: 'ABCD2345', libraryID: 1, name: 'Research' };
+const group = { id: 20, key: 'ABCD2345', libraryID: 7, name: 'Research' };
+let collections: any[];
+let zotero: any;
+let previous: any;
+
+beforeEach(() => {
+    previous = (globalThis as any).Zotero;
+    collections = [{ ...personal }, { ...group }];
+    zotero = {
+        AsterMargin: { libraryScopeInitialized: true, searchableLibraryIds: [1, 7] },
+        Libraries: { userLibraryID: 1, getAll: () => [{ libraryID: 1 }, { libraryID: 7 }] },
+        Groups: {
+            getLibraryIDFromGroupID: (id: number) => id === 12345 ? 7 : false,
+            getGroupIDFromLibraryID: (id: number) => id === 7 ? 12345 : false,
+        },
+        Collections: {
+            get: vi.fn((id: number) => collections.find(c => c.id === id) ?? false),
+            getByLibraryAndKey: vi.fn((id: number, key: string) => collections.find(c => c.libraryID === id && c.key === key) ?? false),
+            getByLibrary: vi.fn((id: number) => collections.filter(c => c.libraryID === id)),
+        },
+    };
+    (globalThis as any).Zotero = zotero;
+});
+afterEach(() => { (globalThis as any).Zotero = previous; });
+
+function expectCode(run: () => unknown, code: string) {
+    expect(run).toThrow(expect.objectContaining({ code }));
+}
+
+describe('collection identity', () => {
+    it.each(['u-ABCD2345', '1-ABCD2345', '1_ABCD2345', 10, '10'])('resolves exact and legacy reference %s', input => {
+        expect(resolveCollection(input)).toMatchObject({ collectionId: 'u-ABCD2345', libraryRef: 'u', libraryID: 1, key: 'ABCD2345' });
+    });
+    it('does not mistake an all-digit bare key for a local numeric ID', () => {
+        collections[0].key = '23456789';
+        expect(resolveCollection('23456789').collection.id).toBe(10);
+        collections[1].key = '23456789';
+        expectCode(() => resolveCollection('23456789'), 'ambiguous_collection');
+    });
+    it('uses the device group mapping and ignores a default library for qualified identity', () => {
+        expect(resolveCollection('g12345-ABCD2345', {})).toMatchObject({ collectionId: 'g12345-ABCD2345', libraryID: 7 });
+    });
+    it.each(['ABCD2345', 'Research', 'research'])('requires disambiguation for unscoped %s', input => {
+        expectCode(() => resolveCollection(input), 'ambiguous_collection');
+        expect(() => resolveCollection(input)).toThrow(/u-ABCD2345.*g12345-ABCD2345/);
+        expect(resolveCollection(input, { libraryID: 7 }).libraryID).toBe(7);
+    });
+    it('does not use a default library to guess a colliding reference', () => {
+        expectCode(() => resolveCollection('ABCD2345', {}), 'ambiguous_collection');
+    });
+    it('keeps qualified IDs terminal even when a collection has that name', () => {
+        collections.push({ id: 30, key: 'ZZZZ2345', libraryID: 1, name: 'u-MISS2345' });
+        expectCode(() => resolveCollection('u-MISS2345'), 'collection_not_found');
+        expectCode(() => resolveCollection('g99999-ABCD2345'), 'library_unavailable');
+    });
+    it('never falls back out of an explicit library', () => {
+        collections[1].key = 'GROUP234';
+        expectCode(() => resolveCollection('GROUP234', { libraryID: 1 }), 'collection_not_found');
+        expectCode(() => resolveCollection('g12345-GROUP234', { libraryID: 1 }), 'library_collection_mismatch');
+        expectCode(() => resolveCollection(20, { libraryID: 1 }), 'library_collection_mismatch');
+    });
+    it('limits ambiguous candidates and paths to the allowed scope', () => {
+        collections.push({ id: 30, key: 'CHILD234', libraryID: 1, name: 'Research', parentID: 10, parentKey: personal.key });
+        expect(() => resolveCollection('Research', { libraryIds: [1] })).toThrow(/Research \/ Research/);
+        try { resolveCollection('Research', { libraryIds: [1] }); } catch (error) {
+            expect(String(error)).not.toContain('g12345');
+        }
+    });
+    it('does not look up excluded libraries or reveal their collection names', () => {
+        zotero.AsterMargin.searchableLibraryIds = [1];
+        collections[1].name = 'Secret';
+        expectCode(() => resolveCollection('g12345-ABCD2345'), 'library_not_searchable');
+        expect(zotero.Collections.getByLibraryAndKey).not.toHaveBeenCalled();
+        expect(resolveCollection('ABCD2345').libraryID).toBe(1);
+        expectCode(() => resolveCollection('Secret'), 'collection_not_found');
+        expect(zotero.Collections.getByLibrary).not.toHaveBeenCalledWith(7, true);
+    });
+    it('supports local-only history labels in excluded libraries', () => {
+        zotero.AsterMargin.searchableLibraryIds = [];
+        expect(resolveCollection('g12345-ABCD2345', { access: 'local' }).libraryID).toBe(7);
+    });
+    it('fails closed for empty scope and an unready access snapshot', () => {
+        expect(resolveCollectionList(['ABCD2345', 10], { libraryIds: [] }).collections).toEqual([]);
+        zotero.AsterMargin.libraryScopeInitialized = false;
+        expect(resolveCollectionList(['u-ABCD2345', 'Research']).collections).toEqual([]);
+        expect(zotero.Collections.getByLibraryAndKey).not.toHaveBeenCalled();
+        expect(zotero.Collections.getByLibrary).not.toHaveBeenCalled();
+    });
+    it('excludes trashed collections from exact and loose lookup', () => {
+        collections[0].deleted = true;
+        expectCode(() => resolveCollection('u-ABCD2345'), 'collection_not_found');
+        expectCode(() => resolveCollection(10), 'collection_not_found');
+        expect(resolveCollection('Research').libraryID).toBe(7);
+    });
+    it('deduplicates full identities, retaining distinct same-key collections', () => {
+        const result = resolveCollectionList(['u-ABCD2345', '1-ABCD2345', 'g12345-ABCD2345', 'Missing']);
+        expect(result.collections.map(c => c.collectionId)).toEqual(['u-ABCD2345', 'g12345-ABCD2345']);
+        expect(result.failures.map(f => f.input)).toEqual(['Missing']);
+    });
+    it('serializes parent identity and refuses missing portable mapping', () => {
+        expect(serializeCollectionIdentity({ ...group, parentKey: 'PARENT23' } as any)).toEqual({
+            collection_id: 'g12345-ABCD2345', library_ref: 'g12345', name: 'Research', parent_collection_id: 'g12345-PARENT23',
+        });
+        zotero.Groups.getGroupIDFromLibraryID = () => false;
+        expectCode(() => resolveCollection('7-ABCD2345'), 'library_unavailable');
+    });
+});
+
+describe('collection ancestor chains', () => {
+    const chain = (libraryID = 1) => {
+        collections = [
+            { id: 1, key: 'TOPLEVEL', libraryID, name: 'PhD' },
+            { id: 2, key: 'MIDDLE23', libraryID, name: 'Papers', parentKey: 'TOPLEVEL' },
+            { id: 3, key: 'PARENT23', libraryID, name: 'Imaging', parentKey: 'MIDDLE23' },
+            { id: 4, key: 'LEAFEEG2', libraryID, name: 'EEG', parentKey: 'PARENT23' },
+        ];
+        return collections[3];
+    };
+    it('lists ancestors top-level first and excludes the collection itself', () => {
+        expect(serializeCollectionAncestors(chain())).toEqual([
+            { collection_key: 'TOPLEVEL', collection_id: 'u-TOPLEVEL', name: 'PhD' },
+            { collection_key: 'MIDDLE23', collection_id: 'u-MIDDLE23', name: 'Papers' },
+            { collection_key: 'PARENT23', collection_id: 'u-PARENT23', name: 'Imaging' },
+        ]);
+        expect(serializeCollectionAncestors(chain(7))?.map(a => a.collection_id))
+            .toEqual(['g12345-TOPLEVEL', 'g12345-MIDDLE23', 'g12345-PARENT23']);
+    });
+    it('returns nothing for a top-level collection', () => {
+        chain();
+        expect(serializeCollectionAncestors(collections[0])).toBeUndefined();
+    });
+    it('returns nothing when an ancestor is missing', () => {
+        const leaf = chain();
+        collections.splice(1, 1);
+        expect(serializeCollectionAncestors(leaf)).toBeUndefined();
+    });
+    it('returns nothing when an ancestor is in the trash', () => {
+        const leaf = chain();
+        collections[0].deleted = true;
+        expect(serializeCollectionAncestors(leaf)).toBeUndefined();
+    });
+    it('returns nothing for a parent cycle', () => {
+        const leaf = chain();
+        collections[0].parentKey = 'PARENT23';
+        expect(serializeCollectionAncestors(leaf)).toBeUndefined();
+        collections[0].parentKey = 'LEAFEEG2';
+        expect(serializeCollectionAncestors(leaf)).toBeUndefined();
+    });
+    it('returns nothing beyond the depth cap', () => {
+        collections = Array.from({ length: 70 }, (_, i) => ({
+            id: i + 1, key: `DEEP${String(i).padStart(4, '0')}`, libraryID: 1, name: `Level ${i}`,
+            ...(i ? { parentKey: `DEEP${String(i - 1).padStart(4, '0')}` } : {}),
+        }));
+        expect(serializeCollectionAncestors(collections[69])).toBeUndefined();
+        expect(serializeCollectionAncestors(collections[64])).toHaveLength(64);
+    });
+    it('omits portable IDs for an unmapped group library without inventing one', () => {
+        zotero.Groups.getGroupIDFromLibraryID = () => false;
+        expect(serializeCollectionAncestors(chain(7))).toEqual([
+            { collection_key: 'TOPLEVEL', name: 'PhD' },
+            { collection_key: 'MIDDLE23', name: 'Papers' },
+            { collection_key: 'PARENT23', name: 'Imaging' },
+        ]);
+    });
+});
+
+describe('model-facing recovery guidance', () => {
+    it('identifies explicit conflicts and tells the caller how to preserve identity', () => {
+        expectCode(() => resolveCollection('g12345-ABCD2345', { libraryID: 1 }), 'library_collection_mismatch');
+        try { resolveCollection('g12345-ABCD2345', { libraryID: 1 }); }
+        catch (error: any) {
+            expect(error.message).toContain('g12345-ABCD2345');
+            expect(error.message).toContain('requested library "u"');
+            expect(error.message).toContain('from library "g12345"');
+            expect(error.message).toContain('list_collections');
+            expect(error.message).toContain('do not strip');
+        }
+    });
+    it('names the unavailable reference and gives a recovery path', () => {
+        expect(() => resolveCollection('g99999-ABCD2345')).toThrow(/g99999-ABCD2345.*list_libraries.*user.*same qualified ID/);
+    });
+    it('distinguishes loading access from an explicitly empty scope', () => {
+        expect(() => resolveCollection('Research', { libraryIds: [] })).toThrow(/Research.*scope.*list_libraries/);
+        zotero.AsterMargin.libraryScopeInitialized = false;
+        expect(() => resolveCollection('Research')).toThrow(/Research.*still loading.*Retry/);
+    });
+    it('offers scope recovery without disclosing excluded collection or library names', () => {
+        zotero.AsterMargin.searchableLibraryIds = [1];
+        collections[1].name = 'Private research';
+        const result = resolveCollectionList(['g12345-ABCD2345']);
+        const message = result.failures[0].error.message;
+        expect(message).toContain('g12345-ABCD2345');
+        expect(message).toContain('list_libraries');
+        expect(message).toContain('Library Access');
+        expect(message).not.toContain('Private research');
+        expect(zotero.Collections.getByLibraryAndKey).not.toHaveBeenCalled();
+        try { resolveCollection(20, { libraryID: 1 }); } catch (error: any) {
+            expect(error.message).not.toContain('g12345');
+            expect(error.message).not.toContain('Private research');
+        }
+    });
+    it.each(['7-MISSING1', '7_MISSING1'])('quotes a numeric reference %s in the portable grammar', input => {
+        expect(() => resolveCollection(input)).toThrow(/"g12345-MISSING1"/);
+        expect(() => resolveCollection(input)).not.toThrow(/7[-_]MISSING1/);
+        expect(() => resolveCollection('1-MISSING1')).toThrow(/"u-MISSING1"/);
+        expect(() => resolveCollection(input, { libraryID: 1 })).toThrow(/"g12345-MISSING1" from library "g12345"/);
+    });
+    it('keeps a numeric reference into an excluded library numeric', () => {
+        zotero.AsterMargin.searchableLibraryIds = [1];
+        expectCode(() => resolveCollection('7-ABCD2345'), 'library_not_searchable');
+        expect(() => resolveCollection('7-ABCD2345')).toThrow(/"7-ABCD2345"/);
+        expect(() => resolveCollection('7-ABCD2345')).not.toThrow(/g12345/);
+    });
+    it('lists permitted identities and gives operation-specific single-library guidance', () => {
+        const targets = resolveCollectionList(['u-ABCD2345', 'g12345-ABCD2345']).collections;
+        for (const operation of ['search', 'note'] as const) {
+            const message = collectionLibrariesMismatchError(targets, operation).message;
+            expect(message).toContain('u-ABCD2345 (library u)');
+            expect(message).toContain('g12345-ABCD2345 (library g12345)');
+            expect(message).toContain(operation === 'search' ? 'separate requests' : 'A single note');
+        }
+    });
+});
+
+it('keeps read references usable without inventing portable identity for an unmapped library', () => {
+    zotero.Groups.getGroupIDFromLibraryID = () => false;
+    const value = { ...group, parentKey: 'PARENT23' } as any;
+    expect(serializeCollectionReadIdentity(value)).toEqual({ name: 'Research' });
+    expect(collectionToReference(value)).toMatchObject({ library_id: 7, zotero_key: 'ABCD2345', name: 'Research' });
+    expect(collectionToReference(value)).not.toHaveProperty('collection_id');
+    expect(() => serializeCollectionIdentity(value)).toThrow(expect.objectContaining({ code: 'library_unavailable' }));
+});
+
+it('reports a read-only library as a typed collection resolution failure', () => {
+    zotero.Libraries.get = () => ({ editable: false });
+    expect(() => assertLibraryWritable(7)).toThrow(CollectionResolutionError);
+    expect(() => assertLibraryWritable(7)).toThrow(expect.objectContaining({ code: 'library_not_editable' }));
+});
+
+describe('recheck of recorded mutation targets', () => {
+    beforeEach(() => { zotero.Libraries.get = (id: number) => ({ libraryID: id, editable: true }); });
+
+    it('quotes the reference the caller supplied, not the one it was qualified with', () => {
+        // The library prefix is added internally so a bare key resolves exactly.
+        // Echoing it back makes a missing collection look like a prefix mistake,
+        // and models then "fix" the prefix instead of rediscovering the key.
+        expect(() => recheckCollection('MISSING1', 1)).toThrow(/"MISSING1"/);
+        expect(() => recheckCollection('MISSING1', 1)).not.toThrow(/1-MISSING1/);
+    });
+
+    it('drops a remove target that no longer exists and keeps access failures typed', () => {
+        expect(recheckExistingCollections(['MISSING1', 'ABCD2345'], 1).map(entry => entry.key)).toEqual(['ABCD2345']);
+        zotero.Libraries.get = () => ({ editable: false });
+        expectCode(() => recheckExistingCollections(['ABCD2345'], 1), 'library_not_editable');
+    });
+
+    it('resolves a trashed collection for undo and reports an erased one as nothing to restore', () => {
+        collections[0].deleted = true;
+        expect(recheckCollectionForUndo('ABCD2345', 1)).toMatchObject({ key: 'ABCD2345' });
+        expectCode(() => recheckCollection('ABCD2345', 1), 'collection_not_found');
+        expect(recheckCollectionForUndo('MISSING1', 1)).toBeNull();
+    });
+
+    it('reports an unmapped library as unavailable rather than as a missing collection', () => {
+        // A resolved collection carries a portable ID, so an unmapped library is
+        // an availability problem; undo must not mistake it for "already gone"
+        // and silently skip a membership it could still restore later.
+        zotero.Groups.getGroupIDFromLibraryID = () => false;
+        expectCode(() => recheckCollection('ABCD2345', 7), 'library_unavailable');
+        expectCode(() => recheckCollectionForUndo('ABCD2345', 7), 'library_unavailable');
+    });
+});

@@ -1,0 +1,535 @@
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { createOpenAiClient } from '@astermargin/agent-local/llm/openAiClient';
+import { LlmRequestError } from '@astermargin/agent-local/llm/types';
+import { ZOTERO_SEARCH_TOOL } from '@astermargin/agent-local/tools/toolSchemas';
+
+const model = {
+    name: 'GPT',
+    snapshot: 'gpt-4.1',
+    api_key: 'sk-test',
+    api_base: 'https://api.openai.com/v1',
+    format: 'openai' as const,
+};
+
+const sseResponse = (...frames: string[]) => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    body: {
+        getReader: () => {
+            const encoder = new TextEncoder();
+            let i = 0;
+            return {
+                read: async () =>
+                    i < frames.length
+                        ? { done: false, value: encoder.encode(frames[i++]) }
+                        : { done: true, value: undefined },
+                cancel: async () => {},
+                releaseLock: () => {},
+            };
+        },
+    },
+    text: async () => '',
+    json: async () => ({}),
+});
+
+const errorResponse = (status: number, statusText: string, body: string) => ({
+    ok: false,
+    status,
+    statusText,
+    body: null,
+    text: async () => body,
+    json: async () => ({}),
+});
+
+const handlers = () => ({ onTextDelta: vi.fn(), onThinkingDelta: vi.fn() });
+const signal = () => new AbortController().signal;
+const turn = (overrides = {}) => ({
+    model,
+    messages: [{ role: 'user' as const, content: 'hi' }],
+    tools: [],
+    ...overrides,
+});
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe('createOpenAiClient', () => {
+    it('streams cumulative text rather than deltas', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"content":"Rea"}}]}\n\n',
+                    'data: {"choices":[{"delta":{"content":"dy."}}]}\n\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const h = handlers();
+        const result = await createOpenAiClient().streamTurn(turn(), h, signal());
+        expect(h.onTextDelta.mock.calls.map(([t]) => t)).toEqual(['Rea', 'Ready.']);
+        expect(result.text).toBe('Ready.');
+        expect(result.finishReason).toBe('stop');
+    });
+
+    it('reassembles tool arguments streamed across frames', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"zotero_search","arguments":"{\\"que"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ry\\":\\"x\\"}"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(
+            turn({ tools: [ZOTERO_SEARCH_TOOL] }),
+            handlers(),
+            signal()
+        );
+        expect(result.finishReason).toBe('tool_calls');
+        expect(result.toolCalls).toHaveLength(1);
+        expect(result.toolCalls[0]).toMatchObject({
+            id: 'c1',
+            name: 'zotero_search',
+            args: { query: 'x' },
+            parseError: null,
+        });
+    });
+
+    it('sends tools in the OpenAI function envelope', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(
+            turn({ tools: [ZOTERO_SEARCH_TOOL] }),
+            handlers(),
+            signal()
+        );
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe('https://api.openai.com/v1/chat/completions');
+        expect(init.headers.Authorization).toBe('Bearer sk-test');
+        const sent = JSON.parse(init.body);
+        expect(sent.stream).toBe(true);
+        expect(sent.model).toBe('gpt-4.1');
+        expect(sent.tools[0]).toEqual({
+            type: 'function',
+            function: {
+                name: ZOTERO_SEARCH_TOOL.name,
+                description: ZOTERO_SEARCH_TOOL.description,
+                parameters: ZOTERO_SEARCH_TOOL.parameters,
+            },
+        });
+    });
+
+    it('sends tool_choice none when the turn forbids tool calls', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(turn({ tools: [ZOTERO_SEARCH_TOOL], toolChoice: 'none' }), handlers(), signal());
+        await createOpenAiClient().streamTurn(turn({ tools: [ZOTERO_SEARCH_TOOL] }), handlers(), signal());
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body).tool_choice).toBe('none');
+        expect(JSON.parse(fetchMock.mock.calls[1][1].body).tool_choice).toBeUndefined();
+    });
+
+    it('sends no Authorization header when the model has no API key', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(
+            turn({ model: { ...model, api_key: '', api_base: 'http://localhost:11434/v1' } }),
+            handlers(),
+            signal()
+        );
+        expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty('Authorization');
+    });
+
+    it('omits the tools field entirely when there are none', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty('tools');
+    });
+
+    it('classifies a 401 as an auth error', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                errorResponse(401, 'Unauthorized', '{"error":{"message":"bad key"}}')
+            )
+        );
+        await expect(
+            createOpenAiClient().streamTurn(turn(), handlers(), signal())
+        ).rejects.toMatchObject({ kind: 'auth' });
+    });
+
+    it('classifies a 404 as a not_found error', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                errorResponse(404, 'Not Found', '{"error":{"message":"model not found"}}')
+            )
+        );
+        await expect(
+            createOpenAiClient().streamTurn(turn(), handlers(), signal())
+        ).rejects.toMatchObject({ kind: 'not_found' });
+    });
+
+    it('classifies a 429 as a rate limit and surfaces the provider message', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                errorResponse(429, 'Too Many Requests', '{"error":{"message":"slow down"}}')
+            )
+        );
+        const failure = await createOpenAiClient()
+            .streamTurn(turn(), handlers(), signal())
+            .catch((e) => e);
+        expect(failure).toBeInstanceOf(LlmRequestError);
+        expect(failure.kind).toBe('rate_limit');
+        expect(failure.message).toContain('slow down');
+    });
+
+    it('classifies a thrown fetch as a network error', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('connection refused')));
+        await expect(
+            createOpenAiClient().streamTurn(turn(), handlers(), signal())
+        ).rejects.toMatchObject({ kind: 'network' });
+    });
+
+    it('joins the endpoint path without doubling a trailing slash', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(
+            turn({ model: { ...model, api_base: 'https://api.openai.com/v1/' } }),
+            handlers(),
+            signal()
+        );
+        expect(fetchMock.mock.calls[0][0]).toBe('https://api.openai.com/v1/chat/completions');
+    });
+
+    it('serialises assistant tool calls and tool results back into the transcript', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(
+            turn({
+                messages: [
+                    { role: 'user', content: 'hi' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [
+                            {
+                                id: 'c1',
+                                name: 'zotero_search',
+                                args: { query: 'x' },
+                                rawArgs: '{"query":"x"}',
+                                parseError: null,
+                            },
+                        ],
+                    },
+                    { role: 'tool', content: '{"results":[]}', toolCallId: 'c1' },
+                ],
+            }),
+            handlers(),
+            signal()
+        );
+        const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+        expect(sent.messages[1]).toEqual({
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+                {
+                    id: 'c1',
+                    type: 'function',
+                    function: { name: 'zotero_search', arguments: '{"query":"x"}' },
+                },
+            ],
+        });
+        expect(sent.messages[2]).toEqual({
+            role: 'tool',
+            tool_call_id: 'c1',
+            content: '{"results":[]}',
+        });
+    });
+
+    it('replays a call whose arguments did not parse as an empty JSON object', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(
+            turn({
+                messages: [
+                    { role: 'user', content: 'hi' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [
+                            {
+                                id: 'c1',
+                                name: 'zotero_search',
+                                args: {},
+                                rawArgs: '{"query": "unterminated',
+                                parseError: 'Tool arguments were not valid JSON',
+                            },
+                            {
+                                id: 'c2',
+                                name: 'zotero_search',
+                                args: {},
+                                rawArgs: '[1,2]',
+                                parseError: null,
+                            },
+                        ],
+                    },
+                    { role: 'tool', content: 'not run', toolCallId: 'c1' },
+                    { role: 'tool', content: 'not run', toolCallId: 'c2' },
+                ],
+            }),
+            handlers(),
+            signal()
+        );
+        const sent = JSON.parse(fetchMock.mock.calls[0][1].body);
+        const args = sent.messages[1].tool_calls.map((call: any) => call.function.arguments);
+        expect(args).toEqual(['{}', '{}']);
+        for (const text of args) expect(() => JSON.parse(text)).not.toThrow();
+    });
+
+    it('keeps index-less parallel calls apart by id, with id-less fragments on the last opened call', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"tool_calls":[{"id":"a","function":{"name":"first","arguments":"{\\"x\\":"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"id":"b","function":{"name":"second","arguments":"{\\"y\\":"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"2}"}}]}}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(result.toolCalls.map(({ id, name, args, parseError }) => ({ id, name, args, parseError }))).toEqual([
+            { id: 'a', name: 'first', args: { x: 1 }, parseError: null },
+            { id: 'b', name: 'second', args: { y: 2 }, parseError: null },
+        ]);
+    });
+
+    it('keeps parallel calls with neither index nor id apart by their position in the delta', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"first","arguments":"{\\"x\\":"}},{"function":{"name":"second","arguments":"{\\"y\\":"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"1}"}},{"function":{"arguments":"2}"}}]}}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(result.toolCalls.map(({ name, args, parseError }) => ({ name, args, parseError }))).toEqual([
+            { name: 'first', args: { x: 1 }, parseError: null },
+            { name: 'second', args: { y: 2 }, parseError: null },
+        ]);
+    });
+
+    it('keeps interleaved indexed calls apart and ignores a repeated name', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"first","arguments":"{\\"x\\":"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"second","arguments":"{\\"y\\":"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"first","arguments":"1}"}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]}}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(result.toolCalls.map(({ id, name, args }) => ({ id, name, args }))).toEqual([
+            { id: 'a', name: 'first', args: { x: 1 } },
+            { id: 'b', name: 'second', args: { y: 2 } },
+        ]);
+    });
+
+    it('captures usage from a final chunk with empty choices', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                    'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(result.usage).toEqual({ inputTokens: 12, outputTokens: 3 });
+    });
+
+    it('reports null usage when the provider never sends it', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":"stop"}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(result.usage).toBeNull();
+    });
+
+    it('never requests stream_options', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse('data: [DONE]\n\n'));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(turn(), handlers(), signal());
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty('stream_options');
+    });
+
+    it('rejects as cancelled when the request is aborted before fetch resolves', async () => {
+        const controller = new AbortController();
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockImplementation(() => {
+                controller.abort();
+                const abortError = new Error('The operation was aborted.');
+                abortError.name = 'AbortError';
+                return Promise.reject(abortError);
+            })
+        );
+        const failure = await createOpenAiClient()
+            .streamTurn(turn(), handlers(), controller.signal)
+            .catch((e) => e);
+        expect(failure).toBeInstanceOf(LlmRequestError);
+        expect(failure.kind).toBe('cancelled');
+    });
+
+    it('rejects as cancelled when the caller aborts mid-stream', async () => {
+        const controller = new AbortController();
+        const onTextDelta = vi.fn(() => controller.abort());
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+                    'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                    'data: [DONE]\n\n'
+                )
+            )
+        );
+        const failure = await createOpenAiClient()
+            .streamTurn(turn(), { onTextDelta, onThinkingDelta: vi.fn() }, controller.signal)
+            .catch((e) => e);
+        expect(failure).toBeInstanceOf(LlmRequestError);
+        expect(failure.kind).toBe('cancelled');
+    });
+});
+
+describe('createOpenAiClient hosted web search', () => {
+    const openRouterModel = { ...model, snapshot: 'anthropic/claude-sonnet-4.5', api_base: 'https://openrouter.ai/api/v1' };
+    const bodyOf = (fetchMock: any, call = 0) => JSON.parse(fetchMock.mock.calls[call][1].body);
+    const DONE = 'data: [DONE]\n\n';
+
+    it('adds the OpenRouter web search server tool for an OpenRouter model', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse(DONE));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(
+            turn({ model: openRouterModel, tools: [ZOTERO_SEARCH_TOOL], webSearch: { enabled: true, maxUses: 3 } }),
+            handlers(),
+            signal()
+        );
+        const body = bodyOf(fetchMock);
+        expect(body.tools).toHaveLength(2);
+        expect(body.tools[1]).toEqual({ type: 'openrouter:web_search', parameters: { max_uses: 3 } });
+        expect(body.plugins).toBeUndefined();
+    });
+
+    it('sends the server tool alone when the turn has no local tools', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse(DONE));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(turn({ model: openRouterModel, webSearch: { enabled: true } }), handlers(), signal());
+        expect(bodyOf(fetchMock).tools).toEqual([{ type: 'openrouter:web_search' }]);
+    });
+
+    it('adds nothing when web search is off', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse(DONE));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(turn({ model: openRouterModel, webSearch: { enabled: false } }), handlers(), signal());
+        expect(bodyOf(fetchMock).tools).toBeUndefined();
+    });
+
+    it('adds nothing for a provider without a supported hosted search, even if asked', async () => {
+        const fetchMock = vi.fn().mockResolvedValue(sseResponse(DONE));
+        vi.stubGlobal('fetch', fetchMock);
+        await createOpenAiClient().streamTurn(turn({ webSearch: { enabled: true } }), handlers(), signal());
+        await createOpenAiClient().streamTurn(
+            turn({ model: { ...model, api_base: 'http://localhost:11434/v1' }, webSearch: { enabled: true } }),
+            handlers(),
+            signal()
+        );
+        for (const call of [0, 1]) {
+            const body = bodyOf(fetchMock, call);
+            expect(body.tools).toBeUndefined();
+            expect(body.plugins).toBeUndefined();
+            expect(body.web_search_options).toBeUndefined();
+        }
+    });
+
+    it('collects url_citation annotations into citations, unique by URL', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"content":"Born 1916."}}]}\n\n',
+                    'data: {"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"url":"https://a.example/1","title":"A","start_index":0,"end_index":5}}]}}]}\n\n',
+                    'data: {"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"url":"https://a.example/1","title":"A"}},{"type":"url_citation","url_citation":{"url":"https://b.example/2","title":""}}]},"finish_reason":"stop"}]}\n\n',
+                    DONE
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn({ model: openRouterModel, webSearch: { enabled: true } }), handlers(), signal());
+        expect(result.text).toBe('Born 1916.');
+        expect(result.citations).toEqual([
+            { url: 'https://a.example/1', title: 'A' },
+            { url: 'https://b.example/2', title: 'https://b.example/2' },
+        ]);
+    });
+
+    it('also reads annotations from a message object on the chunk', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(
+                sseResponse(
+                    'data: {"choices":[{"delta":{"content":"x"},"message":{"annotations":[{"type":"url_citation","url_citation":{"url":"https://c.example","title":"C"}}]}}]}\n\n',
+                    DONE
+                )
+            )
+        );
+        const result = await createOpenAiClient().streamTurn(turn({ model: openRouterModel, webSearch: { enabled: true } }), handlers(), signal());
+        expect(result.citations).toEqual([{ url: 'https://c.example', title: 'C' }]);
+    });
+
+    it('reports a web-search-specific error when the provider rejects the web tool', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockResolvedValue(errorResponse(400, 'Bad Request', '{"error":{"message":"Server tool openrouter:web_search is not supported for this model"}}'))
+        );
+        const failure = await createOpenAiClient()
+            .streamTurn(turn({ model: openRouterModel, webSearch: { enabled: true } }), handlers(), signal())
+            .catch((e) => e);
+        expect(failure).toBeInstanceOf(LlmRequestError);
+        expect(failure.kind).toBe('bad_request');
+        expect(failure.message).toMatch(/web search is not available for this provider or model/i);
+    });
+
+    it('leaves an unrelated 400 unchanged', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(errorResponse(400, 'Bad Request', '{"error":{"message":"context too long"}}')));
+        const failure = await createOpenAiClient()
+            .streamTurn(turn({ model: openRouterModel, webSearch: { enabled: true } }), handlers(), signal())
+            .catch((e) => e);
+        expect(failure.message).toBe('context too long');
+    });
+});

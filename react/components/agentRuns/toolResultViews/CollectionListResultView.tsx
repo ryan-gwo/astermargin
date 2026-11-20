@@ -1,0 +1,73 @@
+import { collectionReferenceKey } from '@astermargin/agent-core/types/zotero';
+import { normalizeBackendCollection } from '@astermargin/agent-core/run-state/toolResultTypes';
+import React, { useState } from 'react';
+import { CollectionListView } from '@astermargin/agent-core/run-state/toolResultViews';
+import { CSSIcon } from '../../icons/icons';
+import { getHost } from '@astermargin/agent-ui/host';
+import { useItemContextMenu } from '@astermargin/agent-ui/chat/useItemContextMenu';
+
+/**
+ * Shared renderer for the {@link CollectionListView} view model (list_collections).
+ *
+ * Collection clicks reveal the collection through the navigation host; a
+ * right-click offers the same as "Show in Library".
+ */
+export const CollectionListResultView: React.FC<{ view: CollectionListView }> = ({ view }) => {
+    const [hoveredKey, setHoveredKey] = useState<string | null>(null);
+    const { openCollectionMenu, itemMenu } = useItemContextMenu();
+
+    const collections = view.collections;
+    if (collections.length === 0) {
+        return (
+            <div className="p-3 text-sm font-color-tertiary">
+                No collections found
+            </div>
+        );
+    }
+
+    const revealCollection = (collection: CollectionListView['collections'][number]) => {
+        const ref = normalizeBackendCollection(collection, collection.library_id, collection.library_ref);
+        if (ref) getHost().navigation?.revealCollection(ref);
+    };
+
+    return (
+        <div className="display-flex flex-col">
+            {collections.map((collection, index) => {
+                const ref = normalizeBackendCollection(collection, collection.library_id, collection.library_ref);
+                const compositeKey = ref ? collectionReferenceKey(ref) : `unresolved-${index}`;
+                const isHovered = hoveredKey === compositeKey;
+
+                return (
+                    <div
+                        key={compositeKey}
+                        className={`display-flex flex-row items-start gap-25 p-2 min-w-0 cursor-pointer transition-colors ${
+                            isHovered ? 'bg-quinary' : ''
+                        }`}
+                        onClick={() => revealCollection(collection)}
+                        onContextMenu={ref ? (event) => openCollectionMenu(ref, event) : undefined}
+                        onMouseEnter={() => setHoveredKey(compositeKey)}
+                        onMouseLeave={() => setHoveredKey(null)}
+                        title="Click to reveal in Zotero"
+                    >
+                        <div className="display-flex items-center justify-center flex-shrink-0 rounded-md ml-05 mt-010">
+                            <CSSIcon name="collection" className="icon-16 scale-90" />
+                        </div>
+                        <div className="display-flex flex-col flex-1 min-w-0 font-color-primary">
+                            <div className="truncate font-color-primary" style={{ fontSize: '0.925rem' }}>
+                                {collection.name}
+                            </div>
+                        </div>
+                    </div>
+                );
+            })}
+            {view.total_count > collections.length && (
+                <div className="px-15 py-2 text-xs font-color-tertiary border-t border-primary">
+                    Showing {collections.length} of {view.total_count} collections
+                </div>
+            )}
+            {itemMenu}
+        </div>
+    );
+};
+
+export default CollectionListResultView;

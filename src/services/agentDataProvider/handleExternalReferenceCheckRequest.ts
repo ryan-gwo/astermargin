@@ -1,0 +1,121 @@
+/**
+ * Agent Data Provider
+ * 
+ * This service provides WebSocket communication for agent runs,
+ * enabling bidirectional communication between the Zotero plugin and the backend.
+ * 
+ * The AsterMargin agent is the primary agent that handles chat completions and tool execution.
+ */
+
+import { logger } from '@astermargin/agent-core/platform/logger';
+
+import {
+    ExternalReferenceCheckResult,
+    WSExternalReferenceCheckRequest,
+    WSExternalReferenceCheckResponse,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import { batchFindExistingReferences, BatchReferenceCheckItem } from '../../utils/batchFindExistingReferences';
+import { libraryRefForLibraryID } from '../../utils/libraryIdentity';
+import { getSearchableLibraryIds, resolveLibrariesFilterToSearchableIds } from './utils';
+
+
+/**
+ * Handle external_reference_check_request event.
+ *
+ * Uses batch lookups for optimal performance:
+ *   Phase 1 — Batch DOI/ISBN lookup.
+ *   Phase 2 — Title candidates (exact-value fast path + keyword LIKE scan),
+ *             meta fetch, creator fetch. Runs only for items not already
+ *             resolved by Phase 1.
+ *   Phase 3 — In-memory fuzzy match (title / DOI / ISBN / year / creator).
+ *
+ * If library_ids is provided, only search those libraries. If library_ids
+ * is not provided or empty, search all accessible libraries.
+ */
+export async function handleExternalReferenceCheckRequest(request: WSExternalReferenceCheckRequest): Promise<WSExternalReferenceCheckResponse> {
+    const startTime = Date.now();
+
+    // Determine which libraries to search. `library_ids` entries are resolved
+    // through the shared filter resolver, so a portable library token
+    // ("u" / "g<groupID>") is a complete identity here — the backend never has
+    // to map one onto a device-local rowid. Never search libraries the user
+    // excluded from AsterMargin.
+    const libraryIds: number[] = request.library_ids && request.library_ids.length > 0
+        ? resolveLibrariesFilterToSearchableIds(request.library_ids)
+        : getSearchableLibraryIds();
+
+    // Convert request items to batch format
+    const batchItems: BatchReferenceCheckItem[] = request.items.map(item => ({
+        id: item.id,
+        data: {
+            title: item.title,
+            date: item.date,
+            DOI: item.doi,
+            ISBN: item.isbn,
+            creators: item.creators,
+            PMID: item.pmid ?? undefined,
+            url: item.url ?? undefined,
+            reportNumber: item.report_number ?? undefined,
+        }
+    }));
+
+    // Use batch lookup for all items at once
+    let batchResults;
+    let timing;
+    try {
+        const batchOutput = await batchFindExistingReferences(batchItems, libraryIds);
+        batchResults = batchOutput.results;
+        timing = batchOutput.timing;
+    } catch (error) {
+        logger(`AgentService: Batch reference check failed: ${error}`, 1);
+        // Return all as not found on error
+        batchResults = batchItems.map(item => ({ id: item.id, item: null }));
+        timing = {
+            total_ms: Date.now() - startTime,
+            phase1_identifier_lookup_ms: 0,
+            phase2_title_candidates_ms: 0,
+            phase3_fuzzy_matching_ms: 0,
+            candidates_fetched: 0,
+            matches_by_identifier: 0,
+            matches_by_fuzzy: 0,
+        };
+    }
+
+    // Convert batch results to response format
+    const results: ExternalReferenceCheckResult[] = batchResults.map(result => {
+        if (result.item) {
+            return {
+                id: result.id,
+                exists: true,
+                item: {
+                    library_id: result.item.library_id,
+                    zotero_key: result.item.zotero_key,
+                    library_ref: libraryRefForLibraryID(result.item.library_id) ?? undefined,
+                }
+            };
+        } else {
+            return {
+                id: result.id,
+                exists: false
+            };
+        }
+    });
+
+    const response: WSExternalReferenceCheckResponse = {
+        type: 'external_reference_check',
+        request_id: request.request_id,
+        results,
+        timing: {
+            total_ms: timing.total_ms,
+            item_count: request.items.length,
+            phase1_identifier_lookup_ms: timing.phase1_identifier_lookup_ms,
+            phase2_title_candidates_ms: timing.phase2_title_candidates_ms,
+            phase3_fuzzy_matching_ms: timing.phase3_fuzzy_matching_ms,
+            candidates_fetched: timing.candidates_fetched,
+            matches_by_identifier: timing.matches_by_identifier,
+            matches_by_fuzzy: timing.matches_by_fuzzy,
+        }
+    };
+
+    return response;
+}

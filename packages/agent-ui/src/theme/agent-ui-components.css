@@ -1,0 +1,788 @@
+/*
+ * Component rules for the sign-in surface, the composer and the bars docked to
+ * it, the editor field, tooltips, and the link vocabulary they share with the
+ * rest of the render layer.
+ *
+ * The component sheet for this package. Tokens say what the colours are and
+ * the utility layer is the vocabulary a component is written in; this is neither
+ * — it is a handful of named things (a primary button, a text field, a code box)
+ * that have to look the same in every client because they are the same control.
+ *
+ * Order matters and is set by the client: this sheet must load AFTER
+ * agent-ui-utilities.css. Both are scoped `.astermargin-root .x`, so a rule here and
+ * a utility weigh the same and source order decides — `.text-link` beside
+ * `.font-color-secondary` is exactly that case, and the link colour has to win.
+ *
+ * `@keyframes spin` lives here because the spinner below is its only reason to
+ * exist in a shared sheet. Keyframes resolve by name across every author sheet
+ * in the document, not within one file, so a client rule elsewhere that animates
+ * `spin` keeps working.
+ */
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* Webapp button styles for login forms - using existing theme colors */
+.astermargin-root .webapp-btn {
+    padding: 12px;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: 0.5rem;
+    transition: all 300ms ease-in-out;
+    border: 1px solid;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* align-self: center; */
+    gap: 0.5rem;
+    cursor: pointer;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* Primary button variant (Send code to email / Sign in) */
+.astermargin-root .webapp-btn-primary {
+    /* background-color: var(--accent-blue); */
+    font-size: 0.9rem;
+    background-color: var(--fill-primary);
+    color: var(--material-sidepane);
+    border-color: var(--fill-primary);
+}
+
+.astermargin-root .webapp-btn-primary:hover:not(:disabled) {
+    filter: opacity(0.9);
+}
+
+.astermargin-root .webapp-btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    filter: none;
+}
+
+/* Secondary button variant (Use password / Sign in with email code) */
+.astermargin-root .webapp-btn-secondary {
+    background-color: var(--fill-quarternary);
+    color: var(--fill-secondary);
+    border-color: var(--fill-quarternary);
+}
+
+.astermargin-root .webapp-btn-secondary:hover:not(:disabled) {
+    background-color: var(--fill-tertiary);
+    color: var(--fill-primary);
+}
+
+.astermargin-root .webapp-btn-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Input styles for login forms */
+.astermargin-root .webapp-input {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 0.5rem;
+    background-color: var(--material-mix-quarternary);
+    color: var(--fill-primary);
+    font-size: 0.875rem;
+    transition: border-color 0.2s ease-in-out;
+    outline: none;
+    box-sizing: border-box;
+    margin: 0;
+}
+
+.astermargin-root .webapp-input::placeholder {
+    color: var(--fill-tertiary);
+}
+
+.astermargin-root .webapp-input:focus {
+    border-color: var(--fill-tertiary);
+    outline: none;
+}
+
+/* Typography styles for login forms */
+.astermargin-root .webapp-text-3xl {
+    font-size: 1.875rem;
+    line-height: 2.25rem;
+}
+
+.astermargin-root .webapp-text-2xl {
+    font-size: 1.5rem;
+    line-height: 2rem;
+}
+
+.astermargin-root .webapp-text-lg {
+    font-size: 1.125rem;
+    line-height: 1.75rem;
+}
+
+.astermargin-root .webapp-font-bold {
+    font-weight: 700;
+}
+
+/* Layout utilities for login forms */
+.astermargin-root .webapp-space-y-6 > * + * {
+    margin-top: 1.5rem;
+}
+
+.astermargin-root .webapp-space-y-5 > * + * {
+    margin-top: 1.25rem;
+}
+
+.astermargin-root .webapp-space-y-3 > * + * {
+    margin-top: 0.75rem;
+}
+
+.astermargin-root .webapp-space-y-2 > * + * {
+    margin-top: 0.5rem;
+}
+
+.astermargin-root .webapp-max-w-md {
+    max-width: 28rem;
+}
+
+.astermargin-root .webapp-mx-auto {
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* OTP input styles */
+.astermargin-root .webapp-otp-input {
+    width: 3rem;
+    /* Six of these and five gaps have to fit a column whose width belongs to
+       the user: a Zotero pane and a Word task pane are both dragged to taste,
+       and a row of fixed boxes clips the last digit rather than reflowing —
+       the one box the person is about to type into. Shrink but never grow, so
+       anything wide enough for six 3rem boxes renders exactly as before and
+       only a narrower column pays. `min-width: 0` is what lets it happen at
+       all: form controls have an intrinsic minimum that overrides shrinking. */
+    flex: 0 1 3rem;
+    min-width: 0;
+    height: 3rem;
+    text-align: center;
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 0.5rem;
+    background-color: var(--material-mix-quarternary);
+    color: var(--fill-primary);
+    font-size: 1.125rem;
+    font-weight: 500;
+    outline: none;
+    transition: border-color 0.2s ease-in-out;
+    box-sizing: border-box;
+}
+
+.astermargin-root .webapp-otp-input:focus {
+    border-color: var(--fill-secondary);
+}
+
+.astermargin-root .webapp-otp-input:disabled {
+    opacity: 0.5;
+}
+
+/* Spinner for loading states */
+.astermargin-root .webapp-spinner {
+    width: 11px;
+    height: 11px;
+    border: 2px solid transparent;
+    border-top: 2px solid currentColor;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+/* Link styles */
+.astermargin-root .text-link {
+    color: var(--accent-blue);
+    opacity: 0.8;
+    text-decoration: none;
+    cursor: pointer;
+    border: 0px solid transparent;
+    box-shadow: none;
+    background-color: transparent;
+}
+
+.astermargin-root .text-link:hover {
+    text-decoration: underline;
+}
+
+.astermargin-root .text-link-muted {
+    color: var(--fill-secondary);
+    text-decoration: none;
+    cursor: pointer;
+    border: 0px solid transparent;
+    box-shadow: none;
+    background-color: transparent;
+}
+
+.astermargin-root .text-link-muted:hover {
+    color: var(--fill-primary);
+    text-decoration: underline;
+}
+
+/* Underlined path inside a tertiary footnote. Resting colour matches the
+   surrounding note; hover/focus lifts it to primary so the target is obvious. */
+.astermargin-root .text-link-footnote {
+    color: var(--fill-tertiary);
+    text-decoration: underline;
+    cursor: pointer;
+    border: 0;
+    padding: 0;
+    background-color: transparent;
+    box-shadow: none;
+    transition: color 0.2s ease-in-out;
+}
+
+.astermargin-root .text-link-footnote:hover,
+.astermargin-root .text-link-footnote:focus-visible {
+    color: var(--fill-primary);
+}
+
+.astermargin-root .text-link-red {
+    color: var(--tag-red);
+    opacity: 0.8;
+    text-decoration: underline;
+    cursor: pointer;
+    border: 0px solid transparent;
+    box-shadow: none;
+    background-color: transparent;
+}
+
+.astermargin-root .text-link-red:hover {
+    color: var(--tag-red-primary);
+    opacity: 1;
+}
+
+/* Outcome row that names a place to go. Plain text until hover/focus —
+   a column of accent links would read as a menu. */
+.astermargin-root .batch-outcome-target {
+    cursor: pointer;
+    text-decoration: none;
+    text-underline-offset: 2px;
+}
+
+.astermargin-root .batch-outcome-target:hover,
+.astermargin-root .batch-outcome-target:focus-visible {
+    text-decoration: underline;
+}
+
+/* The colour a legend entry or a section head shares with its track segment. */
+.astermargin-root .batch-swatch {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+}
+.astermargin-root .batch-track-legend {
+    column-gap: 0.85rem;
+    row-gap: 0.15rem;
+    margin-top: 2px;
+}
+.astermargin-root .batch-block-heading-count {
+    letter-spacing: 0;
+    text-transform: none;
+    font-variant-numeric: tabular-nums;
+}
+/* The head aligns its parts on the baseline, which puts an empty dot's bottom
+   edge on it and the dot too high; centre it on the caps instead. */
+.astermargin-root .batch-block-heading .batch-swatch {
+    align-self: center;
+}
+
+/* The receipt's framing. Scoped so the live bar above the composer, which
+   draws the same body, keeps its own. Chrome and section heads step down to
+   caps in secondary grey; the batch title and the rows are what stand out. */
+.astermargin-root .batch-outcome-receipt {
+    row-gap: 0.9rem;
+}
+.astermargin-root .batch-outcome-receipt .batch-outcome-goal {
+    font-size: 0.875rem;
+    line-height: 1.45;
+}
+.astermargin-root .batch-outcome-receipt .batch-block-heading {
+    font-size: 0.85rem;
+    color: var(--fill-primary);
+}
+.astermargin-root .batch-outcome-receipt .batch-block-heading-count {
+    color: var(--fill-secondary);
+}
+
+/* A tally label wraps rather than truncates: a finding is a sentence the user
+   has to read. The 100-character backend cap bounds it to a few lines. */
+.astermargin-root .batch-tally-label {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.astermargin-root .batch-tally-toggle {
+    cursor: pointer;
+    border-radius: 4px;
+    margin: 0 -4px;
+    padding: 1px 4px;
+}
+.astermargin-root .batch-tally-toggle:hover,
+.astermargin-root .batch-tally-toggle:focus-visible {
+    background-color: var(--fill-quinary);
+    outline: none;
+}
+.astermargin-root .batch-tally-meter,
+.astermargin-root .batch-tally-chevron {
+    /* Align with the first line of a label that may wrap. */
+    margin-top: 0.45em;
+}
+.astermargin-root .batch-tally-chevron {
+    margin-top: 0.15em;
+}
+
+/* The items behind a row: indented under it, ruled off from the label. */
+.astermargin-root .batch-item-list {
+    gap: 0.15rem;
+    margin: 0.15rem 0 0.35rem 0.35rem;
+    padding: 0.1rem 0 0.15rem 0.6rem;
+    border-left: 2px solid var(--fill-quinary);
+}
+.astermargin-root .batch-item-list-actions {
+    padding-top: 0.2rem;
+}
+.astermargin-root .batch-item-row {
+    padding: 2px 4px;
+    margin: 0 -4px;
+    border-radius: 3px;
+}
+/* Name takes its content width; the title fills what is left and truncates.
+   The name only shrinks when it itself is wider than the row — a title-led
+   name (a creatorless item, a standalone attachment) still cannot push the
+   reveal glyph out. */
+.astermargin-root .batch-item-row-name {
+    font-weight: 500;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.astermargin-root .batch-item-row-title {
+    flex: 1 1 0%;
+    min-width: 0;
+}
+.astermargin-root .batch-item-row-icon {
+    display: inline-flex;
+    align-items: center;
+}
+.astermargin-root .batch-item-row-link {
+    cursor: pointer;
+}
+.astermargin-root .batch-item-row-link:hover,
+.astermargin-root .batch-item-row-link:focus-visible {
+    background-color: var(--fill-quinary);
+    outline: none;
+}
+.astermargin-root .batch-item-row-reveal {
+    opacity: 0;
+}
+.astermargin-root .batch-item-row-link:hover .batch-item-row-reveal,
+.astermargin-root .batch-item-row-link:focus-visible .batch-item-row-reveal {
+    opacity: 1;
+}
+
+/* A one-item finding: the item leads, the finding follows in full. The whole
+   block is the target — the finding is about the item, so it opens it too. */
+.astermargin-root .batch-item-finding {
+    padding: 3px 4px;
+    margin: 0 -4px;
+    border-radius: 4px;
+}
+.astermargin-root .batch-item-finding-link {
+    cursor: pointer;
+}
+.astermargin-root .batch-item-finding-link:hover,
+.astermargin-root .batch-item-finding-link:focus-visible {
+    background-color: var(--fill-quinary);
+    outline: none;
+}
+.astermargin-root .batch-item-finding-link:hover .batch-item-row-reveal,
+.astermargin-root .batch-item-finding-link:focus-visible .batch-item-row-reveal {
+    opacity: 1;
+}
+.astermargin-root .batch-item-finding + .batch-item-finding {
+    border-top: 1px solid var(--fill-senary);
+}
+/* Indented to the name, past the type icon, so the finding reads as the
+   item's line continued rather than a new row. */
+.astermargin-root .batch-item-finding-text {
+    padding-left: 21px;
+    line-height: 1.4;
+}
+
+/* Filter box above a long record. */
+.astermargin-root .batch-item-filter {
+    border: 1px solid var(--fill-quarternary);
+    border-radius: 6px;
+    padding: 0.15rem 0.5rem;
+    background-color: var(--astermargin-surface-overlay);
+}
+.astermargin-root .batch-item-filter-input {
+    border: 0;
+    outline: 0;
+    background: transparent;
+    font: inherit;
+    color: var(--fill-primary);
+}
+
+/* Batch progress: the track before anything has been credited.
+   A determinate track sitting at zero reads as a batch that has stalled, which
+   is exactly wrong at the moment one has just been approved and the model is
+   still deciding what the first slice should get. The sweep says "working" and
+   is replaced by real segments as soon as the first outcome lands.
+   Keyframes live here with `spin` for the same reason: this is the only rule
+   that needs them, and a client sheet animating the same name keeps working. */
+.astermargin-root .batch-progress-indeterminate {
+    height: 100%;
+    width: 100%;
+    opacity: 0.7;
+    background-image: linear-gradient(
+        90deg,
+        transparent 0%,
+        var(--accent-blue) 50%,
+        transparent 100%
+    );
+    background-size: 40% 100%;
+    background-repeat: no-repeat;
+    animation: astermargin-batch-progress-sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes astermargin-batch-progress-sweep {
+    0% { background-position: -40% 0; }
+    100% { background-position: 140% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .astermargin-root .batch-progress-indeterminate {
+        animation: none;
+        background-image: none;
+        background-color: var(--fill-tertiary);
+        opacity: 0.4;
+    }
+
+    .astermargin-root .batch-progress-hairline {
+        transition: none !important;
+    }
+}
+
+/* ───── Find in chat ───── */
+
+/* A find match. Hits are emitted as `<mark>` by the shared highlighters, which
+   Gecko gives its own loud yellow-on-black, so both rules replace that
+   background outright and keep the colour the surrounding text already has.
+   Only a background and a radius are set: anything affecting text metrics
+   (padding, border, weight) would reflow the paragraph as the query is typed.
+   The tag ramps are translucent, so the tint composites over whichever surface
+   the hit lands on and stays legible in light and dark themes alike. */
+.astermargin-root .astermargin-find-hit {
+    background: var(--tag-yellow-tertiary);
+    color: inherit;
+    border-radius: 2px;
+}
+
+/* The one hit the reader has navigated to. A different hue rather than a
+   stronger rung of the same one: two opacities of one colour read as "darker
+   yellow", which is hard to pick out of a page of yellow, while the hue shift
+   is legible at a glance and survives being scrolled past. Orange stops at the
+   middle rung — the opaque one composites dark enough that inherited body text
+   loses its contrast against it on a dark theme. */
+.astermargin-root .astermargin-find-hit-current {
+    background: var(--tag-orange-secondary);
+    color: inherit;
+}
+
+/* ───── The composer ───── */
+
+/* The card the message is composed in, and the control row under its editor.
+   Three of the cards that stand in for the composer — BatchApprovalCard,
+   AskUserQuestionCard, CreditConfirmationCard — are shared components in this
+   package, so the surface all four wear has to be here too.
+
+   Every button rule below qualifies its class with the `button` element. That
+   is deliberate: it is what beats the `.variant-*` family a client sheet
+   defines, whatever order the sheets load in. */
+
+/* The composer surface, shared with the cards that stand in for it (user
+ * request, approval, credit confirmation, ask-user-question).
+ *
+ * The card sits on the pane ground (--astermargin-surface-ground) and is one
+ * 60%-strength quarternary step away from it: #eaeaea on #f2f2f2 in a light
+ * theme, #353535 on #303030 in a dark one. So it darkens against a light
+ * ground and lightens against a dark one, which is the direction Zotero's own
+ * fills go. The recipe itself lives in agent-ui-tokens.css, as
+ * --astermargin-surface-raised, so every raised surface shares it.
+ *
+ * Top and bottom pads are intentionally different: extra top for a text line,
+ * tighter bottom because the control row already fills that edge. Docked bars
+ * and attachment chips cancel the extra top via negative margins keyed to the
+ * same tokens — do not equalize this shorthand, or every docked child has to
+ * re-compensate. A display card with no chips and no control row opts out
+ * with .user-message-display-text.
+ *
+ * A client that wants a different card geometry retargets --astermargin-card-pad-*
+ * / --astermargin-radius-card rather than overriding the declarations here:
+ * .composer-docked-bar below reads the same tokens to cancel this padding, so
+ * an overridden declaration would leave every docked bar bleeding by the wrong
+ * amount with a corner cut for the wrong radius. */
+.astermargin-root .user-message-display {
+    position: relative;
+    padding: var(--astermargin-card-pad-top) var(--astermargin-card-pad-x) var(--astermargin-card-pad-bottom);
+    border: 1px solid var(--astermargin-border-default);
+    border-radius: var(--astermargin-radius-card);
+    background-color: var(--astermargin-surface-raised);
+    user-select: text;
+}
+
+/* Display-only card whose first content is a text line (no chips to pull
+ * toward the edge, no control row to fill the bottom). Matches the bottom
+ * inset so the text does not sit in a top-heavy box. */
+.astermargin-root .user-message-display-text {
+    padding-top: var(--astermargin-card-pad-bottom);
+}
+
+/* Chips for whatever is attached to the message being composed. Mounted only
+ * when there is something to show. Chips have their own height, so they need
+ * less inset than a text line: pull toward the card edge by the extra
+ * `--astermargin-card-pad-top`, leaving `--astermargin-card-pad-bottom`. The same pull
+ * tightens the gap after a `.composer-docked-bar` (its bottom margin is the
+ * card's top pad; the negative here subtracts the extra). */
+.astermargin-root .composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: calc(-1 * var(--astermargin-card-pad-top) + var(--astermargin-card-pad-bottom));
+    margin-bottom: 0.75rem;
+}
+
+/* Control row under the editor: add sources and the model on the left, web
+ * search and send after the flexible gap. */
+.astermargin-root .composer-controls {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    /* Wraps only when it has to: the approval verdict pair carries labels and
+     * a count, which a narrow sidebar cannot always fit on one line. */
+    flex-wrap: wrap;
+    row-gap: 4px;
+    gap: 4px;
+    margin-top: 0.5rem;
+    margin-right: -0.2rem;
+    margin-left: -0.2rem;
+}
+
+/* One height and one hover shape for every control in the row, whatever
+ * variant it carries. The element selector is what beats the client's
+ * `.variant-*` rules, whichever sheet they are in and whatever order it
+ * loads in. */
+.astermargin-root .composer-controls button {
+    /* height: 26px; */
+    border-radius: var(--astermargin-radius-control);
+}
+
+/* Icon-only controls are square. `Icon` defaults to 1em, so an icon that is
+ * not given an explicit size follows the button's font-size. */
+.astermargin-root .composer-controls button.composer-add-sources,
+.astermargin-root .composer-controls button.composer-icons {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    justify-content: center;
+}
+
+/* Web search takes its icon size from the button, per the rule above. */
+.astermargin-root button.composer-icons {
+    font-size: 15px;
+}
+
+/* Send is a touch larger than the row's square buttons, and fully rounded. */
+.astermargin-root button.composer-send {
+    width: 23px;
+    height: 23px;
+    margin-left: 4px;
+    padding: 0;
+    justify-content: center;
+    border-radius: var(--astermargin-radius-pill);
+}
+
+/* Disabled Send greys out rather than fading the accent, which at
+ * .variant-solid's 0.5 opacity still reads as an available button. */
+.astermargin-root button.composer-send:disabled {
+    background-color: var(--fill-quarternary);
+    border-color: transparent;
+    color: var(--fill-tertiary);
+    opacity: 1;
+}
+
+/* Send carries an arrow rather than a label, so it needs a real icon size
+ * instead of .variant-solid's 1em. */
+.astermargin-root button.composer-send svg {
+    width: 16px;
+    height: 16px;
+}
+
+.astermargin-root button.composer-send.composer-send-stop svg {
+    width: 13px;
+    height: 13px;
+}
+
+/* The verdict pair sits in Send's slot while an approval is pending. It carries
+ * labels rather than an icon, so it keeps the row's control radius (set above
+ * for every button in it) instead of Send's pill, and is padded to read as a
+ * text button rather than a squeezed icon one. */
+.astermargin-root button.composer-reject,
+.astermargin-root button.composer-approve {
+    margin-left: 4px;
+    padding: 3px 8px;
+}
+
+/* ───── Bars docked to the composer's top edge ───── */
+
+/* One geometry, worn by every bar that docks to the card: cancel the card's
+   padding so the bar renders as the card's own top edge rather than a strip
+   floating above it, and repeat the card's corner less its 1px border.
+
+   Only the geometry is shared. Each bar's fill belongs to the sheet that owns
+   the component wearing it — this package styles `.batch-progress-bar` because
+   `BatchProgressBar` lives here; the Zotero-only bars are filled in
+   `astermargin.css`.
+
+   Bars stack flush: the upper bar's positive bottom margin collapses against
+   the lower bar's negative top margin, and the lower one drops its rounding so
+   the pair reads as a single edge. */
+.astermargin-root .composer-docked-bar {
+    margin: calc(-1 * var(--astermargin-card-pad-top)) calc(-1 * var(--astermargin-card-pad-x)) var(--astermargin-card-pad-top);
+    border-radius: calc(var(--astermargin-radius-card) - 1px) calc(var(--astermargin-radius-card) - 1px) 0 0;
+}
+
+.astermargin-root .composer-docked-bar + .composer-docked-bar {
+    border-radius: 0;
+}
+
+/* Live batch progress. `overflow` clips the hairline to the bar's top radius;
+   without it the sweep is a sharp rectangle hanging over the corner. No
+   `position` here: BatchProgressBar sets it inline, which wins anyway. */
+.astermargin-root .batch-progress-bar {
+    background-color: var(--astermargin-fill-bar);
+    overflow: hidden;
+}
+
+/* ───── The editor field ───── */
+
+/* Typography and sizing for whatever text is typed into. It is worn by the
+   Lexical contenteditable, by the plain textareas and inputs that stand in for
+   it, and by the search field of the mention and slash menus, so it stays
+   deliberately thin — type, caret, and a height band, with the chrome
+   properties zeroed out so the host's own form styling does not show through.
+
+   Both places a client is expected to override it work by loading later:
+   `.text-base` replaces the literal 13px, and the client's contenteditable rule
+   replaces the height band. */
+
+.astermargin-root .chat-input {
+    font-family: system-ui, -apple-system, sans-serif;
+    width: 100%;
+    font-size: 13px;
+    background-color: transparent;
+    border: 0px solid transparent;
+    outline: none;
+    caret-color: var(--fill-primary);
+    resize: none;
+    padding: 1px 0;
+    line-height: 1.25;
+    height: calc(1.25em + 3px);
+    min-height: calc(1.25em + 2px);
+    max-height: 12.5em;
+    /* transition: all .2s ease-in-out; */
+    /* overflow-y: auto; */
+}
+
+.astermargin-root .chat-input:focus {
+    border-color: var(--fill-quarternary);
+    box-shadow: 0 0 0 0px transparent;
+    background-color: transparent !important;
+    border: 0px solid transparent !important;
+    border-bottom-color: transparent !important;
+    background-image: none !important;
+}
+
+.astermargin-root .chat-input:hover {
+    background-color: transparent !important;
+}
+
+.astermargin-root .chat-input::placeholder {
+    color: var(--fill-tertiary);
+}
+
+/* ───── Tooltips ───── */
+
+/* The floating box, the arrow that points back at the trigger, and the fade-in
+   that brings it up. The arrow is drawn by three shared components (Tooltip,
+   ContextMenu, SlashCommandHoverCardPlugin), and the rest of the vocabulary is
+   kept beside it rather than split across sheets.
+
+   The keyframes live here for the same reason `spin` does at the top of this
+   file: names resolve across every author sheet in the document, so a client
+   rule animating `tooltipFadeIn` keeps working. */
+
+/* Arrow styles with border */
+.astermargin-root .tooltip-arrow {
+    position: absolute;
+    width: 0;
+    height: 0;
+    transform: translateX(-50%);
+}
+
+.astermargin-root .tooltip-arrow-bottom {
+    top: -6px;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-bottom: 6px solid var(--astermargin-border-strong);
+}
+
+.astermargin-root .tooltip-arrow-bottom::after {
+    content: '';
+    position: absolute;
+    left: -5px;
+    top: 1px;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-bottom: 5px solid var(--astermargin-surface-overlay);
+}
+
+.astermargin-root .tooltip-arrow-top {
+    bottom: -6px;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 6px solid var(--astermargin-border-strong);
+}
+
+.astermargin-root .tooltip-arrow-top::after {
+    content: '';
+    position: absolute;
+    left: -5px;
+    bottom: 1px;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 5px solid var(--astermargin-surface-overlay);
+}
+
+@keyframes tooltipFadeIn {
+    from { opacity: 0; transform: translateY(5px) translateX(-50%); }
+    to { opacity: 1; transform: translateY(0) translateX(-50%); }
+}
+
+@keyframes tooltipFadeInTop {
+    from { opacity: 0; transform: translateY(-5px) translateX(-50%); }
+    to { opacity: 1; transform: translateY(0) translateX(-50%); }
+}
+
+.astermargin-root .tooltip-fade-in-bottom {
+    animation: tooltipFadeIn 0.2s ease-in-out forwards;
+}
+
+.astermargin-root .tooltip-fade-in-top {
+    animation: tooltipFadeInTop 0.2s ease-in-out forwards;
+}

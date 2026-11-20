@@ -1,0 +1,412 @@
+// @vitest-environment jsdom
+
+import React, { act } from 'react';
+import { createRoot, Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useAddSourcesMenu, AddSourcesMenuHandle } from '@astermargin/agent-ui/composer/useAddSourcesMenu';
+
+type Hook = ReturnType<typeof useAddSourcesMenu>;
+
+const RECT = { left: 40, right: 340, top: 200, bottom: 260 } as DOMRect;
+
+/** Stands in for the editor's contenteditable, which the hook measures to
+ *  place the menu. jsdom reports no caret rect, so the fallback (the editor's
+ *  own left edge) applies. */
+function editorElement(): HTMLElement {
+    const el = document.createElement('div');
+    el.getBoundingClientRect = () => RECT;
+    return el;
+}
+
+const EDITOR = editorElement();
+
+/**
+ * Renders the hook and exposes its latest return value, plus the editor seams
+ * it drives (content mirror, trailing-query delete, focus).
+ */
+function mount(options?: { goBack?: () => boolean; caret?: number }) {
+    const contentRef: React.MutableRefObject<string> = { current: '' };
+    const menuRef: React.MutableRefObject<AddSourcesMenuHandle | null> = {
+        current: options?.goBack ? { goBack: options.goBack } : null,
+    };
+    const deleted: number[] = [];
+    const keptAfter: number[] = [];
+    const caretRef = { current: options?.caret ?? 0 };
+    const focused = { count: 0 };
+    let latest: Hook;
+
+    const Harness: React.FC = () => {
+        latest = useAddSourcesMenu({
+            verticalPosition: 'above',
+            deleteTrailingQuery: (length, keepAfter) => {
+                deleted.push(length);
+                keptAfter.push(keepAfter);
+            },
+            getCaretOffset: options?.caret === undefined ? undefined : () => caretRef.current,
+            focusEditor: () => { focused.count++; },
+            setMessageContent: (value) => { contentRef.current = value; },
+            menuRef,
+        });
+        return null;
+    };
+
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root: Root = createRoot(container);
+    act(() => { root.render(React.createElement(Harness)); });
+
+    return {
+        get hook() { return latest!; },
+        contentRef,
+        deleted,
+        keptAfter,
+        caretRef,
+        focused,
+        /** Run an interaction and let React flush the state it produced. */
+        run<T>(fn: (hook: Hook) => T): T {
+            let result!: T;
+            act(() => { result = fn(latest!); });
+            return result;
+        },
+        unmount() {
+            act(() => { root.unmount(); });
+            container.remove();
+        },
+    };
+}
+
+/** A keydown event shaped like the React synthetic one the hook receives. */
+function keyEvent(key: string) {
+    const prevented = { value: false };
+    const event = {
+        key,
+        preventDefault: () => { prevented.value = true; },
+    } as unknown as React.KeyboardEvent<HTMLElement>;
+    return { event, prevented };
+}
+
+describe('useAddSourcesMenu', () => {
+    let harness: ReturnType<typeof mount>;
+
+    afterEach(() => {
+        harness?.unmount();
+    });
+
+    describe('opening from a typed @', () => {
+        it('opens when the @ starts a word, with the editor as its search box', () => {
+            harness = mount();
+            expect(harness.run(h => h.handleTrigger('find @', EDITOR))).toBe(true);
+            expect(harness.hook.isOpen).toBe(true);
+            expect(harness.hook.query).toBe('');
+            expect(harness.hook.querySource).toBe('editor');
+        });
+
+        it('opens when the @ is the first character', () => {
+            harness = mount();
+            expect(harness.run(h => h.handleTrigger('@', EDITOR))).toBe(true);
+            expect(harness.hook.isOpen).toBe(true);
+        });
+
+        it('leaves an @ inside a word alone', () => {
+            harness = mount();
+            expect(harness.run(h => h.handleTrigger('joscha@', EDITOR))).toBe(false);
+            expect(harness.hook.isOpen).toBe(false);
+        });
+
+        it('opens at the caret rather than the composer\'s left edge', () => {
+            // A wide composer whose text ends far to the right: the menu
+            // belongs under the `@`, not under the editor's left edge.
+            const editor = editorElement();
+            const line = document.createElement('span');
+            const text = document.createTextNode('a long line ending far right @');
+            line.appendChild(text);
+            line.getBoundingClientRect = () => ({ left: 280, top: 210, bottom: 230 } as DOMRect);
+            editor.appendChild(line);
+            document.body.appendChild(editor);
+            document.getSelection()!.collapse(text, text.length);
+
+            harness = mount();
+            harness.run(h => h.handleTrigger('a long line ending far right @', editor));
+            expect(harness.hook.position.x).toBe(280);
+            editor.remove();
+        });
+
+        it('falls back to the composer\'s left edge when the caret has no rect', () => {
+            harness = mount();
+            harness.run(h => h.handleTrigger('find @', EDITOR));
+            expect(harness.hook.position.x).toBe(40);
+        });
+
+        it('keeps the typed @ in the editor content', () => {
+            harness = mount();
+            harness.run(h => h.handleTrigger('find @', EDITOR));
+            expect(harness.contentRef.current).toBe('find @');
+            expect(harness.deleted).toEqual([]);
+        });
+    });
+
+    describe('an @ typed at the end of a line with more lines after it', () => {
+        const AFTER = '\nthen compare';
+
+        beforeEach(() => {
+            harness = mount({ caret: 'find @'.length });
+            harness.run(h => h.handleTrigger(`find @${AFTER}`, EDITOR));
+        });
+
+        it('opens with the editor as its search box', () => {
+            expect(harness.hook.isOpen).toBe(true);
+            expect(harness.hook.querySource).toBe('editor');
+        });
+
+        it('reads the query up to the following lines', () => {
+            harness.run(h => h.handleChange(`find @smith${AFTER}`));
+            expect(harness.hook.query).toBe('smith');
+        });
+
+        it('keeps the caret at the end of the query, not the end of the content', () => {
+            const value = `find @smith${AFTER}`;
+            harness.run(h => h.handleChange(value));
+            expect(harness.hook.caretOffsetFor(value)).toBe('find @smith'.length);
+        });
+
+        it('leaves the caret where the @ was when deleting it closes the menu', () => {
+            const value = `find ${AFTER}`;
+            harness.caretRef.current = 'find '.length; // where Backspace left it
+            harness.run(h => h.handleChange(value));
+            expect(harness.hook.isOpen).toBe(false);
+            expect(harness.hook.caretOffsetFor(value)).toBe('find '.length);
+        });
+
+        it('takes back only the @ and the query when something is picked', () => {
+            harness.run(h => h.handleChange(`find @smith${AFTER}`));
+            harness.run(h => h.commit());
+            expect(harness.deleted).toEqual(['@smith'.length]);
+            expect(harness.keptAfter).toEqual([AFTER.length]);
+        });
+    });
+
+    describe('an @ typed in front of existing text', () => {
+        beforeEach(() => {
+            harness = mount({ caret: 1 });
+            harness.run(h => h.handleTrigger('@sdfsdf', EDITOR));
+        });
+
+        it('opens, reporting the text after the query', () => {
+            expect(harness.hook.isOpen).toBe(true);
+            expect(harness.hook.hasTextAfterQuery).toBe(true);
+        });
+
+        it('reads the query up to that text', () => {
+            harness.run(h => h.handleChange('@smisdfsdf'));
+            expect(harness.hook.query).toBe('smi');
+        });
+
+        it('stops reporting text after the query once closed', () => {
+            harness.run(h => h.dismiss());
+            expect(harness.hook.hasTextAfterQuery).toBe(false);
+        });
+    });
+
+    it('does not open on an @ typed inside a word', () => {
+        harness = mount({ caret: 'sdfsdf@'.length });
+        expect(harness.run(h => h.handleTrigger('sdfsdf@DSdsd', EDITOR))).toBe(false);
+    });
+
+    it('reports no text after the query for an @ typed at the end', () => {
+        harness = mount();
+        harness.run(h => h.handleTrigger('find @', EDITOR));
+        expect(harness.hook.hasTextAfterQuery).toBe(false);
+    });
+
+    describe('typing the query', () => {
+        beforeEach(() => {
+            harness = mount();
+            harness.run(h => h.handleTrigger('find @', EDITOR));
+        });
+
+        it('treats everything after the @ as the query', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            expect(harness.hook.query).toBe('smith');
+            expect(harness.hook.isOpen).toBe(true);
+        });
+
+        it('keeps a space that is not the first query character', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            harness.run(h => h.handleChange('find @smith 2020'));
+            expect(harness.hook.query).toBe('smith 2020');
+            expect(harness.hook.isOpen).toBe(true);
+        });
+
+        it('closes once the @ itself is deleted', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            harness.run(h => h.handleChange('find '));
+            expect(harness.hook.isOpen).toBe(false);
+            expect(harness.contentRef.current).toBe('find ');
+        });
+
+        it('ignores a menu search field it is not rendering', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            harness.run(h => h.setQuery('somethingelse'));
+            expect(harness.hook.query).toBe('smith');
+        });
+
+        it('reports the change as handled while open, and not once closed', () => {
+            expect(harness.run(h => h.handleChange('find @s'))).toBe(true);
+            expect(harness.run(h => h.handleChange('other text'))).toBe(true);
+            expect(harness.run(h => h.handleChange('other text!'))).toBe(false);
+        });
+    });
+
+    describe('closing', () => {
+        beforeEach(() => {
+            harness = mount();
+            harness.run(h => h.handleTrigger('find @', EDITOR));
+        });
+
+        it('closes on a space typed as the first query character', () => {
+            const { event, prevented } = keyEvent(' ');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(true);
+            expect(harness.hook.isOpen).toBe(false);
+            // The space still types — only the menu goes away.
+            expect(prevented.value).toBe(false);
+        });
+
+        it('does not close on a space typed later in the query', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            const { event } = keyEvent(' ');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(false);
+            expect(harness.hook.isOpen).toBe(true);
+        });
+
+        it('closes on Escape', () => {
+            const { event, prevented } = keyEvent('Escape');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(true);
+            expect(harness.hook.isOpen).toBe(false);
+            expect(prevented.value).toBe(true);
+        });
+
+        it('leaves the typed text alone when dismissed', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            harness.run(h => h.dismiss());
+            expect(harness.deleted).toEqual([]);
+            expect(harness.contentRef.current).toBe('find @smith');
+        });
+
+        it('takes back the @ and the query when something is picked', () => {
+            harness.run(h => h.handleChange('find @smith'));
+            harness.run(h => h.commit());
+            expect(harness.hook.isOpen).toBe(false);
+            expect(harness.deleted).toEqual(['@smith'.length]);
+        });
+
+        it('refocuses the editor after a pick', async () => {
+            harness.run(h => h.commit());
+            await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+            expect(harness.focused.count).toBe(1);
+        });
+
+        it('passes navigation keys to the menu without consuming them further', () => {
+            for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'Tab']) {
+                const { event, prevented } = keyEvent(key);
+                expect(harness.run(h => h.handleKeyDown(event))).toBe(true);
+                expect(prevented.value).toBe(true);
+                expect(harness.hook.isOpen).toBe(true);
+            }
+        });
+
+        it('ignores keys once closed', () => {
+            harness.run(h => h.dismiss());
+            const { event } = keyEvent('Enter');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(false);
+        });
+    });
+
+    describe('submenu navigation', () => {
+        it('steps back out of a submenu on an empty-query Backspace', () => {
+            const goBack = vi.fn(() => true);
+            harness = mount({ goBack });
+            harness.run(h => h.handleTrigger('@', EDITOR));
+            const { event, prevented } = keyEvent('Backspace');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(true);
+            expect(goBack).toHaveBeenCalled();
+            expect(prevented.value).toBe(true);
+            expect(harness.hook.isOpen).toBe(true);
+        });
+
+        it('lets Backspace delete the @ when there is no submenu to leave', () => {
+            const goBack = vi.fn(() => false);
+            harness = mount({ goBack });
+            harness.run(h => h.handleTrigger('@', EDITOR));
+            const { event, prevented } = keyEvent('Backspace');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(false);
+            expect(prevented.value).toBe(false);
+        });
+
+        it('drops the typed query from the editor when entering a submenu', () => {
+            harness = mount();
+            harness.run(h => h.handleTrigger('@', EDITOR));
+            harness.run(h => h.handleChange('@lib'));
+            harness.run(h => h.resetQuery());
+            expect(harness.deleted).toEqual(['lib'.length]);
+            expect(harness.hook.query).toBe('');
+            expect(harness.hook.isOpen).toBe(true);
+        });
+    });
+
+    describe('opening from the "+" button', () => {
+        beforeEach(() => {
+            harness = mount();
+            harness.contentRef.current = 'draft text ';
+            harness.run(h => h.openFromButton({ x: 10, y: 20 }));
+        });
+
+        it('opens a menu that searches from its own field', () => {
+            expect(harness.hook.isOpen).toBe(true);
+            expect(harness.hook.querySource).toBe('menu');
+            expect(harness.hook.position).toEqual({ x: 10, y: 20 });
+        });
+
+        it('takes its query from that field, leaving the composer text alone', () => {
+            harness.run(h => h.setQuery('smith'));
+            expect(harness.hook.query).toBe('smith');
+            expect(harness.contentRef.current).toBe('draft text ');
+        });
+
+        it('leaves editor keystrokes to the editor', () => {
+            const { event, prevented } = keyEvent('Enter');
+            expect(harness.run(h => h.handleKeyDown(event))).toBe(false);
+            expect(prevented.value).toBe(false);
+            expect(harness.run(h => h.handleChange('draft text more'))).toBe(false);
+        });
+
+        it('deletes nothing from the composer when something is picked', async () => {
+            harness.run(h => h.setQuery('smith'));
+            harness.run(h => h.commit());
+            expect(harness.hook.isOpen).toBe(false);
+            expect(harness.deleted).toEqual([]);
+            await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+            expect(harness.focused.count).toBe(1);
+        });
+
+        it('clears only its own field when entering a submenu', () => {
+            harness.run(h => h.setQuery('lib'));
+            harness.run(h => h.resetQuery());
+            expect(harness.hook.query).toBe('');
+            expect(harness.hook.isOpen).toBe(true);
+            expect(harness.deleted).toEqual([]);
+        });
+
+        it('hands focus back to the editor when dismissed from the keyboard', async () => {
+            harness.run(h => h.dismiss('keyboard'));
+            await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+            expect(harness.hook.isOpen).toBe(false);
+            expect(harness.focused.count).toBe(1);
+        });
+
+        it('leaves focus alone when dismissed by a click elsewhere', async () => {
+            harness.run(h => h.dismiss('outside-click'));
+            await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+            expect(harness.focused.count).toBe(0);
+        });
+    });
+});

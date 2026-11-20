@@ -1,0 +1,110 @@
+import { ColumnOptions, DialogHelper } from "zotero-plugin-toolkit";
+import { config, version } from "../package.json";
+import { ThreadRepository } from './services/threads/threadRepository';
+import { ThreadPresence } from './services/threads/threadPresence';
+import hooks from "./hooks";
+import { ProviderVault } from './services/providerVault';
+import { createBackgroundTaskSource } from "./utils/backgroundTasks";
+import { AsterMarginInstance } from './runtime/instance';
+import { BackgroundExtractor } from "./services/backgroundExtractor";
+import type { NewItemWatcher } from "./services/backgroundProcessing/newItemWatcher";
+import type { ReconcilerService } from "./services/backgroundProcessing/reconciler";
+import { CitationService } from "./services/CitationService";
+import { AsterMarginDB } from "./services/database";
+import { DocumentCache } from "./services/documentCache";
+import { LibraryMutations } from './services/libraryMutations';
+import { LibraryOperations } from './services/libraryOperations';
+import { DeferredCommits } from './services/committedTransaction';
+import { OpenTransactionWatch } from './services/openTransaction';
+import { ItemImportService } from './services/itemImport/service';
+import { InstanceExport } from './services/export/instanceExport';
+import { InstanceImages } from './services/images/instanceImages';
+import { NotePreviews } from './services/notePreviews';
+import { AIProvider } from "./services/OpenAIProvider";
+import { createSyncPauseService } from './services/syncPause';
+import { createZToolkit } from "./utils/ztoolkit";
+
+class Addon {
+    public localEndpoints?: import("./services/instanceLocalEndpoints").InstanceLocalEndpoints;
+    public vault = new ProviderVault();
+    public threads = new ThreadRepository();
+    public presence = new ThreadPresence();
+    public documents?: import("./services/instanceDocuments").InstanceDocuments;
+    public background?: import("./services/instanceBackground").InstanceBackground;
+    public backgroundTasks = createBackgroundTaskSource();
+    public preferences?: import("./services/instancePreferences").InstancePreferences;
+    public account?: import("./services/instanceAccount").InstanceAccount;
+    public tableFills?: import("./services/tableFills/service").InstanceTableFills;
+    public notePreviews = new NotePreviews();
+    public syncPause = createSyncPauseService();
+    public mutations = new LibraryMutations(
+        token => {
+            this.notePreviews.setMutationActive(true);
+            this.syncPause.pauseSyncForMutatingRun(token);
+        },
+        token => {
+            this.notePreviews.setMutationActive(false);
+            this.syncPause.scheduleResumeAfterRun(token);
+        },
+    );
+    public libraryOperations = new LibraryOperations();
+    public deferredCommits = new DeferredCommits();
+    public transactionWatch = new OpenTransactionWatch();
+    public itemImport = new ItemImportService();
+    public exporter = new InstanceExport();
+    public images = new InstanceImages();
+    public runtime = new AsterMarginInstance();
+    public data: {
+        alive: boolean;
+        config: typeof config;
+        // Env type, see build.js
+        env: "development" | "production";
+        ztoolkit: ZToolkit;
+        locale?: {
+            current: any;
+        };
+        prefs?: {
+            window: Window;
+            columns: Array<ColumnOptions>;
+            rows: Array<{ [dataKey: string]: string }>;
+        };
+        dialog?: DialogHelper;
+    };
+    public aiProvider?: AIProvider;
+    public citationService?: CitationService;
+    public db?: AsterMarginDB;
+    public documentCache?: DocumentCache;
+    public backgroundExtractor?: BackgroundExtractor;
+    public processingReconciler?: ReconcilerService;
+    public newItemWatcher?: NewItemWatcher;
+    public pluginVersion?: typeof version;
+    /** Instance-owned OCR entitlement */
+    public hasOcrAccess: boolean = false;
+    /** Instance-owned cloud search-index entitlement */
+    public hasSearchIndexAccess: boolean = false;
+    public searchableLibraryIds: number[] = [];
+    public libraryScopeInitialized: boolean = false;
+    /** Incremented whenever a library leaves `searchableLibraryIds`. */
+    public libraryRevocations: number = 0;
+    /** Local mode, fixed at plugin startup; see `Zotero.AsterMargin.localMode`. */
+    public localMode: boolean = false;
+    /** Whether local mode is on because this build has no AsterMargin server settings. */
+    public localModeForced: boolean = false;
+    // Lifecycle hooks
+    public hooks: typeof hooks;
+    // APIs
+    public api: object;
+    
+    constructor() {
+        this.data = {
+            alive: true,
+            config,
+            env: __env__,
+            ztoolkit: createZToolkit()
+        };
+        this.hooks = hooks;
+        this.api = {};
+    }
+}
+
+export default Addon;

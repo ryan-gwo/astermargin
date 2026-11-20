@@ -1,0 +1,321 @@
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { upstreamVersion as CURRENT_VERSION } from '../../../package.json';
+import {
+    CLIENT_FEATURES,
+    ZOTERO_PLUGIN_CLIENT_TYPE,
+    ZOTERO_PLUGIN_FEATURES,
+} from '@astermargin/agent-core/protocol/agentProtocol';
+import { isExternalRecordsEnabled } from '../../../src/services/externalRecordsCapability';
+
+// Guards the client-feature handshake (Lane C).
+type Op = 'gt' | 'gte';
+
+const VERSION_GATES: { feature: string; minVersion: string; op: Op }[] = [
+    { feature: 'library_management', minVersion: '0.10.999', op: 'gt' },
+    { feature: 'manage_library_structure', minVersion: '0.17.999', op: 'gt' },
+    { feature: 'note_support', minVersion: '0.17.0', op: 'gte' },
+    { feature: 'note_append', minVersion: '0.19.4', op: 'gte' },
+    { feature: 'annotation_support', minVersion: '0.19.999', op: 'gte' },
+    { feature: 'find_annotations', minVersion: '0.20.0b4', op: 'gte' },
+    { feature: 'extract', minVersion: '0.17.0', op: 'gt' },
+    { feature: 'astermargin_extract', minVersion: '0.19.999', op: 'gte' },
+    { feature: 'image_extraction', minVersion: '0.17.999', op: 'gt' },
+    { feature: 'view_page_images', minVersion: '0.17.999', op: 'gt' },
+    { feature: 'read_tool', minVersion: '0.20.999', op: 'gte' },
+    { feature: 'view_tool', minVersion: '0.20.999', op: 'gte' },
+    { feature: 'find_in_attachments', minVersion: '0.20.999', op: 'gt' },
+    { feature: 'document_payload_budget', minVersion: '0.20.999', op: 'gte' },
+    { feature: 'filter_only_search', minVersion: '0.15.999', op: 'gt' },
+    { feature: 'sentence_level_citation', minVersion: '0.19.999', op: 'gte' },
+    { feature: 'unified_citation_format', minVersion: '0.19.999', op: 'gte' },
+    { feature: 'citation_v2', minVersion: '0.20.999', op: 'gte' },
+    { feature: 'tool_result_view', minVersion: '0.20.999', op: 'gte' },
+    { feature: 'external_search_surcharge', minVersion: '0.12.3', op: 'gte' },
+    { feature: 'edit_metadata_creators', minVersion: '0.11.2', op: 'gte' },
+];
+
+// Features the backend never derives from version. ask_user_question is
+// declaration-only because client-feature declaration predates it — every
+// client that ships the question card also declares features explicitly.
+// portable_ids is declaration-only because it gates emission of the
+// device-portable model-facing id format, which every declaring client both
+// emits and resolves — there is no version threshold to derive it from.
+// list_items_include_children, create_note_tags_collections, and
+// edit_note_batch are declaration-only because they gate request/action_data
+// shapes a client only honors if its handlers implement them: builds that
+// predate them drop the unknown fields, so the backend degrades gracefully
+// instead of assuming support from a version.
+// citations_event is declaration-only because it gates an outbound frame the
+// client must have a handler for — a version cannot vouch for that, and the
+// backend keeps embedding citations in run_complete without it.
+// recursive_collections_filter is declaration-only because it describes what
+// the client's two item-search handlers do with collections_filter; without it
+// the backend warns the model that only direct membership was matched.
+// item_quick_search is declaration-only because it gates an inbound request
+// event a client only answers if it has the handler: a build that predates it
+// drops the unknown event silently, so the backend refuses the op up front
+// rather than letting the caller wait out the request timeout.
+// list_items_nested_children, list_items_special_collections,
+// list_collections_recursive, list_tags_name_query and list_tags_types are
+// declaration-only for the same reason as list_items_include_children: they
+// gate request fields a client only honors if its handler implements them, and
+// a build that predates them drops the field and answers a narrower question
+// without saying so.
+// credit_confirmation is declaration-only because it gates an inbound event a
+// client only answers if it has the handler: a build that predates it drops the
+// event and stalls the run for the whole confirmation timeout, so the backend
+// falls back to the per-tool confirmations instead.
+// batch_jobs is declaration-only because it gates a deferred capability with
+// no client handler: a client that does not declare it sees no catalog entry.
+// citation_graph is declaration-only because it gates a deferred capability;
+// on relayed runs the provider declaration controls Zotero-backed lookups.
+// pdf_candidates is declaration-only because the backend would otherwise send a
+// ranked candidate list to clients that ignore it, paying the payload for
+// nothing.
+// population_any_conditions is declaration-only because it gates a
+// resolve_population request field: a build that predates it drops the ORed
+// condition group and resolves a WIDER population than the batch described, so
+// the backend refuses the field up front rather than infer support.
+// batch_item_display is declaration-only because it gates an inbound
+// item_display_request a client only answers if it has the handler: a build
+// that predates it drops the event, and every batch start would wait out the
+// request timeout for nothing.
+// continuation_new_run is declaration-only because it gates an offer shape the
+// client must render and act on: a build that predates it ignores `mode` and
+// `prompt`, so a 'new_run' card would either resume the wrong way or show a
+// button that sends nothing. The backend only composes those offers for a
+// client that declares it.
+// item_links is declaration-only because it describes what the chat client's
+// markdown renderer does with object-id hrefs; a client that predates it would
+// treat `[Smith 2004](u-KEY)` as a broken relative link, so the backend only
+// tells the model to write those when this feature is declared.
+// zotero_duplicates is declaration-only because it gates an inbound
+// duplicates_request and the merge_items action: a build that predates them
+// drops the unknown event and never answers, so the backend withholds the
+// duplicate tools instead of inferring support from a version.
+// item_import_v2 is declaration-only because it gates the import_item action
+// type: an older build cannot resolve, render or write it.
+// book_chapters is declaration-only because it gates a deferred capability
+// whose chapter imports rely on the duplicate check matching ISBNs only
+// between books; a build that predates it would report new chapters as their
+// book.
+// two_page_highlights is declaration-only because it gates a relocation shape
+// the client must apply: a build that predates it refuses a two-page highlight
+// destination, so the backend keeps rejecting those unless it is declared.
+// underline_annotations is declaration-only because a build that predates it
+// ignores `style` and writes highlights where the user asked for underlines.
+// run_reattach is declaration-only because it commits the client to answering a
+// re-sent request or prompt id from memory after a reattach: a build that
+// predates it would run a re-sent action a second time.
+// undelivered_action_ack is declaration-only because it makes the backend store
+// actions as unconfirmed before executing them: a build that predates it never
+// completes those records and would offer to retry a change already made.
+// parked_runs is declaration-only because a run then parks on an unanswered
+// card instead of giving up on it: a build that predates it never shows the
+// stored cards again and leaves the run's calls open.
+// external_records is declaration-only because it gates record shapes (details,
+// search headers, combined snapshots) and import behavior (click-time
+// proposals, fill-only rules, ordered attachments) a build must implement; the
+// PubMed and trial capabilities are offered only to declaring clients.
+// tables is declaration-only because the client serves the table data and runs
+// fills itself; the backend never infers it from a version.
+const DECLARATION_ONLY_FEATURES = [
+    'external_files',
+    'pdf_candidates',
+    'ask_user_question',
+    'portable_ids',
+    'collection_ids',
+    'list_items_include_children',
+    'list_items_nested_children',
+    'list_items_special_collections',
+    'create_note_tags_collections',
+    'edit_note_batch',
+    'edit_annotations',
+    'citations_event',
+    'recursive_collections_filter',
+    'item_quick_search',
+    'list_collections_recursive',
+    'list_tags_name_query',
+    'list_tags_types',
+    'credit_confirmation',
+    'batch_jobs',
+    'citation_graph',
+    'population_any_conditions',
+    'batch_item_display',
+    'item_links',
+    'continuation_new_run',
+    'zotero_duplicates',
+    'two_page_highlights',
+    'underline_annotations',
+    'item_import_v2',
+    'book_chapters',
+    'run_reattach',
+    'undelivered_action_ack',
+    'parked_runs',
+    'external_records',
+    'tables',
+];
+
+// The full backend feature vocabulary (ALL_FEATURES in version_gates.py): every
+// version-gated feature plus the declaration-only ones.
+const ALL_BACKEND_FEATURES = [
+    ...VERSION_GATES.map((g) => g.feature),
+    ...DECLARATION_ONLY_FEATURES,
+].sort();
+
+// =============================================================================
+// PEP 440 version comparison (subset) — reproduces packaging.version.Version
+// ordering for the release + pre-release forms used by the thresholds above
+// (e.g. "0.20.0b4" is a beta that sorts below the "0.20.0" final) as well as
+// the npm/semver-style pre-release suffix the package.json version uses (e.g.
+// "0.22.0-beta.1"). `packaging.version.Version` normalizes both spellings to
+// the same pre-release representation, so this mirrors that normalization.
+// =============================================================================
+const PRE_ORDER: Record<string, number> = { a: 0, b: 1, rc: 2 };
+const PRE_ALIASES: Record<string, keyof typeof PRE_ORDER> = {
+    a: 'a', alpha: 'a',
+    b: 'b', beta: 'b',
+    c: 'rc', rc: 'rc', pre: 'rc', preview: 'rc',
+};
+
+function parseVersion(v: string): { release: number[]; pre: { stage: number; num: number } | null } {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:[-_.]?(alpha|beta|preview|pre|rc|a|b|c)[-_.]?(\d+))?$/i.exec(v);
+    if (!m) throw new Error(`Unparseable version: ${v}`);
+    const preLabel = m[4] ? PRE_ALIASES[m[4].toLowerCase()] : undefined;
+    return {
+        release: [Number(m[1]), Number(m[2]), Number(m[3])],
+        pre: preLabel ? { stage: PRE_ORDER[preLabel], num: Number(m[5]) } : null,
+    };
+}
+
+function compareVersions(a: string, b: string): number {
+    const pa = parseVersion(a);
+    const pb = parseVersion(b);
+    for (let i = 0; i < 3; i++) {
+        if (pa.release[i] !== pb.release[i]) return pa.release[i] < pb.release[i] ? -1 : 1;
+    }
+    // A final release outranks any pre-release of the same release tuple.
+    if (!pa.pre && !pb.pre) return 0;
+    if (!pa.pre) return 1;
+    if (!pb.pre) return -1;
+    if (pa.pre.stage !== pb.pre.stage) return pa.pre.stage < pb.pre.stage ? -1 : 1;
+    if (pa.pre.num !== pb.pre.num) return pa.pre.num < pb.pre.num ? -1 : 1;
+    return 0;
+}
+
+function featuresFromVersion(version: string): string[] {
+    return VERSION_GATES.filter(({ minVersion, op }) => {
+        const cmp = compareVersions(version, minVersion);
+        return op === 'gt' ? cmp > 0 : cmp >= 0;
+    }).map(({ feature }) => feature);
+}
+
+// The plugin version drives the derivation, so the contract is checked against
+// whatever this build actually is.
+
+// Expected declared set for the current production build: everything the
+// backend grants a client of this version, plus the declaration-only features
+// this plugin always ships.
+const EXPECTED_DECLARED_FEATURES = [
+    ...featuresFromVersion(CURRENT_VERSION),
+    ...DECLARATION_ONLY_FEATURES,
+].sort();
+
+describe('client feature declaration (Lane C)', () => {
+    it('declares the Zotero plugin client type', () => {
+        expect(ZOTERO_PLUGIN_CLIENT_TYPE).toBe('zotero-plugin');
+    });
+
+    it('feature vocabulary includes the negotiated declaration-only contracts', () => {
+        expect(Object.values(CLIENT_FEATURES).slice().sort()).toEqual(ALL_BACKEND_FEATURES);
+    });
+
+    it('declares no duplicate features', () => {
+        expect(new Set(ZOTERO_PLUGIN_FEATURES).size).toBe(ZOTERO_PLUGIN_FEATURES.length);
+    });
+
+    it('declares exactly the features the backend grants this plugin version', () => {
+        // Derived from the version-gate table — not a frozen mirror — so a new
+        // backend gate that this version crosses forces a CLIENT_FEATURES update.
+        expect(ZOTERO_PLUGIN_FEATURES.slice().sort()).toEqual(EXPECTED_DECLARED_FEATURES);
+    });
+
+    it('declares citation_v2 so streaming run_complete events serialize as v2', () => {
+        // Regression guard: without this flag the backend downgrades streamed
+        // citations to the legacy shape (no display_name), while DB-loaded
+        // threads — gated on the version header — still get v2 and render fine.
+        expect(featuresFromVersion(CURRENT_VERSION)).toContain('citation_v2');
+        expect(ZOTERO_PLUGIN_FEATURES).toContain('citation_v2');
+    });
+
+    it('always declares batch_jobs', () => {
+        expect(ZOTERO_PLUGIN_FEATURES).toContain('batch_jobs');
+    });
+
+    it('always declares citation_graph', () => {
+        expect(ZOTERO_PLUGIN_FEATURES).toContain('citation_graph');
+    });
+
+    it('always declares population_any_conditions', () => {
+        // The resolve_population handler applies the ORed condition group, so
+        // the backend may send it. Without the declaration a batch that mixes
+        // the joins is refused before it reaches this build.
+        expect(ZOTERO_PLUGIN_FEATURES).toContain('population_any_conditions');
+    });
+});
+
+describe('version-gate mirror integrity', () => {
+    it('the gate table plus declaration-only features cover the whole vocabulary', () => {
+        const tableFeatures = [
+            ...VERSION_GATES.map((g) => g.feature),
+            ...DECLARATION_ONLY_FEATURES,
+        ];
+        // No duplicate rows, and the table is the same vocabulary asserted above.
+        expect(new Set(tableFeatures).size).toBe(tableFeatures.length);
+        expect(tableFeatures.slice().sort()).toEqual(ALL_BACKEND_FEATURES);
+    });
+
+    it('version comparison reproduces PEP 440 ordering at the boundaries', () => {
+        // Self-check the comparator so a derivation built on it can be trusted.
+        expect(compareVersions('0.21.1', '0.20.999')).toBe(1);
+        expect(compareVersions('0.20.999', '0.21.0')).toBe(-1);
+        expect(compareVersions('0.20.0b4', '0.20.0')).toBe(-1); // beta sorts below final
+        expect(compareVersions('0.20.0b4', '0.20.0b5')).toBe(-1);
+        expect(compareVersions('0.19.4', '0.19.4')).toBe(0);
+        // The `>` gates exclude an exact-threshold match; `>=` gates include it.
+        expect(compareVersions('0.20.999', '0.20.999')).toBe(0);
+    });
+
+    it('normalizes the npm/semver pre-release spelling used by package.json', () => {
+        // "0.22.0-beta.1" (package.json) and "0.22.0b1" (PEP 440 compact form used
+        // in the gate table) must compare equal, matching packaging.version.Version.
+        expect(compareVersions('0.22.0-beta.1', '0.22.0b1')).toBe(0);
+        expect(compareVersions('0.22.0-beta.1', '0.22.0')).toBe(-1);
+        expect(compareVersions('0.22.0-beta.2', '0.22.0-beta.1')).toBe(1);
+    });
+});
+
+// The external-records declaration is withheld from the handshake on release
+// builds (`zoteroClientIdentity.ts` filters it out), while the feature stays in
+// the vocabulary above: the build gate decides what is declared, not what this
+// build knows how to do.
+describe('external records build gate', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('enables external records only on development and staging builds', () => {
+        vi.stubEnv('NODE_ENV', 'production');
+        vi.stubEnv('BUILD_ENV', '');
+        expect(isExternalRecordsEnabled()).toBe(false);
+
+        vi.stubEnv('NODE_ENV', 'development');
+        expect(isExternalRecordsEnabled()).toBe(true);
+
+        vi.stubEnv('NODE_ENV', 'production');
+        vi.stubEnv('BUILD_ENV', 'staging');
+        expect(isExternalRecordsEnabled()).toBe(true);
+    });
+
+    it('keeps external_records in the declared vocabulary this build implements', () => {
+        expect(ZOTERO_PLUGIN_FEATURES).toContain(CLIENT_FEATURES.EXTERNAL_RECORDS);
+    });
+});

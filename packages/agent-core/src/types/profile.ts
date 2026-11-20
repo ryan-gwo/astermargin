@@ -1,0 +1,167 @@
+import { ZoteroLibrary } from "./zotero";
+
+export interface ExcludedLibrary {
+    type: 'user' | 'group';
+    group_id?: number | null;
+}
+
+export type CreditPlanStatus = "none" | "active" | "past_due" | "canceled";
+
+export interface ProfileBalance {
+    pagesRemaining: number;
+    /** Spendable now — zero unless billing status allows subscription credits. */
+    subscriptionChatCreditsRemaining: number;
+    /** Spendable now — zero once the purchased pool has expired. */
+    purchasedChatCreditsRemaining: number;
+    chatCreditsRemaining: number;
+    /** Allowance + rollover the current period can draw on; zero when ineligible. */
+    subscriptionCreditLimit: number;
+    rolledOverCredits: number;
+    monthlyCredits: number;
+    monthlyCreditsUsed: number;
+}
+
+/**
+ * Subscription status enum (based on SubscriptionStatus)
+ * @deprecated Still used by the WS protocol in agentProtocol.ts
+ */
+export enum SubscriptionStatus {
+    FREE = "free",
+    ACTIVE = "active",
+    PAST_DUE = "past_due"
+}
+
+/**
+ * Charge type for chat requests (determines billing method)
+ */
+export enum ChargeType {
+    SUBSCRIPTION_CREDIT = "subscription_credit",
+    USER_API_KEY = "user_api_key",
+    USAGE_BASED_BILLING = "usage_based_billing",
+    APP_KEY_FALLBACK = "app_key_fallback",
+    BYOK_PLUS_TOOLS = "byok_plus_tools"
+}
+
+/**
+ * Credit breakdown for the profile
+ */
+export interface CreditBreakdown {
+    subscriptionRemaining: number;
+    rolledOverCredits: number;
+    purchasedCredits: number;
+    purchasedExpiresAt: string | null;
+    total: number;
+}
+
+/**
+ * Credit plan for the profile
+ */
+export interface CreditPlan {
+    plan: string | null;
+    status: CreditPlanStatus;
+    monthlyCredits: number; // monthly credits for the plan
+    periodEnd: string | null; // period end date
+    monthlyResetAt: string | null; // annual plans: next intra-year credit reset
+    cancelAtPeriodEnd: boolean; // whether to cancel at period end
+    pendingDowngrade: boolean; // whether a downgrade is pending at period end
+}
+
+/**
+ * Processing mode determines where document processing happens
+ * - FRONTEND: Documents processed client-side (free users, paid users before indexing)
+ * - BACKEND: Pre-indexed server-side data (paid users after indexing complete)
+ */
+export enum ProcessingMode {
+    FRONTEND = "frontend",
+    BACKEND = "backend"
+}
+
+/**
+ * Profile interface representing user profile data (based on SafeProfileModel)
+ */
+export interface SafeProfileModel {
+    user_id: string;             // UUID
+    
+    // Subscription
+    current_plan_id: string;     // UUID
+
+    // Credit plan (LLM credit subscription)
+    credit_plan: string | null;  // 'plus' (or null if no active credit plan)
+    credit_plan_status: CreditPlanStatus;
+    credit_plan_monthly_credits: number;
+    credit_period_start: string | null;
+    credit_period_end: string | null;
+    credit_monthly_reset_at: string | null;
+    credit_cancel_at_period_end: boolean;
+    credit_pending_downgrade: boolean;
+    rolled_over_credits: number;
+    purchased_credits_expires_at: string | null;
+    
+    // Zotero integration and settings
+    zotero_user_id: string | null;
+    zotero_local_ids: string[] | null;
+    use_zotero_sync: boolean;
+
+    // Consent and authorization status: Database sync (Pro plan)
+    has_authorized_access: boolean;
+    consented_at?: Date | null;
+    has_completed_onboarding: boolean;
+
+    // Consent and authorization status: Free plan
+    has_authorized_free_access: boolean;
+    free_consented_at?: Date | null;
+
+    // Plan transition flags
+    pending_upgrade_consent: boolean;
+    pending_downgrade_ack: boolean;
+    data_deletion_scheduled_for?: Date | null;
+
+    // User preferences
+    consent_to_share: boolean;
+    email_notifications: boolean;
+    libraries?: ZoteroLibrary[];
+    excluded_libraries?: ExcludedLibrary[];
+
+    // First-run state (migration 20260430000001)
+    first_run_completed_at: string | null;
+    first_run_completion_kind: string | null;
+    
+    // Balances
+    standard_page_balance: number;
+    purchased_standard_page_balance: number;
+
+    // Chat credits
+    chat_credits_used: number;
+    purchased_chat_credits: number;
+
+    // Spendable balances, computed by the backend from billing status and
+    // purchased-credit expiry. The raw allowance/rollover/used fields above
+    // describe the plan and the current period; these are what the account can
+    // actually spend, so any displayed balance or has-credits check must read
+    // these instead of recomputing from the raw fields.
+    available_subscription_credits: number;
+    available_purchased_credits: number;
+    subscription_credit_limit: number;
+
+    // Indexing status for backend processing mode
+    indexing_complete: boolean;
+
+    // Data migration version
+    data_version: number;
+    data_migrated_at: string | null;
+
+    // OCR entitlement
+    has_ocr_access: boolean;
+
+    // Cloud search-index entitlement
+    has_search_index_access: boolean;
+
+    // Copy-only label for the background-processing welcome popup
+    indexing_plan_label: 'pro' | 'search' | null;
+}
+
+/**
+ * Profile payload returned by the backend. The backend still attaches a frozen
+ * legacy `plan` object for older clients; this client does not read it.
+ */
+export type SafeProfileWithPlan = SafeProfileModel;

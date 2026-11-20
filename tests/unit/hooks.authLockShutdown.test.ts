@@ -1,0 +1,498 @@
+vi.mock('../../src/services/instanceLocalEndpoints', () => ({ InstanceLocalEndpoints: class { start() {} dispose() {} } }));
+import { AsterMarginInstance } from '../../src/runtime/instance';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const {
+    mockCloseAsterMarginWindow,
+    mockClosePreferencesWindow,
+    mockCleanupContextMenus,
+    mockCancelAllActiveTasks,
+    mockDisposeMuPDFWorker,
+    mockRegisterChatPanel,
+    mockRegisterShortcuts,
+    mockRemoveChatPanel,
+    mockUnregisterAsterMarginProtocolHandler,
+    mockUnregisterShortcuts,
+} = vi.hoisted(() => ({
+    mockCloseAsterMarginWindow: vi.fn(),
+    mockClosePreferencesWindow: vi.fn(),
+    mockCleanupContextMenus: vi.fn(),
+    mockCancelAllActiveTasks: vi.fn(),
+    mockDisposeMuPDFWorker: vi.fn().mockResolvedValue(undefined),
+    mockRegisterChatPanel: vi.fn(),
+    mockRegisterShortcuts: vi.fn(),
+    mockRemoveChatPanel: vi.fn(),
+    mockUnregisterAsterMarginProtocolHandler: vi.fn(),
+    mockUnregisterShortcuts: vi.fn(),
+}));
+
+vi.mock('../../src/ui/ui', () => ({
+    AsterMarginUIFactory: {
+        closeAsterMarginWindow: vi.fn(),
+        registerChatPanel: mockRegisterChatPanel,
+        removeChatPanel: mockRemoveChatPanel,
+        registerShortcuts: mockRegisterShortcuts,
+        unregisterShortcuts: mockUnregisterShortcuts,
+        closeWindowsRenderedBy: vi.fn(),
+        closeAsterMarginWindow: mockCloseAsterMarginWindow,
+        closePreferencesWindow: mockClosePreferencesWindow,
+    },
+}));
+
+vi.mock('../../src/astermargin-extract', () => ({
+    disposeMuPDFWorker: mockDisposeMuPDFWorker,
+}));
+
+vi.mock('../../src/services/protocolHandler', () => ({
+    registerAsterMarginProtocolHandler: vi.fn(),
+    unregisterAsterMarginProtocolHandler: mockUnregisterAsterMarginProtocolHandler,
+}));
+
+vi.mock('../../src/utils/backgroundTasks', () => ({
+    cancelAllActiveTasks: mockCancelAllActiveTasks,
+}));
+
+vi.mock('../../src/modules/zoteroContextMenu', () => ({
+    initContextMenus: vi.fn(),
+    cleanupContextMenus: mockCleanupContextMenus,
+}));
+
+vi.mock('../../src/utils/locale', () => ({
+    initLocale: vi.fn(),
+}));
+
+vi.mock('../../src/utils/ztoolkit', () => ({
+    createZToolkit: vi.fn(),
+}));
+
+vi.mock('../../src/services/CitationService', () => ({
+    CitationService: class MockCitationService {},
+}));
+
+vi.mock('../../src/services/database', () => ({
+    AsterMarginDB: class MockAsterMarginDB {
+        initDatabase = vi.fn().mockResolvedValue(undefined);
+        closeDatabase = vi.fn().mockResolvedValue(undefined);
+    },
+}));
+
+vi.mock('../../src/services/backgroundExtractor', () => ({
+    BackgroundExtractor: class MockBackgroundExtractor {
+        start = vi.fn();
+        stop = vi.fn().mockResolvedValue(undefined);
+        processOnce = vi.fn().mockResolvedValue({ processed: false });
+    },
+}));
+
+vi.mock('../../react/eventBus', () => ({
+    default: {},
+}));
+
+vi.mock('../../src/utils/prefs', () => ({
+    getPref: vi.fn(),
+    setPref: vi.fn(),
+    clearPref: vi.fn(),
+}));
+
+vi.mock('../../src/utils/versionNotificationPrefs', () => ({
+    addPendingVersionNotification: vi.fn(),
+}));
+
+vi.mock('../../react/constants/versionUpdateMessages', () => ({
+    getAllVersionUpdateMessageVersions: vi.fn(() => []),
+}));
+
+vi.mock('../../src/services/documentCache', () => ({
+    DocumentCache: class {
+        init = vi.fn().mockResolvedValue(undefined);
+        runStartupGC = vi.fn().mockResolvedValue(undefined);
+    },
+}));
+vi.mock('../../src/utils/configurePDFForAsterMargin', () => ({ configurePDFForAsterMargin: vi.fn() }));
+vi.mock('../../src/modules/readerIntegration', () => ({ initReaderIntegration: vi.fn(), cleanupReaderIntegration: vi.fn() }));
+vi.mock('../../src/modules/readerToolbarMenu', () => ({ initReaderToolbarMenu: vi.fn(), cleanupReaderToolbarMenu: vi.fn() }));
+vi.mock('../../src/modules/noteEditorExportMenu', () => ({ initNoteEditorExportMenu: vi.fn(), cleanupNoteEditorExportMenu: vi.fn() }));
+vi.mock('../../src/services/artifacts/view/readerTableView', () => ({
+    initTableReaderRedirect: vi.fn(), cleanupTableReaderRedirect: vi.fn(),
+}));
+vi.mock('../../src/ui/tableTab', () => ({ initTableTabs: vi.fn(), cleanupTableTabs: vi.fn() }));
+vi.mock('../../src/ui/astermarginTabs', () => ({
+    initAsterMarginTabs: vi.fn(), cleanupAsterMarginTabs: vi.fn(),
+    recoverTabsAfterAsterMarginTabs: vi.fn(async () => 0), restoreAsterMarginTabs: vi.fn(async () => 0),
+}));
+vi.mock('../../src/ui/tableTabProbe', () => ({ stopTableTabProbe: vi.fn(), handleTableTabProbe: vi.fn() }));
+vi.mock('../../src/services/artifacts/tablesApiHost', () => ({
+    registerTablesApi: vi.fn(), unregisterTablesApi: vi.fn(), unregisterTableShadowRestore: vi.fn(),
+}));
+
+function makeAuthLock() {
+    return {
+        locked: true,
+        queue: [],
+        lockName: 'refresh-session',
+        lockToken: 1,
+        tokenCounter: 1,
+    };
+}
+
+function makeWindow() {
+    const win = {
+        EventTarget,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        closed: false,
+        document: {
+            getElementById: vi.fn().mockReturnValue(null),
+        },
+    } as Window & Record<string, unknown>;
+    (globalThis as any).addon.runtime.attachWindow(win);
+    return win;
+}
+
+function setupGlobals() {
+    const styleSheetService = {
+        sheetRegistered: vi.fn().mockReturnValue(false),
+        unregisterSheet: vi.fn(),
+        loadAndRegisterSheet: vi.fn(),
+    };
+
+    (globalThis as any).Services = {
+        startup: {
+            shuttingDown: true,
+        },
+        io: {
+            newURI: vi.fn((uri: string) => uri),
+        },
+        obs: {
+            addObserver: vi.fn(),
+            removeObserver: vi.fn(),
+        },
+        wm: {
+            addListener: vi.fn(),
+            removeListener: vi.fn(),
+        },
+    };
+
+    (globalThis as any).Cc = {
+        '@mozilla.org/content/style-sheet-service;1': {
+            getService: vi.fn(() => styleSheetService),
+        },
+    };
+
+    (globalThis as any).Ci = {
+        ...(globalThis as any).Ci,
+        nsIFile: {
+            DIRECTORY_TYPE: 1,
+        },
+        nsIStyleSheetService: {
+            AUTHOR_SHEET: 'author',
+        },
+    };
+
+    (globalThis as any).addon = {
+        threads: { start: vi.fn(), dispose: vi.fn() },
+        presence: { dispose: vi.fn() },
+        account: { subscribe: vi.fn(() => () => {}), dispose: vi.fn().mockResolvedValue(undefined), start: vi.fn() },
+        preferences: { dispose: vi.fn() },
+        runtime: new AsterMarginInstance(),
+        mutations: { cancelOwner: vi.fn(), dispose: vi.fn().mockResolvedValue(undefined) },
+        itemImport: { dispose: vi.fn() },
+        images: { dispose: vi.fn() },
+        notePreviews: { detachOwner: vi.fn().mockResolvedValue(undefined) },
+        syncPause: { releaseWindow: vi.fn(), scheduleResumeAfterRun: vi.fn(), resumeSyncNow: vi.fn() },
+        transactionWatch: { start: vi.fn(), stop: vi.fn(), openAgeMs: vi.fn(() => 0) },
+        data: {
+            alive: true,
+            config: {
+                addonRef: 'astermargin',
+                addonInstance: 'AsterMargin',
+                addonID: 'astermargin@test',
+            },
+        },
+    };
+
+    (globalThis as any).rootURI = 'chrome://astermargin/';
+    (globalThis as any).ztoolkit = {
+        log: vi.fn(),
+        unregisterAll: vi.fn(),
+    };
+
+    Object.assign(globalThis.Zotero, {
+        getMainWindows: vi.fn(() => []),
+        getMainWindow: vi.fn(() => null),
+        logError: vi.fn(),
+        __astermarginShuttingDown: false,
+        AsterMargin: {},
+    });
+
+    return { styleSheetService };
+}
+
+async function loadHooks() {
+    return (await import('../../src/hooks')).default;
+}
+
+describe('hooks auth lock shutdown cleanup', () => {
+    it.each(['onShutdown', 'onAppShutdown'] as const)('stops ingress before waiting for mutations in %s', async entry => {
+        const hooks = await loadHooks();
+        const disposeIngress = vi.fn();
+        const instance = (globalThis as any).addon;
+        instance.localEndpoints = { dispose: disposeIngress };
+        let finish!: () => void;
+        instance.mutations.dispose = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+        const shutdown = hooks[entry]();
+        expect(disposeIngress).toHaveBeenCalledOnce();
+        expect(instance.localEndpoints).toBeUndefined();
+        expect(instance.account.dispose).not.toHaveBeenCalled();
+        finish();
+        await shutdown;
+    });
+
+    it.each(['onShutdown', 'onAppShutdown'] as const)('flushes table fills before the mutation queue closes in %s', async entry => {
+        const hooks = await loadHooks();
+        const instance = (globalThis as any).addon;
+        const order: string[] = [];
+        let flushed!: () => void;
+        instance.tableFills = {
+            dispose: vi.fn(() => new Promise<void>(resolve => { order.push('fills'); flushed = resolve; })),
+        };
+        instance.mutations.dispose = vi.fn(async () => { order.push('mutations'); });
+        const shutdown = hooks[entry]();
+        await Promise.resolve();
+        expect(order).toEqual(['fills']);
+        flushed();
+        await shutdown;
+        expect(order).toEqual(['fills', 'mutations']);
+        expect(instance.tableFills).toBeUndefined();
+    });
+
+    it('makes a second shutdown path wait for the first one\'s fill flush', async () => {
+        const hooks = await loadHooks();
+        const instance = (globalThis as any).addon;
+        const order: string[] = [];
+        let flushed!: () => void;
+        const dispose = vi.fn(() => new Promise<void>(resolve => { flushed = resolve; }));
+        instance.tableFills = { dispose };
+        instance.mutations.dispose = vi.fn(async () => { order.push('mutations'); });
+        const first = hooks.onAppShutdown();
+        await Promise.resolve();
+        const second = hooks.onShutdown();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(order).toEqual([]);
+        order.push('flushed');
+        flushed();
+        await Promise.all([first, second]);
+        // Neither path closed the queue before the flush, and the service was disposed once.
+        expect(order[0]).toBe('flushed');
+        expect(order.filter((step) => step === 'mutations').length).toBeGreaterThan(0);
+        expect(dispose).toHaveBeenCalledTimes(1);
+    });
+
+    beforeEach(() => {
+        vi.resetModules();
+        vi.clearAllMocks();
+        setupGlobals();
+        // No `compileScript`: renderers load their bundle with a script tag.
+        (globalThis as any).ChromeUtils = {};
+        mockDisposeMuPDFWorker.mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('completes essential startup', async () => {
+        (globalThis as any).Services.startup.shuttingDown = false;
+        const testConnection = vi.fn().mockResolvedValue(undefined);
+        (Zotero as any).DBConnection = vi.fn(function () { return { test: testConnection }; });
+        (Zotero as any).PreferencePanes = { register: vi.fn().mockResolvedValue(undefined) };
+        const hooks = await loadHooks();
+        await hooks.onStartup();
+        expect(testConnection).toHaveBeenCalledOnce();
+        expect((globalThis as any).addon.db.initDatabase).toHaveBeenCalledOnce();
+        expect((globalThis as any).addon.db.closeDatabase).not.toHaveBeenCalled();
+        expect(mockRegisterShortcuts).toHaveBeenCalledOnce();
+        expect(Zotero.PreferencePanes.register).toHaveBeenCalledOnce();
+        const prefs = await import('../../src/utils/prefs');
+        expect(prefs.clearPref).toHaveBeenCalledWith('backgroundProcessingContinuous');
+    });
+
+    describe('main windows opened after startup', () => {
+        async function startWatching() {
+            (globalThis as any).Services.startup.shuttingDown = false;
+            (Zotero as any).DBConnection = vi.fn(function () { return { test: vi.fn().mockResolvedValue(undefined) }; });
+            (Zotero as any).PreferencePanes = { register: vi.fn().mockResolvedValue(undefined) };
+            const hooks = await loadHooks();
+            await hooks.onStartup();
+            const listener = vi.mocked((globalThis as any).Services.wm.addListener).mock.calls[0]?.[0];
+            expect(listener).toBeDefined();
+            return { hooks, listener };
+        }
+
+        function openWindow(listener: any, pane: Record<string, unknown>) {
+            let onLoad: (() => void) | undefined;
+            const win: any = {
+                EventTarget,
+                closed: false,
+                location: { href: 'chrome://zotero/content/zoteroPane.xhtml' },
+                document: { getElementById: vi.fn(() => null), querySelector: vi.fn(() => null) },
+                ZoteroPane: pane,
+                addEventListener: vi.fn((type: string, handler: () => void) => { if (type === 'load') onLoad = handler; }),
+                removeEventListener: vi.fn(),
+            };
+            listener.onOpenWindow({ docShell: { domWindow: win } });
+            return { win, load: () => onLoad?.() };
+        }
+
+        it('attaches a Zotero 11 window that opens without a library view, once Zotero has set it up', async () => {
+            const { listener } = await startWatching();
+            let paneLoaded!: () => void;
+            const { win, load } = openWindow(listener, {
+                libraryViews: [],
+                loadedPromise: new Promise<void>(resolve => { paneLoaded = resolve; }),
+            });
+            load();
+            await Promise.resolve();
+            expect((globalThis as any).addon.runtime.getWindow(win)).toBeUndefined();
+            paneLoaded();
+            await vi.waitFor(() => expect((globalThis as any).addon.runtime.getWindow(win)).toBeDefined());
+        });
+
+        it('leaves Zotero 7–10 windows to Zotero\'s own load notification', async () => {
+            const { listener } = await startWatching();
+            const { win, load } = openWindow(listener, { loadedPromise: Promise.resolve() });
+            load();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect((globalThis as any).addon.runtime.getWindow(win)).toBeUndefined();
+        });
+
+        it('stops attaching windows once AsterMargin shuts down', async () => {
+            const { hooks, listener } = await startWatching();
+            const { win, load } = openWindow(listener, { libraryViews: [], loadedPromise: Promise.resolve() });
+            (globalThis as any).Services.startup.shuttingDown = true;
+            await hooks.onShutdown();
+            expect((globalThis as any).Services.wm.removeListener).toHaveBeenCalledWith(listener);
+            load();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect((globalThis as any).addon.runtime.getWindow(win)).toBeUndefined();
+        });
+    });
+
+    it('holds the quit until running table fills have flushed, and disposes the account after', async () => {
+        (globalThis as any).Services.startup.shuttingDown = false;
+        (Zotero as any).DBConnection = vi.fn(function () { return { test: vi.fn().mockResolvedValue(undefined) }; });
+        (Zotero as any).PreferencePanes = { register: vi.fn().mockResolvedValue(undefined) };
+        const addBlocker = vi.fn();
+        (globalThis as any).ChromeUtils = {
+            importESModule: vi.fn(() => ({ AsyncShutdown: { appShutdownConfirmed: { addBlocker, removeBlocker: vi.fn() } } })),
+        };
+        try {
+            const hooks = await loadHooks();
+            await hooks.onStartup();
+            expect(addBlocker).toHaveBeenCalledWith('AsterMargin: flush table fills', expect.any(Function));
+            const blocker = addBlocker.mock.calls[0][1] as () => Promise<void>;
+            const observer = vi.mocked((globalThis as any).Services.obs.addObserver).mock.calls
+                .find(([, topic]: [unknown, string]) => topic === 'quit-application')![0] as { observe(s: unknown, t: string): void };
+            let flushed!: () => void;
+            const dispose = vi.fn(() => new Promise<void>((resolve) => { flushed = resolve; }));
+            (globalThis as any).addon.tableFills = { dispose };
+            // Gecko runs the blocker and the observer in the same phase.
+            const holding = blocker();
+            observer.observe(null, 'quit-application');
+            await Promise.resolve();
+            await Promise.resolve();
+            // The account outlives the flush: its last commit needs it.
+            expect(dispose).toHaveBeenCalledOnce();
+            expect((globalThis as any).addon.account.dispose).not.toHaveBeenCalled();
+            flushed();
+            await holding;
+            await vi.waitFor(() => expect((globalThis as any).addon.account.dispose).toHaveBeenCalledOnce());
+        } finally {
+            delete (globalThis as any).ChromeUtils;
+        }
+    });
+
+    it('closes the database and stops background services on shutdown', async () => {
+        const hooks = await loadHooks();
+        const stop = vi.fn().mockResolvedValue(undefined), closeDatabase = vi.fn().mockResolvedValue(undefined);
+        (globalThis as any).addon.db = { closeDatabase };
+        (globalThis as any).addon.backgroundExtractor = { stop };
+        await hooks.onShutdown();
+        expect(stop).toHaveBeenCalledOnce(); expect(closeDatabase).toHaveBeenCalledOnce();
+        expect((globalThis as any).addon.runtime.getSnapshot()).toEqual([]);
+    });
+
+    it('disposes instance auth during full shutdown unload', async () => {
+        const hooks = await loadHooks();
+        const win = makeWindow();
+        (globalThis as any).addon.account.dispose = vi.fn().mockResolvedValue(undefined);
+
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect((globalThis as any).addon.account.dispose).toHaveBeenCalled();
+        expect(mockCancelAllActiveTasks).toHaveBeenCalledOnce();
+    });
+
+    it.each([false, true])('clears the document owner after disposal (throws: %s)', async (throws) => {
+        const hooks = await loadHooks();
+        const win = makeWindow();
+        const dispose = vi.fn(() => { if (throws) throw new Error('disposed'); });
+        (globalThis as any).addon.documents = { dispose };
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+        await hooks.onMainWindowUnload(win);
+        expect(dispose).toHaveBeenCalledOnce();
+        expect((globalThis as any).addon.documents).toBeUndefined();
+    });
+
+    it('continues cleanup when instance auth disposal throws', async () => {
+        const hooks = await loadHooks();
+        const win = makeWindow();
+        (globalThis as any).addon.account.dispose = vi.fn().mockRejectedValue(new Error('dispose failed'));
+
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        await hooks.onMainWindowUnload(win);
+
+        expect((globalThis as any).addon.account.dispose).toHaveBeenCalled();
+        expect(ztoolkit.log).toHaveBeenCalledWith(expect.stringContaining('disposeAccount: Error: dispose failed'));
+    });
+
+    it('continues cleanup after instance auth disposal times out', async () => {
+        vi.useFakeTimers();
+
+        const hooks = await loadHooks();
+        const win = makeWindow();
+        (globalThis as any).addon.account.dispose = vi.fn(() => new Promise<void>(() => {}));
+
+        vi.mocked(Zotero.getMainWindows).mockReturnValue([win]);
+
+        const unloadPromise = hooks.onMainWindowUnload(win);
+        await vi.advanceTimersByTimeAsync(3000);
+        await unloadPromise;
+
+        expect((globalThis as any).addon.account.dispose).toHaveBeenCalled();
+        expect(Zotero.debug).toHaveBeenCalledWith(expect.stringContaining('disposeAccount timed out after 3000ms'));
+    });
+
+    it('clears the shutdown flag for the next startup even when cleanup throws', async () => {
+        const hooks = await loadHooks();
+        vi.mocked(ztoolkit.unregisterAll).mockImplementation(() => { throw new Error('cleanup failure'); });
+        await hooks.onShutdown();
+        expect(Zotero.__astermarginShuttingDown).toBeUndefined();
+    });
+
+    it('disposes instance auth in fallback shutdown cleanup', async () => {
+        const hooks = await loadHooks();
+        const mainWin = makeWindow();
+        (globalThis as any).addon.account.dispose = vi.fn().mockRejectedValue(new Error('dispose failed'));
+
+        vi.mocked(Zotero.getMainWindow).mockReturnValue(mainWin);
+
+        await hooks.onShutdown();
+
+        expect((globalThis as any).addon.account.dispose).toHaveBeenCalled();
+    });
+});

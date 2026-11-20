@@ -1,0 +1,398 @@
+import { BoundingBox, CoordOrigin, PageLocation, convertBoundingBoxToBottomLeft, toZoteroRectFromBBox } from '@astermargin/agent-core/types/citations';
+import { getCurrentReader, getCurrentReaderAndWaitForView } from './readerUtils';
+import { ZoteroReader } from './annotationUtils';
+import { logger } from '@astermargin/agent-core/platform/logger';
+import { getPageViewportInfo, isPDFDocumentAvailable, waitForPDFDocument, applyRotationToBoundingBox } from './pdfUtils';
+import { isLibraryEditable } from '../../src/utils/zoteroUtils';
+import { resolveAsterMarginAnnotationColor } from '../../src/constants/annotations';
+import { markAsterMarginAnnotationWriteByKey } from '../../src/services/annotations/astermarginAnnotationRegistry';
+import { AnnotationProposedAction, isHighlightAnnotationAction, isNoteAnnotationAction, AnnotationResultData } from '@astermargin/agent-core/types/agentActions/base';
+import { libraryRefForLibraryID, resolveLibraryRef } from '../../src/utils/libraryIdentity';
+
+
+const NOTE_RECT_SIZE = 18;
+
+function resolveHighlightColor(color?: string | null): string {
+    return resolveAsterMarginAnnotationColor(color);
+}
+
+async function getAttachmentItem(
+    libraryId: number,
+    attachmentKey: string
+): Promise<Zotero.Item | null> {
+    return (await Zotero.Items.getByLibraryAndKeyAsync(libraryId, attachmentKey)) || null;
+}
+
+function isReaderForAttachment(reader: ZoteroReader | null, attachment: Zotero.Item): boolean {
+    if (!reader) return false;
+    if (!attachment.id) return false;
+    return (reader as any).itemID === attachment.id;
+}
+
+function isReaderForAttachmentKey(reader: ZoteroReader | null, attachmentKey: string): boolean {
+    if (!reader) return false;
+    if (!attachmentKey) return false;
+    return (reader as any)._item === undefined || (reader as any)._item?.key === attachmentKey;
+}
+
+/** The library the reader saves its annotations into, when it can be read. */
+function readerLibraryID(reader: ZoteroReader): number | undefined {
+    const libraryID = (reader as any)._item?.libraryID;
+    return typeof libraryID === 'number' ? libraryID : undefined;
+}
+
+/**
+ * Hand a prepared annotation to the reader and record it as AsterMargin's own.
+ *
+ * `addAnnotation` returns the key without yielding; record in this same stack
+ * or the observer can see the save first. Record under the reader's library
+ * (what the saved annotation will report).
+ */
+function addReaderAnnotation(reader: ZoteroReader, data: unknown, libraryId: number): string {
+    const iframeWindow = (reader as any)?._internalReader?._primaryView?._iframeWindow;
+    if (!iframeWindow) {
+        throw new Error('Unable to access reader iframe window');
+    }
+
+    const created = (reader as any)._internalReader._annotationManager.addAnnotation(
+        Components.utils.cloneInto(data, iframeWindow)
+    );
+
+    if (!created || !created.id) {
+        throw new Error('Failed to create annotation - annotation manager returned null');
+    }
+
+    markAsterMarginAnnotationWriteByKey(readerLibraryID(reader) ?? libraryId, created.id);
+    return created.id;
+}
+
+async function convertLocationToRects(
+    reader: ZoteroReader,
+    location: PageLocation
+): Promise<{ rects: number[][]; viewBox: number[] }> {
+    // Get viewport info directly from PDF document (no need for rendered page)
+    const { viewBox, height, width, rotation } = await getPageViewportInfo(reader, location.page_idx);
+    const viewBoxLL: [number, number] = [viewBox[0], viewBox[1]];
+
+    if (!location.boxes) {
+        throw new Error('Location boxes missing');
+    }
+
+    // Only apply rotation transformation if page is actually rotated
+    const rects = rotation !== 0
+        ? location.boxes
+            .map((box) => convertBoundingBoxToBottomLeft(box, height))
+            .map((box) => {
+                logger(`Applying rotation ${rotation}° to box: l=${box.l}, b=${box.b}, r=${box.r}, t=${box.t}, rotated dims: w=${width}, h=${height}`, 2);
+                const rotated = applyRotationToBoundingBox(box, rotation, width, height);
+                logger(`Result: l=${rotated.l}, b=${rotated.b}, r=${rotated.r}, t=${rotated.t}`, 2);
+                return rotated;
+            })
+            .map((box) => toZoteroRectFromBBox(box, viewBoxLL))
+            .filter((rect) => Array.isArray(rect) && rect.length === 4)
+        : location.boxes
+            .map((box) => convertBoundingBoxToBottomLeft(box, height))
+            .map((box) => toZoteroRectFromBBox(box, viewBoxLL))
+            .filter((rect) => Array.isArray(rect) && rect.length === 4);
+
+    return { rects, viewBox };
+}
+
+/**
+ * Build a Zotero PDF sort-index string in canonical `page|offset|top` format.
+ *
+ * Legacy single-action path: no backend reading-order offset is available
+ * here, so the offset field falls back to display-top. Matches Zotero's
+ * reader formula (Math.floor(viewBox[3] - rect[3])) at
+ * /reader/src/pdf/selection.js:399.
+ *
+ * The bulk path in src/services/annotations/createAnnotation.ts uses the
+ * backend-supplied reading_order_offset as the offset and is preferred for
+ * any new code; this helper exists backward compatibility.
+ */
+function generateSortIndex(pageIndex: number, rect: number[], viewBox: number[]): string {
+    const clamp = (v: unknown, max: number): number => {
+        if (typeof v !== 'number' || !Number.isFinite(v)) return 0;
+        const floored = Math.floor(v);
+        if (floored <= 0) return 0;
+        return floored > max ? max : floored;
+    };
+    const viewBoxTop = viewBox?.[3];
+    const rectTop = rect?.[3];
+    const displayTopRaw =
+        typeof viewBoxTop === 'number' && Number.isFinite(viewBoxTop)
+        && typeof rectTop === 'number' && Number.isFinite(rectTop)
+            ? Math.floor(viewBoxTop - rectTop)
+            : 0;
+    const page = clamp(pageIndex, 99999).toString().padStart(5, '0');
+    const offset = clamp(displayTopRaw, 999999).toString().padStart(6, '0');
+    const top = clamp(displayTopRaw, 99999).toString().padStart(5, '0');
+    return `${page}|${offset}|${top}`;
+}
+
+async function createHighlightAnnotation(
+    reader: ZoteroReader,
+    annotation: AnnotationProposedAction,
+    libraryId: number
+): Promise<string> {
+    if (
+        !annotation.proposed_data.highlight_locations ||
+        annotation.proposed_data.highlight_locations.length === 0
+    ) {
+        throw new Error('Highlight annotation missing geometry');
+    }
+
+    const locations: PageLocation[] = annotation.proposed_data.highlight_locations;
+    const primaryLocation = locations[0];
+    // Zotero stores a highlight on at most two consecutive pages: `rects` on
+    // the first and `nextPageRects` on the one after it.
+    const nextPageIndex = primaryLocation.page_idx + 1;
+    const spansTwoPages = locations.some((loc) => loc.page_idx === nextPageIndex);
+    const unsupported = locations.some(
+        (loc) => loc.page_idx !== primaryLocation.page_idx && loc.page_idx !== nextPageIndex,
+    );
+    if (unsupported) {
+        logger('Highlight annotation spans more than two consecutive pages; applying the first page only', 2);
+    }
+
+    const convertPage = async (pageIndex: number) => Promise.all(
+        locations
+            .filter((loc) => loc.page_idx === pageIndex)
+            .map((loc) => convertLocationToRects(reader, loc)),
+    );
+    const conversions = await convertPage(primaryLocation.page_idx);
+    const rects = conversions.flatMap((c) => c.rects);
+    if (rects.length === 0) {
+        throw new Error('Highlight annotation failed to compute rectangles');
+    }
+    const primaryViewBox = conversions[0].viewBox;
+    const nextPageRects = spansTwoPages && !unsupported
+        ? (await convertPage(nextPageIndex)).flatMap((c) => c.rects)
+        : [];
+
+    const now = (new Date()).toISOString();
+    const sortIndex = generateSortIndex(primaryLocation.page_idx, rects[0], primaryViewBox);
+    const data = {
+        type: 'highlight',
+        color: resolveHighlightColor(annotation.proposed_data.color),
+        comment: annotation.proposed_data.comment || '',
+        // Zotero keeps page labels as strings; its label editor calls `trim()`.
+        pageLabel: String(primaryLocation.page_idx + 1),
+        sortIndex,
+        position: {
+            pageIndex: primaryLocation.page_idx,
+            rects,
+            ...(nextPageRects.length > 0 ? { nextPageRects } : {}),
+        },
+        text: annotation.proposed_data.text || '',
+        tags: [],
+        temporary: false,
+        dateCreated: now,
+        dateModified: now,
+    };
+
+    return addReaderAnnotation(reader, data, libraryId);
+}
+
+async function convertNotePositionToRect(
+    reader: ZoteroReader,
+    annotation: AnnotationProposedAction
+): Promise<{ pageIndex: number; rect: number[]; viewBox: number[] }> {
+    if (!annotation.proposed_data.note_position) {
+        throw new Error('Note annotation missing position');
+    }
+
+    const { page_index, side, y, coord_origin } = annotation.proposed_data.note_position;
+    
+    // Get viewport info directly from PDF document (no need for rendered page)
+    const { viewBox, height, width, rotation } = await getPageViewportInfo(reader, page_index);
+    const viewBoxLL: [number, number] = [viewBox[0], viewBox[1]];
+    
+    // Calculate x position based on side
+    // Note: Use absolute page coordinates (viewBox[0] is the left edge, viewBox[0] + width is the right edge)
+    let x: number;
+    if (side === 'right') {
+        // Position at right edge of page, accounting for margin and note size
+        x = width - NOTE_RECT_SIZE - 12;
+    } else {
+        // Position at left edge of page with small margin
+        x = 12;
+    }
+
+    const yCenter = coord_origin === CoordOrigin.BOTTOMLEFT
+        ? y
+        : height - y;
+    const yBottom = yCenter - NOTE_RECT_SIZE / 2;
+
+    let converted: BoundingBox = convertBoundingBoxToBottomLeft(
+        {
+            l: x,
+            b: yBottom,
+            r: x + NOTE_RECT_SIZE,
+            t: yBottom + NOTE_RECT_SIZE,
+            coord_origin: CoordOrigin.BOTTOMLEFT,
+        },
+        height
+    );
+    
+    // Apply rotation transformation only if page is rotated
+    if (rotation !== 0) {
+        logger(`Applying rotation ${rotation}° to note position`, 2);
+        converted = applyRotationToBoundingBox(converted, rotation, width, height);
+    }
+
+    return {
+        pageIndex: page_index,
+        rect: toZoteroRectFromBBox(converted, viewBoxLL),
+        viewBox,
+    };
+}
+
+async function createNoteAnnotation(
+    reader: ZoteroReader,
+    annotation: AnnotationProposedAction,
+    libraryId: number
+): Promise<string> {
+    const { pageIndex, rect, viewBox } = await convertNotePositionToRect(reader, annotation);
+    const sortIndex = generateSortIndex(pageIndex, rect, viewBox);
+
+    const now = (new Date()).toISOString();
+    const data = {
+        type: 'note',
+        comment: annotation.proposed_data.comment || annotation.proposed_data.title || '',
+        color: resolveHighlightColor(annotation.proposed_data.color),
+        pageLabel: String(pageIndex + 1),
+        sortIndex,
+        position: {
+            pageIndex,
+            rects: [rect],
+        },
+        tags: [],
+        temporary: false,
+        notePosition: annotation.proposed_data.note_position,
+        dateCreated: now,
+        dateModified: now,
+    };
+
+    return addReaderAnnotation(reader, data, libraryId);
+}
+
+async function createAnnotation(
+    reader: ZoteroReader,
+    annotation: AnnotationProposedAction,
+    libraryId: number
+): Promise<string> {
+    if (isNoteAnnotationAction(annotation)) {
+        return createNoteAnnotation(reader, annotation, libraryId);
+    } else if (isHighlightAnnotationAction(annotation)) {
+        return createHighlightAnnotation(reader, annotation, libraryId);
+    } else {
+        throw new Error('Invalid annotation type');
+    }
+}
+
+/**
+ * Applies an annotation to a given PDF reader instance.
+ *
+ * This function assumes the provided reader is open and corresponds to the
+ * correct attachment for the annotation.
+ *
+ * @param reader - The active ZoteroReader instance.
+ * @param annotation - The annotation to apply.
+ * @returns An object indicating success ('applied') or failure ('error').
+ */
+export async function applyAnnotation(
+    annotation: AnnotationProposedAction,
+    reader?: ZoteroReader
+): Promise<AnnotationResultData> {
+    // Get the current reader if not provided, and wait for PDF document to be loaded
+    reader = reader ?? (await getCurrentReaderAndWaitForView(undefined, true) as ZoteroReader | undefined);
+    if (!reader || !annotation.proposed_data?.attachment_key) {
+        throw new Error('Invalid reader or attachment key');
+    }
+
+    // Resolve the annotation's library through the device-portable library_ref
+    // (with legacy library_id fallback) so the editability check and the recorded
+    // result target the library the annotation actually lands in — even when this
+    // device numbers a group library differently than the device that proposed it.
+    // The proposed_data.library_id alone is a stale device-local rowid for
+    // cross-device group annotations. Mirrors deleteAnnotationFromReader.
+    const resolvedLibraryId = resolveLibraryRef(annotation.proposed_data);
+    if (!resolvedLibraryId) {
+        throw new Error("The annotation's library isn't available on this computer");
+    }
+
+    try {
+        // Check if the library is editable before attempting to create annotations
+        if (!isLibraryEditable(resolvedLibraryId)) {
+            throw new Error('Cannot create annotations in a read-only library');
+        }
+
+        // Check if the reader is still correct
+        if (!isReaderForAttachmentKey(reader, annotation.proposed_data.attachment_key)) {
+            throw new Error('Reader changed to another attachment');
+        }
+        
+        // Final check: ensure PDF document is available
+        // (in case reader was provided directly without going through getCurrentReaderAndWaitForView)
+        if (!isPDFDocumentAvailable(reader)) {
+            logger(`applyAnnotation: PDF document not available, attempting to wait...`, 2);
+            const pdfAvailable = await waitForPDFDocument(reader, 3000);
+            if (!pdfAvailable) {
+                throw new Error('PDF document not available - reader may be closed or PDF failed to load');
+            }
+        }
+        
+        // Create the annotation
+        const annotationKey = await createAnnotation(reader, annotation, resolvedLibraryId);
+        return {
+            zotero_key: annotationKey,
+            library_id: resolvedLibraryId,
+            library_ref: libraryRefForLibraryID(resolvedLibraryId) ?? annotation.proposed_data.library_ref ?? undefined,
+            attachment_key: annotation.proposed_data.attachment_key,
+        };
+    } catch (error: any) {
+        logger(`applyAnnotation error: ${error?.message || error?.toString()}`, 1);
+        const errorMessage = error?.message || 'Failed to create annotation';
+        throw new Error(errorMessage);
+    }
+}
+
+export async function deleteAnnotationFromReader(
+    annotation: AnnotationProposedAction
+): Promise<void> {
+    if (!annotation.result_data?.zotero_key) {
+        throw new Error('Annotation key missing for deletion');
+    }
+
+    // Resolve the annotation's library through library_ref (with legacy
+    // library_id fallback) so undo targets the right library even when this
+    // device numbers a group library differently than the applying device.
+    const resolvedLibraryId = resolveLibraryRef(annotation.result_data);
+    if (!resolvedLibraryId) {
+        logger('deleteAnnotationFromReader: annotation library is not available on this computer', 1);
+        return;
+    }
+
+    const reader = getCurrentReader() as ZoteroReader | null;
+    const attachmentItem = await getAttachmentItem(
+        resolvedLibraryId,
+        annotation.result_data.attachment_key
+    );
+    if (reader && attachmentItem && isReaderForAttachment(reader, attachmentItem)) {
+        const iframeWindow = (reader as any)?._internalReader?._iframeWindow;
+        if (iframeWindow) {
+            await (reader as any)._internalReader.unsetAnnotations(
+                Components.utils.cloneInto([annotation.result_data.zotero_key], iframeWindow)
+            );
+        }
+    }
+
+    const annotationItem = await Zotero.Items.getByLibraryAndKeyAsync(
+        resolvedLibraryId,
+        annotation.result_data.zotero_key
+    );
+    if (annotationItem) {
+        await annotationItem.eraseTx();
+    }
+}

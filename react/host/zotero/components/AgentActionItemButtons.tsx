@@ -1,0 +1,371 @@
+import { viewAttachment } from '../../../runtime/navigation';
+import { getContextWindow } from '../../../runtime/windowRuntime';
+import React, { useEffect, useState, useCallback } from 'react';
+import { useAtomValue, useSetAtom } from 'jotai';
+import {
+    ArrowUpRightIcon,
+    PdfIcon,
+    InformationCircleIcon,
+    Spinner,
+    TickIcon,
+    CancelIcon,
+    AlertIcon,
+} from '../../../components/icons/icons';
+import { 
+    isExternalReferenceDetailsDialogVisibleAtom, 
+    selectedExternalReferenceAtom 
+} from '../../../atoms/ui';
+import Button from '@astermargin/agent-ui/primitives/Button';
+import IconButton from '@astermargin/agent-ui/primitives/IconButton';
+import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
+import { ZOTERO_ICONS, ZoteroIcon } from '../../../components/icons/ZoteroIcon';
+import { revealSource } from '../../../utils/sourceUtils';
+import {
+    checkExternalReferenceAtom,
+} from '../../../atoms/externalReferences';
+import {
+    getCachedReferenceForObjectAtom,
+    isCheckingReferenceObjectAtom,
+} from '@astermargin/agent-core/citations/externalReferences';
+import { ButtonVariant } from '@astermargin/agent-ui/primitives/Button';
+import { ItemCreatingAgentAction } from '../../../agents/agentActions';
+import { trialDetails, workDetails, type ExternalReference } from '@astermargin/agent-core/types/externalReferences';
+import { isOpenAlexWorkId } from '@astermargin/agent-core/citations/externalRecords';
+import { primaryExternalUrl } from '@astermargin/agent-core/citations/externalRecordDisplay';
+import { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
+import { resolveSearchableLibraryId } from '../libraryAccess';
+import { searchableLibraryIdsAtom } from '../../../atoms/profile';
+import { isUnconfirmedAction } from './reviewChangeRows';
+
+const CITED_BY_URL = 'https://openalex.org/works?page=1&filter=cites:';
+
+interface AgentActionItemButtonsProps {
+    action: ItemCreatingAgentAction;
+    /** The reference the action stands for (import_item actions carry none of their own). */
+    item?: ExternalReference;
+    isBusy: boolean;
+    onApply: () => void;
+    onReject: () => void;
+    /** Callback when an existing library match is found for a pending item */
+    onExistingMatch?: (itemRef: ZoteroItemReference) => void;
+    /** Button variant */
+    buttonVariant?: ButtonVariant;
+    /** Button size */
+    className?: string;
+}
+
+/**
+ * Action buttons for agent action item creation.
+ * Handles different states: pending, applied, rejected/undone, error.
+ * 
+ * For pending items, checks if item already exists in library:
+ * - If exists: calls onExistingMatch callback for auto-acknowledge
+ * - If not: shows Add button
+ * 
+ * For applied items: shows Reveal, Details, Web, PDF buttons
+ * For rejected/undone: shows Add button
+ */
+const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
+    action,
+    item: itemProp,
+    isBusy,
+    onApply,
+    onReject,
+    onExistingMatch,
+    buttonVariant = 'surface-light',
+    className = '',
+}) => {
+    const item: ExternalReference = itemProp ?? (action.proposed_data as { item: ExternalReference }).item;
+    // An import_item that found its work already in the library fails rather
+    // than adopting it; the card then offers the existing item.
+    const existingFromError: ZoteroItemReference | null = action.status === 'error'
+        && action.error_details?.error_code === 'already_in_library'
+        && action.error_details?.existing_item?.zotero_key
+        ? action.error_details.existing_item as ZoteroItemReference
+        : null;
+    const setIsDetailsVisible = useSetAtom(isExternalReferenceDetailsDialogVisibleAtom);
+    const setSelectedReference = useSetAtom(selectedExternalReferenceAtom);
+    const checkReference = useSetAtom(checkExternalReferenceAtom);
+    const getCachedReference = useAtomValue(getCachedReferenceForObjectAtom);
+    const isChecking = useAtomValue(isCheckingReferenceObjectAtom);
+    const searchableLibraryIds = useAtomValue(searchableLibraryIdsAtom);
+    
+    // Local state for library item reference
+    const [existingItemRef, setExistingItemRef] = useState<ZoteroItemReference | null>(null);
+    const [isCheckingLibrary, setIsCheckingLibrary] = useState(false);
+    const [bestAttachment, setBestAttachment] = useState<Zotero.Item | null>(null);
+
+    // Determine effective item reference based on action status
+    const getEffectiveItemRef = useCallback((): ZoteroItemReference | null => {
+        // If applied, use result_data
+        if (action.status === 'applied' && action.result_data?.zotero_key) {
+            return {
+                library_id: action.result_data.library_id,
+                zotero_key: action.result_data.zotero_key,
+                library_ref: action.result_data.library_ref,
+            };
+        }
+        // Otherwise use existing library match if found
+        return existingItemRef ?? existingFromError;
+    }, [action.status, action.result_data, existingItemRef, existingFromError]);
+
+    const effectiveItemRef = getEffectiveItemRef();
+
+    /**
+     * Check if item already exists in library when pending
+     * If found, notify parent for auto-acknowledge
+     */
+    useEffect(() => {
+        const checkExistingItem = async () => {
+            // Only check for pending items
+            if (action.status !== 'pending') return;
+            
+            const refId = item.source_id;
+            if (!refId) return;
+            
+            // Check cache first
+            const cached = getCachedReference(item);
+            
+            if (cached !== undefined) {
+                // Already checked
+                if (cached !== null) {
+                    setExistingItemRef(cached);
+                    // Notify parent for auto-acknowledge
+                    if (onExistingMatch) {
+                        onExistingMatch(cached);
+                    }
+                }
+                return;
+            }
+            
+            // Not cached, need to check
+            if (!isChecking(item)) {
+                setIsCheckingLibrary(true);
+                try {
+                    const result = await checkReference(item);
+                    if (result) {
+                        setExistingItemRef(result);
+                        // Notify parent for auto-acknowledge
+                        if (onExistingMatch) {
+                            onExistingMatch(result);
+                        }
+                    }
+                } finally {
+                    setIsCheckingLibrary(false);
+                }
+            }
+        };
+        
+        checkExistingItem();
+    }, [action.status, item, getCachedReference, checkReference, isChecking, onExistingMatch]);
+
+    // Fetch best attachment when we have an item reference
+    useEffect(() => {
+        let cancelled = false;
+        const fetchAttachment = async () => {
+            if (!effectiveItemRef) {
+                setBestAttachment(null);
+                return;
+            }
+            const libraryId = resolveSearchableLibraryId(
+                effectiveItemRef,
+                searchableLibraryIds,
+            );
+            if (!libraryId) {
+                setBestAttachment(null);
+                return;
+            }
+
+            const zoteroItem = await Zotero.Items.getByLibraryAndKeyAsync(
+                libraryId,
+                effectiveItemRef.zotero_key
+            );
+            
+            if (zoteroItem && zoteroItem.isRegularItem()) {
+                await Zotero.Items.loadDataTypes([zoteroItem], ['itemData', 'childItems']);
+                const attachment = await zoteroItem.getBestAttachment();
+                if (!cancelled) setBestAttachment(attachment || null);
+            } else {
+                if (!cancelled) setBestAttachment(null);
+            }
+        };
+        
+        void fetchAttachment().catch(() => {
+            if (!cancelled) setBestAttachment(null);
+        });
+        return () => { cancelled = true; };
+    }, [effectiveItemRef, searchableLibraryIds]);
+
+    const handleShowDetails = useCallback(() => {
+        setSelectedReference(item);
+        setIsDetailsVisible(true);
+    }, [item, setSelectedReference, setIsDetailsVisible]);
+
+    const webUrl = primaryExternalUrl(item);
+    const handleOpenWeb = useCallback(() => {
+        const url = primaryExternalUrl(item);
+        if (url) {
+            Zotero.launchURL(url);
+        }
+    }, [item]);
+
+    const handleOpenPdf = useCallback(() => {
+        if (bestAttachment) {
+            viewAttachment(bestAttachment.id);
+        } else if (item.open_access_url) {
+            Zotero.launchURL(item.open_access_url);
+        }
+    }, [bestAttachment, item.open_access_url]);
+
+    const handleReveal = useCallback(() => {
+        if (effectiveItemRef) {
+            revealSource(effectiveItemRef);
+        }
+    }, [effectiveItemRef]);
+
+    const isLoading = isBusy || isCheckingLibrary || isChecking(item);
+    const hasPdf = item.open_access_url || bestAttachment;
+    const hasWeb = !!webUrl;
+    const hasDetails = Boolean(item.abstract) || !!trialDetails(item) || !!workDetails(item);
+    // OpenAlex counts citations and lists the citing works only for its own ids.
+    const showCitedBy = item.citation_count !== undefined && item.citation_count !== null && isOpenAlexWorkId(item.source_id);
+
+    // Determine which buttons to show based on status
+    const showRevealButton = action.status === 'applied' || (action.status === 'pending' && existingItemRef) || !!existingFromError;
+    const showAddButton = (action.status === 'pending' && !existingItemRef && !isCheckingLibrary) 
+        || action.status === 'rejected' 
+        || action.status === 'undone';
+    const showRejectButton = action.status === 'pending' && !existingItemRef;
+
+    return (
+        <div className="display-flex flex-row items-center gap-3 flex-wrap">
+
+            {/* Details button */}
+            <Tooltip content={`${hasDetails ? 'Show details' : 'No details available'}`} singleLine>
+                <IconButton
+                    variant={buttonVariant}
+                    icon={InformationCircleIcon}
+                    className={`font-color-secondary ${className}`}
+                    iconClassName="scale-90"
+                    ariaLabel="Show details"
+                    onClick={handleShowDetails}
+                    style={{ padding: '2px' }}
+                />
+            </Tooltip>
+
+            {/* Web button */}
+            {hasWeb && (
+                <Tooltip content="Open website" singleLine>
+                    <IconButton
+                        variant={buttonVariant}
+                        icon={ArrowUpRightIcon}
+                        className={`font-color-secondary ${className}`}
+                        ariaLabel="Open website"
+                        onClick={handleOpenWeb}
+                        style={{ padding: '2px' }}
+                    />
+                </Tooltip>
+            )}
+
+            {/* PDF button */}
+            {hasPdf && (
+                <Tooltip content="Open PDF" singleLine>
+                    <IconButton
+                        variant={buttonVariant}
+                        icon={PdfIcon}
+                        className={`font-color-secondary ${className}`}
+                        ariaLabel="Open PDF"
+                        onClick={handleOpenPdf}
+                        style={{ padding: '2px' }}
+                    />
+                </Tooltip>
+            )}
+
+            {/* Citation count */}
+            {showCitedBy && item.citation_count! > 0 && (
+                <a
+                    onClick={() => Zotero.launchURL(`${CITED_BY_URL}${item.source_id}`)}
+                    className="text-link-muted text-sm"
+                >
+                    Cited by {item.citation_count!.toLocaleString()}
+                </a>
+            )}
+            {showCitedBy && item.citation_count === 0 && (
+                <div className="font-color-tertiary text-sm">
+                    Cited by {item.citation_count!.toLocaleString()}
+                </div>
+            )}
+
+            <div className="flex-1"/>
+
+            {isLoading && (
+                <Spinner className="scale-12 -mr-1" />
+            )}
+
+            {action.status === 'error' && !existingFromError && !isUnconfirmedAction(action) && !isLoading && (
+                <Tooltip content="Retry creating item" singleLine>
+                    <IconButton
+                        variant={buttonVariant}
+                        icon={AlertIcon}
+                        className={`font-color-secondary ${className}`}
+                        iconClassName="scale-90"
+                        ariaLabel="Error creating item"
+                        onClick={onApply}
+                        disabled={isLoading}
+                        style={{ padding: '2px' }}
+                    />
+                </Tooltip>
+            )}
+
+            {/* Pending: Reject button */}
+            {showRejectButton && !isLoading && (
+                <Tooltip content="Reject Item" singleLine>
+                    <IconButton
+                        variant={buttonVariant}
+                        icon={CancelIcon}
+                        className={`font-color-secondary ${className}`}
+                        iconClassName="scale-90"
+                        ariaLabel="Reject Item"
+                        onClick={onReject}
+                        disabled={isLoading}
+                        style={{ padding: '2px' }}
+                    />
+                </Tooltip>
+            )}
+
+            {/* Add button: shown for pending (no match), rejected, or undone */}
+            {showAddButton && !isLoading && (
+                <Tooltip content="Add to library" singleLine>
+                    <IconButton
+                        variant={buttonVariant}
+                        icon={TickIcon}
+                        iconClassName="scale-12"
+                        className={`font-color-secondary ${className}`}
+                        style={{ padding: '2px' }}
+                        onClick={onApply}
+                        ariaLabel="Add to library"
+                        disabled={isLoading}
+                    />
+                </Tooltip>
+            )}
+
+            {/* Pending with existing match OR Applied: Reveal button */}
+            {showRevealButton && !isLoading && (
+                <Tooltip content={action.status !== 'applied' ? 'Already in library - click to reveal' : 'Reveal in Zotero'} singleLine>
+                    <Button
+                        variant={buttonVariant}
+                        rightIcon={() => <ZoteroIcon icon={ZOTERO_ICONS.SHOW_ITEM} size={9} />}
+                        className={`font-color-secondary ${className}`}
+                        style={{ padding: '1px 4px' }}
+                        onClick={handleReveal}
+                        disabled={isLoading}
+                    >
+                        {action.status !== 'applied' ? 'In Library' : 'Reveal'}
+                    </Button>
+                </Tooltip>
+            )}
+        </div>
+    );
+};
+
+export default AgentActionItemButtons;

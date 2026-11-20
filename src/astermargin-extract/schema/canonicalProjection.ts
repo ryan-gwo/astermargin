@@ -1,0 +1,149 @@
+import type { DocItem, SentenceItem } from "@astermargin/agent-core/extract/types";
+import { bboxToRect } from "./bbox";
+import { kindCarriesSentences } from "./itemKinds";
+import type { DocumentItem, Sentence, StructuredPage } from "@astermargin/agent-core/extract/schema";
+
+interface InternalPageForProjection {
+    index: number;
+    label?: string;
+    width: number;
+    height: number;
+    viewBox: [number, number, number, number];
+    rotation: 0 | 90 | 180 | 270;
+    items: DocItem[];
+    sentences?: SentenceItem[];
+}
+
+function projectSentence(
+    sentence: SentenceItem,
+    order: number,
+    precision: number,
+): Sentence {
+    return {
+        id: "",
+        order,
+        text: sentence.text,
+        bboxes: sentence.bboxes.map((bbox) => bboxToRect(bbox, precision)),
+        ...(sentence.joinWithNext ? { joinWithNext: true } : {}),
+    };
+}
+
+function projectBase(item: DocItem, precision: number) {
+    return {
+        id: item.id,
+        pageIndex: item.pageIndex,
+        order: item.index,
+        bbox: bboxToRect(item.bbox, precision),
+    };
+}
+
+function attachSentences(
+    publicItem: DocumentItem,
+    internalItem: DocItem,
+    sentencesByParent: Map<string, SentenceItem[]>,
+    precision: number,
+): DocumentItem {
+    if (!kindCarriesSentences(publicItem.kind)) return publicItem;
+    const sourceSentences = sentencesByParent.get(internalItem.id) ?? [];
+    if (sourceSentences.length === 0) return publicItem;
+    const sentences = sourceSentences.map((sentence, index) =>
+        projectSentence(sentence, index, precision),
+    );
+    return { ...publicItem, sentences } as DocumentItem;
+}
+
+/** Convert the internal pipeline page into the canonical structured page. */
+export function projectStructuredPage(
+    page: InternalPageForProjection,
+    bboxPrecision = 1,
+): StructuredPage {
+    const sentencesByParent = new Map<string, SentenceItem[]>();
+    for (const sentence of page.sentences ?? []) {
+        const list = sentencesByParent.get(sentence.parentId) ?? [];
+        list.push(sentence);
+        sentencesByParent.set(sentence.parentId, list);
+    }
+
+    const items: DocumentItem[] = page.items.map((item) => {
+        const base = projectBase(item, bboxPrecision);
+        switch (item.kind) {
+            case "text":
+                return attachSentences({
+                    ...base,
+                    kind: "text",
+                    text: item.text,
+                }, item, sentencesByParent, bboxPrecision);
+            case "section_header":
+                return {
+                    ...base,
+                    kind: "section_header",
+                    text: item.text,
+                    level: item.level,
+                };
+            case "margin":
+                return {
+                    ...base,
+                    kind: "margin",
+                    text: item.text,
+                };
+            case "caption":
+            case "footnote":
+            case "list_item":
+                return attachSentences({
+                    ...base,
+                    kind: item.kind,
+                    text: item.text,
+                } as DocumentItem, item, sentencesByParent, bboxPrecision);
+            case "formula":
+                return {
+                    ...base,
+                    kind: "formula",
+                    text: item.text,
+                };
+            case "reference":
+                return {
+                    ...base,
+                    kind: "reference",
+                    text: item.text,
+                };
+            case "table":
+                return attachSentences({
+                    ...base,
+                    kind: "table",
+                    text: item.text,
+                }, item, sentencesByParent, bboxPrecision);
+            case "picture":
+                return item.text
+                    ? { ...base, kind: "picture", text: item.text }
+                    : { ...base, kind: "picture" };
+        }
+    });
+
+    // Glyphs and aggregate boxes may extend beyond the visible source page.
+    // Clip published locators while retaining text and the original page frame.
+    const clip = (rect: [number, number, number, number]): [number, number, number, number] => {
+        if (!rect.every(Number.isFinite) || rect[0] > rect[2] || rect[1] > rect[3]) {
+            throw new Error('Invalid extraction rectangle');
+        }
+        return [Math.max(0, Math.min(page.width, rect[0])),
+            Math.max(0, Math.min(page.height, rect[1])),
+            Math.max(0, Math.min(page.width, rect[2])),
+            Math.max(0, Math.min(page.height, rect[3]))];
+    };
+    for (const item of items) {
+        item.bbox = clip(item.bbox);
+        if ('sentences' in item && item.sentences) {
+            for (const sentence of item.sentences) sentence.bboxes = sentence.bboxes.map(clip);
+        }
+    }
+
+    return {
+        index: page.index,
+        label: page.label,
+        width: page.width,
+        height: page.height,
+        viewBox: page.viewBox,
+        rotation: page.rotation,
+        items,
+    };
+}

@@ -1,0 +1,813 @@
+
+declare const _globalThis: {
+  [key: string]: any;
+  Zotero: _ZoteroTypes.Zotero;
+  ztoolkit: ZToolkit;
+  addon: typeof addon;
+};
+
+declare interface SymbolConstructor {
+  readonly observable: symbol;
+}
+
+declare type ZToolkit = ReturnType<
+  typeof import("../src/utils/ztoolkit").createZToolkit
+>;
+
+declare const ztoolkit: ZToolkit;
+
+declare const rootURI: string;
+
+declare const addon: import("../src/addon").default;
+
+declare const __env__: "production" | "development";
+
+interface Window {
+    __astermarginSkipInitialSelection?: boolean;
+    __astermarginRuntime?: import("../src/runtime/instance").WindowRuntime;
+    __astermarginJotaiStore?: ReturnType<typeof import('jotai').createStore>;
+    /**
+     * On the separate AsterMargin / preferences windows: a weak reference to the
+     * main window whose `AsterMarginReact` bundle renders this window (set in their
+     * bootstrap scripts). They cannot outlive that window — see
+     * `AsterMarginUIFactory.closeWindowsRenderedBy`.
+     */
+    __astermarginOwnerWindowRef?: WeakRef<Window>;
+    /** Stops the busy-context event-loop-lag heartbeat (registered by busyContext.ts) */
+    __astermarginStopBusyHeartbeat?: () => void;
+}
+
+interface ZoteroSearchWritable extends Zotero.Search {
+    libraryID: number;  // Override to make it writable
+}
+
+declare namespace Zotero {
+    /** Set to true at the start of shutdown to signal all in-flight operations to bail out */
+    let __astermarginShuttingDown: boolean | undefined;
+    /** Items AsterMargin has just written; see astermarginAnnotationRegistry.ts. Shared across bundles. */
+    let __astermarginWrittenAnnotationItems: WeakSet<Zotero.Item> | undefined;
+    /** As above, keyed `libraryID:key` with the write timestamp, for reader writes. */
+    let __astermarginWrittenAnnotationKeys: Map<string, number> | undefined;
+    /**
+     * The stored-table surfaces, published by the esbuild bundle at startup.
+     * The reader-view registry and the table tabs keep module state, so they
+     * must exist in one bundle only; the webpack side reaches
+     * them through here. See src/services/artifacts/tablesApi.ts.
+     */
+    let __astermarginTables:
+        | import("../src/services/artifacts/tablesApi").TablesApi
+        | undefined;
+    /**
+     * The write half of the stored-table recovery shadow, published by the
+     * *webpack* bundle. Restoring goes through `tableStore.ts`, which is
+     * webpack-only (it imports the library-exclusion check), so esbuild-side
+     * callers reach it through here.
+     */
+    let __astermarginTableLocalCommands:
+        | Map<Window, import("../src/services/artifacts/tablesApi").TableLocalCommands>
+        | undefined;
+    let __astermarginTableShadowRestore:
+        | import("../src/services/artifacts/tablesApi").TableShadowRestore
+        | undefined;
+    /**
+     * Stored-table write locks, one promise chain per table. On the shared
+     * global so the lock is one per process however the store is bundled.
+     * See `src/services/artifacts/tablesApi.ts`.
+     */
+    let __astermarginTableWriteLocks: Map<string, Promise<unknown>> | undefined;
+    /**
+     * Identifies this run of Zotero. Set once per process and kept across
+     * plugin reloads, so a saved record can tell a reload from a restart.
+     * See `src/ui/tableTab.ts`.
+     */
+    let __astermarginAppSessionID: string | undefined;
+    /**
+     * The AsterMargin tabs (every kind), published by the esbuild bundle while it
+     * runs. A window renderer closes its window's tabs through this before it
+     * goes away. See `src/ui/astermarginTabs.ts`.
+     */
+    let __astermarginTabs: { closeForWindow(win: Window): number } | undefined;
+
+    namespace AsterMargin {
+        let localEndpoints: import("../src/services/instanceLocalEndpoints").InstanceLocalEndpoints | undefined;
+        const threads: import('../src/services/threads/threadRepository').ThreadRepository;
+        const presence: import('../src/services/threads/threadPresence').ThreadPresence;
+        let background: import("../src/services/instanceBackground").InstanceBackground | undefined;
+        let documents: import("../src/services/instanceDocuments").InstanceDocuments | undefined;
+        let notePreviews: import("../src/services/notePreviews").NotePreviews;
+        let libraryOperations: import("../src/services/libraryOperations").LibraryOperations;
+        const deferredCommits: import("../src/services/committedTransaction").DeferredCommits | undefined;
+        const transactionWatch: import("../src/services/openTransaction").OpenTransactionWatch | undefined;
+        let itemImport: import("../src/services/itemImport/service").ItemImportService;
+        let exporter: import("../src/services/export/instanceExport").InstanceExport;
+        /** Image decoding and re-encoding; plugin realm, reached from renderers through this slot. */
+        let images: import("../src/services/images/instanceImages").InstanceImages;
+        let backgroundTasks: import("../src/utils/backgroundTasks").BackgroundTaskSource;
+        let mutations: import("../src/services/libraryMutations").LibraryMutations;
+        let syncPause: ReturnType<typeof import("../src/services/syncPause").createSyncPauseService>;
+        const preferences: import("../src/services/instancePreferences").InstancePreferences | undefined;
+        const account: import("../src/services/instanceAccount").InstanceAccount | undefined;
+        /** Table fill plans and jobs; plugin realm, reached from renderers through this slot. */
+        const tableFills: import("../src/services/tableFills/service").InstanceTableFills | undefined;
+        const runtime: import("../src/runtime/instance").AsterMarginInstance;
+        const pluginVersion: string;
+        /**
+         * Local mode, read once from the `localMode` pref at plugin startup and
+         * fixed until the next plugin load. While true nothing may contact
+         * AsterMargin's servers. Read this, never the pref, from backend-access and
+         * account code.
+         */
+        const localMode: boolean | undefined;
+        /**
+         * True when local mode is on because the build has no AsterMargin server
+         * settings; the `localMode` pref cannot turn it off.
+         */
+        const localModeForced: boolean | undefined;
+
+        const data: {
+            env: "development" | "production";
+        };
+
+        const documentCache: import("../src/services/documentCache").DocumentCache | undefined;
+
+        const vault: import('../src/services/providerVault').ProviderVault;
+        const db: {
+            localHistory: import('../src/services/threads/localHistory').LocalHistory;
+            /**
+             * Initialize the database by creating tables if they don't exist.
+             * Should be called once after constructing the class.
+             */
+            initDatabase(pluginVersion: string): Promise<void>;
+
+            /**
+             * Close the database connection.
+             */
+            closeDatabase(): Promise<void>;
+
+            /**
+             * Create a new chat thread.
+             * @param user_id The user_id of the thread
+             * @param name Optional name for the thread
+             * @returns The complete ThreadData for the newly created thread
+             */
+            createThread(user_id: string, name?: string): Promise<import("../react/atoms/threads").ThreadData>;
+
+            /**
+             * Retrieve a thread by its ID.
+             * @param user_id The user_id of the thread
+             * @param id The ID of the thread to retrieve
+             * @returns The ThreadData if found, otherwise null
+             */
+            getThread(user_id: string, id: string): Promise<import("../react/atoms/threads").ThreadData | null>;
+
+            /**
+             * Get a paginated list of threads.
+             * @param user_id The user_id of the threads
+             * @param limit Number of threads per page
+             * @param offset Number of threads to skip
+             * @returns Object containing an array of ThreadData objects and a boolean indicating if there are more items
+             */
+            getThreadsPaginated(
+                user_id: string,
+                limit: number,
+                offset: number
+            ): Promise<{ threads: import("../react/atoms/threads").ThreadData[]; has_more: boolean }>;
+
+            /**
+             * Delete a thread and all its messages.
+             * @param user_id The user_id of the thread
+             * @param id The ID of the thread to delete
+             */
+            deleteThread(user_id: string, id: string): Promise<void>;
+
+            /**
+             * Rename a thread.
+             * @param user_id The user_id of the thread
+             * @param id The ID of the thread to rename
+             * @param name The new name for the thread
+             */
+            renameThread(user_id: string, id: string, name: string): Promise<void>;
+
+            /**
+             * Update a thread. Currently only supports renaming.
+             * @param user_id The user_id of the thread
+             * @param id The ID of the thread to update
+             * @param updates An object containing the fields to update (using ThreadData format)
+             */
+            updateThread(
+                user_id: string,
+                id: string,
+                updates: Partial<Omit<import("../react/atoms/threads").ThreadData, 'id' | 'createdAt'>>
+            ): Promise<void>;
+
+            // --- Sync Logs Methods ---
+
+            /**
+             * Get sync log record for library_id and user_id with the highest library_version.
+             * @param user_id The user_id to filter by
+             * @param library_id The library_id to filter by
+             * @returns The SyncLogsRecord with highest library_version, or null if not found
+             */
+            getSyncLogWithHighestVersion(user_id: string, library_id: number): Promise<import("../src/services/database").SyncLogsRecord | null>;
+
+            /**
+             * Get sync log record for library_id and user_id with the most recent library_date_modified.
+             * @param user_id The user_id to filter by
+             * @param library_id The library_id to filter by
+             * @returns The SyncLogsRecord with most recent library_date_modified, or null if not found
+             */
+            getSyncLogWithMostRecentDate(user_id: string, library_id: number): Promise<import("../src/services/database").SyncLogsRecord | null>;
+
+            // --- Embedding Methods ---
+
+            /**
+             * Insert or update an embedding record.
+             * @param embedding The embedding data to store
+             */
+            upsertEmbedding(embedding: Omit<import("../src/services/database").EmbeddingRecord, 'indexed_at'> & { indexed_at?: string }): Promise<void>;
+
+            /**
+             * Insert or update multiple embedding records in a batch.
+             * @param embeddings Array of embedding data to store
+             */
+            upsertEmbeddingsBatch(embeddings: Array<Omit<import("../src/services/database").EmbeddingRecord, 'indexed_at'> & { indexed_at?: string }>): Promise<void>;
+
+            /**
+             * Get an embedding record by item ID.
+             * @param itemId The Zotero item ID
+             * @returns The embedding record or null if not found
+             */
+            getEmbedding(itemId: number): Promise<import("../src/services/database").EmbeddingRecord | null>;
+
+            /**
+             * Get embedding records for multiple item IDs.
+             * @param itemIds Array of Zotero item IDs
+             * @returns Map of item ID to embedding record
+             */
+            getEmbeddingsBatch(itemIds: number[]): Promise<Map<number, import("../src/services/database").EmbeddingRecord>>;
+
+            /**
+             * Get all embeddings for a library.
+             * @param libraryId The Zotero library ID
+             * @returns Array of embedding records
+             */
+            getEmbeddingsByLibrary(libraryId: number): Promise<import("../src/services/database").EmbeddingRecord[]>;
+
+            /**
+             * Get all embeddings across all libraries.
+             * @returns Array of embedding records
+             */
+            getAllEmbeddings(): Promise<import("../src/services/database").EmbeddingRecord[]>;
+
+            /**
+             * Get embeddings for multiple libraries.
+             * @param libraryIds Array of library IDs
+             * @returns Array of embedding records
+             */
+            getEmbeddingsByLibraries(libraryIds: number[]): Promise<import("../src/services/database").EmbeddingRecord[]>;
+
+            /**
+             * Get content hashes for items to check what needs re-indexing.
+             * @param itemIds Array of Zotero item IDs
+             * @returns Map of item ID to content hash
+             */
+            getContentHashes(itemIds: number[]): Promise<Map<number, string>>;
+
+            /**
+             * Delete an embedding by item ID.
+             * @param itemId The Zotero item ID
+             */
+            deleteEmbedding(itemId: number): Promise<void>;
+
+            /**
+             * Delete embeddings for multiple item IDs.
+             * @param itemIds Array of Zotero item IDs
+             */
+            deleteEmbeddingsBatch(itemIds: number[]): Promise<void>;
+
+            /**
+             * Delete all embeddings for a library.
+             * @param libraryId The Zotero library ID
+             */
+            deleteEmbeddingsByLibrary(libraryId: number): Promise<void>;
+
+            /**
+             * Get the count of embeddings for a library.
+             * @param libraryId The Zotero library ID (optional - if not provided, returns total count)
+             * @returns Number of embeddings
+             */
+            getEmbeddingCount(libraryId?: number): Promise<number>;
+
+            /**
+             * Get item IDs that have embeddings in a library.
+             * @param libraryId The Zotero library ID (optional - if not provided, returns all embedded item IDs)
+             * @returns Array of item IDs
+             */
+            getEmbeddedItemIds(libraryId?: number): Promise<number[]>;
+
+            getDocumentCacheMetadataByKey(
+                libraryId: number,
+                zoteroKey: string,
+            ): Promise<import("../src/services/database").DocumentCacheMetadataRecord | null>;
+
+            getAllDocumentCacheMetadata(): Promise<import("../src/services/database").DocumentCacheMetadataRecord[]>;
+
+            getDocumentCachePayload(
+                libraryId: number,
+                zoteroKey: string,
+                payloadKind: import("../src/services/database").DocumentCachePayloadKind,
+            ): Promise<import("../src/services/database").DocumentCachePayloadRecord | null>;
+
+            // --- External files (user-attached files behind `ext-<KEY>` ids) ---
+            upsertExternalFile(
+                input: import("../src/services/database").ExternalFileInput,
+            ): Promise<void>;
+
+            getExternalFileByKey(
+                extKey: string,
+            ): Promise<import("../src/services/database").ExternalFileRecord | null>;
+
+            getExternalFileBySha256(
+                sha256: string,
+            ): Promise<import("../src/services/database").ExternalFileRecord | null>;
+
+            setExternalFilePageCount(extKey: string, pageCount: number | null): Promise<void>;
+
+            deleteExternalFile(extKey: string): Promise<void>;
+
+            listExternalFiles(): Promise<import("../src/services/database").ExternalFileRecord[]>;
+
+            getExternalFileStats(): Promise<{ count: number; totalBytes: number }>;
+
+            deleteAllExternalFiles(): Promise<void>;
+
+            // --- Stored-table recovery shadow ---
+            upsertTableShadow(
+                input: import("../src/services/database").TableShadowRecord,
+            ): Promise<void>;
+
+            getTableShadows(
+                libraryId: number,
+                zoteroKey: string,
+            ): Promise<import("../src/services/database").TableShadowRecord[]>;
+
+            deleteTableShadowVersions(
+                libraryId: number,
+                zoteroKey: string,
+                versions: number[],
+            ): Promise<import("../src/services/database").TableShadowRecord[]>;
+
+            deleteTableShadows(
+                libraryId: number,
+                zoteroKey: string,
+            ): Promise<import("../src/services/database").TableShadowRecord[]>;
+
+            // --- Background job queue ---
+            enqueueBackgroundJob(
+                input: import("../src/services/database").BackgroundJobInput,
+            ): Promise<import("../src/services/database").BackgroundJobEnqueueResult>;
+
+            enqueueBackgroundJobs(
+                inputs: import("../src/services/database").BackgroundJobInput[],
+            ): Promise<import("../src/services/database").BackgroundJobEnqueueResult[]>;
+
+            claimNextBackgroundJob(
+                now: number,
+                visibilityTimeoutMs: number,
+                maxPriority?: number,
+                jobTypes?: import("../src/services/database").BackgroundJobType[],
+            ): Promise<import("../src/services/database").BackgroundJobRecord | null>;
+
+            peekBackgroundJobs(
+                limit?: number,
+            ): Promise<import("../src/services/database").BackgroundJobRecord[]>;
+
+            promotePendingBackgroundJob(
+                jobType: import("../src/services/database").BackgroundJobType,
+                libraryId: number,
+                zoteroKey: string,
+                payloadKind: import("../src/services/database").DocumentCachePayloadKind,
+                priority: number,
+                preparationPayload?: import("../src/services/database").BackgroundJobPayload,
+            ): Promise<{ exists: boolean; promoted: boolean }>;
+
+            beginFulltextCacheRecovery: import('../src/services/database').AsterMarginDB['beginFulltextCacheRecovery'];
+            deferFulltextCacheRecovery: import('../src/services/database').AsterMarginDB['deferFulltextCacheRecovery'];
+            finishFulltextCacheRecovery: import('../src/services/database').AsterMarginDB['finishFulltextCacheRecovery'];
+            cancelFulltextCacheRecovery: import('../src/services/database').AsterMarginDB['cancelFulltextCacheRecovery'];
+
+            completeBackgroundJob(id: number): Promise<void>;
+            completeBackgroundPreparationJob(id: number, now: number): Promise<boolean>;
+
+            failBackgroundJob(
+                id: number,
+                error: string,
+                opts: {
+                    maxAttempts: number;
+                    backoffMs: (attempt: number) => number;
+                    now: number;
+                },
+            ): Promise<{ dead: boolean }>;
+
+            rescheduleBackgroundJob(id: number, availableAt: number, error: string): Promise<void>;
+            releaseBackgroundJob(id: number, now: number): Promise<void>;
+
+            getBackgroundQueueStats(
+                now: number,
+                jobTypes?: string[],
+                pausedTypes?: string[],
+            ): Promise<import("../src/services/database").BackgroundQueueStats>;
+
+            recordDocumentProcessingFailure(
+                input: import("../src/services/database").DocumentProcessingFailureInput,
+            ): Promise<void>;
+
+            getDocumentProcessingFailure(
+                fileHash: string,
+                task: import("../src/services/database").DocumentProcessingTask,
+                engineVersion?: string,
+            ): Promise<import("../src/services/database").DocumentProcessingFailureRecord | null>;
+
+            isDocumentProcessingPermanentlyFailed(
+                fileHash: string,
+                task: import("../src/services/database").DocumentProcessingTask,
+                engineVersion?: string,
+            ): Promise<boolean>;
+
+            isDocumentProcessingReadyForRetry(
+                fileHash: string,
+                task: import("../src/services/database").DocumentProcessingTask,
+                engineVersion?: string,
+                now?: string,
+            ): Promise<boolean>;
+
+            clearDocumentProcessingFailure(
+                fileHash: string,
+                task: import("../src/services/database").DocumentProcessingTask,
+                engineVersion?: string,
+            ): Promise<void>;
+
+            ensureAttachmentProcessingState(
+                input: import("../src/services/database").AttachmentProcessingStateInput,
+            ): Promise<import("../src/services/database").AttachmentProcessingStateRecord>;
+            getAttachmentProcessingState(
+                libraryId: number,
+                zoteroKey: string,
+            ): Promise<import("../src/services/database").AttachmentProcessingStateRecord | null>;
+            getAttachmentProcessingStatesByLibrary(
+                libraryId: number,
+            ): Promise<import("../src/services/database").AttachmentProcessingStateRecord[]>;
+            deleteAttachmentProcessingState(
+                libraryId: number,
+                zoteroKey: string,
+            ): Promise<import("../src/services/database").AttachmentProcessingStateRecord | null>;
+            deleteAttachmentProcessingStatesByLibrary(libraryId: number): Promise<void>;
+            deleteBackgroundJobsByLibrary(libraryId: number): Promise<void>;
+            restoreIndexCleanup(accountId: string): Promise<number>;
+            acknowledgeIndexCleanup(job: import('../src/services/database').BackgroundJobRecord): Promise<void>;
+            markIndexCleanupReacquireAttempted: import('../src/services/database').AsterMarginDB['markIndexCleanupReacquireAttempted'];
+            retireAttachmentProcessingStates: import('../src/services/database').AsterMarginDB['retireAttachmentProcessingStates'];
+            hasPendingFulltextUpsert: import('../src/services/database').AsterMarginDB['hasPendingFulltextUpsert'];
+            replaceAttachmentExtractionSource: import('../src/services/database').AsterMarginDB['replaceAttachmentExtractionSource'];
+            relocateAttachmentExtractionSource: import('../src/services/database').AsterMarginDB['relocateAttachmentExtractionSource'];
+            adoptAttachmentExtractionSource(input: {
+                libraryId: number; zoteroKey: string; source: string;
+                contentKind: import("../src/services/database").AttachmentProcessingStateRecord['contentKind'];
+                fileMtimeMs: number; fileSizeBytes: number;
+            }): Promise<boolean>;
+            resetAttachmentExtraction(libraryId: number, zoteroKey: string, reason?: string | null): Promise<void>;
+            resetAttachmentOcr(libraryId: number, zoteroKey: string, reason?: string | null): Promise<void>;
+            resetAttachmentUpsert(libraryId: number, zoteroKey: string, reason?: string | null): Promise<void>;
+            markAttachmentExtracted(input: {
+                libraryId: number; zoteroKey: string;
+                expectedFileMtimeMs: number | null; expectedFileSizeBytes: number | null;
+                previousDocumentHash: string | null;
+                expectedExtractStatus: import("../src/services/database").AttachmentExtractStatus;
+                fileMtimeMs: number; fileSizeBytes: number;
+                fileHash: string | null; structuredDocumentHash: string | null;
+                extractSchemaVersion: string; ocrStatus: 'na' | 'needed';
+                extractionSource?: string | null;
+            }): Promise<boolean>;
+            markAttachmentExtractedForOcrRestore: import('../src/services/database').AsterMarginDB['markAttachmentExtractedForOcrRestore'];
+            markAttachmentExtractFailure(input: {
+                libraryId: number; zoteroKey: string; status: 'failed' | 'skipped'; error: string;
+                attemptedAt: number; extractionSource?: string | null;
+            }): Promise<void>;
+            ensureAttachmentFileHash(libraryId: number, zoteroKey: string, fileHash: string): Promise<void>;
+            markAttachmentOcrDone(input: {
+                attemptedAt: number;
+                libraryId: number; zoteroKey: string; fileHash: string;
+                ocrEngineVersion: string; structuredDocumentHash: string;
+                expectedOcrStatus: import("../src/services/database").AttachmentOcrStatus;
+                expectedOcrEngineVersion: string | null;
+                expectedExtractStatus: import("../src/services/database").AttachmentExtractStatus;
+            }): Promise<boolean>;
+            markAttachmentOcrFailed(libraryId: number, zoteroKey: string, fileHash: string, error: string): Promise<void>;
+            markAttachmentOcrUnavailable(libraryId: number, zoteroKey: string, fileHash: string, error: string): Promise<boolean>;
+            clearAttachmentOcrUnavailable(libraryId: number, zoteroKey: string, fileHash: string): Promise<boolean>;
+            touchAttachmentOcrUnavailable(libraryId: number, zoteroKey: string): Promise<void>;
+            getOcrUnavailableAttachments(libraryIds: number[]): Promise<Array<{ libraryId: number; zoteroKey: string; ticketed: boolean }>>;
+            recordAttachmentIndexIdentity: import('../src/services/database').AsterMarginDB['recordAttachmentIndexIdentity'];
+            markAttachmentUpsertDone: import('../src/services/database').AsterMarginDB['markAttachmentUpsertDone'];
+            markAttachmentUpsertFailed(libraryId: number, zoteroKey: string, structuredDocumentHash: string, error: string): Promise<void>;
+            getSearchPreparationRows: import('../src/services/database').AsterMarginDB['getSearchPreparationRows'];
+            getPendingFulltextUpsertKeys: import('../src/services/database').AsterMarginDB['getPendingFulltextUpsertKeys'];
+            getAttachmentProcessingAggregates(
+                libraryId?: number,
+                targets?: { ocr?: boolean; upsert?: boolean },
+            ): Promise<import("../src/services/database").AttachmentProcessingAggregates>;
+            getBackgroundProcessingFailures(
+                limit?: number,
+            ): Promise<import("../src/services/database").BackgroundProcessingFailureSummary[]>;
+            getAttachmentProcessingIssueRows(
+                limit?: number,
+            ): Promise<import("../src/services/backgroundProcessing/issues").AttachmentProcessingIssueRow[]>;
+            getProcessingIssueCounts(
+                entitlements: import("../src/services/backgroundProcessing/issues").IssueEntitlements,
+            ): Promise<import("../src/services/backgroundProcessing/issues").ProcessingIssueSummary[]>;
+            getProcessingIssuePage(
+                entitlements: import("../src/services/backgroundProcessing/issues").IssueEntitlements,
+                reason: import("../src/services/backgroundProcessing/issues").ProcessingIssueReason,
+                offset?: number,
+                limit?: number,
+            ): Promise<import("../src/services/backgroundProcessing/issues").ProcessingIssueItem[]>;
+            getProcessingIssueRefs(
+                entitlements: import("../src/services/backgroundProcessing/issues").IssueEntitlements,
+                reason: import("../src/services/backgroundProcessing/issues").ProcessingIssueReason,
+                limit?: number,
+            ): Promise<import("../src/services/backgroundProcessing/issues").AttachmentRef[]>;
+            deleteBackgroundDeadLetters(libraryId: number, zoteroKey: string): Promise<void>;
+            requeueAttachmentOcr(libraryId: number, zoteroKey: string, reason?: string | null): Promise<void>;
+            getBackgroundDeadLetters(
+                limit?: number,
+                onlyUnresolved?: boolean,
+            ): Promise<import("../src/services/backgroundProcessing/issues").BackgroundQueueDeadRow[]>;
+            getProcessingIndexState(
+                libraryId: number,
+            ): Promise<import("../src/services/database").ProcessingIndexStateRecord | null>;
+            upsertProcessingIndexState(
+                state: import("../src/services/database").ProcessingIndexStateRecord,
+            ): Promise<void>;
+            deleteProcessingIndexState(libraryId: number): Promise<void>;
+            recordAttachmentReadingOutcome(input: {
+                libraryId: number; zoteroKey: string; contentKind: string;
+                errorCode: string | null; attemptedAt: number;
+            }): Promise<void>;
+            getAttachmentReadingError(libraryId: number, zoteroKey: string): Promise<string | null>;
+            getAttachmentReadingKeysByLibrary(libraryId: number): Promise<string[]>;
+            deleteAttachmentReadingState(libraryId: number, zoteroKey: string): Promise<void>;
+            resetLocalProcessingState(libraryId?: number, discardRemoteState?: boolean): Promise<void>;
+            getUncachedProcessingCandidates: import('../src/services/database').AsterMarginDB['getUncachedProcessingCandidates'];
+            configureProcessingProgress: import('../src/services/database').AsterMarginDB['configureProcessingProgress'];
+            getProcessingProgress: import('../src/services/database').AsterMarginDB['getProcessingProgress'];
+            subscribeProcessingChanges: import('../src/services/database').AsterMarginDB['subscribeProcessingChanges'];
+        }
+
+        const backgroundExtractor:
+            | import("../src/services/backgroundExtractor").BackgroundExtractor
+            | undefined;
+
+        const processingReconciler:
+            | import("../src/services/backgroundProcessing/reconciler").ReconcilerService
+            | undefined;
+        const newItemWatcher:
+            | import("../src/services/backgroundProcessing/newItemWatcher").NewItemWatcher
+            | undefined;
+
+        /**
+         * OCR entitlement mirror, synced from the webpack profile hook so the
+         * esbuild OCR enqueue gate can read it.
+         */
+        let hasOcrAccess: boolean | undefined;
+
+        /**
+         * Cloud search-index entitlement mirror, synced from the webpack profile
+         * hook so the esbuild `fulltext_upsert` enqueue gate can read it.
+         */
+        let hasSearchIndexAccess: boolean | undefined;
+
+        /**
+         * Searchable-library mirror (local libraries minus the profile's
+         * excluded libraries), synced from the webpack profile hook so esbuild
+         * background code can enforce the exclusion boundary. Read it through
+         * `src/services/libraryScope`, which fails closed while it is unset.
+         */
+        let searchableLibraryIds: number[] | undefined;
+
+        /**
+         * True once `searchableLibraryIds` reflects a loaded profile and a
+         * loaded local library list.
+         */
+        let libraryScopeInitialized: boolean | undefined;
+
+        /**
+         * Incremented whenever a library leaves `searchableLibraryIds`, so work
+         * that outlives a scope check can tell whether access was revoked since.
+         */
+        let libraryRevocations: number | undefined;
+
+        /**
+         * Citation object for CSL formatting
+         */
+        type Citation = {
+            id: number;
+            locator?: string;
+            label?: string;
+            prefix?: string;
+            suffix?: string;
+            suppressAuthor?: boolean;
+            authorOnly?: boolean;
+        }
+
+        /**
+         * Citation service for formatting citations using CSL
+         */
+        const citationService: {
+            /**
+             * Format an in-text citation for Zotero items
+             * @param items Single Zotero item or array of items to format
+             * @param clean If true, removes parentheses and normalizes quotes
+             * @returns Formatted in-text citation or empty string on error
+             */
+            formatCitation(items: Zotero.Item | Zotero.Item[], clean?: boolean): string;
+
+            /**
+             * Format an in-text citation for citation objects
+             * @param citationItems Array of citation objects to format
+             * @param clean If true, removes parentheses and normalizes quotes
+             * @returns Formatted in-text citation or empty string on error
+             */
+            formatCitation(citationItems: Citation[], clean?: boolean): string;
+
+            /**
+             * Format multiple items as a bibliography entry
+             * @param items Single Zotero item or array of items
+             * @param format Output format - "text" or "html"
+             * @returns Formatted bibliography or empty string on error
+             */
+            formatBibliography(items: Zotero.Item | Zotero.Item[], format?: "text" | "html"): string;
+
+            /** Format a whole document's citations as one sequence (export). */
+            formatCitationSequence: import("../src/services/CitationService").CitationService["formatCitationSequence"];
+
+            /** The installed style and locale an export formats with. */
+            resolveStyle: import("../src/services/CitationService").CitationService["resolveStyle"];
+
+            /**
+             * Force recreation of the CSL engine on next use
+             * Call this when preferences change
+             */
+            reset(): void;
+
+            /**
+             * Free resources when the service is no longer needed
+             * Call during plugin shutdown
+             */
+            dispose(): void;
+        }
+    }
+
+    interface Item {
+        /**
+         * Determine whether the item or any of its ancestors is in the trash
+         *
+         * @return {Boolean}
+         */
+        isInTrash(): boolean;
+
+        /**
+         * Zotero 9+ returns child annotation IDs for a file attachment without
+         * consulting the object cache; the array is Zotero's internal cache.
+         * Zotero 7 and 8 ignore `asIDs` and return items. Use
+         * `getAnnotationIDs()` from `src/utils/zoteroDataLoading.ts` instead.
+         */
+        getAnnotations(
+            includeTrashed: boolean | undefined,
+            asIDs: true,
+        ): readonly number[] | Zotero.Item[];
+    }
+
+    interface Utilities {
+        Internal: {
+            /**
+             * Compress text content using gzip
+             * @param textContent The text content to compress
+             * @returns Promise that resolves to the compressed content
+             */
+            gzip(textContent: string): Promise<string>;
+        }
+    }
+
+    interface Exception {
+        UnloadedDataException: new (...args: any[]) => Error;
+    }
+
+    interface Prompt {
+        confirm(options: {
+            window: any;
+            title: string;
+            text: string;
+            button0?: string;
+            button1?: string;
+            button2?: string;
+            defaultButton?: number;
+        }): number;
+
+        BUTTON_TITLE_YES: string;
+        BUTTON_TITLE_NO: string;
+        BUTTON_TITLE_CANCEL: string;
+        BUTTON_TITLE_OK: string;
+    }
+    const Exception: Exception;
+    const Prompt: Prompt;
+}
+
+declare namespace Zotero {
+    namespace Profile {
+        const dir: string;
+    }
+    
+    namespace BetterBibTeX {
+        /**
+         * Better BibTeX KeyManager API
+         */
+        const KeyManager: {
+            /**
+             * Get citation key information for a Zotero item
+             * @param itemID - The Zotero item ID (number)
+             * @returns Object containing citation key and metadata
+             */
+            get(itemID: number): {
+                citationKey: string;
+                pinned?: boolean;
+                itemID?: number;
+                libraryID?: number;
+                itemKey?: string;
+                lcCitationKey?: string;
+                retry?: boolean;
+            };
+
+            /**
+             * Find first citation key record matching query
+             */
+            first(query: any): any;
+
+            /**
+             * Find all citation key records matching query
+             */
+            find(query: any): any[];
+
+            /**
+             * Get all citation key records
+             */
+            all(): any[];
+
+            /**
+             * Update/generate citation key for an item
+             */
+            update(item: Zotero.Item): string;
+        };
+    }
+}
+
+
+declare namespace Zotero {
+    namespace MenuManager {
+        function registerMenu(options: any): string | false;
+        function unregisterMenu(menuID: string): boolean;
+    }
+
+    /** Full-text indexing. `queueItem` is missing from zotero-types. */
+    namespace FullText {
+        function queueItem(item: Zotero.Item): Promise<void>;
+    }
+}
+
+declare namespace _ZoteroTypes {
+    interface HTTP {
+        UnexpectedStatusException: new (...args: any[]) => Error;
+        BrowserOfflineException: new (...args: any[]) => Error;
+        TimeoutException: new (...args: any[]) => Error;
+        SecurityException: new (...args: any[]) => Error;
+    }
+
+    interface FullText {
+        queueItem(item: Zotero.Item): Promise<void>;
+    }
+
+    interface Zotero {
+        /** Set to true at the start of shutdown to signal all in-flight operations to bail out */
+        __astermarginShuttingDown?: boolean;
+        /**
+         * Cross-bundle MuPDFWorkerClient singletons, one per slot name.
+         * Typed as `unknown` to avoid pulling the implementation file into
+         * the global typings (which would risk circular references).
+         * Callers cast at the boundary.
+         *
+         *  - `_hot`: user-facing agent extraction (low-latency).
+         *  - `_background`: background/queue extraction (independent heap).
+         */
+        __astermarginMuPDFWorkerClient_hot?: unknown;
+        __astermarginMuPDFWorkerClient_background?: unknown;
+    }
+}

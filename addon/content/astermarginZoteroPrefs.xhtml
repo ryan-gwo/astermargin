@@ -1,0 +1,16 @@
+<vbox id="astermargin-zotero-prefpane" xmlns:html="http://www.w3.org/1999/xhtml">
+    <groupbox>
+        <!-- <label><html:h2>AsterMargin Preferences</html:h2></label> -->
+        <html:p style="margin: 8px 0 16px 0; font-size: 13px">
+            Click the button below to open the AsterMargin sidebar.
+            AsterMargin preferences are available from within the sidebar.
+        </html:p>
+        <hbox>
+        <!-- The command handler lives in astermarginZoteroPrefs.js, registered via
+             the `scripts` option of Zotero.PreferencePanes.register(). Inline
+             event handlers are blocked by the baseline chrome CSP that
+             Firefox 153 (Zotero 11) introduced. -->
+        <button id="astermargin-open-prefs-btn" label="Open AsterMargin" />
+        </hbox>
+    </groupbox>
+</vbox>

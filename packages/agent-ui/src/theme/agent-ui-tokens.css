@@ -1,0 +1,257 @@
+/*
+ * @astermargin/agent-ui — design tokens.
+ *
+ * Two halves, and the split is the whole point:
+ *
+ *   OWNED    — AsterMargin's own custom properties, defined below. They mean the same
+ *              thing in every client, so the package ships the values. Two kinds:
+ *              literal values (the tag ramps, the webapp palette), and derived
+ *              semantic tokens (`--astermargin-surface-*`, `--astermargin-fill-*`,
+ *              `--astermargin-border-*`, and the geometry) whose values are
+ *              compositions of required tokens.
+ *   REQUIRED — platform custom properties the package uses but must never
+ *              define. Listed in the contract at the bottom of this file.
+ *
+ * Why the package ships no value for a required token: those names belong to the
+ * host application's theme. Zotero supplies them from its own stylesheets, which
+ * means AsterMargin follows Zotero's light, dark and high-contrast themes for free,
+ * and keeps following them when Zotero restyles. Defining a value here would
+ * freeze the shared layer against one client's palette and silently stop it
+ * tracking the app it renders inside. Each client satisfies the contract its own
+ * way instead — Zotero implicitly, the Word add-in explicitly in its own theme
+ * file, which mirrors these exact names and adds a `prefers-color-scheme: dark`
+ * block.
+ *
+ * The corollary: a shared component may use any name in the contract, but adding
+ * a name to it is a change every client has to implement. Prefer an owned token,
+ * or an existing required one.
+ *
+ * That corollary binds the derived tokens too, and more tightly: a derived token
+ * may only be composed from names already in the contract. Composing one from a
+ * name that is not in it would add a required name silently — the token looks
+ * owned, so nobody reads it as a new obligation, and the client that does not
+ * define the name renders the surface transparent instead of failing loudly.
+ * Because they are expressed in the host's own names, the derived tokens track
+ * whatever theme the host is in without the package knowing anything about it.
+ *
+ * `--material-background` is deliberately NOT in the contract, so no derived
+ * token may use it: it is a Zotero alias, and the Word add-in defines
+ * `--color-background` instead. Mix towards `--material-sidepane` and the
+ * `--fill-*` ramp, which both clients do define.
+ *
+ * This sheet must be loaded before `agent-ui-utilities.css` and before the
+ * client's own sheet.
+ */
+
+:root {
+    /* Tag colour ramps. Six hues x six opacity rungs, primary (most opaque) to
+       senary (faintest). The hue is Zotero's tag colour where one exists; the
+       rungs are AsterMargin's. Ramps are used for status and category surfaces —
+       background at quinary/senary, text at secondary, borders at tertiary. */
+    --tag-blue-primary: #2ea8e5;
+    --tag-blue-secondary: #2ea8e58c;
+    --tag-blue-tertiary: #2ea8e54d;
+    --tag-blue-quarternary: #2ea8e51f;
+    --tag-blue-quinary: #2ea8e50f;
+    --tag-blue-senary: #2ea8e508;
+
+    --tag-yellow-primary: #ffd400e5;
+    --tag-yellow-secondary: #ffd4008c;
+    --tag-yellow-tertiary: #ffd4004d;
+    --tag-yellow-quarternary: #ffd4001f;
+    --tag-yellow-quinary: #ffd4000f;
+    --tag-yellow-senary: #ffd40008;
+
+    --tag-orange-primary: #e8850ce5;
+    --tag-orange-secondary: #e8850c8c;
+    --tag-orange-tertiary: #e8850c4d;
+    --tag-orange-quarternary: #e8850c1f;
+    --tag-orange-quinary: #e8850c0f;
+    --tag-orange-senary: #e8850c08;
+
+    --tag-red-primary: #ff6666e5;
+    --tag-red-secondary: #ff66668c;
+    --tag-red-tertiary: #ff66664d;
+    --tag-red-quarternary: #ff66661f;
+    --tag-red-quinary: #ff66660f;
+    --tag-red-senary: #ff666608;
+
+    --tag-green-primary: #22c55ee5;
+    --tag-green-secondary: #22c55e8c;
+    --tag-green-tertiary: #22c55e4d;
+    --tag-green-quarternary: #22c55e1f;
+    --tag-green-quinary: #22c55e0f;
+    --tag-green-senary: #22c55e08;
+
+    --tag-purple-primary: #8b5cf6e5;
+    --tag-purple-secondary: #8b5cf68c;
+    --tag-purple-tertiary: #8b5cf64d;
+    --tag-purple-quarternary: #8b5cf61f;
+    --tag-purple-quinary: #8b5cf60f;
+    --tag-purple-senary: #8b5cf608;
+
+    /* Webapp color scheme. AsterMargin's marketing/web palette, kept so a surface
+       that has to match the web app (rather than the host application) can. */
+    --webapp-background: #F5F0ED;
+    --webapp-foreground: #111729;
+    --webapp-primary: #111729;
+    --webapp-primary-foreground: #F5F0ED;
+    --webapp-secondary: #FFF;
+    --webapp-secondary-foreground: #111729;
+    --webapp-accent: #FFD700;
+    --webapp-muted: #F5F0ED;
+    --webapp-muted-foreground: #6B7280;
+    --webapp-border: #E8DDD6;
+    --webapp-input: #FFFFFF;
+    --webapp-ring: #111729;
+}
+
+/* Semantic tokens — owned names, values composed from the required contract.
+   Every value below resolves through the host's own theme tokens, so a surface
+   built from them follows the host's light, dark and high-contrast themes
+   without the shared layer knowing which one is active.
+
+   The resolved Zotero colours, for orientation:
+
+                                  light      dark
+       --astermargin-surface-ground    #f2f2f2    #303030
+       --astermargin-surface-raised    #eaeaea    #353535
+       --astermargin-surface-overlay   #e5e5e5    #393939
+
+   Surfaces are opaque, so they can be stacked; fills are translucent and
+   composite onto whichever surface they sit on. */
+:root {
+    /* Surfaces — opaque, ordered by distance from the pane ground */
+    --astermargin-surface-ground: var(--material-sidepane);
+    --astermargin-surface-raised: var(--material-sidepane); /* flat fallback, see @supports */
+    --astermargin-surface-overlay: var(--material-mix-quarternary);
+
+    /* Fills — translucent, composite onto whichever surface they sit on */
+    --astermargin-fill-subtle: var(--fill-senary);
+    --astermargin-fill-hover: var(--fill-quinary);
+    /* A bar docked to the top edge of a raised card — a pending-approvals or
+       progress strip. It reads as inset against the card without being a
+       surface of its own, so it tints rather than covers. Senary is one rung
+       below hover/chip: enough to mark the strip, not enough to compete with
+       the card's own step off the pane. */
+    --astermargin-fill-bar: var(--fill-senary);
+    /* Chips (inline badges and pills) sit inside cards as often as directly on
+       the pane, so the fill must be translucent and tint whatever is behind it
+       rather than cover it. `--fill-quinary` is the rung that composites on the
+       pane ground to the same colour the opaque `--material-mix-quarternary`
+       resolves to, so a chip on the ground reads identically either way. */
+    --astermargin-fill-chip: var(--fill-quinary);
+
+    /* Borders, by weight */
+    --astermargin-border-subtle: var(--fill-quinary);
+    --astermargin-border-default: var(--fill-quarternary); /* flat fallback, see @supports */
+    --astermargin-border-strong: var(--fill-quarternary);
+
+    /* Geometry — two axes.
+       `sm`/`md`/`lg`/`xl` is the general-purpose corner scale the `.rounded-*`
+       utility classes expose, in rem to match the rest of the utility layer.
+       `control`/`card`/`pill` are named roles for recurring shapes: the buttons
+       of a control row, a card level with the composer, and a fully rounded
+       button. Reach for a role when the shape is the point, the scale when the
+       corner is incidental.
+
+       The roles are in px on purpose. They are measured against the chrome they
+       round — a 22px button, a 1px card border the docked bars subtract from —
+       not against type, and both are values a designer picks by eye at a
+       specific size. The rem scale is pinned anyway (the contract at the bottom
+       of this file), so neither axis moves with the user's font-size setting:
+       Zotero applies that preference to the panes it registers, not to `:root`,
+       whose 13px the whole utility layer is measured against. */
+    --astermargin-radius-sm: 0.125rem;
+    --astermargin-radius-md: 0.375rem;
+    --astermargin-radius-lg: 0.5rem;
+    --astermargin-radius-xl: 0.75rem;
+    --astermargin-radius-control: 6px;
+    --astermargin-radius-card: 10px;
+    --astermargin-radius-pill: 999px;
+    --astermargin-card-pad-x: 0.8rem;
+    --astermargin-card-pad-top: 0.85rem;
+    --astermargin-card-pad-bottom: 0.5rem;
+
+    /* Elevation shadow for overlays */
+    --astermargin-shadow-overlay: 0 0.375rem 0.75rem rgba(0, 0, 0, 0.15);
+}
+
+/* The two tokens that need `color-mix()` are defined flat above and upgraded
+   here, and the guard has to sit on the *definition* rather than on the use
+   site. A custom property accepts any token stream, so on an engine without
+   `color-mix()` the declaration `--x: color-mix(...)` parses cleanly and only
+   fails when it is substituted — at which point the whole declaration that used
+   it is invalid at computed-value time and resolves to `unset` (transparent),
+   rather than falling back to a preceding declaration for the same property.
+   Writing `color-mix()` literally at the use site does fall back, because an
+   unsupported function there is dropped at parse time; through a variable it
+   does not. This matters for the Word add-in on macOS, which renders in
+   WKWebView, where `color-mix()` needs Safari 16.2+. */
+@supports (background: color-mix(in srgb, red, blue)) {
+    :root {
+        --astermargin-surface-raised:
+            color-mix(in srgb, var(--material-mix-quarternary) 60%, var(--material-sidepane));
+        --astermargin-border-default:
+            color-mix(in srgb, var(--material-mix-quarternary) 50%, var(--fill-quarternary));
+    }
+}
+
+/* ============================================================================
+ * THE TOKEN CONTRACT — required, never defined here
+ * ============================================================================
+ *
+ * Every client that loads a AsterMargin shared sheet must define all of these. A
+ * `var()` naming an undefined property with no fallback makes the declaration
+ * invalid at computed-value time, which usually shows up as an invisible or
+ * unstyled element rather than an error — so an unmet contract is quiet.
+ *
+ * Fill scale — text and surface levels, primary (strongest) to senary
+ * (faintest). The package's font-colour and background utilities are built
+ * entirely from these:
+ *
+ *     --fill-primary  --fill-secondary  --fill-tertiary
+ *     --fill-quarternary  --fill-quinary  --fill-senary
+ *
+ *   Note the spelling `quarternary`: it is Zotero's, and the package matches it
+ *   rather than correcting it. (One background utility reads
+ *   `--material-mix-quarternary` instead; that is deliberate, not a typo.)
+ *
+ * Materials — composited surfaces, not flat colours:
+ *
+ *     --material-background  --material-sidepane  --material-mix-quarternary
+ *
+ *   `--material-background` is the application's base content surface — the one
+ *   a full-width working surface sits on, as opposed to `--material-sidepane`,
+ *   which is the pane material. The table layer needs it because the fill scale
+ *   is translucent: a sticky header or a hovered row has to composite a fill
+ *   over an *opaque* base, and there is no other token that names one.
+ *
+ * Accents — the host application's interactive colour and the foreground that
+ * is legible on it:
+ *
+ *     --accent-blue  --accent-green  --accent-white
+ *
+ * Borders and scrollbars:
+ *
+ *     --color-border50  --color-scrollbar  --color-scrollbar-background
+ *
+ * Flat tag hues — the base colour of each ramp above, without an opacity rung.
+ * The host defines these because it also owns the tag colours the user sees in
+ * its own UI, so the two stay in step:
+ *
+ *     --tag-blue  --tag-green  --tag-orange  --tag-purple  --tag-red
+ *     --tag-yellow
+ *
+ * Runtime-supplied, not theme — set as an inline style on the element by client
+ * code rather than declared in any stylesheet, so they are read with a fallback
+ * (`var(--astermargin-argument-hint-left, 0)`) and a client that does not implement
+ * the feature simply never sets them:
+ *
+ *     --astermargin-argument-hint-left  --astermargin-argument-hint-top
+ *
+ * The `rem` scale: the utility layer is in `rem`, so a client must also pin its
+ * root font size to the one the values were measured against (13px). Zotero's
+ * windows inherit it from the application; the separate AsterMargin window mirrors it
+ * from the main window in `astermarginWindow.js`.
+ * ========================================================================== */

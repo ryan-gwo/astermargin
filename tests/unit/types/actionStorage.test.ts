@@ -1,0 +1,401 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+// actionStorage only uses the legacy-import helper from settings; mocking it
+// breaks the settings → atoms/ui → atoms/models import cycle in tests.
+vi.mock('../../../react/types/settings', () => ({
+    getCustomPromptsFromPreferences: () => [],
+}));
+
+import { getActionCustomizations, getHiddenBuiltinActions, getMergedActions, saveActionCustomizations } from '../../../react/types/actionStorage';
+import { BUILTIN_ACTIONS, ALL_BUILTIN_ACTIONS } from '../../../react/types/builtinActions';
+import { ARCHIVED_ACTIONS } from '../../../react/types/archivedActions';
+import { getActionCommand, toSlashToken } from '@astermargin/agent-ui/composer/slashCommands';
+import { categoryLabel, type ActionCustomizations } from '@astermargin/agent-core/types/actions';
+
+// In-memory pref store backing the Zotero.Prefs stub from tests/setup.ts, so
+// customizations round-trip through the real JSON serialization.
+const prefStore = new Map<string, unknown>();
+const { Prefs } = (globalThis as any).Zotero;
+
+describe('actionStorage', () => {
+    beforeEach(() => {
+        prefStore.clear();
+        vi.mocked(Prefs.get).mockImplementation((key: string) => prefStore.get(key));
+        vi.mocked(Prefs.set).mockImplementation((key: string, value: unknown) => {
+            prefStore.set(key, value);
+        });
+    });
+
+    const builtinWithName = BUILTIN_ACTIONS.find(a => a.name)!;
+    const lockedBuiltin = BUILTIN_ACTIONS.find(a => a.locked)!;
+
+    it('built-in names are unique', () => {
+        const commands = BUILTIN_ACTIONS.filter(a => !a.deprecated).map(getActionCommand);
+        expect(new Set(commands).size).toBe(commands.length);
+    });
+
+    it('applies a name override to a built-in', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [builtinWithName.id]: { name: 'my-command' } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === builtinWithName.id)!;
+        expect(merged.name).toBe('my-command');
+        expect(getActionCommand(merged)).toBe('my-command');
+    });
+
+    it('persists a cleared built-in name ("") so the command derives from the title', () => {
+        // Clearing back to automatic mode stores "" — a plain `undefined`
+        // would be dropped by JSON.stringify and the base name would return.
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [builtinWithName.id]: { title: 'My Custom Digest', name: '' } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === builtinWithName.id)!;
+        expect(merged.name).toBe('');
+        expect(getActionCommand(merged)).toBe(toSlashToken('My Custom Digest'));
+        expect(getActionCommand(merged)).not.toBe(builtinWithName.name);
+    });
+
+    it('drops undefined override fields in the JSON round-trip (why "" is required)', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [builtinWithName.id]: { title: 'My Custom Digest', name: undefined } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === builtinWithName.id)!;
+        // The undefined name never reaches storage — the base name survives.
+        expect(merged.name).toBe(builtinWithName.name);
+    });
+
+    it('persists and merges argumentHint overrides', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [builtinWithName.id]: { argumentHint: 'topic to focus on' } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === builtinWithName.id)!;
+        expect(merged.argumentHint).toBe('topic to focus on');
+    });
+
+    it('keeps name and argumentHint on custom actions', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: {},
+            custom: [{
+                id: 'custom-1',
+                title: 'My Action',
+                text: 'Do the thing',
+                name: 'my-action',
+                argumentHint: 'what to do it to',
+                targets: ['global'],
+            }],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === 'custom-1')!;
+        expect(merged.name).toBe('my-action');
+        expect(merged.argumentHint).toBe('what to do it to');
+    });
+
+    it('ignores historical overrides and hidden flags for locked built-ins', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: {
+                [lockedBuiltin.id]: {
+                    hidden: true,
+                    title: 'Old customized title',
+                    text: 'Old customized prompt',
+                },
+            },
+            custom: [],
+        };
+
+        // Seed the raw preference directly to simulate data written by a
+        // version where this built-in was still editable.
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify(c));
+
+        const merged = getMergedActions().find(a => a.id === lockedBuiltin.id);
+        expect(merged).toMatchObject({
+            title: lockedBuiltin.title,
+            text: lockedBuiltin.text,
+            locked: true,
+        });
+        expect(getActionCustomizations().overrides[lockedBuiltin.id]).toBeUndefined();
+        expect(getHiddenBuiltinActions().some(a => a.id === lockedBuiltin.id)).toBe(false);
+    });
+
+    it('strips locked from custom actions read from persisted user data', () => {
+        const raw = {
+            version: 1,
+            overrides: {},
+            custom: [{
+                id: 'custom-locked',
+                title: 'Custom action',
+                text: 'Do the thing',
+                targets: ['global'],
+                locked: true,
+            }],
+        };
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify(raw));
+
+        const custom = getMergedActions().find(a => a.id === 'custom-locked');
+        expect(custom).toBeDefined();
+        expect(custom?.locked).toBeUndefined();
+    });
+
+    it('keeps a custom action whose category this build does not know', () => {
+        const raw = {
+            version: 1,
+            overrides: {},
+            custom: [{
+                id: 'custom-open-category',
+                title: 'Check citations',
+                text: 'Do the thing',
+                targets: ['global'],
+                category: 'cite-check',
+            }],
+        };
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify(raw));
+
+        expect(getActionCustomizations().custom[0]?.category).toBe('cite-check');
+
+        // Round-trip: the filtered list is what gets written back.
+        saveActionCustomizations(getActionCustomizations());
+        expect(getMergedActions().find(a => a.id === 'custom-open-category')?.category).toBe('cite-check');
+    });
+
+    it('drops a custom action whose category is malformed', () => {
+        const withCategory = (category: unknown) => ({
+            version: 1,
+            overrides: {},
+            custom: [{ id: 'custom-bad-category', title: 'T', text: 'P', targets: ['global'], category }],
+        });
+        for (const category of ['', '   ', 7, null, {}]) {
+            Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify(withCategory(category)));
+            expect(getActionCustomizations().custom, JSON.stringify(category)).toEqual([]);
+        }
+    });
+
+    it('resolves a category named after an Object.prototype member', () => {
+        // Object.prototype names must not resolve to inherited functions via object index.
+        for (const category of ['constructor', 'toString', 'hasOwnProperty', 'valueOf', 'isPrototypeOf']) {
+            expect(typeof categoryLabel(category), category).toBe('string');
+        }
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify({
+            version: 1,
+            overrides: {},
+            custom: [{ id: 'custom-proto', title: 'T', text: 'P', targets: ['global'], category: 'constructor' }],
+        }));
+        expect(getActionCustomizations().custom[0]?.category).toBe('constructor');
+    });
+
+    it('keeps a category that happens to be spelled "uncategorized"', () => {
+        // "uncategorized" is a legal category; the no-category filter is "".
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify({
+            version: 1,
+            overrides: {},
+            custom: [{ id: 'custom-word', title: 'T', text: 'P', targets: ['global'], category: 'uncategorized' }],
+        }));
+        expect(getActionCustomizations().custom[0]?.category).toBe('uncategorized');
+        saveActionCustomizations(getActionCustomizations());
+        expect(getMergedActions().find(a => a.id === 'custom-word')?.category).toBe('uncategorized');
+    });
+
+    it('survives a malformed override category and never merges the cleared sentinel', () => {
+        const outline = BUILTIN_ACTIONS[0];
+        // Non-string override must not throw on string methods.
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify({
+            version: 1,
+            overrides: { [outline.id]: { category: 7 } },
+            custom: [],
+        }));
+        const malformedMerged = getMergedActions().find(a => a.id === outline.id);
+        expect(malformedMerged?.category).toBe(outline.category);
+
+        // Cleared category must be undefined on Action, not null.
+        Prefs.set('extensions.zotero.astermargin.actions', JSON.stringify({
+            version: 1,
+            overrides: { [outline.id]: { category: '' } },
+            custom: [],
+        }));
+        const merged = getMergedActions().find(a => a.id === outline.id);
+        expect(merged?.category).toBeUndefined();
+        expect(Object.prototype.hasOwnProperty.call(merged ?? {}, 'category')).toBe(true);
+        expect(merged?.category).not.toBeNull();
+    });
+
+    it('does not persist locked built-in overrides or custom locked flags', () => {
+        saveActionCustomizations({
+            version: 1,
+            overrides: { [lockedBuiltin.id]: { title: 'Do not save' } },
+            custom: [{
+                id: 'custom-locked',
+                title: 'Custom action',
+                text: 'Do the thing',
+                targets: ['global'],
+                locked: true,
+            }],
+        });
+
+        const stored = JSON.parse(prefStore.get('extensions.zotero.astermargin.actions') as string);
+        expect(stored.overrides[lockedBuiltin.id]).toBeUndefined();
+        expect(stored.custom[0].locked).toBeUndefined();
+    });
+
+    it('normalizes legacy custom actions (single targetType, minItems) to targets', () => {
+        // Older versions stored a single `targetType` string and an optional
+        // `minItems`. Readers accept the legacy shape and normalize.
+        const legacy = {
+            version: 1,
+            overrides: {},
+            custom: [{
+                id: 'custom-legacy',
+                title: 'Legacy Action',
+                text: 'Do the thing',
+                targetType: 'attachment',
+                minItems: 2,
+            }],
+        };
+        saveActionCustomizations(legacy as unknown as ActionCustomizations);
+        const merged = getMergedActions().find(a => a.id === 'custom-legacy')!;
+        expect(merged.targets).toEqual(['attachment']);
+        expect((merged as any).targetType).toBeUndefined();
+        expect((merged as any).minItems).toBeUndefined();
+    });
+
+    it('normalizes a legacy targetType override to targets', () => {
+        const legacy = {
+            version: 1,
+            overrides: { [builtinWithName.id]: { targetType: 'note' } },
+            custom: [],
+        };
+        saveActionCustomizations(legacy as unknown as ActionCustomizations);
+        const merged = getMergedActions().find(a => a.id === builtinWithName.id)!;
+        expect(merged.targets).toEqual(['note']);
+    });
+
+    it('applies a targets override wholesale', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [builtinWithName.id]: { targets: ['items', 'attachment'] } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === builtinWithName.id)!;
+        expect(merged.targets).toEqual(['items', 'attachment']);
+    });
+
+    it('drops stored actions with no valid target in either shape', () => {
+        const invalid = {
+            version: 1,
+            overrides: {},
+            custom: [{ id: 'custom-bad', title: 'Bad', text: 'x', targetType: 'bogus' }],
+        };
+        saveActionCustomizations(invalid as unknown as ActionCustomizations);
+        expect(getMergedActions().some(a => a.id === 'custom-bad')).toBe(false);
+    });
+
+    // ── Deprecated tombstones (archivedActions.ts) ──────────────────────
+    //
+    // Retired built-ins that shipped in a released build stay in the base
+    // list as `deprecated: true` tombstones: invisible unless the user has
+    // an override, in which case the override merges onto the full default.
+
+    const archived = ARCHIVED_ACTIONS[0];
+
+    it('archived tombstones keep full attributes, deprecated flag, and no category', () => {
+        for (const a of ARCHIVED_ACTIONS) {
+            expect(a.deprecated, a.id).toBe(true);
+            expect(a.category, a.id).toBeUndefined();
+            expect(a.title, a.id).toBeTruthy();
+            expect(a.text, a.id).toBeTruthy();
+            expect(a.targets.length, a.id).toBeGreaterThan(0);
+        }
+        // Tombstone ids must not collide with active built-ins
+        const activeIds = new Set(BUILTIN_ACTIONS.map(a => a.id));
+        for (const a of ARCHIVED_ACTIONS) {
+            expect(activeIds.has(a.id), a.id).toBe(false);
+        }
+        expect(ALL_BUILTIN_ACTIONS.length).toBe(BUILTIN_ACTIONS.length + ARCHIVED_ACTIONS.length);
+    });
+
+    it('hides a deprecated built-in from users without an override', () => {
+        saveActionCustomizations({ version: 1, overrides: {}, custom: [] });
+        expect(getMergedActions().some(a => a.id === archived.id)).toBe(false);
+    });
+
+    it('keeps a deprecated built-in for users with an override, merging base fields', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [archived.id]: { title: 'My renamed action' } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const merged = getMergedActions().find(a => a.id === archived.id)!;
+        expect(merged).toBeDefined();
+        expect(merged.title).toBe('My renamed action');
+        // Unmodified fields resolve from the tombstone (including prompt improvements)
+        expect(merged.text).toBe(archived.text);
+        expect(merged.targets).toEqual(archived.targets);
+        // No category → never shown on the homepage launcher
+        expect(merged.category).toBeUndefined();
+    });
+
+    it('preserves archived built-in commands when an override does not change the name', () => {
+        const shippedCommands: Record<string, string> = {
+            'builtin-key-findings': 'key-findings',
+            'builtin-attachment-fit-research': 'fit-into-library-pdf',
+            'builtin-organize-recent': 'organize-recent',
+            'builtin-fix-metadata-recent': 'fix-metadata',
+        };
+
+        const overrides = Object.fromEntries(
+            Object.keys(shippedCommands).map(id => [id, { title: 'My renamed action' }]),
+        ) as ActionCustomizations['overrides'];
+
+        saveActionCustomizations({ version: 1, overrides, custom: [] });
+        const mergedById = new Map(getMergedActions().map(a => [a.id, a]));
+
+        for (const [id, command] of Object.entries(shippedCommands)) {
+            const merged = mergedById.get(id);
+            expect(merged, id).toBeDefined();
+            expect(getActionCommand(merged!), id).toBe(command);
+        }
+    });
+
+    it('keeps a hidden deprecated built-in hidden', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { [archived.id]: { hidden: true } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        expect(getMergedActions().some(a => a.id === archived.id)).toBe(false);
+    });
+
+    it('/literature-review keeps its id and is offered for a collection, items, or no selection', () => {
+        saveActionCustomizations({ version: 1, overrides: {}, custom: [] });
+        const review = getMergedActions().find(a => getActionCommand(a) === 'literature-review')!;
+        expect(review.id).toBe('builtin-collection-literature-review');
+        expect(review.targets).toEqual(expect.arrayContaining(['collection', 'items', 'global']));
+        expect(review.category).toBe('write');
+    });
+
+    it('applies an existing /literature-review text override to the review action', () => {
+        const c: ActionCustomizations = {
+            version: 1,
+            overrides: { 'builtin-collection-literature-review': { text: 'My own review prompt' } },
+            custom: [],
+        };
+        saveActionCustomizations(c);
+        const review = getMergedActions().find(a => a.id === 'builtin-collection-literature-review')!;
+        expect(review.text).toBe('My own review prompt');
+        expect(getActionCommand(review)).toBe('literature-review');
+    });
+});
