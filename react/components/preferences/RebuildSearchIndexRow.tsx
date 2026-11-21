@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import React, { useCallback } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import Button from '@astermargin/agent-ui/primitives/Button';
@@ -31,21 +32,20 @@ const RebuildSearchIndexRow: React.FC<{ hasBorder?: boolean }> = ({ hasBorder = 
     return (
         <>
             <SettingsRow
-                title="Rebuild Search Index"
+                title={settingsText("Rebuild Search Index")}
                 hasBorder={hasBorder}
                 announceDescription
                 description={
                     <>
-                        Check that the local index used to search by title and abstract matches your Zotero libraries.
-                        This happens automatically; run it by hand if search results look out of date.
+                        {settingsText("Check that the local index used to search by title and abstract matches your Zotero libraries. This happens automatically; run it by hand if search results look out of date.")}
                         {indexState.failedItems > 0 && (
                             <span className="display-flex font-color-yellow mt-1">
-                                {indexState.failedItems.toLocaleString()} items failed to index
+                                {settingsText("{count} items failed to index", { count: indexState.failedItems.toLocaleString() })}
                             </span>
                         )}
                         {indexState.status === 'error' && indexState.error && (
                             <span className="display-flex font-color-red mt-1">
-                                Error: {indexState.error}
+                                {settingsText("Error:")}{' '}{indexState.error}
                             </span>
                         )}
                     </>
@@ -58,7 +58,7 @@ const RebuildSearchIndexRow: React.FC<{ hasBorder?: boolean }> = ({ hasBorder = 
                         loading={isIndexing}
                         style={{ padding: '4px 6px' }}
                     >
-                        {isIndexing ? `Indexing${progress}` : 'Rebuild'}
+                        {isIndexing ? settingsText("Indexing{progress}", { progress }) : settingsText("Rebuild")}
                     </Button>
                 }
             />

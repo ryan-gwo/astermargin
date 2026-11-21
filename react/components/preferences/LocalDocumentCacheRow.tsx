@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import React, { useCallback, useEffect, useState } from 'react';
 import { useAtomValue } from 'jotai';
 import Button from '@astermargin/agent-ui/primitives/Button';
@@ -81,15 +82,15 @@ const LocalDocumentCacheRow: React.FC<{ hasBorder?: boolean }> = ({ hasBorder = 
     const clear = useCallback(async () => {
         if (!cache) return;
         const notes = [
-            'Your original files are not affected. AsterMargin reads a file again the next time it is needed.',
-            'Prepared OCR text is retained, including after cloud access ends.',
-            hasSearchAccess ? 'Your full-text search index is not affected.' : null,
+            settingsText("Your original files are not affected. AsterMargin reads a file again the next time it is needed."),
+            settingsText("Prepared OCR text is retained, including after cloud access ends."),
+            hasSearchAccess ? settingsText("Your full-text search index is not affected.") : null,
         ].filter(Boolean).join(' ');
         const buttonIndex = Zotero.Prompt.confirm({
             window: surfaceWindow,
-            title: 'Clear Local Document Cache?',
-            text: `Clear extracted text from ${describeCache(cache)}?\n\n${notes}`,
-            button0: 'Clear',
+            title: settingsText("Clear Local Document Cache?"),
+            text: settingsText("Clear extracted text from {files}?", { files: describeCache(cache) }) + "\n\n" + notes,
+            button0: settingsText("Clear"),
             // Cancel at button1 so Escape/dialog-close routes here.
             button1: Zotero.Prompt.BUTTON_TITLE_CANCEL,
             defaultButton: 1,
@@ -102,7 +103,7 @@ const LocalDocumentCacheRow: React.FC<{ hasBorder?: boolean }> = ({ hasBorder = 
             await clearDocumentCache();
             setCleared(true);
         } catch (err) {
-            setError(err instanceof Error ? err.message : 'Could not clear the local cache.');
+            setError(err instanceof Error ? err.message : settingsText("Could not clear the local cache."));
         } finally {
             await refresh();
             setClearing(false);
@@ -111,20 +112,22 @@ const LocalDocumentCacheRow: React.FC<{ hasBorder?: boolean }> = ({ hasBorder = 
 
     return (
         <SettingsRow
-            title="Local Document Cache"
+            title={settingsText("Local Document Cache")}
             hasBorder={hasBorder}
             announceDescription
             description={
                 <>
-                    Text AsterMargin has read from your attachments, kept so it can respond faster.
+                    {settingsText("Text AsterMargin has read from your attachments, kept so it can respond faster.")}
                     <span className="display-flex mt-1">
-                        {cache === undefined ? 'Checking local storage…' : cache === null ? 'Cache status unavailable' : describeCache(cache)}
+                        {cache === undefined ? settingsText("Checking local storage…") : cache === null ? settingsText("Cache status unavailable") : describeCache(cache)}
                     </span>
                     {!!cache?.ocr_repreparation_required_count && <span role="status" className="display-flex mt-1">
-                        {plural(cache.ocr_repreparation_required_count, 'prepared scan')} need re-preparation after an extraction update. Their cached data is retained and will not be served until compatible preparation is available.
+                        {settingsText(cache.ocr_repreparation_required_count === 1
+                            ? "{count} prepared scan needs re-preparation after an extraction update. Its cached data is retained and will not be served until compatible preparation is available."
+                            : "{count} prepared scans need re-preparation after an extraction update. Their cached data is retained and will not be served until compatible preparation is available.", { count: cache.ocr_repreparation_required_count })}
                     </span>}
                     {cleared && <span role="status" className="display-flex mt-1">
-                        Cache cleared. Prepared OCR text is retained. Other files will be read again when needed. To prepare them ahead of time, enable Background Processing and use Rebuild cache under Cached text once pending processing has finished.
+                        {settingsText("Cache cleared. Prepared OCR text is retained. Other files will be read again when needed. To prepare them ahead of time, enable Background Processing and use Rebuild cache under Cached text once pending processing has finished.")}
                     </span>}
                     {error && <span role="alert" className="display-flex font-color-red mt-1">{error}</span>}
                 </>
@@ -137,7 +140,7 @@ const LocalDocumentCacheRow: React.FC<{ hasBorder?: boolean }> = ({ hasBorder = 
                     loading={clearing}
                     style={{ padding: '4px 6px' }}
                 >
-                    Clear…
+                    {settingsText("Clear…")}
                 </Button>
             }
         />

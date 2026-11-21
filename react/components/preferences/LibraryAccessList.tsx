@@ -1,3 +1,5 @@
+import { settingsText } from "../../utils/settingsText";
+import { plural } from "./processingStatusSentence";
 import React, { useEffect, useMemo, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { getLibraryItemCounts, LibraryStatistics } from '../../../src/utils/libraries';
@@ -26,8 +28,8 @@ import { SettingsGroup } from './components/SettingsElements';
  * nothing syncs across devices, so it drops the multi-device sentence.
  */
 export function libraryAccessDescription(localMode: boolean): string {
-    const base = 'AsterMargin only searches, reads, and edits the libraries checked here.';
-    return localMode ? base : `${base} This applies on every device signed in to your account.`;
+    const base = settingsText("AsterMargin only searches, reads, and edits the libraries checked here.");
+    return localMode ? base : [base, settingsText("This applies on every device signed in to your account.")].join(" ");
 }
 
 /** Libraries shown before the list collapses behind "Show all". */
@@ -163,10 +165,10 @@ const LibraryAccessList: React.FC = () => {
                     <Icon icon={AlertIcon} className="scale-11 mt-015 flex-none" />
                     <span>
                         {localEntriesInvalid
-                            ? 'Your saved library list is invalid. Check a library below to reset it.'
+                            ? settingsText("Your saved library list is invalid. Check a library below to reset it.")
                             : allLibrariesExcluded
-                                ? "All libraries are unchecked. AsterMargin can't access any libraries."
-                                : 'Your personal library is unchecked, so AsterMargin cannot use it on any of your devices.'}
+                                ? settingsText("All libraries are unchecked. AsterMargin can't access any libraries.")
+                                : settingsText("Your personal library is unchecked, so AsterMargin cannot use it on any of your devices.")}
                     </span>
                 </div>
             )}
@@ -174,10 +176,10 @@ const LibraryAccessList: React.FC = () => {
             <SettingsGroup>
                 {allLibraries === null || !profileReady ? (
                     <div className="p-2 text-base font-color-secondary">
-                        {allLibraries === null ? 'Loading libraries…' : 'Waiting for your AsterMargin account to load…'}
+                        {allLibraries === null ? settingsText("Loading libraries…") : settingsText("Waiting for your AsterMargin account to load…")}
                     </div>
                 ) : allLibraries.length === 0 ? (
-                    <div className="p-2 text-base font-color-secondary">No libraries found.</div>
+                    <div className="p-2 text-base font-color-secondary">{settingsText("No libraries found.")}</div>
                 ) : visibleLibraries.map((library, index) => {
                     const stats = statsById[library.library_id];
                     const checked = !excludedKeys.has(libraryExclusionKey(library));
@@ -200,14 +202,14 @@ const LibraryAccessList: React.FC = () => {
                                     <div className="font-color-primary text-base font-medium truncate">{library.name}</div>
                                     <div className="text-sm font-color-tertiary">
                                         {stats
-                                            ? `${stats.itemCount.toLocaleString()} items, ${stats.attachmentCount.toLocaleString()} attachments`
+                                            ? settingsText("{items}, {attachments}", { items: plural(stats.itemCount, "item"), attachments: plural(stats.attachmentCount, "attachment") })
                                             : '…'}
                                     </div>
                                 </div>
                             </div>
                             <input
                                 type="checkbox"
-                                aria-label={`Allow AsterMargin to use ${library.name}`}
+                                aria-label={settingsText("Allow AsterMargin to use {library}", { library: library.name })}
                                 checked={checked}
                                 disabled={isUpdating}
                                 onChange={toggle}
@@ -226,9 +228,9 @@ const LibraryAccessList: React.FC = () => {
                         onClick={() => setExpanded((value) => !value)}
                     >
                         {expanded
-                            ? 'Show fewer'
-                            : `Show all ${allLibraries.length.toLocaleString()} libraries`
-                                + (hiddenExcluded > 0 ? ` · ${hiddenExcluded.toLocaleString()} unchecked` : '')}
+                            ? settingsText("Show fewer")
+                            : settingsText("Show all {count} libraries", { count: allLibraries.length.toLocaleString() })
+                                + (hiddenExcluded > 0 ? " · " + settingsText("{count} unchecked", { count: hiddenExcluded.toLocaleString() }) : '')}
                     </button>
                 )}
             </SettingsGroup>

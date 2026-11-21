@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import Button from "@astermargin/agent-ui/primitives/Button";
@@ -19,13 +20,16 @@ import {
     revealExternalFilesDir,
 } from "../../../src/services/externalFiles";
 
-/** "3 files, 12.4 MB" style summary for the external files row. */
+import { plural } from "./processingStatusSentence";
+
+/** File count and total size for the external files row. */
+
 function formatStorageStats(count: number, totalBytes: number): string {
-    const files = `${count} file${count === 1 ? '' : 's'}`;
+    const files = plural(count, "file");
     if (totalBytes <= 0) return files;
     const mb = totalBytes / 1024 / 1024;
     const size = mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(totalBytes / 1024))} KB`;
-    return `${files}, ${size}`;
+    return settingsText("{files} · {size}", { files, size });
 }
 
 
@@ -60,12 +64,12 @@ const AdvancedSection: React.FC = () => {
         const stats = externalFileStats ?? { count: 0, totalBytes: 0 };
         const buttonIndex = Zotero.Prompt.confirm({
             window: surfaceWindow,
-            title: 'Delete External Files?',
+            title: settingsText("Delete External Files?"),
             text:
-                `Delete ${formatStorageStats(stats.count, stats.totalBytes)} attached to past chats?\n\n` +
-                'AsterMargin will no longer be able to read these files in past conversations. ' +
-                'Files can be re-attached at any time.',
-            button0: 'Delete',
+                settingsText("Delete {files} attached to past chats?", { files: formatStorageStats(stats.count, stats.totalBytes) }) + "\n\n" +
+                settingsText("AsterMargin will no longer be able to read these files in past conversations.") + " " +
+                settingsText("Files can be re-attached at any time."),
+            button0: settingsText("Delete"),
             // Cancel at button1 so Escape/dialog-close routes here.
             button1: Zotero.Prompt.BUTTON_TITLE_CANCEL,
             defaultButton: 1,
@@ -93,7 +97,7 @@ const AdvancedSection: React.FC = () => {
     // --- MCP Server port ---
     const mcpServerPort = useMemo(() => {
         try {
-            return Zotero.Prefs.get('httpServer.port') || 23119;
+            return Number(Zotero.Prefs.get('httpServer.port')) || 23119;
         } catch {
             return 23119;
         }
@@ -168,17 +172,17 @@ const AdvancedSection: React.FC = () => {
 
             {/* ===== STORAGE ===== */}
             <div className="display-flex flex-row items-center gap-2" style={{ marginTop: '20px', marginBottom: '6px', paddingLeft: '2px' }}>
-                <div className="text-lg font-color-primary font-bold">Storage</div>
+                <div className="text-lg font-color-primary font-bold">{settingsText("Storage")}</div>
             </div>
             <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>
-                Data AsterMargin stores on this computer. This data is not deleted automatically including when the plugin is removed.
+                {settingsText("Data AsterMargin stores on this computer. This data is not deleted automatically including when the plugin is removed.")}
             </div>
             <SettingsGroup>
                 <SettingsRow
-                    title="External Files"
+                    title={settingsText("External Files")}
                     description={
                         <>
-                            Copies of external files you attach to chats.
+                            {settingsText("Copies of external files you attach to chats.")}
                             {externalFileStats && externalFileStats.count > 0 && (
                                 <span className="display-flex mt-1">
                                     {formatStorageStats(externalFileStats.count, externalFileStats.totalBytes)}
@@ -195,14 +199,14 @@ const AdvancedSection: React.FC = () => {
                                 loading={isDeletingExternalFiles}
                                 style={{ padding: '4px 6px' }}
                             >
-                                Delete All…
+                                {settingsText("Delete All…")}
                             </Button>
                             <Button
                                 variant="outline"
                                 onClick={handleShowExternalFilesFolder}
                                 style={{ padding: '4px 6px' }}
                             >
-                                Show Folder
+                                {settingsText("Show Folder")}
                             </Button>
                         </div>
                     }
@@ -212,7 +216,7 @@ const AdvancedSection: React.FC = () => {
 
             {/* ===== TROUBLESHOOTING ===== */}
             <div className="display-flex flex-row items-center gap-2" style={{ marginTop: '20px', marginBottom: '6px', paddingLeft: '2px' }}>
-                <div className="text-lg font-color-primary font-bold">Troubleshooting</div>
+                <div className="text-lg font-color-primary font-bold">{settingsText("Troubleshooting")}</div>
             </div>
             <SettingsGroup>
                 <RebuildSearchIndexRow />
@@ -222,22 +226,22 @@ const AdvancedSection: React.FC = () => {
             {process.env.NODE_ENV === 'development' && (
                 <>
                     <div className="display-flex flex-row items-center gap-2" style={{ marginTop: '20px', marginBottom: '6px', paddingLeft: '2px' }}>
-                        <div className="text-lg font-color-primary font-bold">Connected Apps</div>
-                        <span className="text-xs font-color-secondary px-15 py-05 rounded-md bg-quinary border-quinary">Experimental</span>
+                        <div className="text-lg font-color-primary font-bold">{settingsText("Connected Apps")}</div>
+                        <span className="text-xs font-color-secondary px-15 py-05 rounded-md bg-quinary border-quinary">{settingsText("Experimental")}</span>
                     </div>
                     <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>
-                        Lets AsterMargin in other apps access your Zotero library while Zotero is running.
+                        {settingsText("Lets AsterMargin in other apps access your Zotero library while Zotero is running.")}
                     </div>
                     <SettingsGroup>
                         <SettingsRow
-                            title="Allow Library Access"
-                            description="AsterMargin chats started in connected apps can search and read this Zotero library"
+                            title={settingsText("Allow Library Access")}
+                            description={settingsText("AsterMargin chats started in connected apps can search and read this Zotero library")}
                             onClick={handleDataProviderToggle}
                             control={
                                 <div className="display-flex flex-row items-center gap-2">
                                     <input
                                         type="checkbox"
-                                        aria-label="Allow Library Access"
+                                        aria-label={settingsText("Allow Library Access")}
                                         checked={dataProviderEnabled}
                                         onChange={handleDataProviderToggle}
                                         onClick={(e) => e.stopPropagation()}
@@ -252,24 +256,24 @@ const AdvancedSection: React.FC = () => {
 
             {/* ===== MCP SERVER ===== */}
             <div className="display-flex flex-row items-center gap-2" style={{ marginTop: '20px', marginBottom: '6px', paddingLeft: '2px' }}>
-                <div className="text-lg font-color-primary font-bold">MCP Server</div>
-                <span className="text-xs font-color-secondary px-15 py-05 rounded-md bg-quinary border-quinary">Experimental</span>
+                <div className="text-lg font-color-primary font-bold">{settingsText("MCP Server")}</div>
+                <span className="text-xs font-color-secondary px-15 py-05 rounded-md bg-quinary border-quinary">{settingsText("Experimental")}</span>
             </div>
             <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>
-                The MCP server lets AI coding tools like Claude Code, Cursor, and Windsurf search and access your Zotero library.
-                {' '}See our <DocLink path="mcp-server">MCP server guide</DocLink> for setup instructions.
+                {settingsText("The MCP server lets AI coding tools like Claude Code, Cursor, and Windsurf search and access your Zotero library.")}
+                {' '}<DocLink path="mcp-server">{settingsText("MCP server guide")}</DocLink>
             </div>
             <SettingsGroup>
                 <SettingsRow
-                    title="Enable MCP Server"
-                    description={`Endpoint at localhost:${mcpServerPort}`}
+                    title={settingsText("Enable MCP Server")}
+                    description={settingsText("Endpoint at localhost:{port}", { port: mcpServerPort })}
                     onClick={handleMcpServerToggle}
-                    tooltip="Expose your Zotero library to MCP-compatible AI tools"
+                    tooltip={settingsText("Expose your Zotero library to MCP-compatible AI tools")}
                     control={
                         <div className="display-flex flex-row items-center gap-2">
                             <input
                                 type="checkbox"
-                                aria-label="Enable MCP Server"
+                                aria-label={settingsText("Enable MCP Server")}
                                 checked={mcpServerEnabled}
                                 onChange={handleMcpServerToggle}
                                 onClick={(e) => e.stopPropagation()}
@@ -279,16 +283,16 @@ const AdvancedSection: React.FC = () => {
                     }
                 />
                 <SettingsRow
-                    title="Enable Write Tools"
-                    description="Allow MCP clients to create Zotero notes, highlights, and sticky-note annotations. Changing setting requires reloading of the MCP server."
+                    title={settingsText("Enable Write Tools")}
+                    description={settingsText("Allow MCP clients to create Zotero notes, highlights, and sticky-note annotations. Changing setting requires reloading of the MCP server.")}
                     onClick={handleMcpWriteToolsToggle}
                     hasBorder
-                    tooltip="Advertise and allow the MCP tools that write to your library"
+                    tooltip={settingsText("Advertise and allow the MCP tools that write to your library")}
                     control={
                         <div className="display-flex flex-row items-center gap-2">
                             <input
                                 type="checkbox"
-                                aria-label="Enable Write Tools"
+                                aria-label={settingsText("Enable Write Tools")}
                                 checked={mcpWriteToolsEnabled}
                                 onChange={handleMcpWriteToolsToggle}
                                 onClick={(e) => e.stopPropagation()}
@@ -298,10 +302,10 @@ const AdvancedSection: React.FC = () => {
                     }
                 />
                 <SettingsRow
-                    title="Config for HTTP Clients"
+                    title={settingsText("Config for HTTP Clients")}
                     description={
                         <span className="display-flex flex-col gap-05" style={{ opacity: mcpServerEnabled ? 1 : 0.45 }}>
-                            <span>For clients that support HTTP directly (e.g., Claude Code, Cursor).</span>
+                            <span>{settingsText("For clients that support HTTP directly (e.g., Claude Code, Cursor).")}</span>
                             {/* <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{mcpEndpointUrl}</span> */}
                         </span>
                     }
@@ -315,15 +319,15 @@ const AdvancedSection: React.FC = () => {
                             disabled={!mcpServerEnabled}
                             style={{ padding: '4px 6px' }}
                         >
-                            {mcpHttpCopied ? 'Copied' : 'Copy'}
+                            {mcpHttpCopied ? settingsText("Copied") : settingsText("Copy")}
                         </Button>
                     }
                 />
                 <SettingsRow
-                    title="Config for HTTPS-Only Clients"
+                    title={settingsText("Config for HTTPS-Only Clients")}
                     description={
                         <span style={{ opacity: mcpServerEnabled ? 1 : 0.45 }}>
-                            For clients that only connect to HTTPS endpoints (e.g., Claude Desktop). Requires Node.js.
+                            {settingsText("For clients that only connect to HTTPS endpoints (e.g., Claude Desktop). Requires Node.js.")}
                         </span>
                     }
                     hasBorder
@@ -336,7 +340,7 @@ const AdvancedSection: React.FC = () => {
                             disabled={!mcpServerEnabled}
                             style={{ padding: '4px 6px' }}
                         >
-                            {mcpCopied ? 'Copied' : 'Copy'}
+                            {mcpCopied ? settingsText("Copied") : settingsText("Copy")}
                         </Button>
                     }
                 />

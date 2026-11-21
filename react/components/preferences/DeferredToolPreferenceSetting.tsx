@@ -1,3 +1,4 @@
+import { knownSettingsText, settingsText } from "../../utils/settingsText";
 import React, { useMemo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import MenuButton from '@astermargin/agent-ui/primitives/MenuButton';
@@ -48,27 +49,27 @@ const DeferredToolPreferenceSetting: React.FC<DeferredToolPreferenceSettingProps
         ];
 
         return preferences.map((pref) => ({
-            label: DEFERRED_TOOL_PREFERENCE_LABELS[pref],
+            label: knownSettingsText(DEFERRED_TOOL_PREFERENCE_LABELS[pref]),
             onClick: () => handleSelect(pref),
             customContent: (
                 <div className="display-flex flex-col gap-05 min-w-0 py-05 items-start">
                     <div className="display-flex flex-row items-center gap-2">
                         <div className={`text-sm ${currentPreference === pref ? 'font-medium font-color-primary' : 'font-color-secondary'}`}>
-                            {DEFERRED_TOOL_PREFERENCE_LABELS[pref]}
+                            {knownSettingsText(DEFERRED_TOOL_PREFERENCE_LABELS[pref])}
                         </div>
                         {currentPreference === pref && (
                             <Icon icon={TickIcon} className="font-color-primary scale-11" />
                         )}
                     </div>
                     <div className="text-xs font-color-tertiary">
-                        {DEFERRED_TOOL_PREFERENCE_DESCRIPTIONS[pref]}
+                        {knownSettingsText(DEFERRED_TOOL_PREFERENCE_DESCRIPTIONS[pref])}
                     </div>
                 </div>
             ),
         }));
     }, [currentPreference, toolName]);
 
-    const buttonLabel = DEFERRED_TOOL_PREFERENCE_LABELS[currentPreference];
+    const buttonLabel = knownSettingsText(DEFERRED_TOOL_PREFERENCE_LABELS[currentPreference]);
 
     return (
         <div className="display-flex flex-row items-start justify-between gap-4">
@@ -95,7 +96,7 @@ const DeferredToolPreferenceSetting: React.FC<DeferredToolPreferenceSettingProps
                 style={{
                     padding: '4px 2px',
                 }}
-                ariaLabel={`Select preference for ${label}`}
+                ariaLabel={settingsText("Select preference for {label}", { label })}
             />
         </div>
     );

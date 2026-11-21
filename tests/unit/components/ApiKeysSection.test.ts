@@ -57,10 +57,10 @@ vi.mock('../../../react/hooks/usePreference', () => ({
 vi.mock('../../../react/components/preferences/localModeSettings', () => ({
     localModeToggleState: () => ({ checked: false, disabled: false, restartNeeded: false, description: '' }),
     showLocalRoundCap: () => false,
-    LOCAL_ROUND_CAP_DESCRIPTION: '',
+    localRoundCapDescription: () => '',
     parseLocalMaxRoundsInput: () => null,
     DEFAULT_LOCAL_WEB_SEARCH_MAX_USES: 3,
-    LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION: '',
+    localWebSearchMaxUsesDescription: () => '',
     localWebSearchDescription: () => '',
     parseLocalWebSearchMaxUsesInput: () => null,
 }));

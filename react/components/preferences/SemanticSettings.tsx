@@ -1,3 +1,8 @@
+import {
+    SettingsStatus,
+    type SettingsStatusValue,
+} from "./components/SettingsElements";
+import { settingsText } from "../../utils/settingsText";
 import React, { useEffect, useRef, useState } from "react";
 import {
     buildSemanticIndex,
@@ -6,37 +11,7 @@ import {
     modelSize,
 } from "../../runtime/semanticIndex";
 export function SemanticSettings() {
-    const lang = String(Zotero.locale);
-    const labels = /^zh-(TW|HK|Hant)/i.test(lang)
-        ? [
-              "全文語意檢索",
-              "下載模型",
-              "從資料夾匯入",
-              "建立或更新索引",
-              "停止",
-              "已建立索引",
-              "失敗",
-          ]
-        : /^zh/i.test(lang)
-          ? [
-                "全文语义检索",
-                "下载模型",
-                "从文件夹导入",
-                "建立或更新索引",
-                "停止",
-                "已建立索引",
-                "失败",
-            ]
-          : [
-                "Full-text semantic search",
-                "Download model",
-                "Import from folder",
-                "Build or refresh index",
-                "Stop",
-                "Indexed",
-                "Failed",
-            ];
-    const [status, setStatus] = useState(""),
+    const [status, setStatus] = useState<SettingsStatusValue>(""),
         [busy, setBusy] = useState(false);
     const ctl = useRef<AbortController | null>(null);
     useEffect(() => () => ctl.current?.abort(), []);
@@ -51,13 +26,10 @@ export function SemanticSettings() {
                     ctl.current.signal,
                 );
                 setStatus(
-                    labels[5] +
-                        " " +
-                        r.indexed +
-                        " · " +
-                        labels[6] +
-                        " " +
-                        r.failed,
+                    settingsText("Indexed: {indexed} · Failed: {failed}", {
+                        indexed: r.indexed,
+                        failed: r.failed,
+                    }),
                 );
             } else {
                 let dir: string | undefined;
@@ -66,15 +38,26 @@ export function SemanticSettings() {
                         "chrome://zotero/content/modules/filePicker.mjs",
                     );
                     const p = new FilePicker();
-                    p.init(Zotero.getMainWindow(), labels[2], p.modeGetFolder);
+                    p.init(
+                        Zotero.getMainWindow(),
+                        settingsText("Import from folder"),
+                        p.modeGetFolder,
+                    );
                     if ((await p.show()) !== p.returnOK) return;
                     dir = p.file;
                 }
                 await installEmbeddingModel(dir);
-                setStatus("✓ multilingual-e5-small");
+                setStatus(
+                    settingsText("Embedding model installed: {model}", {
+                        model: "multilingual-e5-small",
+                    }),
+                );
             }
         } catch (err) {
-            setStatus(String(err));
+            setStatus({
+                message: settingsText("Semantic search operation failed."),
+                detail: String(err),
+            });
         } finally {
             ctl.current = null;
             setBusy(false);
@@ -82,28 +65,28 @@ export function SemanticSettings() {
     }
     return (
         <fieldset>
-            <legend>{labels[0]}</legend>
+            <legend>{settingsText("Full-text semantic search")}</legend>
             <p>
                 multilingual-e5-small · {(modelSize / 1048576).toFixed(1)} MiB
             </p>
             <button disabled={busy} onClick={() => void work("download")}>
-                {labels[1]}
+                {settingsText("Download model")}
             </button>
             <button disabled={busy} onClick={() => void work("offline")}>
-                {labels[2]}
+                {settingsText("Import from folder")}
             </button>
             <button
                 disabled={busy || !e5Enabled()}
                 onClick={() => void work("index")}
             >
-                {labels[3]}
+                {settingsText("Build or refresh index")}
             </button>
             {busy && (
                 <button onClick={() => ctl.current?.abort()}>
-                    {labels[4]}
+                    {settingsText("Stop")}
                 </button>
             )}
-            <output aria-live="polite">{status}</output>
+            <SettingsStatus value={status} />
         </fieldset>
     );
 }

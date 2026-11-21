@@ -130,7 +130,7 @@ it('lists the personal library first, then groups, with a checked box per access
             'Allow AsterMargin to use Shared Group',
         ]);
         expect(boxes.map((box) => box.checked)).toEqual([true, false]);
-        expect(container.textContent).toContain('10 items, 1 attachments');
+        expect(container.textContent).toContain('10 items, 1 attachment');
         expect(container.textContent).toContain('20 items, 2 attachments');
         expect(container.textContent).not.toContain('A Feed');
         expect(container.textContent).toContain('every device signed in to your account');

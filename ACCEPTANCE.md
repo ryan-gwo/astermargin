@@ -1,4 +1,18 @@
-# AsterMargin 0.1.2 验收记录
+# AsterMargin 验收记录
+
+## 0.1.4 设置入口回归（2026-11-21）
+
+- 0.1.3 的 Zotero 原生设置按钮只打开侧栏。旧验收读取了按钮文案，并通过渲染器命令打开设置，遗漏了原生按钮的实际点击路径。
+- 在 macOS Zotero 10.0.9 的英文、简体中文和繁体中文配置中，通过侧栏菜单和 Zotero 原生设置按钮分别打开 0.1.4 的设置窗口。简体配置从 0.1.3 覆盖升级，同时核对已有的聊天行距设置。
+- `acceptance/host_smoke.py` 的 `--settings-locale` 会点击两个入口并等待设置页渲染。用 `--upgrade-from` 提供旧版 XPI 可复测覆盖升级。三份回执对应 XPI SHA-256 `ee9fb1085bfb9d86616c563a5723b83ddd97d8253ed9595055b9c3ffa54bdcc1`。
+
+## 0.1.3 设置本地化回归（2026-11-21）
+
+- 在 macOS Zotero 10.0.9 的三个隔离配置中分别安装同一 XPI，验证英文、简体中文和繁体中文。覆盖 Zotero 原生设置中的插件面板、星笺设置的六个标签页、审批选项、模型端点表单和 URL 校验、动作编辑器、OCR、语义检索及 WebDAV 控件。
+- 自动化用例检查区域语言映射、含动态参数的文案及各内置动作的简繁译文。核验范围为独立版设置。聊天和研究表格页面的完整语言覆盖另待核验。
+- 使用 `python3 acceptance/host_smoke.py /Applications/Zotero.app dist/astermargin.xpi --settings-locale zh-CN` 复现；另两种语言使用 `zh-TW` 和 `en-US`。三次宿主回执中的 XPI SHA-256 均为 `9fff29fd8f530208d1fbb666c9349012027aafe8617797351bc67776689288f8`。
+
+## 0.1.2 Beaver 基线
 
 2026-11-20，开发包。安装目标为 Zotero Desktop 7–10。物理专用阶段的启动条件为下面的 Beaver 基线验收全部通过。当前仍有宿主、跨平台和功能覆盖项待完成。
 

@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import { uiText } from "../../utils/interfaceText";
 import React, { useState, useCallback } from "react";
 import { v4 as uuidv4 } from "uuid";
@@ -17,10 +18,11 @@ import { localModeStatusAtom, localWebSearchStatusAtom } from "../../atoms/local
 import { usePreference } from "../../hooks/usePreference";
 import {
     DEFAULT_LOCAL_WEB_SEARCH_MAX_USES,
-    LOCAL_ROUND_CAP_DESCRIPTION,
-    LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION,
+    localRoundCapDescription,
+    localWebSearchMaxUsesDescription,
     localWebSearchDescription,
     localModeToggleState,
+    localConfigErrorText,
     parseLocalMaxRoundsInput,
     parseLocalWebSearchMaxUsesInput,
     showLocalRoundCap,
@@ -173,7 +175,7 @@ const ApiKeysSection: React.FC = () => {
             const source = prev[index].model;
             const copy: CustomChatModel = {
                 ...source,
-                name: `${source.name?.trim() || 'Untitled provider'} (copy)`,
+                name: settingsText("{title} (copy)", { title: source.name?.trim() || uiText("Untitled provider") }),
             };
             const next = [...prev];
             next.splice(index + 1, 0, { _id: copyId, model: copy });
@@ -190,16 +192,16 @@ const ApiKeysSection: React.FC = () => {
     return (
         <>
             {/* Local Mode */}
-            <SectionLabel>Local Mode</SectionLabel>
+            <SectionLabel>{settingsText("Local Mode")}</SectionLabel>
             <SettingsGroup className="bg-senary">
                 <SettingsRow
-                    title="Run entirely on this device"
+                    title={settingsText("Run entirely on this device")}
                     description={localModeToggle.description}
                     announceDescription={restartNeeded}
                     control={
                         <input
                             type="checkbox"
-                            aria-label="Run entirely on this device"
+                            aria-label={settingsText("Run entirely on this device")}
                             checked={localModeToggle.checked}
                             disabled={localModeToggle.disabled}
                             onChange={(e) => handleLocalModeToggle(e.target.checked)}
@@ -210,8 +212,8 @@ const ApiKeysSection: React.FC = () => {
                 {showLocalRoundCap(localModePref, localModeActive) && (
                     <SettingsRow
                         hasBorder
-                        title="Round cap"
-                        description={LOCAL_ROUND_CAP_DESCRIPTION}
+                        title={settingsText("Round cap")}
+                        description={localRoundCapDescription()}
                         control={
                             <input
                                 type="text"
@@ -219,7 +221,7 @@ const ApiKeysSection: React.FC = () => {
                                 value={maxRoundsText}
                                 onChange={(e) => handleMaxRoundsChange(e.target.value)}
                                 placeholder={String(DEFAULT_MAX_ROUNDS)}
-                                aria-label="Maximum tool-calling rounds"
+                                aria-label={settingsText("Maximum tool-calling rounds")}
                                 className="chat-input text-base font-color-primary"
                                 style={{ width: '80px', textAlign: 'right' }}
                             />
@@ -231,12 +233,12 @@ const ApiKeysSection: React.FC = () => {
                         hasBorder
                         className="items-start"
                         announceDescription
-                        title="Status"
+                        title={settingsText("Status")}
                         description={
                             <span className={localStatus.ok ? 'font-color-green' : 'font-color-error'}>
                                 {localStatus.ok
-                                    ? `Ready — using “${localStatus.config.model.name}”.`
-                                    : localStatus.message}
+                                    ? settingsText("Ready — using “{model}”.", { model: localStatus.config.model.name })
+                                    : localConfigErrorText(localStatus.reason)}
                             </span>
                         }
                     />
@@ -249,12 +251,12 @@ const ApiKeysSection: React.FC = () => {
                     <SectionLabel>{uiText("Search")}</SectionLabel>
                     <SettingsGroup className="bg-senary">
                         <SettingsRow
-                            title="Scholarly search"
-                            description="Let the model look up published research beyond your library. Its search query is sent to OpenAlex and Semantic Scholar."
+                            title={settingsText("Scholarly search")}
+                            description={settingsText("Let the model look up published research beyond your library. Its search query is sent to OpenAlex and Semantic Scholar.")}
                             control={
                                 <input
                                     type="checkbox"
-                                    aria-label="Scholarly search"
+                                    aria-label={settingsText("Scholarly search")}
                                     checked={scholarlySearchPref}
                                     onChange={(e) => handleScholarlySearchToggle(e.target.checked)}
                                     onClick={(e) => e.stopPropagation()}
@@ -263,43 +265,42 @@ const ApiKeysSection: React.FC = () => {
                         />
                         <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                             <div className="text-sm font-color-secondary mb-1">
-                                Optional. Without a key, OpenAlex allows only a small daily search budget and
-                                may refuse requests once it's spent. A free key raises that.
+                                {settingsText("Optional. Without a key, OpenAlex allows only a small daily search budget and may refuse requests once it's spent. A free key raises that.")}
                             </div>
                             <ApiKeyInput
                                 id="openalex-key"
-                                label="OpenAlex API key"
+                                label={settingsText("OpenAlex API key")}
                                 verify={false}
                                 value={openAlexKey}
                                 onChange={setOpenAlexKey}
                                 savePref={(newValue) => handlePrefSave('openAlexApiKey', newValue)}
-                                placeholder="Optional"
+                                placeholder={settingsText("Optional")}
                                 linkUrl="https://openalex.org/settings/api"
                             />
                         </div>
                         <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                             <div className="text-sm font-color-secondary mb-1">
-                                Optional. Raises Semantic Scholar's shared rate limit for these requests.
+                                {settingsText("Optional. Raises Semantic Scholar's shared rate limit for these requests.")}
                             </div>
                             <ApiKeyInput
                                 id="semantic-scholar-key"
-                                label="Semantic Scholar API key"
+                                label={settingsText("Semantic Scholar API key")}
                                 verify={false}
                                 value={semanticScholarKey}
                                 onChange={setSemanticScholarKey}
                                 savePref={(newValue) => handlePrefSave('semanticScholarApiKey', newValue)}
-                                placeholder="Optional"
+                                placeholder={settingsText("Optional")}
                                 linkUrl="https://www.semanticscholar.org/product/api"
                             />
                         </div>
                         <SettingsRow
                             hasBorder
-                            title="Web search"
+                            title={settingsText("Web search")}
                             description={localWebSearchDescription(localWebSearchStatus.kind, localWebSearchStatus.hostUnconfirmed)}
                             control={
                                 <input
                                     type="checkbox"
-                                    aria-label="Web search"
+                                    aria-label={settingsText("Web search")}
                                     checked={webSearchPref}
                                     onChange={(e) => handleWebSearchToggle(e.target.checked)}
                                     onClick={(e) => e.stopPropagation()}
@@ -308,8 +309,8 @@ const ApiKeysSection: React.FC = () => {
                         />
                         <SettingsRow
                             hasBorder
-                            title="Max searches per request"
-                            description={LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION}
+                            title={settingsText("Max searches per request")}
+                            description={localWebSearchMaxUsesDescription()}
                             control={
                                 <input
                                     type="text"
@@ -317,7 +318,7 @@ const ApiKeysSection: React.FC = () => {
                                     value={maxUsesText}
                                     onChange={(e) => handleMaxUsesChange(e.target.value)}
                                     placeholder={String(DEFAULT_LOCAL_WEB_SEARCH_MAX_USES)}
-                                    aria-label="Max searches per request"
+                                    aria-label={settingsText("Max searches per request")}
                                     className="chat-input text-base font-color-primary"
                                     style={{ width: '80px', textAlign: 'right' }}
                                 />
@@ -330,14 +331,13 @@ const ApiKeysSection: React.FC = () => {
             <SectionDescription>
                 {localModeActive ? (
                     <>
-                        Connect your own local or self-hosted model below. Requests go straight from
-                        this device to your endpoint — AsterMargin's backend is not involved.
+                        {settingsText("Connect your own local or self-hosted model below. Requests go straight from this device to your endpoint — AsterMargin's backend is not involved.")}
                     </>
                 ) : (
                     <>
-                        Connect your own API keys (see our <DocLink path="api-key">guide</DocLink>),
-                        or add a <DocLink path="custom-models">custom endpoint</DocLink>. Free and new paid keys (Tier 1) keys often hit rate limits. A key with higher rate limits works best (Tier 2+).
-                        <DocLink path="api-key#why-astermargin-needs-more-from-your-api-key"> Why?</DocLink>
+                        {settingsText("Connect your own API keys or add a custom endpoint. Keys with higher rate limits (Tier 2 or above) work best.")}
+                        {' '}<DocLink path="api-key">{settingsText("API key setup guide")}</DocLink>
+                        {' · '}<DocLink path="custom-models">{settingsText("Custom endpoint setup guide")}</DocLink>
                     </>
                 )}
             </SectionDescription>
@@ -348,36 +348,36 @@ const ApiKeysSection: React.FC = () => {
                 <div style={{ padding: '8px 12px' }}>
                     <ApiKeyInput
                         id="gemini-key"
-                        label="Google API Key"
+                        label={uiText("Google API Key")}
                         provider="google"
                         value={geminiKey}
                         onChange={setGeminiKey}
                         savePref={(newValue) => handlePrefSave('googleGenerativeAiApiKey', newValue)}
-                        placeholder="Enter your Google AI Studio API Key"
+                        placeholder={settingsText("Enter your Google AI Studio API Key")}
                         linkUrl="https://aistudio.google.com/app/apikey"
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <ApiKeyInput
                         id="openai-key"
-                        label="OpenAI API Key"
+                        label={uiText("OpenAI API Key")}
                         provider="openai"
                         value={openaiKey}
                         onChange={setOpenaiKey}
                         savePref={(newValue) => handlePrefSave('openAiApiKey', newValue)}
-                        placeholder="Enter your OpenAI API Key"
+                        placeholder={settingsText("Enter your OpenAI API Key")}
                         linkUrl="https://platform.openai.com/api-keys"
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <ApiKeyInput
                         id="anthropic-key"
-                        label="Anthropic API Key"
+                        label={uiText("Anthropic API Key")}
                         provider="anthropic"
                         value={anthropicKey}
                         onChange={setAnthropicKey}
                         savePref={(newValue) => handlePrefSave('anthropicApiKey', newValue)}
-                        placeholder="Enter your Anthropic API Key"
+                        placeholder={settingsText("Enter your Anthropic API Key")}
                         linkUrl="https://console.anthropic.com/settings/keys"
                     />
                 </div>
@@ -404,17 +404,14 @@ const ApiKeysSection: React.FC = () => {
                 <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>
                     {localModeActive ? (
                         <>
-                            OpenRouter, OpenAI-compatible proxies, or a local server such as Ollama or
-                            LM Studio. Requests go straight from this device to the endpoint.
+                            {settingsText("OpenRouter, OpenAI-compatible proxies, or a local server such as Ollama or LM Studio. Requests go straight from this device to the endpoint.")}
                         </>
                     ) : (
                         <>
-                            OpenRouter, OpenAI-compatible proxies, or self-hosted HTTPS endpoints.
-                            Requests are routed through AsterMargin's server. Each endpoint must be reachable from the public
-                            internet over HTTPS.
+                            {settingsText("OpenRouter, OpenAI-compatible proxies, or self-hosted HTTPS endpoints. Requests are routed through AsterMargin's server. Each endpoint must be reachable from the public internet over HTTPS.")}
                         </>
                     )}
-                    {' '}<DocLink path="custom-models">Learn more</DocLink>
+                    {' '}<DocLink path="custom-models">{settingsText("Learn more")}</DocLink>
                 </div>
 
                 <div
@@ -423,12 +420,9 @@ const ApiKeysSection: React.FC = () => {
                 >
                     <Icon icon={AlertIcon} className="flex-shrink-0 mt-020 stroke-width-2" style={{ color: 'var(--tag-orange-secondary)' }} />
                     <span style={{ color: 'var(--tag-orange)' }} >
-                        <span className="font-medium">Choose a capable model.</span>
-                        {' '}AsterMargin plans, calls tools, and reads long documents. Small or older
-                        models often produce poor results. Pick a model scoring at
-                        least <span className="font-medium">26</span> on the{' '}
-                        <ExternalLink href={INTELLIGENCE_INDEX_URL}>Artificial Analysis Intelligence Index</ExternalLink>.
-                        {' '}We recommend a score of <span className="font-medium">35</span> or higher for the best experience.
+                        <span className="font-medium">{settingsText("Choose a capable model.")}</span>
+                        {' '}{settingsText("AsterMargin plans, calls tools, and reads long documents. Choose a model with an Artificial Analysis score of at least 26, preferably 35 or higher.")}
+                        {' '}<ExternalLink href={INTELLIGENCE_INDEX_URL}>{settingsText("Artificial Analysis Intelligence Index")}</ExternalLink>
                     </span>
                 </div>
 
@@ -449,7 +443,7 @@ const ApiKeysSection: React.FC = () => {
                     </div>
                 ) : (
                     <div className="text-base font-color-tertiary" style={{ paddingLeft: '2px' }}>
-                        Click <span className="font-semibold" onClick={handleAddProvider}>{uiText("Add Provider")}</span> to add custom endpoints
+                        {settingsText("Select Add Provider to add custom endpoints.")}
                     </div>
                 )}
             </div>

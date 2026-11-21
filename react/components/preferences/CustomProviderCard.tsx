@@ -1,3 +1,4 @@
+import { knownSettingsText, settingsText } from "../../utils/settingsText";
 import { uiText } from "../../utils/interfaceText";
 import {checkModelCapabilities} from "./modelCapabilities";
 import React, { useState, useCallback, useMemo, useRef, useEffect } from "react";
@@ -27,7 +28,7 @@ import {
     normalizeCustomModelFormat,
     validateProviderApiBase,
 } from "../../types/settings";
-import { DocLink, ExternalLink, INTELLIGENCE_INDEX_URL } from "./components/SettingsElements";
+import { DocLink, ExternalLink, INTELLIGENCE_INDEX_URL, SettingsStatus } from "./components/SettingsElements";
 import {
     chatService,
     RockPaperScissorsMove,
@@ -88,6 +89,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
     const [testResult, setTestResult] = useState<RockPaperScissorsTestResult | null>(null);
     const [testError, setTestError] = useState<string | null>(null);
     const [localTestMessage, setLocalTestMessage] = useState<string | null>(null);
+    const [testingCapabilities, setTestingCapabilities] = useState(false);
     const [contextWindowText, setContextWindowText] = useState<string>(
         model.context_window != null ? String(model.context_window) : ''
     );
@@ -168,16 +170,17 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                 setTestStatus('success');
             } else {
                 setTestStatus('error');
-                setTestError(result.error_message || 'The provider test failed.');
+                setTestError(result.error_message || settingsText("The provider test failed."));
             }
         } catch (error) {
             setTestStatus('error');
-            setTestError(error instanceof Error ? error.message : 'The provider test failed.');
+            setTestError(error instanceof Error ? error.message : settingsText("The provider test failed."));
         }
     }, [model, format]);
 
     // --- Test endpoint (local mode: talk to the provider directly, no backend hop) ---
     const runLocalTest = useCallback(async () => {
+        setTestingCapabilities(false);
         // Cancel a prior in-flight test (and stop applying its result) before starting this one.
         const signal = testRunnerRef.current!.start();
         setTestStatus('loading');
@@ -211,6 +214,34 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         }
     }, [model]);
 
+    const runCapabilitiesTest = async (document: Document) => {
+        setTestingCapabilities(true);
+        setTestError(null);
+        setLocalTestMessage(null);
+        setTestStatus("loading");
+
+        const runner = testRunnerRef.current!;
+        const signal = runner.start();
+        const deadline = new AbortController();
+        const abort = () => deadline.abort();
+        signal.addEventListener("abort", abort);
+        const timer = setTimeout(abort, 60_000);
+        try {
+            const report = await checkModelCapabilities(model, deadline.signal, document);
+            if (!runner.isCurrent(signal)) return;
+            setLocalTestMessage(report);
+            setTestStatus("success");
+        } catch (error) {
+            if (!runner.isCurrent(signal)) return;
+            setTestError(error instanceof Error ? error.message : String(error));
+            setTestStatus("error");
+        } finally {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", abort);
+        }
+    };
+
+    const localizedTestError = testError ? knownSettingsText(testError) : null;
     const testMenuItems: MenuItem[] = useMemo(() => [
         { label: '', isDivider: true, onClick: () => {} },
         ...MOVES.map((move) => ({
@@ -233,7 +264,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
             {testStatus === 'loading' ? <Spinner /> : testStatus === 'success' ? (
                 <Icon icon={TickIcon} className="font-color-green" />
             ) : null}
-            <span>{uiText("Test Endpoint")}</span>
+            <span>{settingsText("Test Endpoint")}</span>
             <Icon icon={ArrowDownIcon} />
         </span>
     );
@@ -264,7 +295,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                                 className="scale-90 px-15 py-05 text-sm rounded-md"
                                 style={{ color: 'var(--tag-orange-secondary)', border: '1px solid var(--tag-orange-tertiary)', background: 'var(--tag-orange-quinary)' }}
                             >
-                                Incomplete
+                                {settingsText("Incomplete")}
                             </span>
                         )}
                     </div>
@@ -289,8 +320,8 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                         type="text"
                         value={model.name}
                         onChange={(e) => update({ name: e.target.value })}
-                        placeholder="My Custom Model"
-                        aria-label="Provider name"
+                        placeholder={settingsText("My Custom Model")}
+                        aria-label={settingsText("Provider name")}
                         className="chat-input text-base font-color-primary"
                     />
                 </label>
@@ -302,13 +333,13 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                         type="text"
                         value={model.snapshot}
                         onChange={(e) => update({ snapshot: e.target.value })}
-                        placeholder="openai/gpt-4o or claude-3-5-sonnet-20241022"
-                        aria-label="Model snapshot"
+                        placeholder="openai/gpt-4o"
+                        aria-label={settingsText("Model snapshot")}
                         className="chat-input text-base font-color-primary"
                     />
                     <span className="text-sm font-color-tertiary">
-                        Small or older models struggle with AsterMargin's tools. Aim for 26+ on the{' '}
-                        <ExternalLink href={INTELLIGENCE_INDEX_URL}>Intelligence Index</ExternalLink>, 35+ for a good experience.
+                        {settingsText("Small or older models may struggle with tool calls. Choose a model with an Artificial Analysis score of at least 26, preferably 35 or higher.")}
+                        {' '}<ExternalLink href={INTELLIGENCE_INDEX_URL}>{settingsText("Artificial Analysis Intelligence Index")}</ExternalLink>
                     </span>
                 </label>
 
@@ -320,18 +351,18 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                         value={model.api_base ?? ''}
                         onChange={(e) => update({ api_base: e.target.value })}
                         placeholder="https://openrouter.ai/api/v1"
-                        aria-label="Endpoint URL"
+                        aria-label={settingsText("Endpoint URL")}
                         className="chat-input text-base font-color-primary"
                     />
                     {model.api_base?.trim() && !apiBaseValidation.valid && (
                         <span className="display-flex flex-row items-start text-sm font-color-error">
                             <Icon icon={AlertIcon} className="flex-shrink-0 mt-020 mr-1" />
                             <span>
-                                {apiBaseValidation.error}
+                                {knownSettingsText(apiBaseValidation.error ?? "")}
                                 {!localMode && (
                                     <>
                                         {' '}
-                                        <DocLink path="custom-models">Network requirements</DocLink>
+                                        <DocLink path="custom-models">{settingsText("Network requirements")}</DocLink>
                                     </>
                                 )}
                             </span>
@@ -340,7 +371,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     {(formatHint || httpWarning) && (
                         <span className="display-flex flex-row items-start text-sm" style={{ color: 'var(--tag-orange-secondary)' }}>
                             <Icon icon={AlertIcon} className="flex-shrink-0 mt-020 mr-1" />
-                            <span>{formatHint || httpWarning}</span>
+                            <span>{knownSettingsText((formatHint || httpWarning)!)}</span>
                         </span>
                     )}
                 </label>
@@ -359,7 +390,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                                 rightIcon={ArrowDownIcon}
                                 width="210px"
                                 className="text-base"
-                                ariaLabel="API format"
+                                ariaLabel={settingsText("API format")}
                                 disabled={isOpenRouter}
                             />
                         </div>
@@ -376,14 +407,14 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             />
                             {contextWindowError && (
                                 <span className="text-sm" style={{ color: 'var(--tag-red-secondary)' }}>
-                                    Enter a number (e.g. 128000).
+                                    {settingsText("Enter a number (e.g. 128000).")}
                                 </span>
                             )}
                         </label>
                     </div>
                     {isOpenRouter && (
                         <span className="text-sm font-color-tertiary">
-                            OpenRouter uses AsterMargin's built-in OpenRouter connection, so Format does not apply.
+                            {settingsText("OpenRouter uses AsterMargin's built-in OpenRouter connection, so Format does not apply.")}
                         </span>
                     )}
                 </div>
@@ -398,15 +429,15 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             type="password"
                             value={model.api_key}
                             onChange={(e) => update({ api_key: e.target.value })}
-                            placeholder={apiKeyOptional ? "Optional for a server on this computer" : "sk-..."}
+                            placeholder={apiKeyOptional ? settingsText("Optional for a server on this computer") : "sk-..."}
                             aria-label={uiText("API key")}
                             className="chat-input text-base font-color-primary flex-1 min-w-0"
                         />
                         {hasApiKey && (
                             <CopyButton
                                 content={model.api_key}
-                                ariaLabel="Copy API key"
-                                title="Copy API key"
+                                ariaLabel={settingsText("Copy API key")}
+                                title={settingsText("Copy API key")}
                                 className="scale-11 p-0 flex-shrink-0"
                             />
                         )}
@@ -424,32 +455,29 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     <span className="text-base font-color-primary">{uiText("Supports vision (image input)")}</span>
                 </label>
 
-                {localMode && <button type="button" disabled={!isComplete || testStatus==="loading"} onClick={async()=>{
-                    const signal=testRunnerRef.current!.start();
-                    setTestStatus("loading");
-                    const deadline=new AbortController();
-                    const abort=()=>deadline.abort();signal.addEventListener('abort',abort);
-                    const timer=setTimeout(abort,60000);
-                    try{
-                        const report=await checkModelCapabilities(model,deadline.signal,document);
-                        if(testRunnerRef.current?.isCurrent(signal)){setLocalTestMessage(report);setTestStatus("success");}
-                    }catch(err){if(testRunnerRef.current?.isCurrent(signal)){setTestError(String(err));setTestStatus("error");}}
-                    finally{clearTimeout(timer);signal.removeEventListener('abort',abort);}
-                }}>{/^zh/.test(Zotero.locale) ? "SSE · 工具 · 视觉 (3)" : "Test streaming, tools and vision (3 requests)"}</button>}
+                {localMode && (
+                    <button
+                        type="button"
+                        disabled={!isComplete || testStatus === "loading"}
+                        onClick={(event) => void runCapabilitiesTest(event.currentTarget.ownerDocument)}
+                    >
+                        {settingsText("Test streaming, tools and vision (3 requests)")}
+                    </button>
+                )}
                 {/* Footer actions */}
                 <div className="display-flex flex-row items-center justify-between mt-1">
                     {localMode ? (
                         <Button
                             variant="outline"
-                            icon={testStatus === 'loading' ? undefined : testStatus === 'success' ? TickIcon : undefined}
+                            icon={testStatus === "success" && !testingCapabilities ? TickIcon : undefined}
                             onClick={runLocalTest}
                             style={{ padding: '4px 6px' }}
                             disabled={(!isComplete && testStatus !== 'loading') || testStatus === 'loading'}
-                            title={!isComplete ? 'Fill in all required fields to test the endpoint.' : undefined}
+                            title={!isComplete ? settingsText("Fill in all required fields to test the endpoint.") : undefined}
                             loading={testStatus === 'loading'}
-                            loadingText="Testing..."
+                            loadingText={settingsText("Testing...")}
                         >
-                            Test Endpoint
+                            {settingsText("Test Endpoint")}
                         </Button>
                     ) : (
                         <MenuButton
@@ -460,9 +488,9 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             width="220px"
                             className="text-base"
                             style={{ padding: '4px 6px' }}
-                            ariaLabel="Test endpoint"
+                            ariaLabel={settingsText("Test endpoint")}
                             disabled={!isComplete && testStatus !== 'loading'}
-                            tooltipContent={!isComplete ? 'Fill in all required fields to test the endpoint.' : undefined}
+                            tooltipContent={!isComplete ? settingsText("Fill in all required fields to test the endpoint.") : undefined}
                         />
                     )}
                     <div className="display-flex flex-row items-center gap-3">
@@ -472,7 +500,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             onClick={onDuplicate}
                             style={{ padding: '4px 6px' }}
                         >
-                            Duplicate
+                            {settingsText("Duplicate")}
                         </Button>
                         <Button
                             variant="outline"
@@ -480,14 +508,14 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             onClick={onRemove}
                             style={{ padding: '4px 6px' }}
                         >
-                            Delete
+                            {settingsText("Delete")}
                         </Button>
                         <Button
                             variant="solid"
                             onClick={onToggleExpand}
                             style={{ padding: '4px 6px' }}
                         >
-                            Done
+                            {settingsText("Done")}
                         </Button>
                     </div>
                 </div>
@@ -500,11 +528,11 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     >
                         <div className="display-flex flex-row items-center gap-2 font-color-primary">
                             <Icon icon={TickIcon} className="font-color-green" />
-                            <span className="font-medium">{uiText("Endpoint works")}</span>
+                            <span className="font-medium">{testingCapabilities ? settingsText("Capability test results") : uiText("Endpoint works")}</span>
                         </div>
                         {localTestMessage && (
                             <div className="font-color-secondary" style={{ fontStyle: 'italic' }}>
-                                “{localTestMessage}”
+                                “{knownSettingsText(localTestMessage)}”
                             </div>
                         )}
                     </div>
@@ -543,7 +571,9 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                         style={{ border: '1px solid var(--tag-red-tertiary)', background: 'var(--tag-red-quinary)', color: 'var(--tag-red-secondary)' }}
                     >
                         <Icon icon={AlertIcon} className="flex-shrink-0 mt-020" />
-                        <span>{testError}</span>
+                        {localizedTestError === testError && localMode
+                            ? <SettingsStatus value={{ message: settingsText("The provider test failed."), detail: testError }} />
+                            : <span>{localizedTestError}</span>}
                     </div>
                 )}
             </div>

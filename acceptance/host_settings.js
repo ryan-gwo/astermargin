@@ -1,0 +1,317 @@
+/* Loaded by host_smoke.py only for a locale check in its disposable profile. */
+const settingsExpectations = {
+    "en-US": {
+        native: ["Open AsterMargin Settings", "Open the settings window for AsterMargin"],
+        title: "AsterMargin Settings",
+        general: [
+            "Keyboard Shortcut",
+            "Changes require restart",
+            "Chat Line Spacing",
+            "Spacious",
+            "Citation Format",
+        ],
+        sync: ["Libraries", "Background Processing", "Problems"],
+        permissions: [
+            "Library Modifications",
+            "Metadata Edits",
+            "Always ask",
+            "System Notifications",
+            "Access Remote Files",
+        ],
+        approval: [
+            "Always apply",
+            "Always review later",
+            "Prompt for approval before making changes",
+        ],
+        models: [
+            "Run entirely on this device",
+            "Scholarly search",
+            "Max searches per request",
+            "Select Add Provider",
+        ],
+        addProvider: "Add Provider",
+        provider: [
+            "Provider name",
+            "Endpoint URL",
+            "Test streaming, tools and vision",
+            "Supports vision",
+            "Test Endpoint",
+        ],
+        invalidUrl: "Enter a valid URL",
+        actions: [
+            "Import",
+            "Add Action",
+            "Summarize",
+            "Write a literature review",
+        ],
+        addAction: "Add Action",
+        editor: [
+            "Action title",
+            "Slash command",
+            "Prompt",
+            "Applies to",
+            "Save",
+        ],
+        advanced: [
+            "Custom Instructions",
+            "Local Document Cache",
+            "Scanned PDF OCR",
+            "Full-text semantic search",
+            "Research sync",
+            "Explain the selected passage or annotation(s)",
+            "Enable MCP Server",
+        ],
+    },
+    "zh-CN": {
+        native: ["打开星笺设置", "打开星笺的独立设置窗口"],
+        title: "星笺设置",
+        general: ["键盘快捷键", "重启后生效", "对话行距", "宽松", "引文格式"],
+        sync: ["文献库", "后台处理", "问题"],
+        permissions: [
+            "更改文献库",
+            "编辑元数据",
+            "每次询问",
+            "系统通知",
+            "访问远程文件",
+        ],
+        approval: ["直接应用", "稍后审阅", "更改前征求批准"],
+        models: [
+            "在本机运行",
+            "学术检索",
+            "单次请求的搜索次数上限",
+            "选择“添加服务”",
+        ],
+        addProvider: "添加服务",
+        provider: [
+            "服务名称",
+            "端点地址",
+            "测试流式输出、工具调用和图像输入",
+            "支持视觉",
+            "测试端点",
+        ],
+        invalidUrl: "请输入有效的 URL",
+        actions: ["导入", "添加动作", "概括文献", "撰写文献综述"],
+        addAction: "添加动作",
+        editor: ["动作标题", "斜杠命令", "提示词", "适用范围", "保存"],
+        advanced: [
+            "自定义指令",
+            "本机文档缓存",
+            "扫描件 OCR",
+            "全文语义检索",
+            "研究数据同步",
+            "用通俗语言解释这篇论文中选中的段落或批注",
+            "启用 MCP 服务器",
+        ],
+    },
+    "zh-TW": {
+        native: ["開啟星箋設定", "開啟星箋的獨立設定視窗"],
+        title: "星箋設定",
+        general: [
+            "鍵盤快速鍵",
+            "重新啟動後生效",
+            "對話行距",
+            "加寬",
+            "引文格式",
+        ],
+        sync: ["文獻庫", "背景處理", "問題"],
+        permissions: [
+            "變更文獻庫",
+            "編輯詮釋資料",
+            "每次詢問",
+            "系統通知",
+            "存取遠端檔案",
+        ],
+        approval: ["直接套用", "稍後審閱", "變更前徵求核准"],
+        models: [
+            "在本機執行",
+            "學術檢索",
+            "單次請求的搜尋次數上限",
+            "選擇「新增服務」",
+        ],
+        addProvider: "新增服務",
+        provider: [
+            "服務名稱",
+            "端點位址",
+            "測試串流輸出、工具呼叫和影像輸入",
+            "支援視覺",
+            "測試端點",
+        ],
+        invalidUrl: "請輸入有效的 URL",
+        actions: ["匯入", "新增動作", "摘要文獻", "撰寫文獻回顧"],
+        addAction: "新增動作",
+        editor: ["動作標題", "斜線命令", "提示詞", "適用範圍", "儲存"],
+        advanced: [
+            "自訂指令",
+            "本機文件快取",
+            "掃描文件 OCR",
+            "全文語意檢索",
+            "研究資料同步",
+            "用淺白的文字解釋這篇論文中選取的段落或註解",
+            "啟用 MCP 伺服器",
+        ],
+    },
+};
+
+async function waitFor(read, label) {
+    for (let i = 0; i < 100; i++) {
+        const value = read();
+        if (value) return value;
+        await sleep(100);
+    }
+    throw Error("Settings did not render: " + label);
+}
+
+const copyOf = (element) =>
+    [
+        element.textContent,
+        ...Array.from(
+            element.querySelectorAll("[title], [aria-label], [placeholder]"),
+            (node) =>
+                ["title", "aria-label", "placeholder"]
+                    .map((attribute) => node.getAttribute(attribute) ?? "")
+                    .join(" "),
+        ),
+    ]
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+function requireCopy(copy, expected, section) {
+    for (const text of expected) {
+        if (!copy.includes(text))
+            throw Error(section + " missing " + text + " in " + copy);
+    }
+}
+
+async function inspectSettings(locale) {
+    if (Zotero.locale !== locale)
+        throw Error("Unexpected Zotero locale: " + Zotero.locale);
+    const expected = settingsExpectations[locale];
+    const mainWindow = Zotero.getMainWindow();
+    const findSettings = () => {
+        const win = Services.wm.getMostRecentWindow("astermargin:preferences");
+        return win && !win.closed && win.document.getElementById("astermargin-preferences-panel")
+            ? win : null;
+    };
+    const settingsLabel = { "en-US": "Settings", "zh-CN": "设置", "zh-TW": "設定" }[locale];
+    const sidebarMenu = await waitFor(() => Array.from(mainWindow.document.querySelectorAll(
+        "#astermargin-react-root-sidebar button[aria-haspopup='menu']",
+    )).find(button => button.getAttribute("aria-label") === expected.title ||
+        button.getAttribute("aria-label") === "AsterMargin settings"), "sidebar settings menu");
+    sidebarMenu.click();
+    const settingsItem = await waitFor(() => Array.from(mainWindow.document.querySelectorAll(
+        "[role='menuitem']",
+    )).find(item => item.textContent.trim() === settingsLabel), "sidebar settings command");
+    settingsItem.click();
+    const sidebarSettings = await waitFor(findSettings, "settings opened by sidebar menu");
+    sidebarSettings.close();
+    await waitFor(() => !findSettings(), "sidebar settings closed");
+
+    const nativeWindow = Zotero.Utilities.Internal.openPreferences(
+        "astermargin-prefpane",
+    );
+    const nativeButton = await waitFor(() => {
+        const node = nativeWindow.document.getElementById(
+            "astermargin-open-prefs-btn",
+        );
+        return node?.getAttribute("label") ? node : null;
+    }, "native pane");
+    const nativeCopy =
+        nativeButton.getAttribute("label") +
+        " " +
+        nativeWindow.document.getElementById("astermargin-zotero-prefpane")
+            .textContent;
+    requireCopy(nativeCopy, expected.native, "native pane");
+    nativeButton.doCommand();
+    const win = await waitFor(findSettings, "settings opened by Zotero preferences button");
+    nativeWindow.close();
+    const doc = win.document;
+    const panel = await waitFor(
+        () => doc.getElementById("astermargin-preferences-panel"),
+        "preferences panel",
+    );
+    const title = doc.documentElement.getAttribute("title");
+    requireCopy(title, [expected.title], "window title");
+    const sections = {};
+    const tab = (id) => doc.getElementById("astermargin-preferences-tab-" + id);
+    const button = (label) =>
+        Array.from(panel.querySelectorAll("button")).find(
+            (el) => el.textContent.trim() === label,
+        );
+    for (const id of [
+        "general",
+        "sync",
+        "permissions",
+        "models",
+        "actions",
+        "advanced",
+    ]) {
+        tab(id).click();
+        await waitFor(
+            () => tab(id).getAttribute("aria-selected") === "true",
+            id,
+        );
+        await waitFor(
+            () => copyOf(panel).includes(expected[id][0]),
+            id + " content",
+        );
+        sections[id] = copyOf(panel);
+        requireCopy(sections[id], expected[id], id);
+
+        if (id === "permissions") {
+            button(expected.permissions[2]).click();
+            await waitFor(
+                () =>
+                    copyOf(
+                        doc.getElementById("astermargin-pane-preferences"),
+                    ).includes(expected.approval[0]),
+                "approval menu",
+            );
+            sections.approval = copyOf(
+                doc.getElementById("astermargin-pane-preferences"),
+            );
+            requireCopy(sections.approval, expected.approval, "approval menu");
+            tab(id).click();
+        } else if (id === "models") {
+            button(expected.addProvider).click();
+            const input = await waitFor(
+                () =>
+                    Array.from(panel.querySelectorAll("input")).find(
+                        (el) =>
+                            el.getAttribute("aria-label") ===
+                            expected.provider[1],
+                    ),
+                "endpoint field",
+            );
+            sections.provider = copyOf(panel);
+            requireCopy(
+                sections.provider,
+                expected.provider,
+                "provider editor",
+            );
+            // Use the native setter so React sees a user-style input event.
+            Object.getOwnPropertyDescriptor(
+                win.HTMLInputElement.prototype,
+                "value",
+            ).set.call(input, "invalid-url");
+            input.dispatchEvent(new win.Event("input", { bubbles: true }));
+            await waitFor(
+                () => copyOf(panel).includes(expected.invalidUrl),
+                "endpoint validation",
+            );
+            sections.validation = expected.invalidUrl;
+        } else if (id === "actions") {
+            button(expected.addAction).click();
+            await waitFor(
+                () => panel.querySelector(".action-card-editing"),
+                "action editor",
+            );
+            sections.editor = copyOf(
+                panel.querySelector(".action-card-editing"),
+            );
+            requireCopy(sections.editor, expected.editor, "action editor");
+        }
+    }
+    win.close();
+    return { locale, title, native: nativeCopy.trim(), entryPoints: ["sidebar menu", "Zotero preferences button"], sections };
+}

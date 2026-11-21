@@ -5,6 +5,7 @@
  * check (`chatService.testCustomProviderRockPaperScissors`), this never goes
  * through AsterMargin's backend — the api key and endpoint stay on this machine.
  */
+import { localConfigErrorText } from "./localModeSettings";
 import type { CustomChatModel } from '@astermargin/agent-core/types/customChatModel';
 import { isLoopbackEndpoint, resolveLocalAgentConfig, type SupportedFormat } from '@astermargin/agent-local/config/localAgentConfig';
 import { clientForFormat } from '@astermargin/agent-local/llm/clientForFormat';
@@ -102,7 +103,7 @@ export async function testLocalEndpoint(
     options: { clientFor?: (format: SupportedFormat) => LlmClient; timeoutMs?: number } = {},
 ): Promise<LocalProviderTestResult> {
     const resolved = resolveLocalAgentConfig({ model, maxRounds: null });
-    if (!resolved.ok) return { ok: false, message: resolved.message };
+    if (!resolved.ok) return { ok: false, message: localConfigErrorText(resolved.reason) };
     const format = (resolved.config.model.format ?? 'openai') as SupportedFormat;
     const client = (options.clientFor ?? clientForFormat)(format);
     return testLocalProvider(resolved.config.model, client, options.timeoutMs, externalSignal);

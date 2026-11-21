@@ -1,7 +1,15 @@
+import { knownSettingsText, settingsText } from "../../utils/settingsText";
 import type { BackgroundProcessingStatus } from '../../atoms/backgroundProcessing';
 
-export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
-    return `${count.toLocaleString()} ${count === 1 ? singular : pluralForm}`;
+const countLabels = {
+    file: ["{count} file", "{count} files"],
+    item: ["{count} item", "{count} items"],
+    attachment: ["{count} attachment", "{count} attachments"],
+    document: ["{count} document", "{count} documents"],
+} as const;
+
+export function plural(count: number, noun: keyof typeof countLabels): string {
+    return settingsText(countLabels[noun][count === 1 ? 0 : 1], { count: count.toLocaleString() });
 }
 
 export type StatusTone = 'idle' | 'busy' | 'waiting' | 'error';
@@ -43,7 +51,7 @@ const BLOCKER_CAPTION: Record<string, string> = {
 };
 
 function blockerCaption(blocker: string): string {
-    return BLOCKER_CAPTION[blocker] ?? 'Waiting for Zotero to be ready.';
+    return knownSettingsText(BLOCKER_CAPTION[blocker] ?? "Waiting for Zotero to be ready.");
 }
 
 /**
@@ -64,14 +72,14 @@ export function describeStatus(
     options: StatusSentenceOptions = {},
 ): StatusSentence {
     if (status.updatedAt === null && !status.worker && !status.error) return {
-        tone: 'waiting', headline: 'Checking status…',
-        caption: 'Reading background activity.', processNow: false, stopDrain: false,
+        tone: 'waiting', headline: settingsText("Checking status…"),
+        caption: settingsText("Reading background activity."), processNow: false, stopDrain: false,
     };
     if (status.error) {
         return {
             tone: 'error',
-            headline: 'Status unavailable',
-            caption: 'AsterMargin will try again in a few seconds.',
+            headline: settingsText("Status unavailable"),
+            caption: settingsText("AsterMargin will try again in a few seconds."),
             processNow: false,
             stopDrain: false,
         };
@@ -100,31 +108,31 @@ export function describeStatus(
         const waitingAfter = Math.max(0, outstanding - (status.worker?.inFlightFiles ?? inFlight));
         return {
             tone: 'busy',
-            headline: 'Finishing current file…',
-            caption: (waitingAfter > 0 ? `${plural(waitingAfter, 'file')} waiting. ` : '')
-                + 'Processing continues when your computer is idle.',
+            headline: settingsText("Finishing current file…"),
+            caption: (waitingAfter > 0 ? settingsText("{files} waiting.", { files: plural(waitingAfter, "file") }) + " " : '')
+                + settingsText("Processing continues when your computer is idle."),
             outstanding,
             processNow: false,
             stopDrain: false,
         };
     }
     if (inFlight === 0 && remoteWaiting > 0) return {
-        tone: 'waiting', headline: 'Waiting for OCR…',
-        caption: `${plural(remoteWaiting, 'file')} processing remotely.`,
+        tone: 'waiting', headline: settingsText("Waiting for OCR…"),
+        caption: settingsText("{files} processing remotely.", { files: plural(remoteWaiting, "file") }),
         outstanding, processNow: runnable > 0 && !gateOpen && !draining,
         processNowBlocked: Boolean(blocker), stopDrain: draining,
     };
     if (inFlight > 0 || (runnable > 0 && gateOpen)) {
         return {
             tone: 'busy',
-            headline: 'Processing files…',
+            headline: settingsText("Processing files…"),
             // A job can finish between the lane read and the queue read, which
             // leaves a running lane with nothing left to count.
             caption: inFlight === 0
-                ? 'Starting…'
+                ? settingsText("Starting…")
                 : outstanding > 0
-                    ? `${plural(outstanding, 'file')} remaining`
-                    : 'Reading text from your files.',
+                    ? settingsText("{files} remaining", { files: plural(outstanding, "file") })
+                    : settingsText("Reading text from your files."),
             outstanding,
             // Only lanes that run while the user is active can be busy behind a
             // shut gate here, so starting the rest must stay one click away.
@@ -134,29 +142,29 @@ export function describeStatus(
         };
     }
     if (status.progress?.discovering) return {
-        tone: 'busy', headline: 'Checking for additional files…',
-        caption: 'AsterMargin is checking your libraries for files to process.',
+        tone: 'busy', headline: settingsText("Checking for additional files…"),
+        caption: settingsText("AsterMargin is checking your libraries for files to process."),
         processNow: false, stopDrain: draining,
     };
-    const waiting = outstanding > 0 ? `${plural(outstanding, 'file')} waiting` : 'Waiting to start';
+    const waiting = outstanding > 0 ? settingsText("{files} waiting", { files: plural(outstanding, "file") }) : settingsText("Waiting to start");
     if (runnable > 0) {
         return {
             tone: 'waiting',
             headline: waiting,
             caption: blocker
                 ? blockerCaption(blocker)
-                : 'Starts after about 30 seconds without keyboard or mouse activity on your computer.',
+                : settingsText("Starts after about 30 seconds without keyboard or mouse activity on your computer."),
             processNow: !draining,
             processNowBlocked: Boolean(blocker),
             stopDrain: draining,
         };
     }
-    const settled = options.searchIndexUpToDate === true ? 'Full-text search is up to date' : 'Processing finished';
+    const settled = options.searchIndexUpToDate === true ? settingsText("Full-text search is up to date") : settingsText("Processing finished");
     if (deferred > 0) {
         return {
             tone: 'waiting',
             headline: waiting,
-            caption: 'Some files are processing remotely or waiting to retry.',
+            caption: settingsText("Some files are processing remotely or waiting to retry."),
             processNow: false,
             stopDrain: draining,
         };
@@ -166,7 +174,7 @@ export function describeStatus(
         return {
             tone: 'waiting',
             headline: waiting,
-            caption: 'AsterMargin picks up unfinished files automatically.',
+            caption: settingsText("AsterMargin picks up unfinished files automatically."),
             processNow: !draining,
             processNowBlocked: Boolean(blocker),
             stopDrain: draining,
@@ -176,7 +184,7 @@ export function describeStatus(
         return {
             tone: 'idle',
             headline: settled,
-            caption: 'No files to process yet. AsterMargin checks your libraries for new files automatically.',
+            caption: settingsText("No files to process yet. AsterMargin checks your libraries for new files automatically."),
             processNow: false,
             stopDrain: false,
         };
@@ -184,7 +192,7 @@ export function describeStatus(
     return {
         tone: 'idle',
         headline: settled,
-        caption: 'AsterMargin processes new and changed files automatically.',
+        caption: settingsText("AsterMargin processes new and changed files automatically."),
         processNow: false,
         stopDrain: false,
     };

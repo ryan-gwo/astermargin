@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import { getContextWindow } from '../../runtime/windowRuntime';
 import React, { useState, useEffect } from "react";
 import { LinkIcon, ArrowRightIcon, Spinner, TickIcon, AlertIcon, Icon, InformationCircleIcon } from '../icons/icons';
@@ -44,7 +45,7 @@ const ApiKeyInput: React.FC<ApiKeyInputProps> = ({
     linkUrl,
     value,
     onChange,
-    placeholder = "Enter your API Key",
+    placeholder = settingsText("Enter your API Key"),
     className = "",
     savePref,
     verify = true,
@@ -187,7 +188,7 @@ const ApiKeyInput: React.FC<ApiKeyInputProps> = ({
                         icon={LinkIcon}
                         onClick={() => getContextWindow()?.ZoteroPane.loadURI(linkUrl)}
                         className="scale-11 p-0"
-                        ariaLabel="Read more"
+                        ariaLabel={settingsText("Read more")}
                     />
                 )}
             </div>
@@ -231,7 +232,7 @@ const ApiKeyInput: React.FC<ApiKeyInputProps> = ({
                             rel="noopener noreferrer"
                             className="font-color-link underline"
                         >
-                            Learn more
+                            {settingsText("Learn more")}
                         </a>
                     </div>
                 )}

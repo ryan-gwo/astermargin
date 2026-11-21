@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import React, { useEffect, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { cloudConsentAtom, hasOcrAccessAtom, hasSearchIndexAccessAtom } from '../../atoms/profile';
@@ -52,9 +53,9 @@ const ProcessingStatusRow: React.FC<{
     const readingIssueCount = issueCount - indexIssueCount;
     // One line for every kind of problem; the Problems section directly below
     // breaks them down by reason.
-    const problemVerb = indexIssueCount > 0 && readingIssueCount > 0
-        ? 'read or indexed'
-        : indexIssueCount > 0 ? 'indexed' : 'read';
+    const problemMessage = indexIssueCount > 0 && readingIssueCount > 0
+        ? "{files} could not be read or indexed."
+        : indexIssueCount > 0 ? "{files} could not be indexed." : "{files} could not be read.";
     const progress = run && run.total > 0 && (run.pending > 0 || (status.worker?.inFlight ?? 0) > 0) ? {
         total: run.total,
         done: run.succeeded + run.problems + run.removed,
@@ -85,7 +86,7 @@ const ProcessingStatusRow: React.FC<{
                 </div>
                 {sentence.stopDrain ? (
                     <Tooltip
-                        content="The current file finishes first. Processing then waits until your computer is idle."
+                        content={settingsText("The current file finishes first. Processing then waits until your computer is idle.")}
                         placement="top"
                     >
                         <Button
@@ -94,7 +95,7 @@ const ProcessingStatusRow: React.FC<{
                             rightIcon={StopIcon}
                             onClick={onStopDrain}
                         >
-                            Stop
+                            {settingsText("Stop")}
                         </Button>
                     </Tooltip>
                 ) : sentence.processNow ? (
@@ -110,11 +111,11 @@ const ProcessingStatusRow: React.FC<{
                             disabled={sentence.processNowBlocked || processing || status.progress?.discovering}
                             loading={processing}
                             ariaLabel={sentence.processNowBlocked
-                                ? `Start now. ${sentence.caption}`
+                                ? settingsText("Start now. {reason}", { reason: sentence.caption })
                                 : undefined}
                             onClick={onProcessNow}
                         >
-                            Start now
+                            {settingsText("Start now")}
                         </Button>
                     </Tooltip>
                 ) : null}
@@ -131,7 +132,7 @@ const ProcessingStatusRow: React.FC<{
                     aria-valuemin={0}
                     aria-valuemax={progress.total}
                     aria-valuenow={progress.done}
-                    aria-label={`${progress.done.toLocaleString()} of ${progress.total.toLocaleString()} attachments finished in this run`}
+                    aria-label={settingsText("{done} of {total} attachments finished in this run", { done: progress.done.toLocaleString(), total: progress.total.toLocaleString() })}
                     className="display-flex flex-row items-start gap-3"
                     style={{ paddingLeft: '22px' }}
                 >
@@ -139,18 +140,18 @@ const ProcessingStatusRow: React.FC<{
                         <ProgressBar progress={Math.floor((progress.done / progress.total) * 100)} />
                     </div>
                     <span className="text-sm font-color-secondary flex-shrink-0" aria-hidden="true">
-                        {progress.done.toLocaleString()} of {progress.total.toLocaleString()}
+                        {settingsText("{done} of {total}", { done: progress.done.toLocaleString(), total: progress.total.toLocaleString() })}
                     </span>
                 </div>
             )}
             {searchIndexUnavailable && <div className="text-sm font-color-secondary" style={{ paddingLeft: '22px' }}>
-                The search index could not be checked. AsterMargin will try again.
+                {settingsText("The search index could not be checked. AsterMargin will try again.")}
             </div>}
             {issueCount > 0 && <div className="text-base font-color-secondary mt-2" style={{ paddingLeft: '22px' }}>
-                {status.error ? 'Last reported: ' : ''}{plural(issueCount, 'file')} could not be {problemVerb}.{' '}
+                {status.error && settingsText("Last reported: ")}{settingsText(problemMessage, { files: plural(issueCount, 'file') })}{' '}
                 <button type="button" className="text-link cursor-pointer" onClick={onShowProblems}
                     style={{ background: 'none', border: 'none', padding: 0, font: 'inherit' }}>
-                    See Problems
+                    {settingsText("See Problems")}
                 </button>
             </div>}
         </div>
@@ -167,8 +168,8 @@ const CachedTextRow: React.FC<{ processing: boolean; onRebuild: () => void }> = 
     <SettingsRow
         hasBorder
         announceDescription
-        title="Cached text"
-        description="Some processed files are no longer cached. Rebuilding prepares them again for faster responses."
+        title={settingsText("Cached text")}
+        description={settingsText("Some processed files are no longer cached. Rebuilding prepares them again for faster responses.")}
         control={
             <Button
                 variant="outline"
@@ -177,7 +178,7 @@ const CachedTextRow: React.FC<{ processing: boolean; onRebuild: () => void }> = 
                 disabled={processing}
                 loading={processing}
             >
-                Rebuild cache
+                {settingsText("Rebuild cache")}
             </Button>
         }
     />
@@ -193,16 +194,17 @@ function describeSetting(
     hasOcrAccess: boolean,
     locked: boolean,
 ): { title: string; description: string } {
-    const title = hasSearchAccess ? 'Keep Full-Text Search Up to Date' : 'Process Files in the Background';
+    const title = hasSearchAccess ? settingsText("Keep Full-Text Search Up to Date") : settingsText("Process Files in the Background");
     if (!locked) {
-        return { title, description: 'Process files ahead of time while your computer is idle for faster responses.' };
+        return { title, description: settingsText("Process files ahead of time while your computer is idle for faster responses.") };
     }
-    const features = [hasSearchAccess && 'full-text search', hasOcrAccess && 'OCR']
-        .filter((feature): feature is string => Boolean(feature))
-        .join(' and ');
+    const search = settingsText("full-text search");
+    const features = hasSearchAccess && hasOcrAccess
+        ? settingsText("{a} and {b}", { a: search, b: "OCR" })
+        : hasSearchAccess ? search : "OCR";
     return {
         title,
-        description: `AsterMargin reads new and changed files while your computer is idle. Required for ${features}.`,
+        description: settingsText("AsterMargin reads new and changed files while your computer is idle. Required for {features}.", { features }),
     };
 }
 
@@ -226,11 +228,11 @@ const MetadataIndexProblemRow: React.FC<{ indexState: EmbeddingIndexState }> = (
             hasBorder
             announceDescription
             title={failed
-                ? `${plural(indexState.failedItems, 'item')} missing from metadata search`
-                : 'Metadata search index needs attention'}
+                ? settingsText("{items} missing from metadata search", { items: plural(indexState.failedItems, "item") })
+                : settingsText("Metadata search index needs attention")}
             description={errored
-                ? `The last index update failed: ${indexState.error}`
-                : 'These items could not be added to the local index that powers searching by title and abstract.'}
+                ? settingsText("The last index update failed: {detail}", { detail: indexState.error ?? "" })
+                : settingsText("These items could not be added to the local index that powers searching by title and abstract.")}
             control={
                 <Button
                     variant="outline"
@@ -238,7 +240,7 @@ const MetadataIndexProblemRow: React.FC<{ indexState: EmbeddingIndexState }> = (
                     disabled={isIndexing}
                     loading={isIndexing}
                 >
-                    {isIndexing ? 'Rebuilding…' : 'Rebuild'}
+                    {isIndexing ? settingsText("Rebuilding…") : settingsText("Rebuild")}
                 </Button>
             }
         />
@@ -307,7 +309,7 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
         setProcessing(true);
         setActionError(null);
         const report = (error: unknown) => setActionError((current) =>
-            current ?? (error instanceof Error ? error.message : 'Could not start processing.'));
+            current ?? (error instanceof Error ? error.message : settingsText("Could not start processing.")));
         try {
             if (action === 'rebuild') {
                 await prepareUncachedFiles().catch(report);
@@ -342,7 +344,7 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
             );
             if (targets.length > 0) await reconciler.retryAttachments(targets);
         } catch (error) {
-            setActionError(error instanceof Error ? error.message : 'Could not retry these files.');
+            setActionError(error instanceof Error ? error.message : settingsText("Could not retry these files."));
         }
         await refresh();
     };
@@ -364,22 +366,18 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
         && sentence.tone === 'idle'
         && status.documentCache?.can_prepare_uncached_files === true;
     const problemsSummary: React.ReactNode = status.error
-        ? 'Could not update the list of problems. Previously reported problems are shown below.'
+        ? settingsText("Could not update the list of problems. Previously reported problems are shown below.")
         : status.updatedAt === null
-            ? metadataProblem ? 'Checking files for problems…' : 'Checking for problems…'
+            ? metadataProblem ? settingsText("Checking files for problems…") : settingsText("Checking for problems…")
             : issueCount > 0
-                ? <>
-                    Of the files AsterMargin has processed so far,{' '}
-                    <span className="font-medium font-color-primary">{plural(issueCount, 'attachment')}</span>
-                    {' '}could not be read or indexed.
-                </>
+                ? settingsText("Of the files AsterMargin has processed so far, {files} could not be read or indexed.", { files: plural(issueCount, "attachment") })
                 : metadataProblem
-                    ? 'All files AsterMargin has processed so far were read. Metadata search needs attention.'
-                    : 'No problems found in the files AsterMargin has processed so far.';
+                    ? settingsText("All files AsterMargin has processed so far were read. Metadata search needs attention.")
+                    : settingsText("No problems found in the files AsterMargin has processed so far.");
 
     return (
         <>
-            <SectionLabel>Background Processing</SectionLabel>
+            <SectionLabel>{settingsText("Background Processing")}</SectionLabel>
             <SettingsGroup>
                 <SettingsRow
                     title={setting.title}
@@ -387,7 +385,7 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
                     onClick={() => updateEnabled(!enabled)}
                     control={<input
                         type="checkbox"
-                        aria-label={hasSearchAccess ? 'Keep full-text search up to date' : 'Process files in the background'}
+                        aria-label={hasSearchAccess ? settingsText("Keep full-text search up to date") : settingsText("Process files in the background")}
                         disabled={locked}
                         checked={enabled}
                         onChange={(event) => updateEnabled(event.target.checked)}
@@ -411,7 +409,7 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
                 {actionError && <div role="alert" className="font-color-red text-base border-top-quinary" style={{ padding: '8px 12px' }}>{actionError}</div>}
             </SettingsGroup>
 
-            <SectionLabel><span ref={problemsHeading} tabIndex={-1}>Problems</span></SectionLabel>
+            <SectionLabel><span ref={problemsHeading} tabIndex={-1}>{settingsText("Problems")}</span></SectionLabel>
             <SettingsGroup>
                 <div className="font-color-secondary text-base" style={{ padding: '8px 12px' }}>
                     {problemsSummary}
@@ -430,11 +428,9 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
                 <MetadataIndexProblemRow indexState={indexState} />
             </SettingsGroup>
             <div className="text-sm font-color-secondary mt-2" style={{ paddingLeft: '4px' }}>
-                Problems with a specific file? Send it to{' '}
                 <ExternalLink href="mailto:contact@astermarginapp.ai?subject=AsterMargin%20file%20problem" className="text-sm">
-                    contact@astermarginapp.ai
+                    {settingsText("Report a file processing problem by email.")}
                 </ExternalLink>
-                {' '}and we will take a look.
             </div>
         </>
     );

@@ -1,3 +1,4 @@
+import { settingsText } from "../../../utils/settingsText";
 import React from "react";
 import DocsLink from "@astermargin/agent-ui/primitives/DocsLink";
 import { getHost } from "@astermargin/agent-ui/host";
@@ -185,3 +186,19 @@ export const ExternalLink: React.FC<{ href: string; children: React.ReactNode; c
         {children}
     </a>
 );
+
+export type SettingsStatusValue = string | { message: string; detail: string };
+
+export function SettingsStatus({ value }: { value: SettingsStatusValue }) {
+    return typeof value === "string" ? (
+        <output aria-live="polite">{value}</output>
+    ) : (
+        <div>
+            <div role="alert">{value.message}</div>
+            <details>
+                <summary>{settingsText("Technical details")}</summary>
+                <span>{value.detail}</span>
+            </details>
+        </div>
+    );
+}

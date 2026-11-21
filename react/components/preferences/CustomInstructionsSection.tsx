@@ -1,3 +1,5 @@
+import { readerExplainPromptText } from "../../utils/readerExplainPrompt";
+import { settingsText } from "../../utils/settingsText";
 import React, { useState } from "react";
 import { SectionLabel } from "./components/SettingsElements";
 import { getPref, setPref } from "../../../src/utils/prefs";
@@ -8,7 +10,7 @@ const CustomInstructionsSection: React.FC = () => {
 
     // --- Atoms ---
     const [customInstructions, setCustomInstructions] = useState(() => getPref('customInstructions'));
-    const [readerExplainPrompt, setReaderExplainPrompt] = useState(() => getPref('readerExplainPrompt'));
+    const [readerExplainPrompt, setReaderExplainPrompt] = useState(readerExplainPromptText);
 
     // --- Save Preferences ---
     const handlePrefSave = (key: "customInstructions" | "readerExplainPrompt", value: string) => {
@@ -35,16 +37,16 @@ const CustomInstructionsSection: React.FC = () => {
 
     return (
         <>
-            <SectionLabel>Custom Instructions</SectionLabel>
+            <SectionLabel>{settingsText("Custom Instructions")}</SectionLabel>
             <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>
-                Custom instructions are added to all chats and help steer responses. (Max ~250 words)
+                {settingsText("Custom instructions are added to all chats and help steer responses. (Max ~250 words)")}
             </div>
             <div className="custom-prompt-card" style={{ cursor: 'default' }}>
                 <textarea
                     value={customInstructions}
                     onChange={handleCustomInstructionsChange}
-                    placeholder="Enter custom instructions here..."
-                    aria-label="Custom instructions"
+                    placeholder={settingsText("Enter custom instructions here...")}
+                    aria-label={settingsText("Custom instructions")}
                     rows={5}
                     className="chat-input custom-prompt-edit-textarea text-base"
                     style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical' }}
@@ -52,16 +54,16 @@ const CustomInstructionsSection: React.FC = () => {
                 />
             </div>
 
-            <SectionLabel>Reader Explain Prompt</SectionLabel>
+            <SectionLabel>{settingsText("Reader Explain Prompt")}</SectionLabel>
             <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>
-                The prompt sent when you click "Explain" on selected text or annotations in the PDF reader.
+                {settingsText("The prompt sent when you click \"Explain\" on selected text or annotations in the PDF reader.")}
             </div>
             <div className="custom-prompt-card" style={{ cursor: 'default' }}>
                 <textarea
                     value={readerExplainPrompt}
                     onChange={handleReaderExplainPromptChange}
-                    placeholder="Explain the selected passage from this paper in plain language..."
-                    aria-label="Reader explain prompt"
+                    placeholder={settingsText("Explain the selected passage from this paper in plain language...")}
+                    aria-label={settingsText("Reader explain prompt")}
                     rows={4}
                     className="chat-input custom-prompt-edit-textarea text-base"
                     style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical' }}

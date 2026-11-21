@@ -1,3 +1,8 @@
+import {
+    SettingsStatus,
+    type SettingsStatusValue,
+} from "./components/SettingsElements";
+import { settingsText } from "../../utils/settingsText";
 import React, { useState } from "react";
 import {
     syncResearch,
@@ -7,64 +12,20 @@ import {
 } from "../../runtime/webdavSync";
 import type { Conflict } from "../../../src/services/webdav";
 
-const copy = {
-    en: [
-        "Research sync",
-        "WebDAV folder URL",
-        "Username",
-        "Password",
-        "Chats",
-        "Saved actions",
-        "Research tables",
-        "Sync",
-        "Synced",
-        "Choose a revision to resolve the conflict",
-        "Use revision",
-    ],
-    cn: [
-        "研究数据同步",
-        "WebDAV 文件夹地址",
-        "用户名",
-        "密码",
-        "会话",
-        "自定义动作",
-        "研究表格",
-        "同步",
-        "同步完成",
-        "选择要保留的修订版本",
-        "使用此版本",
-    ],
-    tw: [
-        "研究資料同步",
-        "WebDAV 資料夾位址",
-        "使用者名稱",
-        "密碼",
-        "對話",
-        "自訂動作",
-        "研究表格",
-        "同步",
-        "同步完成",
-        "選擇要保留的修訂版本",
-        "使用此版本",
-    ],
-};
+const datasets = {
+    chats: "Chats",
+    actions: "Saved actions",
+    tables: "Research tables",
+} as const satisfies Record<Dataset, string>;
+
 export function WebDavSettings() {
-    const language = String(Zotero.locale || "en");
-    const msg =
-        copy[
-            /zh-(TW|HK|Hant)/i.test(language)
-                ? "tw"
-                : /^zh/i.test(language)
-                  ? "cn"
-                  : "en"
-        ];
     const [base, setBase] = useState(() => readSetting("base"));
     const [user, setUser] = useState(() => readSetting("username"));
     const [password, setPassword] = useState(
         () => Zotero.AsterMargin.vault?.read("webdavPassword") || "",
     );
     const [kind, setKind] = useState<Dataset>("chats");
-    const [status, setStatus] = useState("");
+    const [status, setStatus] = useState<SettingsStatusValue>("");
     const [busy, setBusy] = useState(false);
     const [conflicts, setConflicts] = useState<Conflict[]>([]);
     async function sync(choices: Record<string, string> = {}) {
@@ -83,18 +44,25 @@ export function WebDavSettings() {
                 choices,
             );
             setConflicts(next);
-            setStatus(next.length ? msg[9] : msg[8]);
+            setStatus(
+                next.length
+                    ? settingsText("Choose a revision to resolve the conflict")
+                    : settingsText("Synced"),
+            );
         } catch (error) {
-            setStatus(String(error));
+            setStatus({
+                message: settingsText("WebDAV sync failed."),
+                detail: String(error),
+            });
         } finally {
             setBusy(false);
         }
     }
     return (
         <fieldset disabled={busy} className="display-flex flex-col gap-2">
-            <legend>{msg[0]}</legend>
+            <legend>{settingsText("Research sync")}</legend>
             <label>
-                {msg[1]}{" "}
+                {settingsText("WebDAV folder URL")}{" "}
                 <input
                     type="url"
                     value={base}
@@ -105,7 +73,7 @@ export function WebDavSettings() {
                 />
             </label>
             <label>
-                {msg[2]}{" "}
+                {settingsText("Username")}{" "}
                 <input
                     value={user}
                     onChange={(e) => {
@@ -115,7 +83,7 @@ export function WebDavSettings() {
                 />
             </label>
             <label>
-                {msg[3]}{" "}
+                {settingsText("Password")}{" "}
                 <input
                     type="password"
                     value={password}
@@ -123,16 +91,16 @@ export function WebDavSettings() {
                 />
             </label>
             <select
-                aria-label={msg[0]}
+                aria-label={settingsText("Research sync")}
                 value={kind}
                 onChange={(e) => {
                     setKind(e.target.value as Dataset);
                     setConflicts([]);
                 }}
             >
-                {(["chats", "actions", "tables"] as Dataset[]).map((k, i) => (
+                {Object.entries(datasets).map(([k, label]) => (
                     <option key={k} value={k}>
-                        {msg[4 + i]}
+                        {settingsText(label)}
                     </option>
                 ))}
             </select>
@@ -141,9 +109,9 @@ export function WebDavSettings() {
                 disabled={!base.trim()}
                 onClick={() => void sync()}
             >
-                {msg[7]}
+                {settingsText("Sync")}
             </button>
-            <output aria-live="polite">{status}</output>
+            <SettingsStatus value={status} />
             {conflicts.map((c) => (
                 <details key={c.id}>
                     <summary>{c.id}</summary>
@@ -157,7 +125,7 @@ export function WebDavSettings() {
                                 type="button"
                                 onClick={() => void sync({ [c.id]: h.id })}
                             >
-                                {msg[10]}
+                                {settingsText("Use revision")}
                             </button>
                         </details>
                     ))}

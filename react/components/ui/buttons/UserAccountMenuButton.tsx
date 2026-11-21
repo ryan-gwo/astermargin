@@ -7,6 +7,7 @@ import { useAtomValue, useSetAtom } from 'jotai';
 import { updateRequiredAtom, profileWithPlanAtom } from '../../../atoms/profile';
 import { logoutAtom, userAtom } from '../../../atoms/auth';
 import { firstRunReturnRequestedAtom, firstRunSuggestionsModeAtom } from '../../../atoms/firstRun';
+import { uiText } from "../../../utils/interfaceText";
 import { openPreferencesWindow } from '../../../ui/openPreferencesWindow';
 import { localModeEnabledAtom } from '../../../atoms/localMode';
 
@@ -39,7 +40,7 @@ export function useAccountMenuItems(): MenuItem[] {
     // account, so it offers none of the account entries.
     return [
         ...(!updateRequired ? [{
-            label: "Settings",
+            label: uiText("Settings"),
             onClick: () => openPreferencesWindow(),
             icon: SettingsIcon,
             disabled: false,
@@ -57,7 +58,7 @@ export function useAccountMenuItems(): MenuItem[] {
             disabled: false,
         }] : []),
         {
-            label: "Get Help",
+            label: uiText("Get Help"),
             onClick: () => Zotero.launchURL(`${process.env.WEBAPP_BASE_URL}/docs/getting-started`),
             icon: InformationCircleIcon,
             disabled: false,

@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { type ItemListRow } from '@astermargin/agent-core/run-state/toolResultViews';
 import { logger } from '@astermargin/agent-core/platform/logger';
@@ -28,69 +29,69 @@ function reasonCopy(reason: ProcessingIssueReason, hasOcrAccess: boolean): Reaso
     switch (reason) {
         case 'scanned':
             return {
-                title: 'Scanned files without a text layer',
+                title: settingsText("Scanned files without a text layer"),
                 description: hasOcrAccess
-                    ? 'These files contain only images of text.'
-                    : 'OCR can turn scans into readable, searchable text. It will be included with eligible plans.',
+                    ? settingsText("These files contain only images of text.")
+                    : settingsText("OCR can turn scans into readable, searchable text. It will be included with eligible plans."),
                 plansLink: !hasOcrAccess,
             };
         case 'no_text':
             return {
-                title: 'No readable text',
-                description: 'The file did not yield any readable text. Retry after replacing the file.',
+                title: settingsText("No readable text"),
+                description: settingsText("The file did not yield any readable text. Retry after replacing the file."),
             };
         case 'file_unavailable':
             return {
-                title: 'File not available',
-                description: 'The attachment is missing on this computer or could not be downloaded. Retry after restoring the file.',
+                title: settingsText("File not available"),
+                description: settingsText("The attachment is missing on this computer or could not be downloaded. Retry after restoring the file."),
             };
         case 'permission_denied':
             return {
-                title: 'No permission to read',
+                title: settingsText("No permission to read"),
                 description: Zotero.isMac
-                    ? 'Zotero is not allowed to read these files. Grant Zotero access to their folders in System Settings → Privacy & Security → Files and Folders or Full Disk Access, restart Zotero if asked, then retry.'
-                    : 'Zotero could not open these files. Check that your user account can read them and that no other program has them locked, then retry.',
+                    ? settingsText("Zotero is not allowed to read these files. Grant Zotero access to their folders in System Settings → Privacy & Security → Files and Folders or Full Disk Access, restart Zotero if asked, then retry.")
+                    : settingsText("Zotero could not open these files. Check that your user account can read them and that no other program has them locked, then retry."),
             };
         case 'encrypted':
             return {
-                title: 'Password protected',
-                description: 'Encrypted files cannot be read. Retry after replacing the file with an unprotected copy.',
+                title: settingsText("Password protected"),
+                description: settingsText("Encrypted files cannot be read. Retry after replacing the file with an unprotected copy."),
             };
         case 'too_large':
             return {
-                title: 'Too large to process',
-                description: `These files exceed the ${effectiveMaxPageCount().toLocaleString()}-page or ${effectiveMaxFileSizeMB().toLocaleString()} MB limit. Retry after replacing the file or changing the limit.`,
+                title: settingsText("Too large to process"),
+                description: settingsText("These files exceed the {pages}-page or {size} MB limit. Retry after replacing the file or changing the limit.", { pages: effectiveMaxPageCount().toLocaleString(), size: effectiveMaxFileSizeMB().toLocaleString() }),
             };
         case 'unsupported':
             return {
-                title: 'Unsupported file type',
-                description: 'AsterMargin reads PDFs, EPUBs and web snapshots.',
+                title: settingsText("Unsupported file type"),
+                description: settingsText("AsterMargin reads PDFs, EPUBs and web snapshots."),
             };
         case 'ocr_failed':
             return {
-                title: 'OCR failed',
-                description: 'Text recognition did not succeed for these scans.',
+                title: settingsText("OCR failed"),
+                description: settingsText("Text recognition did not succeed for these scans."),
             };
         case 'ocr_unavailable':
             return {
-                title: 'OCR temporarily unavailable',
-                description: 'Cloud text recognition is not accepting work right now. AsterMargin will retry automatically, or you can retry now.',
+                title: settingsText("OCR temporarily unavailable"),
+                description: settingsText("Cloud text recognition is not accepting work right now. AsterMargin will retry automatically, or you can retry now."),
             };
         case 'ocr_page_cap':
             return {
-                title: 'Exceeds the OCR page limit',
-                description: 'These scans exceed the 500-page OCR limit and will not be retried automatically. Retry after the limit or source changes.',
+                title: settingsText("Exceeds the OCR page limit"),
+                description: settingsText("These scans exceed the 500-page OCR limit and will not be retried automatically. Retry after the limit or source changes."),
             };
         case 'index_failed':
             return {
-                title: 'Not added to the search index',
-                description: 'These files were read but could not be uploaded to the cloud search index.',
+                title: settingsText("Not added to the search index"),
+                description: settingsText("These files were read but could not be uploaded to the cloud search index."),
             };
         case 'extract_failed':
         default:
             return {
-                title: 'Could not extract text',
-                description: 'AsterMargin ran into an error while reading these files.',
+                title: settingsText("Could not extract text"),
+                description: settingsText("AsterMargin ran into an error while reading these files."),
             };
     }
 }
@@ -165,8 +166,8 @@ const ProcessingIssuePage: React.FC<{
 
     return (
         <div ref={pageRef} aria-busy={rows === null || loadingKey === queryKey} style={{ overflowAnchor: 'none' }}>
-            {rows === null && errorKey === queryKey ? <div className="p-2 text-sm font-color-tertiary">Could not load files. AsterMargin will try again shortly.</div> : rows === null
-                ? <div className="p-2 text-sm font-color-tertiary">Loading…</div>
+            {rows === null && errorKey === queryKey ? <div className="p-2 text-sm font-color-tertiary">{settingsText("Could not load files. AsterMargin will try again shortly.")}</div> : rows === null
+                ? <div className="p-2 text-sm font-color-tertiary">{settingsText("Loading…")}</div>
                 : <ItemListResultView
                     view={{ view_type: 'item_list', tool_name: 'background_processing', items: rows }}
                     rowAction={onRetry && ((row) => (
@@ -174,8 +175,8 @@ const ProcessingIssuePage: React.FC<{
                             icon={SyncIcon}
                             variant="ghost-secondary"
                             className="scale-11 mr-1"
-                            ariaLabel={`Retry ${row.display_name}`}
-                            title="Retry"
+                            ariaLabel={settingsText("Retry {file}", { file: row.display_name })}
+                            title={settingsText("Retry")}
                             onClick={(event) => {
                                 event.stopPropagation();
                                 void onRetry([{ libraryId: row.library_id, zoteroKey: row.zotero_key }]);
@@ -240,7 +241,7 @@ export const ProcessingIssueGroupRow: React.FC<{
                     style={{ background: 'none', border: 'none', padding: 0, margin: 0, cursor: 'pointer' }}
                     aria-expanded={open}
                     aria-controls={panelId}
-                    aria-label={`${open ? 'Hide' : 'Show'} files: ${copy.title}`}
+                    aria-label={settingsText(open ? "Hide files: {reason}" : "Show files: {reason}", { reason: copy.title })}
                     onClick={() => setOpen((value) => !value)}
                 >
                     <Icon icon={open ? ArrowDownIcon : ArrowRightIcon} className="scale-11 font-color-secondary" />
@@ -259,7 +260,7 @@ export const ProcessingIssueGroupRow: React.FC<{
                 </div>
                 {copy.plansLink && (
                     <span className="text-xs font-color-secondary px-15 py-05 rounded-md bg-quinary border-quinary flex-shrink-0">
-                        Coming soon
+                        {settingsText("Coming soon")}
                     </span>
                 )}
                 {retryable && (
@@ -267,10 +268,10 @@ export const ProcessingIssueGroupRow: React.FC<{
                         variant="outline"
                         loading={retrying}
                         disabled={retrying}
-                        ariaLabel={`Retry all: ${copy.title}`}
+                        ariaLabel={settingsText("Retry all: {group}", { group: copy.title })}
                         onClick={() => void retry(null)}
                     >
-                        Retry all
+                        {settingsText("Retry all")}
                     </Button>
                 )}
             </div>
@@ -287,20 +288,20 @@ export const ProcessingIssueGroupRow: React.FC<{
                             style={{ padding: '4px 12px 6px 40px' }}
                         >
                             <span className="text-sm font-color-secondary">
-                                {first.toLocaleString()}–{last.toLocaleString()} of {group.count.toLocaleString()}
+                                {settingsText("{first}–{last} of {total}", { first: first.toLocaleString(), last: last.toLocaleString(), total: group.count.toLocaleString() })}
                             </span>
                             <div className="display-flex flex-row gap-1">
                                 <IconButton
                                     variant="ghost"
                                     icon={ArrowLeftIcon}
-                                    ariaLabel="Previous page"
+                                    ariaLabel={settingsText("Previous page")}
                                     disabled={safePage === 0}
                                     onClick={() => setPage(Math.max(0, safePage - 1))}
                                 />
                                 <IconButton
                                     variant="ghost"
                                     icon={ArrowRightIcon}
-                                    ariaLabel="Next page"
+                                    ariaLabel={settingsText("Next page")}
                                     disabled={safePage >= pageCount - 1}
                                     onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))}
                                 />

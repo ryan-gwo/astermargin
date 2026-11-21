@@ -15,11 +15,22 @@
  * does not exist yet — so this listens for the `command` event as it bubbles
  * up to the document instead of binding to the element directly.
  */
-document.addEventListener("command", (event) => {
+document.l10n.addResourceIds(["astermargin-addon.ftl"]);
+
+const { Zotero: prefsZotero } = ChromeUtils.importESModule("chrome://zotero/content/zotero.mjs");
+
+document.addEventListener("command", async (event) => {
     const target = event.target;
     if (!target || target.id !== "astermargin-open-prefs-btn") {
         return;
     }
 
-    Zotero.AsterMargin?.runtime?.openChat().catch(error => Zotero.logError(error));
+    try {
+        await prefsZotero.AsterMargin.hooks.onOpenPreferences();
+    } catch (error) {
+        prefsZotero.logError(error);
+        const title = await document.l10n.formatValue("astermargin-preferences-pane-label");
+        const message = await document.l10n.formatValue("astermargin-preferences-pane-open-failed");
+        prefsZotero.alert(window, title, message);
+    }
 });

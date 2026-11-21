@@ -30,6 +30,7 @@ import { createInstanceTableFills } from './services/tableFills';
 import { InstancePreferences } from './services/instancePreferences';
 import { registerAsterMarginProtocolHandler, unregisterAsterMarginProtocolHandler } from "./services/protocolHandler";
 import { AsterMarginUIFactory } from "./ui/ui";
+import { resolveChatWindow, WindowUnavailableError } from "./runtime/navigation";
 import { openTable } from "./ui/openTable";
 import { prepareRendererBundle } from "./ui/rendererBundle";
 import { cleanupAsterMarginTabs, initAsterMarginTabs, recoverTabsAfterAsterMarginTabs, restoreAsterMarginTabs } from "./ui/astermarginTabs";
@@ -48,7 +49,7 @@ import { cancelAllActiveTasks } from "./utils/backgroundTasks";
 import { compareVersions } from "./utils/compareVersions";
 import { resolveLocalMode } from "./utils/backendConfiguration";
 import { configurePDFForAsterMargin } from "./utils/configurePDFForAsterMargin";
-import { initLocale } from "./utils/locale";
+import { getString, initLocale } from "./utils/locale";
 import { clearPref, getPref, setPref } from "./utils/prefs";
 import { addPendingVersionNotification } from "./utils/versionNotificationPrefs";
 import { createZToolkit } from "./utils/ztoolkit";
@@ -506,7 +507,7 @@ async function onStartup() {
             src: rootURI + 'content/astermarginZoteroPrefs.xhtml',
             scripts: [rootURI + 'content/astermarginZoteroPrefs.js'],
             id: 'astermargin-prefpane',
-            label: 'AsterMargin',
+            label: getString("preferences-pane-label"),
             image: rootURI + 'content/icons/astermargin@0.5x.png',
         });
 
@@ -1223,7 +1224,17 @@ async function disposePlugin(): Promise<void> {
     }
 }
 
+/** The native preferences pane can be open even when the library window is closed. */
+async function onOpenPreferences(): Promise<void> {
+    if (AsterMarginUIFactory.openPreferencesWindow()) return;
+    const owner = await resolveChatWindow();
+    if (!AsterMarginUIFactory.openPreferencesWindow(undefined, undefined, undefined, owner)) {
+        throw new WindowUnavailableError();
+    }
+}
+
 export default {
+    onOpenPreferences,
     onStartup,
     onShutdown,
     onAppShutdown,

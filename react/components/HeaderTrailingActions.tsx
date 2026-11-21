@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import React from 'react';
 import { useAtomValue } from 'jotai';
 import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
@@ -96,7 +97,7 @@ const HeaderTrailingActions: React.FC<HeaderTrailingActionsProps> = ({ children 
             {/* User account menu */}
             <UserAccountMenuButton
                 className="scale-14"
-                ariaLabel="AsterMargin settings"
+                ariaLabel={uiText("AsterMargin settings")}
             />
         </>
     );

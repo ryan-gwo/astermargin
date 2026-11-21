@@ -48,6 +48,11 @@ interface AsterMarginWindow extends Window {
     };
 }
 
+function canRenderPreferences(win: Window | null | undefined): win is AsterMarginWindow {
+    return !!win && !win.closed && win.__astermarginRuntime?.status === "ready"
+        && typeof (win as AsterMarginWindow).AsterMarginReact?.renderPreferencesWindow === "function";
+}
+
 // Window name for the separate AsterMargin window
 const ASTERMARGIN_WINDOW_NAME = 'astermargin-separate-window';
 
@@ -672,8 +677,9 @@ export class AsterMarginUIFactory {
         try {
             const wm = Services.wm;
             const enumerator = wm.getEnumerator('astermargin:preferences');
-            if (enumerator.hasMoreElements()) {
-                return enumerator.getNext() as Window;
+            while (enumerator.hasMoreElements()) {
+                const win = enumerator.getNext() as Window;
+                if (!win.closed) return win;
             }
         } catch (e) {
             // Silently handle errors
@@ -686,9 +692,9 @@ export class AsterMarginUIFactory {
      * that the Actions tab pre-filter its list to that category (or "uncategorized").
      * `actionId` requests that the Actions tab reveal that action in edit mode.
      */
-    static openPreferencesWindow(tab?: PreferencePageTab, actionsCategoryFilter?: ActionCategoryFilter, actionId?: string, window?: Window): void {
+    static openPreferencesWindow(tab?: PreferencePageTab, actionsCategoryFilter?: ActionCategoryFilter, actionId?: string, window?: Window): Window | undefined {
         const existingWindow = this.findPreferencesWindow();
-        if (existingWindow) {
+        if (existingWindow && canRenderPreferences(existingWindow.__astermarginOwnerWindowRef?.deref())) {
             // Switch tab (and apply the category filter / action-edit request)
             // if requested via the global function
             if (tab && (Zotero as any).__astermarginOpenPreferencesTab) {
@@ -696,16 +702,16 @@ export class AsterMarginUIFactory {
             }
             existingWindow.focus();
             Zotero.debug("AsterMargin: Focusing existing preferences window");
-            return;
+            return existingWindow;
         }
+        existingWindow?.close();
 
-        const mainWindow = window?.__astermarginRuntime
-            ? window
-            : (contextMainWindow(window ?? Zotero.getMainWindow()) ??
-              this.findAsterMarginWindow());
-        if (!mainWindow) return;
-        const ownerWindowRef = new WeakRef(mainWindow);
-        const opened = mainWindow.openDialog(
+        const owner = canRenderPreferences(window) ? window
+            : [contextMainWindow(window), Zotero.getMainWindow(), this.findAsterMarginWindow()]
+                .find(canRenderPreferences);
+        if (!owner) return undefined;
+        const ownerWindowRef = new WeakRef(owner);
+        const opened = owner.openDialog(
             'chrome://astermargin/content/astermarginPreferences.xhtml',
             ASTERMARGIN_PREFERENCES_WINDOW_NAME,
             'chrome,resizable,centerscreen,dialog=false',
@@ -714,6 +720,7 @@ export class AsterMarginUIFactory {
         );
         if (opened) opened.__astermarginOwnerWindowRef = ownerWindowRef;
         Zotero.debug("AsterMargin: Opened preferences window");
+        return opened ?? undefined;
     }
 
     /**

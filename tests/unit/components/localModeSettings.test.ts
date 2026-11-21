@@ -20,8 +20,8 @@
 import { describe, expect, it } from 'vitest';
 import {
     DEFAULT_LOCAL_WEB_SEARCH_MAX_USES,
-    LOCAL_ROUND_CAP_DESCRIPTION,
-    LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION,
+    localRoundCapDescription,
+    localWebSearchMaxUsesDescription,
     localWebSearchCapabilityLabel,
     localWebSearchDescription,
     localModeToggleState,
@@ -95,9 +95,9 @@ describe('showLocalRoundCap', () => {
     });
 });
 
-describe('LOCAL_ROUND_CAP_DESCRIPTION', () => {
+describe('localRoundCapDescription', () => {
     it('names the default a blank field falls back to', () => {
-        expect(LOCAL_ROUND_CAP_DESCRIPTION).toContain(`default (${DEFAULT_MAX_ROUNDS})`);
+        expect(localRoundCapDescription()).toContain(`default (${DEFAULT_MAX_ROUNDS})`);
     });
 });
 
@@ -120,10 +120,10 @@ describe('parseLocalWebSearchMaxUsesInput', () => {
     });
 });
 
-describe('LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION', () => {
+describe('localWebSearchMaxUsesDescription', () => {
     it('names the default a blank field falls back to, and that it is per request', () => {
-        expect(LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION).toContain(`default (${DEFAULT_LOCAL_WEB_SEARCH_MAX_USES})`);
-        expect(LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION.toLowerCase()).toContain('request');
+        expect(localWebSearchMaxUsesDescription()).toContain(`default (${DEFAULT_LOCAL_WEB_SEARCH_MAX_USES})`);
+        expect(localWebSearchMaxUsesDescription().toLowerCase()).toContain('request');
     });
 });
 

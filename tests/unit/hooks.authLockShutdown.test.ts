@@ -59,6 +59,7 @@ vi.mock('../../src/modules/zoteroContextMenu', () => ({
 
 vi.mock('../../src/utils/locale', () => ({
     initLocale: vi.fn(),
+    getString: vi.fn(() => 'AsterMargin'),
 }));
 
 vi.mock('../../src/utils/ztoolkit', () => ({

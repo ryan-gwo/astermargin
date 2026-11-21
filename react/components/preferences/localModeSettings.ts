@@ -1,10 +1,11 @@
+import { settingsText } from "../../utils/settingsText";
 /**
  * Pure helpers for the "Local Mode" and "Search" settings groups. Kept free of
  * React and Jotai so the decision logic behind them is testable without a
  * component-rendering harness.
  */
 
-import { DEFAULT_MAX_ROUNDS } from '@astermargin/agent-local/config/localAgentConfig';
+import { DEFAULT_MAX_ROUNDS, type LocalConfigError } from '@astermargin/agent-local/config/localAgentConfig';
 import type { HostedWebSearchKind } from '@astermargin/agent-local/llm/webSearchCapability';
 
 /**
@@ -26,7 +27,16 @@ export interface LocalModeToggleState {
     description: string;
 }
 
-const LOCAL_MODE_DESCRIPTION = 'Connect a custom provider directly, without a AsterMargin account.';
+export function localConfigErrorText(reason: LocalConfigError): string {
+    switch (reason) {
+        case "no_model": return settingsText("Choose a model in AsterMargin Preferences → API Keys before starting a chat.");
+        case "no_api_key": return settingsText("Add an API key for the selected model in AsterMargin Preferences → API Keys.");
+        case "unsupported_format": return settingsText("Choose a supported API format for the selected model.");
+        case "invalid_endpoint": return settingsText("Enter a valid endpoint URL for the selected model.");
+    }
+}
+
+const localModeDescription = () => settingsText("Connect a custom provider directly, without an AsterMargin account.");
 
 /**
  * The local-mode toggle's state. A build without AsterMargin server settings is
@@ -42,7 +52,7 @@ export function localModeToggleState(
             checked: true,
             disabled: true,
             restartNeeded: false,
-            description: `${LOCAL_MODE_DESCRIPTION} This build has no AsterMargin server settings, so local mode is always on.`,
+            description: [localModeDescription(), settingsText("This build has no AsterMargin server settings, so local mode is always on.")].join(" "),
         };
     }
     const restartNeeded = needsLocalModeRestart(prefValue, activeValue);
@@ -51,8 +61,8 @@ export function localModeToggleState(
         disabled: false,
         restartNeeded,
         description: restartNeeded
-            ? `${LOCAL_MODE_DESCRIPTION} Restart Zotero to apply this change.`
-            : LOCAL_MODE_DESCRIPTION,
+            ? [localModeDescription(), settingsText("Restart Zotero to apply this change.")].join(" ")
+            : localModeDescription(),
     };
 }
 
@@ -65,8 +75,8 @@ export function showLocalRoundCap(prefValue: boolean, activeValue: boolean): boo
 }
 
 /** Description for the round-cap field, naming the default a blank field uses. */
-export const LOCAL_ROUND_CAP_DESCRIPTION =
-    `Limit how many tool-calling rounds a single run can take before it stops. Leave blank for the default (${DEFAULT_MAX_ROUNDS}).`;
+export const localRoundCapDescription = () =>
+    settingsText("Limit how many tool-calling rounds a single run can take before it stops. Leave blank for the default ({count}).", { count: DEFAULT_MAX_ROUNDS });
 
 /**
  * Parse the round-cap text field into the value stored in the
@@ -91,8 +101,8 @@ export function parseLocalMaxRoundsInput(text: string): number | null {
 export const DEFAULT_LOCAL_WEB_SEARCH_MAX_USES = 3;
 
 /** Description for the "max searches per request" field. */
-export const LOCAL_WEB_SEARCH_MAX_USES_DESCRIPTION =
-    `Most searches the provider may run for a single request. A run can make several requests. Leave blank for the default (${DEFAULT_LOCAL_WEB_SEARCH_MAX_USES}).`;
+export const localWebSearchMaxUsesDescription = () =>
+    settingsText("Most searches the provider may run for a single request. A run can make several requests. Leave blank for the default ({count}).", { count: DEFAULT_LOCAL_WEB_SEARCH_MAX_USES });
 
 /**
  * Parse the "max searches per request" text field into the value stored in
@@ -121,16 +131,16 @@ export function localWebSearchCapabilityLabel(kind: HostedWebSearchKind | null, 
     const label = (() => {
         switch (kind) {
             case 'anthropic':
-                return 'Anthropic hosted search';
+                return settingsText("Anthropic hosted search");
             case 'openai-responses':
-                return 'OpenAI hosted search';
+                return settingsText("OpenAI hosted search");
             case 'openrouter':
-                return 'OpenRouter web search';
+                return settingsText("OpenRouter web search");
             default:
-                return 'Not available for this provider';
+                return settingsText("Not available for this provider");
         }
     })();
-    return hostUnconfirmed ? `${label} (may not be supported by this endpoint)` : label;
+    return hostUnconfirmed ? settingsText("{search} (may not be supported by this endpoint)", { search: label }) : label;
 }
 
 /**
@@ -140,6 +150,7 @@ export function localWebSearchCapabilityLabel(kind: HostedWebSearchKind | null, 
  * per-message web-search toggle.
  */
 export function localWebSearchDescription(kind: HostedWebSearchKind | null, hostUnconfirmed = false): string {
-    return `${localWebSearchCapabilityLabel(kind, hostUnconfirmed)}. Your provider may bill per search. `
-        + `This is the master switch — the composer's web-search toggle turns it on per message.`;
+    return settingsText("{search}. Your provider may bill per search. This is the master switch — the composer's web-search toggle turns it on per message.", {
+        search: localWebSearchCapabilityLabel(kind, hostUnconfirmed),
+    });
 }

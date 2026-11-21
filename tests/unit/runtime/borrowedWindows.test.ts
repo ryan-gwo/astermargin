@@ -58,6 +58,20 @@ it.each(['chat', 'preferences'])('focusing an existing %s retains its original r
     expect(b.openDialog).not.toHaveBeenCalled();
 });
 
+it("reopens settings if the existing window's renderer has detached", () => {
+    const stale = { closed: false, close: vi.fn(), focus: vi.fn(),
+        __astermarginOwnerWindowRef: new WeakRef(a) };
+    a.__astermarginRuntime.status = "closing";
+    vi.mocked(AsterMarginUIFactory.findPreferencesWindow).mockReturnValue(stale as any);
+    const replacement = { closed: false };
+    b.openDialog.mockReturnValue(replacement);
+
+    expect(AsterMarginUIFactory.openPreferencesWindow()).toBe(replacement);
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect(stale.focus).not.toHaveBeenCalled();
+    expect(b.openDialog).toHaveBeenCalledOnce();
+});
+
 for (const name of ["astermarginPreferences"]) {
     function chromePage(
         ownerRef?: WeakRef<any>,

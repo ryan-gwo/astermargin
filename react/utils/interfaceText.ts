@@ -41,6 +41,8 @@ const words: Record<string, readonly [string, string]> = {
     Model: ["模型", "模型"],
     "Research sync": ["研究数据同步", "研究資料同步"],
     "New Chat": ["新对话", "新對話"],
+    Settings: ["设置", "設定"],
+    "Get Help": ["获取帮助", "取得說明"],
     "AsterMargin settings": ["星笺设置", "星箋設定"],
     "AsterMargin Actions": ["星笺动作", "星箋動作"],
     "Add custom action…": ["添加自定义动作…", "新增自定義動作…"],
@@ -90,9 +92,17 @@ const words: Record<string, readonly [string, string]> = {
     Input: ["输入", "輸入"],
     "AsterMargin Status": ["星笺状态", "星箋狀態"],
 };
-export function uiText(english: string) {
+export function interfaceLocale(): "en" | "zh-CN" | "zh-TW" {
     const lang = String(typeof Zotero === "undefined" ? "" : Zotero.locale);
-    return /^zh/i.test(lang)
-        ? (words[english]?.[/TW|HK|Hant/i.test(lang) ? 1 : 0] ?? english)
-        : english;
+    if (!/^zh(?:[-_]|$)/i.test(lang)) return "en";
+    return /(?:^|[-_])(?:Hant|TW|HK|MO)(?:[-_]|$)/i.test(lang)
+        ? "zh-TW"
+        : "zh-CN";
+}
+
+export function uiText(english: string) {
+    const locale = interfaceLocale();
+    return locale === "en"
+        ? english
+        : (words[english]?.[locale === "zh-TW" ? 1 : 0] ?? english);
 }

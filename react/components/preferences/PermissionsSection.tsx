@@ -1,3 +1,4 @@
+import { settingsText } from "../../utils/settingsText";
 import { usePreference } from '../../hooks/usePreference';
 import React, { useCallback, useState } from "react";
 import {SettingsGroup, SettingsRow, SectionLabel, DocLink, SectionDescription} from "./components/SettingsElements";
@@ -43,77 +44,76 @@ const PermissionsSection: React.FC = () => {
 
     return (
         <>
-            <SectionLabel>Library Modifications</SectionLabel>
+            <SectionLabel>{settingsText("Library Modifications")}</SectionLabel>
             <SectionDescription>
-                When AsterMargin modifies your library, all changes require your approval by default (the only exception is when AsterMargin creates a new note).
-                You can change this behavior here. Be careful, AsterMargin might make changes you didn't expect.
-
-                For more details, see documentation on <DocLink path="editing-metadata">editing metadata</DocLink> and <DocLink path="library-management">organizing your library items</DocLink>.
+                {settingsText("When AsterMargin modifies your library, all changes require your approval by default (the only exception is when AsterMargin creates a new note). You can change this behavior here. Be careful, AsterMargin might make changes you didn't expect.")}
+                {' '}<DocLink path="editing-metadata">{settingsText("Editing metadata")}</DocLink>
+                {' · '}<DocLink path="library-management">{settingsText("Organizing library items")}</DocLink>
             </SectionDescription>
             <SettingsGroup>
                 <div style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="edit_metadata"
-                        label="Metadata Edits"
-                        description="Changes to item titles, authors, abstracts, and other metadata"
+                        label={settingsText("Metadata Edits")}
+                        description={settingsText("Changes to item titles, authors, abstracts, and other metadata")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="create_note"
-                        label="Note Creation"
-                        description="Creating new Zotero notes"
+                        label={settingsText("Note Creation")}
+                        description={settingsText("Creating new Zotero notes")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="edit_note"
-                        label="Note Edits"
-                        description="Changes to Zotero note content"
+                        label={settingsText("Note Edits")}
+                        description={settingsText("Changes to Zotero note content")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="create_highlight_annotations"
-                        label="PDF Annotations"
-                        description="Creating and editing annotations. Deleting annotations always asks for confirmation."
+                        label={settingsText("PDF Annotations")}
+                        description={settingsText("Creating and editing annotations. Deleting annotations always asks for confirmation.")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="create_items"
-                        label="Item Imports"
-                        description="Importing new items from external sources"
+                        label={settingsText("Item Imports")}
+                        description={settingsText("Importing new items from external sources")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="create_collection"
-                        label="Item Organization"
-                        description="Creating collections and adding or removing tags and collections on selected items"
+                        label={settingsText("Item Organization")}
+                        description={settingsText("Creating collections and adding or removing tags and collections on selected items")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="merge_items"
-                        label="Duplicate Merges"
-                        description="Combining duplicate records with undo support"
+                        label={settingsText("Duplicate Merges")}
+                        description={settingsText("Combining duplicate records with undo support")}
                     />
                 </div>
                 <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                     <DeferredToolPreferenceSetting
                         toolName="manage_tags"
-                        label="Tag & Collection Management"
-                        description="Library-wide tag and collection rename, move, merge, and delete operations"
+                        label={settingsText("Tag & Collection Management")}
+                        description={settingsText("Library-wide tag and collection rename, move, merge, and delete operations")}
                     />
                 </div>
             </SettingsGroup>
 
-            <SectionLabel>System Notifications</SectionLabel>
+            <SectionLabel>{settingsText("System Notifications")}</SectionLabel>
             <SettingsGroup>
                 <SettingsRow
-                    title="Approval Notifications"
-                    description="Show a system notification when AsterMargin is waiting for your decision and is not visible."
+                    title={settingsText("Approval Notifications")}
+                    description={settingsText("Show a system notification when AsterMargin is waiting for your decision and is not visible.")}
                     onClick={handleEnableSystemNotificationsToggle}
                     hasBorder
                     control={
@@ -127,8 +127,8 @@ const PermissionsSection: React.FC = () => {
                     }
                 />
                 <SettingsRow
-                    title="Response Notifications"
-                    description="Show a system notification when a response is ready and AsterMargin is not visible."
+                    title={settingsText("Response Notifications")}
+                    description={settingsText("Show a system notification when a response is ready and AsterMargin is not visible.")}
                     onClick={handleEnableResponseCompleteNotificationsToggle}
                     hasBorder
                     control={
@@ -143,11 +143,11 @@ const PermissionsSection: React.FC = () => {
                 />
             </SettingsGroup>
 
-            <SectionLabel>Auto-Apply</SectionLabel>
+            <SectionLabel>{settingsText("Auto-Apply")}</SectionLabel>
             <SettingsGroup>
                 <SettingsRow
-                    title="Auto-Apply Annotations"
-                    description="Automatically apply annotations to PDFs when created by the agent (only when PDF is open)"
+                    title={settingsText("Auto-Apply Annotations")}
+                    description={settingsText("Automatically apply annotations to PDFs when created by the agent (only when PDF is open)")}
                     onClick={handleAutoApplyAnnotationsToggle}
                     control={
                         <input
@@ -161,13 +161,13 @@ const PermissionsSection: React.FC = () => {
                 />
             </SettingsGroup>
 
-            <SectionLabel>File Access</SectionLabel>
+            <SectionLabel>{settingsText("File Access")}</SectionLabel>
             <SettingsGroup>
                 <SettingsRow
-                    title="Access Remote Files"
-                    description="Download PDF files from the Zotero server when not available locally"
+                    title={settingsText("Access Remote Files")}
+                    description={settingsText("Download PDF files from the Zotero server when not available locally")}
                     onClick={handleAccessRemoteFilesToggle}
-                    tooltip="When enabled, AsterMargin will attempt to download PDFs from the Zotero server or WebDAV if the file is not on your local machine. Disable this if you experience slow responses or don't want remote file downloads."
+                    tooltip={settingsText("When enabled, AsterMargin will attempt to download PDFs from the Zotero server or WebDAV if the file is not on your local machine. Disable this if you experience slow responses or don't want remote file downloads.")}
                     control={
                         <input
                             type="checkbox"

@@ -10,3 +10,9 @@ prefs-table-detail = Detail
 tabpanel-lib-tab-label = Lib Tab
 tabpanel-reader-tab-label = Reader Tab
 astermargin-menu-upsert = Upsert to AsterMargin
+
+preferences-pane-label = AsterMargin
+preferences-pane-open =
+    .label = Open AsterMargin Settings
+preferences-pane-help = Open the settings window for AsterMargin.
+preferences-pane-open-failed = AsterMargin could not open its settings window. Reopen Zotero and try again.

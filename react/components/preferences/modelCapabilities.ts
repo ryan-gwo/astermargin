@@ -1,3 +1,5 @@
+import { settingsText } from "../../utils/settingsText";
+import { localConfigErrorText } from "./localModeSettings";
 import { clientForFormat } from "@astermargin/agent-local/llm/clientForFormat";
 import { resolveLocalAgentConfig } from "@astermargin/agent-local/config/localAgentConfig";
 import type { CustomChatModel } from "@astermargin/agent-core/types/customChatModel";
@@ -9,7 +11,7 @@ export async function checkModelCapabilities(
     document: Document,
 ) {
     const cfg = resolveLocalAgentConfig({ model, maxRounds: 1 });
-    if (!cfg.ok) throw new Error(cfg.message);
+    if (!cfg.ok) throw new Error(localConfigErrorText(cfg.reason));
     const client = clientForFormat(cfg.config.model.format ?? "openai"),
         results: string[] = [];
     const turn = (
@@ -31,7 +33,7 @@ export async function checkModelCapabilities(
             results.push(label + " ✗ " + String(error));
         }
     };
-    await check("SSE", async () => {
+    await check(settingsText("Streaming"), async () => {
         let updates = 0;
         const r = await turn(
             [
@@ -46,7 +48,7 @@ export async function checkModelCapabilities(
         );
         return updates > 0 && r.text.trim() === nonce;
     });
-    await check("Tools", async () => {
+    await check(settingsText("Tool calling"), async () => {
         const r = await turn(
             [
                 {
@@ -73,7 +75,7 @@ export async function checkModelCapabilities(
             (c) => c.name === "capability_echo" && c.args.token === nonce,
         );
     });
-    await check("Vision", async () => {
+    await check(settingsText("Vision"), async () => {
         const canvas = document.createElementNS(
             "http://www.w3.org/1999/xhtml",
             "canvas",

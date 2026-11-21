@@ -1,3 +1,5 @@
+import { interfaceLocale } from "../utils/interfaceText";
+import { settingsText } from "../utils/settingsText";
 import React, { useEffect, useRef } from 'react';
 import { useSetAtom } from 'jotai';
 import { isPreferencePageVisibleAtom, activePreferencePageTabAtom, pendingActionsCategoryFilterAtom, pendingActionEditRequestAtom, PreferencePageTab } from '../atoms/ui';
@@ -21,6 +23,10 @@ const PreferencesWindow: React.FC<PreferencesWindowProps> = ({ initialTab, initi
     const containerRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
+        const root = containerRef.current?.ownerDocument.documentElement;
+        root?.setAttribute("title", settingsText("AsterMargin Settings"));
+        root?.setAttribute("lang", interfaceLocale());
+
         // Signal that preferences are visible (used by useProfileSync)
         setPreferencePageVisible(true);
 

@@ -7,7 +7,7 @@
     "url": "git+https://github.com/jlegewie/beaver-zotero.git"
   },
   "type": "module",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "AI-assisted literature reading in Zotero",
   "config": {
     "addonName": "AsterMargin",

@@ -10,3 +10,9 @@ prefs-table-detail = 詳情
 tabpanel-lib-tab-label = Lib Tab
 tabpanel-reader-tab-label = Reader Tab
 astermargin-menu-upsert = Upsert to AsterMargin
+
+preferences-pane-label = 星箋
+preferences-pane-open =
+    .label = 開啟星箋設定
+preferences-pane-help = 開啟星箋的獨立設定視窗。
+preferences-pane-open-failed = 星箋無法開啟設定視窗。請重新開啟 Zotero 後再試。

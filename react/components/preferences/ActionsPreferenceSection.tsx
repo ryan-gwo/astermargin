@@ -1,3 +1,5 @@
+import { actionCategoryText, actionDisplayText } from "../../utils/actionDisplayText";
+import { knownSettingsText, settingsText } from "../../utils/settingsText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useState, useCallback, useEffect, useMemo } from "react";
 import { useAtom, useAtomValue } from 'jotai';
@@ -5,7 +7,7 @@ import { Icon, TickIcon, ArrowDownIcon, UploadCircleIcon, ImportIcon } from '../
 import PlusSignIcon from '@astermargin/agent-ui/icons/PlusSignIcon';
 import Button from "@astermargin/agent-ui/primitives/Button";
 import { useSetAtom } from 'jotai';
-import { Action, ActionCategory, ActionCategoryFilter, ActionTargetType, generateActionId, TARGET_TYPE_LABELS, UNCATEGORIZED_FILTER, categoryLabel } from "@astermargin/agent-core/types/actions";
+import { Action, ActionCategory, ActionCategoryFilter, ActionTargetType, generateActionId, TARGET_TYPE_LABELS, UNCATEGORIZED_FILTER } from "@astermargin/agent-core/types/actions";
 import { actionsAtom, saveActionsAtom, hideActionAtom, restoreActionAtom, resetActionToDefaultAtom, importActionAtom } from "../../atoms/actions";
 import { pendingActionsCategoryFilterAtom, pendingActionEditRequestAtom } from "../../atoms/ui";
 import { importActionFromFile } from "../../utils/actionShareFile";
@@ -125,22 +127,22 @@ const ActionsPreferenceSection: React.FC = () => {
             const result = await importActionFromFile(surfaceWindow);
             if (!result) return; // user cancelled the file picker
             if (!result.ok) {
-                addPopupMessage({ type: 'error', title: 'Import failed', text: result.error, expire: true });
+                addPopupMessage({ type: 'error', title: settingsText("Import failed"), text: result.error, expire: true });
                 return;
             }
             const { action, command, commandRenamed } = importAction(result.action);
             if (commandRenamed) {
                 addPopupMessage({
                     type: 'info',
-                    title: 'Action imported',
-                    text: `A /${getActionCommand(result.action)} command already existed, so this one was added as /${command}.`,
+                    title: settingsText("Action imported"),
+                    text: settingsText("A /{original} command already existed, so this one was added as /{command}.", { original: getActionCommand(result.action), command }),
                     expire: true,
                 });
             }
             // Reveal the new card and open it in edit mode.
             setPendingActionEdit({ actionId: action.id, requestId: Date.now() });
         })().catch(() => {
-            addPopupMessage({ type: 'error', title: 'Import failed', text: 'Could not import the action.', expire: true });
+            addPopupMessage({ type: 'error', title: settingsText("Import failed"), text: settingsText("Could not import the action."), expire: true });
         });
     }, [importAction, addPopupMessage, setPendingActionEdit]);
 
@@ -156,7 +158,7 @@ const ActionsPreferenceSection: React.FC = () => {
     const handleDuplicateAction = useCallback((action: Action) => {
         const { action: copy } = importAction({
             ...action,
-            title: `${action.title} (copy)`,
+            title: settingsText("{title} (copy)", { title: actionDisplayText(action, "title") }),
         });
         setPendingActionEdit({ actionId: copy.id, requestId: Date.now() });
     }, [importAction, setPendingActionEdit]);
@@ -170,28 +172,28 @@ const ActionsPreferenceSection: React.FC = () => {
 
     // --- Filter menu items ---
     const targetFilterItems: MenuItem[] = useMemo(() => [
-        filterMenuItem('All targets', targetFilter === null, () => setTargetFilter(null)),
+        filterMenuItem(settingsText("All targets"), targetFilter === null, () => setTargetFilter(null)),
         { label: '', isDivider: true, onClick: () => {} },
         ...TARGET_FILTER_OPTIONS.map(tt =>
-            filterMenuItem(TARGET_TYPE_LABELS[tt], targetFilter === tt, () => setTargetFilter(tt))
+            filterMenuItem(knownSettingsText(TARGET_TYPE_LABELS[tt]), targetFilter === tt, () => setTargetFilter(tt))
         ),
     ], [targetFilter]);
 
     const categoryFilterItems: MenuItem[] = useMemo(() => [
-        filterMenuItem('All categories', categoryFilter === null, () => setCategoryFilter(null)),
+        filterMenuItem(settingsText("All categories"), categoryFilter === null, () => setCategoryFilter(null)),
         { label: '', isDivider: true, onClick: () => {} },
         ...CATEGORY_FILTER_OPTIONS.map(cat =>
-            filterMenuItem(categoryLabel(cat), categoryFilter === cat, () => setCategoryFilter(cat))
+            filterMenuItem(actionCategoryText(cat), categoryFilter === cat, () => setCategoryFilter(cat))
         ),
-        filterMenuItem('Uncategorized', categoryFilter === UNCATEGORIZED_FILTER, () => setCategoryFilter(UNCATEGORIZED_FILTER)),
+        filterMenuItem(settingsText("Uncategorized"), categoryFilter === UNCATEGORIZED_FILTER, () => setCategoryFilter(UNCATEGORIZED_FILTER)),
     ], [categoryFilter]);
 
-    const targetButtonLabel = targetFilter ? TARGET_TYPE_LABELS[targetFilter] : 'All targets';
+    const targetButtonLabel = targetFilter ? knownSettingsText(TARGET_TYPE_LABELS[targetFilter]) : settingsText("All targets");
     const categoryButtonLabel = categoryFilter === null
-        ? 'All categories'
+        ? settingsText("All categories")
         : categoryFilter === UNCATEGORIZED_FILTER
-            ? 'Uncategorized'
-            : categoryLabel(categoryFilter);
+            ? settingsText("Uncategorized")
+            : actionCategoryText(categoryFilter);
 
     // No background when a filter dimension is unset ("All ..."); a filled, bordered
     // chip once it's narrowed down, so the active filters stand out at a glance.
@@ -216,7 +218,7 @@ const ActionsPreferenceSection: React.FC = () => {
     return (
         <>
             <PageHeader
-                title="Actions"
+                title={settingsText("Actions")}
                 actions={
                 <div className="display-flex flex-row items-center gap-3">
                     <Button
@@ -225,9 +227,9 @@ const ActionsPreferenceSection: React.FC = () => {
                         icon={ImportIcon}
                         style={{ padding: '4px 6px' }}
                         onClick={handleImportAction}
-                        title="Import an action from a .astermarginaction file"
+                        title={settingsText("Import an action from a .astermarginaction file")}
                     >
-                        Import
+                        {settingsText("Import")}
                     </Button>
                     <Button
                         variant="solid"
@@ -236,29 +238,27 @@ const ActionsPreferenceSection: React.FC = () => {
                         style={{ padding: '4px 6px' }}
                         onClick={handleAddAction}
                     >
-                        Add Action
+                        {settingsText("Add Action")}
                     </Button>
                 </div>
                 }
             >
-                Actions are reusable prompts for common research tasks.
-                They appear based on what you're doing in Zotero: on the AsterMargin homepage, in the slash menu, and Zotero's right-click menu.
-                Each action targets items, collections, or your whole library, and AsterMargin shows the relevant ones automatically.
-                {' '}<DocLink path="actions">Learn more</DocLink>.
+                {settingsText("Actions are reusable prompts for common research tasks. They appear based on what you're doing in Zotero: on the AsterMargin homepage, in the slash menu, and Zotero's right-click menu. Each action targets items, collections, or your whole library, and AsterMargin shows the relevant ones automatically.")}
+                {' '}<DocLink path="actions">{settingsText("Learn more")}</DocLink>.
             </PageHeader>
 
             {/* Filter toolbar — narrow the list by target and/or category */}
             <div className="display-flex flex-row flex-1 items-center gap-3 flex-wrap mb-15 mt-4" style={{ paddingLeft: '2px' }}>
                 <div className="display-flex flex-row items-center gap-1 p-1">
                     {/* <Icon icon={FilterIcon} size={14} className="font-color-primary flex-shrink-0" /> */}
-                    <span className="text-base font-color-secondary">Show:</span>
+                    <span className="text-base font-color-secondary">{settingsText("Show:")}</span>
                 </div>
                 <MenuButton
                     menuItems={targetFilterItems}
                     buttonLabel={targetButtonLabel}
                     variant={targetButtonVariant}
                     rightIcon={ArrowDownIcon}
-                    ariaLabel="Filter by target"
+                    ariaLabel={settingsText("Filter by target")}
                     className="text-sm"
                     style={{ padding: '3px 8px' }}
                     maxWidth="200px"
@@ -268,7 +268,7 @@ const ActionsPreferenceSection: React.FC = () => {
                     buttonLabel={categoryButtonLabel}
                     variant={categoryButtonVariant}
                     rightIcon={ArrowDownIcon}
-                    ariaLabel="Filter by category"
+                    ariaLabel={settingsText("Filter by category")}
                     className="text-sm"
                     style={{ padding: '3px 8px' }}
                     maxWidth="200px"
@@ -280,11 +280,11 @@ const ActionsPreferenceSection: React.FC = () => {
                             style={{ padding: "3px 8px" }}
                             onClick={clearFilters}
                         >
-                            Clear
+                            {settingsText("Clear")}
                         </Button>
                         <div className="flex-1"></div>
                         <span className="text-base font-color-secondary px-15">
-                            {filteredActions.length} of {actions.length}
+                            {settingsText("{done} of {total}", { done: filteredActions.length, total: actions.length })}
                         </span>
                     </>
                 )}
@@ -292,7 +292,7 @@ const ActionsPreferenceSection: React.FC = () => {
 
             {filteredActions.length === 0 ? (
                 <div className="text-base font-color-tertiary" style={{ padding: '12px 4px' }}>
-                    No actions match the selected filters.
+                    {settingsText("No actions match the selected filters.")}
                 </div>
             ) : (
                 <div className="display-flex flex-col" style={{ gap: '8px' }}>
@@ -323,18 +323,18 @@ const ActionsPreferenceSection: React.FC = () => {
             {hiddenBuiltins.length > 0 && (
                 <details className="mt-4">
                     <summary className="text-sm font-color-secondary cursor-pointer">
-                        Deleted actions ({hiddenBuiltins.length})
+                        {settingsText("Deleted actions ({count})", { count: hiddenBuiltins.length })}
                     </summary>
                     <div className="display-flex flex-col gap-2 mt-2">
                         {hiddenBuiltins.map(action => (
                             <div key={action.id} className="display-flex flex-row items-center justify-between px-2 py-1">
-                                <span className="text-sm font-color-secondary">{action.title}</span>
+                                <span className="text-sm font-color-secondary">{actionDisplayText(action, "title")}</span>
                                 <Button
                                     variant="outline"
                                     style={{ padding: "2px 8px" }}
                                     onClick={() => restoreAction(action.id)}
                                 >
-                                    <span className="text-xs">Restore</span>
+                                    <span className="text-xs">{settingsText("Restore")}</span>
                                 </Button>
                             </div>
                         ))}
