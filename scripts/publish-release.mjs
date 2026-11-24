@@ -97,21 +97,24 @@ const updates = {
 };
 await writeFile(updateFile, JSON.stringify(updates, null, 2) + "\n");
 
+const scratch = await mkdtemp(join(tmpdir(), "astermargin-release-"));
 if (!releases.some(release => release.tagName === tag)) {
-    gh("release", "create", tag, "--repo", repository, "--draft", "--verify-tag", "--title", tag, "--notes-from-tag");
+    const notes = join(scratch, "release-notes.md");
+    await writeFile(notes, git("for-each-ref", "--format=%(contents)", tagRef) + "\n");
+    gh("release", "create", tag, "--repo", repository, "--draft", "--verify-tag",
+        "--title", tag, "--notes-file", notes);
 }
-const draft = JSON.parse(gh("release", "view", tag, "--repo", repository, "--json", "isDraft,assets"));
+const draft = JSON.parse(gh("release", "view", tag, "--repo", repository, "--json", "isDraft"));
 assert(draft.isDraft, "Only draft assets can be uploaded");
 const assets = [xpi, updateFile];
 // Retries may rebuild with a different timestamp. Replace draft assets together,
 // then verify both bytes before publication. Immutable releases protect public assets.
 gh("release", "upload", tag, ...assets, "--repo", repository, "--clobber");
-const downloaded = await mkdtemp(join(tmpdir(), "astermargin-release-"));
-gh("release", "download", tag, "--repo", repository, "--dir", downloaded,
+gh("release", "download", tag, "--repo", repository, "--dir", scratch,
     "--pattern", "astermargin.xpi", "--pattern", "update.json");
 for (const file of assets) {
     const assetName = file.split("/").at(-1);
-    assert.equal(await sha256(join(downloaded, assetName)), await sha256(file), `Draft asset mismatch: ${assetName}`);
+    assert.equal(await sha256(join(scratch, assetName)), await sha256(file), `Draft asset mismatch: ${assetName}`);
 }
 const url = gh("release", "edit", tag, "--repo", repository, "--draft=false", "--latest");
 const published = JSON.parse(gh("api", `repos/${repository}/releases/tags/${tag}`));

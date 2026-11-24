@@ -38,4 +38,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
-        run: npm run release -- "$RELEASE_TAG"
+        run: |
+          # Load release tooling from the dispatched main commit. All plugin
+          # source, dependencies and build commands come from the tagged checkout.
+          mkdir -p .scaffold
+          git show "$GITHUB_WORKFLOW_SHA:scripts/publish-release.mjs" > .scaffold/publish-release.mjs
+          node .scaffold/publish-release.mjs "$RELEASE_TAG"
