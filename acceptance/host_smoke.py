@@ -78,6 +78,10 @@ def main():
         "extensions.zoteroMacWordIntegration.skipInstallation": True,
         "extensions.zoteroOpenOfficeIntegration.skipInstallation": True,
     }
+    if args.reject_update:
+        # The disposable HTTP loopback feed must be accepted by the fixture
+        # add-on. Zotero still verifies the HTTPS XPI download's supplied hash.
+        prefs["extensions.checkUpdateSecurity"] = False
     if args.settings_locale:
         prefs["intl.locale.requested"] = args.zotero_locale or args.settings_locale
     if args.settings_locale and (args.update_from or args.upgrade_from):

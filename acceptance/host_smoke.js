@@ -17,6 +17,7 @@ async function readyAddon(previous) {
 
 // Invoke the real periodic updater, including its normal auto-install policy.
 async function nativeBackgroundUpdate(manager, scenario, addon) {
+    const { AddonManagerPrivate } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
     const id = "astermargin@astermargin.local";
     const installedBefore = await manager.getAddonByID(id);
     if (!manager.shouldAutoUpdate(installedBefore)) throw Error("Automatic plugin updates are disabled");
@@ -31,7 +32,7 @@ async function nativeBackgroundUpdate(manager, scenario, addon) {
     };
     manager.addInstallListener(listener);
     try {
-        await manager.backgroundUpdateCheck();
+        await AddonManagerPrivate.backgroundUpdateCheck();
         if (scenario !== "compatibility") {
             for (let i = 0; i < 300 && !outcome; i++) await sleep(200);
         }
