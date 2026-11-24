@@ -291,8 +291,8 @@ const InputArea: React.FC<InputAreaProps> = ({
     // Counted labels, so the destructive verdict states its blast radius where
     // the decision is actually taken rather than only in the bar above.
     const verdictCountSuffix = pendingApprovalsMap.size > 1 ? ` all (${pendingApprovalsMap.size})` : '';
-    const approveVerdictLabel = `Approve${verdictCountSuffix}`;
-    const rejectVerdictLabel = `Reject${verdictCountSuffix}`;
+    const approveVerdictLabel = uiText("Approve") + verdictCountSuffix;
+    const rejectVerdictLabel = uiText("Reject") + verdictCountSuffix;
 
     // Exactly one band between the batch panel and the attachment row.
     // Priority: the chat being closed to this window (nothing below can be
@@ -635,8 +635,8 @@ const InputArea: React.FC<InputAreaProps> = ({
         localReason: localWebSearchStatus.reason,
         hostUnconfirmed: localWebSearchStatus.hostUnconfirmed,
     });
-    const webSearchTooltipContent = webSearchCopy.title;
-    const webSearchDescription = webSearchCopy.description;
+    const webSearchTooltipContent = uiText(webSearchCopy.title);
+    const webSearchDescription = uiText(webSearchCopy.description);
     const menuPortalContainer = inputRef.current?.closest('[id^="astermargin-react-root-"], #astermargin-pane-window, #astermargin-pane-floating-popup') as HTMLElement | null;
 
     return (
@@ -702,7 +702,7 @@ const InputArea: React.FC<InputAreaProps> = ({
             {composerBand === 'full-access' && fullAccessRunId && (
                 <div className="composer-docked-bar pending-actions-bar display-flex flex-row items-center px-3 py-2 border-bottom-quinary gap-2">
                     <span className="font-color-secondary text-sm truncate">
-                        Applying library changes without asking
+                        {uiText("Applying library changes without asking")}
                     </span>
                     {fullAccessAppliedCount > 0 && (
                         <span className="font-color-secondary opacity-70 text-sm flex-none">
@@ -750,7 +750,7 @@ const InputArea: React.FC<InputAreaProps> = ({
                 searchQuery={slashSearchQuery}
                 setSearchQuery={setSlashSearchQuery}
                 onSearch={() => {}}
-                noResultsText="No actions found"
+                noResultsText={uiText("No actions found")}
                 placeholder={uiText("Search actions...")}
                 closeOnSelect={false}
                 showSearchInput={false}
@@ -782,7 +782,7 @@ const InputArea: React.FC<InputAreaProps> = ({
                             // The hint sits at the end of the content, so it
                             // would be misplaced ahead of existing text.
                             !addSourcesHasTextAfter
-                                ? 'Type to search'
+                                ? uiText("Type to search")
                                 : null
                         }
                         placeholder={getPlaceholderText()}
@@ -835,8 +835,8 @@ const InputArea: React.FC<InputAreaProps> = ({
                         width={localMode || !isWebSearchAllowed ? '250px' : isWebSearchEnabled ? '220px' : '190px'}
                         customContent={
                             <div className="px-2 py-1 display-flex flex-col gap-1">
-                                <span className="text-base font-color-secondary font-medium">{webSearchCopy.title}</span>
-                                <span className="text-sm font-color-tertiary">{webSearchCopy.detail}</span>
+                                <span className="text-base font-color-secondary font-medium">{webSearchTooltipContent}</span>
+                                <span className="text-sm font-color-tertiary">{uiText(webSearchCopy.detail)}</span>
                             </div>
                         }
                     >
@@ -845,7 +845,7 @@ const InputArea: React.FC<InputAreaProps> = ({
                             variant="ghost-secondary"
                             className="composer-icons"
                             iconClassName={isWebSearchEnabled ? 'font-color-accent-blue stroke-width-2' : ''}
-                            ariaLabel="Web search"
+                            ariaLabel={uiText("Web search")}
                             ariaPressed={isWebSearchEnabled}
                             ariaDescribedBy={webSearchDescriptionId}
                             onClick={handleWebSearchToggle}
@@ -884,7 +884,7 @@ const InputArea: React.FC<InputAreaProps> = ({
                         </>
                     ) : isPending ? (
                         <Tooltip
-                            content={waitsOnFill ? 'Stop response (also stops the table fill)' : 'Stop response'}
+                            content={uiText(waitsOnFill ? "Stop response (also stops the table fill)" : "Stop response")}
                             showArrow
                             singleLine
                         >
@@ -892,7 +892,7 @@ const InputArea: React.FC<InputAreaProps> = ({
                                 icon={StopIcon}
                                 variant="surface"
                                 className="composer-send composer-send-stop"
-                                ariaLabel={waitsOnFill ? 'Stop response (also stops the table fill)' : 'Stop generating'}
+                                ariaLabel={uiText(waitsOnFill ? "Stop response (also stops the table fill)" : "Stop generating")}
                                 onClick={handleStop}
                             />
                         </Tooltip>
@@ -901,7 +901,7 @@ const InputArea: React.FC<InputAreaProps> = ({
                             icon={ArrowUpLineIcon}
                             variant="solid"
                             className="composer-send"
-                            ariaLabel="Send message"
+                            ariaLabel={uiText("Send message")}
                             onClick={handleSubmit}
                             disabled={threadReadOnly || messageContent.length === 0 || !selectedModel || isSlashMenuOpen || isAttachingFiles}
                         />

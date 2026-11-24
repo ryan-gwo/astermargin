@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { newThreadAtom, ThreadData } from '../../atoms/threads';
@@ -50,7 +51,7 @@ const RenameInput: React.FC<RenameInputProps> = ({ name, onCommit, onCancel }) =
                 type="text"
                 className="astermargin-window-nav-rename"
                 value={draft}
-                aria-label="Chat name"
+                aria-label={uiText("Chat name")}
                 onChange={e => setDraft(e.target.value)}
                 onBlur={commit}
                 onKeyDown={e => {
@@ -163,7 +164,7 @@ const ThreadRow: React.FC<ThreadRowProps> = ({
             onClick: () => onStartRename(thread),
         },
         {
-            label: thread.isPinned ? 'Unpin chat' : 'Pin chat',
+            label: thread.isPinned ? uiText("Unpin chat") : uiText("Pin chat"),
             icon: thread.isPinned ? PinOffIcon : PinIcon,
             onClick: () => onTogglePin(thread),
             disabled: pinPending,
@@ -174,7 +175,7 @@ const ThreadRow: React.FC<ThreadRowProps> = ({
             isDivider: true,
         },
         {
-            label: 'Delete chat…',
+            label: uiText("Delete chat…"),
             icon: DeleteIcon,
             onClick: () => onDelete(thread),
         },
@@ -291,7 +292,7 @@ const WindowNav: React.FC<WindowNavProps> = ({ collapsed }) => {
     return (
         <nav
             className="astermargin-window-nav-content"
-            aria-label="Chat history"
+            aria-label={uiText("Chat history")}
             aria-hidden={collapsed}
             // @ts-expect-error `inert` is not in React's attribute typings for this React version.
             inert={collapsed ? '' : undefined}
@@ -305,7 +306,7 @@ const WindowNav: React.FC<WindowNavProps> = ({ collapsed }) => {
                         onClick={() => { void newThread({ window: surfaceWindow }); }}
                     >
                         <Icon icon={PlusSignIcon} aria-hidden="true" focusable="false" />
-                        <span className="truncate">New chat</span>
+                        <span className="truncate">{uiText("New chat")}</span>
                     </button>
                 </Tooltip>
             </div>
@@ -317,8 +318,8 @@ const WindowNav: React.FC<WindowNavProps> = ({ collapsed }) => {
                     ref={searchInputRef}
                     type="text"
                     className="astermargin-window-nav-search-input"
-                    placeholder="Search chats"
-                    aria-label="Search chats"
+                    placeholder={uiText("Search chats")}
+                    aria-label={uiText("Search chats")}
                     value={history.searchQuery}
                     onChange={e => history.setSearchQuery(e.target.value)}
                     onKeyDown={handleSearchKeyDown}
@@ -329,7 +330,7 @@ const WindowNav: React.FC<WindowNavProps> = ({ collapsed }) => {
                     <button
                         type="button"
                         className="astermargin-window-nav-search-trailing astermargin-window-nav-search-clear"
-                        aria-label="Clear search"
+                        aria-label={uiText("Clear search")}
                         onClick={() => { history.setSearchQuery(''); searchInputRef.current?.focus(); }}
                     >
                         <CancelIcon width={12} height={12} />
@@ -340,8 +341,8 @@ const WindowNav: React.FC<WindowNavProps> = ({ collapsed }) => {
             {/* History */}
             <div className="astermargin-window-nav-scroll scrollbar" ref={scrollRef}>
                 {history.pinnedThreads.length > 0 && (
-                    <section className="astermargin-window-nav-group" aria-label="Pinned chats">
-                        <div className="astermargin-window-nav-group-label">Pinned</div>
+                    <section className="astermargin-window-nav-group" aria-label={uiText("Pinned chats")}>
+                        <div className="astermargin-window-nav-group-label">{uiText("Pinned")}</div>
                         {history.pinnedThreads.map(renderRow)}
                     </section>
                 )}
@@ -372,7 +373,7 @@ const WindowNav: React.FC<WindowNavProps> = ({ collapsed }) => {
 
                 <div ref={sentinelRef} style={{ minHeight: history.view.hasMore ? 32 : 1 }}>
                     {history.isLoading && hasRows && (
-                        <div className="display-flex items-center justify-center py-2" role="status" aria-label="Loading more chats">
+                        <div className="display-flex items-center justify-center py-2" role="status" aria-label={uiText("Loading more chats")}>
                             <Spinner size={16} />
                         </div>
                     )}

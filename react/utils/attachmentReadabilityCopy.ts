@@ -1,3 +1,4 @@
+import { uiText } from "./interfaceText";
 import type { ContentKind } from '@astermargin/agent-core/extract/document/shared/contentKinds';
 import type { ItemValidationState } from '../atoms/itemValidation';
 
@@ -137,7 +138,7 @@ export function attachmentIssueLabel(info: AttachmentReadabilityInfo): string {
     const kind = info.contentKind;
     // PDFs over the page limit are blocked without a distinctive status code.
     if (kind === 'pdf' && info.pageCount != null) {
-        return `PDF is too long (${info.pageCount} pages)`;
+        return uiText("PDF is too long ({count} pages)", { count: info.pageCount });
     }
     if (kind === 'image') {
         return 'Image needs a vision model';

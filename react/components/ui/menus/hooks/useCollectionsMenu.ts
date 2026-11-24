@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import { useEffect, useState } from 'react';
 import { getActiveZoteroLibraryId } from '../../../../utils/zoteroTargetContext';
@@ -102,10 +103,10 @@ export const useCollectionsMenu = ({
         const items = filteredCollections.map((collection) =>
             createCollectionMenuItem(collection, collectionMenuItemContext, searchQuery)
         );
-        let headerLabel = 'Select Collections';
+        let headerLabel = uiText("Select Collections");
         if (activeLibraryId) {
             const library = Zotero.Libraries.get(activeLibraryId);
-            headerLabel = library ? `Collections in ${library.name}` : headerLabel;
+            headerLabel = library ? uiText("Collections in {library}", { library: library.name }) : headerLabel;
         }
         const header: SearchMenuItem = { label: headerLabel, isGroupHeader: true, onClick: () => {} };
         if (verticalPosition === 'above') {

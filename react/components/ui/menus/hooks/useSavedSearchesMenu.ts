@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import { useEffect, useMemo, useState } from 'react';
 import { SavedSearchMenuItemContext, createSavedSearchMenuItem } from '../utils/menuItemFactories';
@@ -54,7 +55,7 @@ export const useSavedSearchesMenu = ({
             .map((search) => createSavedSearchMenuItem(search, savedSearchMenuItemContext, searchQuery));
         const library = libraryId ? Zotero.Libraries.get(libraryId) : null;
         const header: SearchMenuItem = {
-            label: library ? `Saved Searches in ${library.name}` : 'Select Saved Searches',
+            label: library ? uiText("Saved Searches in {library}", { library: library.name }) : uiText("Select Saved Searches"),
             isGroupHeader: true,
             onClick: () => {},
         };

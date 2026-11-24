@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import { useEffect, useRef, useState } from 'react';
 import { loadFullItemData } from '../../../../../src/utils/zoteroUtils';
@@ -210,10 +211,10 @@ export const useNotesMenu = ({
                 if (items.length === 0) {
                     setMenuItems([]);
                 } else {
-                    let headerLabel = searchQuery.trim() ? 'Search Results' : 'Recent Notes';
+                    let headerLabel = uiText(searchQuery.trim() ? "Search Results" : "Recent Notes");
                     if (!searchQuery.trim() && activeLibraryId) {
                         const library = Zotero.Libraries.get(activeLibraryId);
-                        headerLabel = library ? `Notes in ${library.name}` : headerLabel;
+                        headerLabel = library ? uiText("Notes in {library}", { library: library.name }) : headerLabel;
                     }
                     const header: SearchMenuItem = { label: headerLabel, isGroupHeader: true, onClick: () => {} };
 

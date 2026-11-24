@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { useSurfaceWindow } from '../../../runtime/SurfaceWindowContext';
 import React, { useCallback } from 'react';
 import { useSetAtom } from 'jotai';
@@ -85,7 +86,7 @@ const ReaderTipContent: React.FC<ReaderTipContentProps> = ({ onDismiss }) => {
                 </div>
 
                 <div className="font-color-primary text-xl font-semibold">
-                    Reading assistant
+                    {uiText("Reading assistant")}
                 </div>
             </div>
 
@@ -129,7 +130,7 @@ const ReaderTipContent: React.FC<ReaderTipContentProps> = ({ onDismiss }) => {
                     variant="ghost-secondary"
                     onClick={handleLearnMore}
                 >
-                    Learn more
+                    {uiText("Learn more")}
                 </Button>
                 <Button
                     variant="solid"
@@ -137,7 +138,7 @@ const ReaderTipContent: React.FC<ReaderTipContentProps> = ({ onDismiss }) => {
                     className="items-center"
                     style={{ padding: '4px 10px', alignItems: 'center', justifyContent: 'center', fontSize: '0.95rem' }}
                 >
-                    Open AsterMargin
+                    {uiText("Open AsterMargin")}
                 </Button>
             </div>
         </div>

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import PermissionMenu, { PermissionMenuOption } from '@astermargin/agent-ui/primitives/PermissionMenu';
 import HandIcon from '@astermargin/agent-ui/icons/HandIcon';
@@ -66,7 +67,7 @@ const LibraryPermissionButton: React.FC<LibraryPermissionButtonProps> = ({
         iconOnly={iconOnly}
         className={className}
         style={style ?? { padding: '2px 6px', fontSize: '0.80rem' }}
-        tooltipContent="How library changes are approved"
+        tooltipContent={uiText("How library changes are approved")}
         onAfterClose={onAfterClose}
     />
 );

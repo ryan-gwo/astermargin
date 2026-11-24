@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { useEffect, useState } from 'react';
 import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import { LibraryMenuItemContext, createLibraryMenuItem } from '../utils/menuItemFactories';
@@ -60,7 +61,7 @@ export const useLibrariesMenu = ({
         const items = filteredLibraries.map((library) =>
             createLibraryMenuItem(library, libraryMenuItemContext, searchQuery)
         );
-        const header: SearchMenuItem = { label: 'Select Library', isGroupHeader: true, onClick: () => {} };
+        const header: SearchMenuItem = { label: uiText("Select Library"), isGroupHeader: true, onClick: () => {} };
         if (verticalPosition === 'above') {
             setMenuItems([...items.reverse(), header]);
         } else {

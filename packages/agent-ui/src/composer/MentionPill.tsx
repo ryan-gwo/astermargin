@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useState } from 'react';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
 import { $getNodeByKey, NodeKey } from 'lexical';
@@ -61,7 +62,7 @@ export const MentionPill: React.FC<{
             {isHovered ? (
                 <span
                     role="button"
-                    aria-label="Remove mention"
+                    aria-label={uiText("Remove mention")}
                     className="source-remove"
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={handleRemove}

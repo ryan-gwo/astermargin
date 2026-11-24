@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useState, useEffect, useCallback } from 'react'
 import { credentials } from '@astermargin/agent-core/transport/credentials';
@@ -362,7 +363,7 @@ export default function SignInForm({ setErrorMsg, emailInputRef }: SignInFormPro
           <form onSubmit={handlePasswordSubmit} className="webapp-space-y-6">
             <div>
               <label htmlFor="password" className="block text-sm font-medium font-color-primary mb-2">
-                Password
+                {uiText("Password")}
               </label>
               <input
                 id="password"

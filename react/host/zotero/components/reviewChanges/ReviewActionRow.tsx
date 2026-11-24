@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { useSurfaceWindow } from '../../../../runtime/SurfaceWindowContext';
 import React, { useCallback, useMemo, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
@@ -331,7 +332,7 @@ export const ReviewActionRow: React.FC<ReviewActionRowProps> = ({
                                 onClick={handleUndo}
                                 loading={isBusy && activeButton === 'undo'}
                                 disabled={isDisabled}
-                                ariaLabel="Undo"
+                                ariaLabel={uiText("Undo")}
                             />
                         </Tooltip>
                     )}
@@ -358,7 +359,7 @@ export const ReviewActionRow: React.FC<ReviewActionRowProps> = ({
                                 loading={isBusy && activeButton === 'refresh'}
                                 style={GHOST_BUTTON_STYLE}
                             >
-                                Refresh
+                                {uiText("Refresh")}
                             </Button>
                         </Tooltip>
                     )}
@@ -386,7 +387,7 @@ export const ReviewActionRow: React.FC<ReviewActionRowProps> = ({
                                 onClick={handleApplyAnyway}
                                 disabled={isDisabled}
                                 loading={isBusy && activeButton === 'applyAnyway'}
-                                ariaLabel="Apply anyway"
+                                ariaLabel={uiText("Apply anyway")}
                             />
                         </Tooltip>
                     )}

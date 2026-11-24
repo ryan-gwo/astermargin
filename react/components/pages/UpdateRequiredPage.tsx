@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from "react";
 import { useAtomValue } from "jotai";
 import { minimumFrontendVersionAtom } from "../../atoms/profile";
@@ -66,7 +67,7 @@ const UpdateRequiredPage: React.FC = () => {
                                     <li className="display-flex flex-row gap-2 items-start">
                                         <span className="font-semibold">2.</span>
                                         <span className="display-flex flex-row gap-1 items-center flex-wrap">
-                                            Click on the settings icon
+                                            {uiText("Click on the settings icon")}
                                             <Icon icon={SettingsIcon} className="mx-05 mt-015" />
                                             and select <span className="font-semibold">"Check for Updates"</span>
                                         </span>

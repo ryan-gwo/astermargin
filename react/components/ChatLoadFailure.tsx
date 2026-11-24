@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import React from 'react';
 import Button from '@astermargin/agent-ui/primitives/Button';
 import type { ChatLoadError } from '../../src/services/threads/chatLoadError';
@@ -17,9 +18,9 @@ export default function ChatLoadFailure({ error, retry, loading = false }: {
         : 'Something went wrong while loading your chats. Please try again.';
     return (
         <div role="alert" className="display-flex flex-col items-center gap-2 py-3 px-3 text-center">
-            <span className="font-color-primary font-semibold text-sm">{title}</span>
-            <span className="font-color-tertiary text-sm">{message}</span>
-            <Button variant="outline" type="button" onClick={retry} disabled={loading}>Try again</Button>
+            <span className="font-color-primary font-semibold text-sm">{uiText(title)}</span>
+            <span className="font-color-tertiary text-sm">{uiText(message)}</span>
+            <Button variant="outline" type="button" onClick={retry} disabled={loading}>{uiText("Try again")}</Button>
         </div>
     );
 }

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { viewAttachment } from '../../runtime/navigation';
 import { isTableAttachment } from '../../../src/services/artifacts/tableItemIdentity';
 import { getTablesApi } from '../../../src/services/artifacts/tablesApi';
@@ -84,7 +85,7 @@ const AnnotationImagePopupPreview = ({ item }: { item: Zotero.Item }) => {
             {imageUri ? (
                 <img
                     src={imageUri}
-                    alt="Area annotation"
+                    alt={uiText("Area annotation")}
                     style={{ maxWidth: '100%', maxHeight: '150px', objectFit: 'contain' }}
                 />
             ) : (
@@ -216,18 +217,18 @@ export const MessageItemButton = forwardRef<HTMLButtonElement, MessageItemButton
         // the one in view.
         const useItemMenu = !isTableAttachment(item) && !revealInCollectionKey;
         const revealMenuItems: MenuItem[] = useItemMenu ? [] : isAnnotation
-            ? [{ label: 'Reveal in PDF', icon: FileViewIcon, onClick: () => navigateToAnnotation(item) }]
+            ? [{ label: uiText("Reveal in PDF"), icon: FileViewIcon, onClick: () => navigateToAnnotation(item) }]
             : item.isNote()
                 ? [
-                    { label: 'Reveal in Library', icon: LibraryIcon, onClick: revealInLibrary },
-                    { label: 'Open Note', icon: NoteIcon, onClick: () => openNoteById(item.id), disabled: isItemActiveTab(item.id) },
+                    { label: uiText("Reveal in Library"), icon: LibraryIcon, onClick: revealInLibrary },
+                    { label: uiText("Open Note"), icon: NoteIcon, onClick: () => openNoteById(item.id), disabled: isItemActiveTab(item.id) },
                 ]
                 : isFileAttachment
                     ? [
-                        { label: 'Reveal in Library', icon: LibraryIcon, onClick: revealInLibrary },
-                        { label: 'Open Attachment', icon: FileViewIcon, onClick: openAttachment, disabled: isItemActiveTab(item.id) },
+                        { label: uiText("Reveal in Library"), icon: LibraryIcon, onClick: revealInLibrary },
+                        { label: uiText("Open Attachment"), icon: FileViewIcon, onClick: openAttachment, disabled: isItemActiveTab(item.id) },
                     ]
-                    : [{ label: 'Reveal in Library', icon: LibraryIcon, onClick: revealInLibrary }];
+                    : [{ label: uiText("Reveal in Library"), icon: LibraryIcon, onClick: revealInLibrary }];
 
         // Right-click "remove" menu for this button. A left-click on the "x"
         // removes just this item; right-clicking the button opens a menu with
@@ -346,7 +347,7 @@ export const MessageItemButton = forwardRef<HTMLButtonElement, MessageItemButton
                         ? <AnnotationImagePopupPreview item={item} />
                         : null,
                     status: validation && !validation.isValidating && validation.state !== 'readable' && validation.reason
-                        ? { label: validation.reason }
+                        ? { label: uiText(validation.reason) }
                         : null,
                 };
             }
@@ -369,9 +370,9 @@ export const MessageItemButton = forwardRef<HTMLButtonElement, MessageItemButton
                 {getIconElement()}
                 <span className={`truncate ${isStrongError ? 'font-color-red' : isUnreadable ? 'font-color-secondary' : ''}`}>
                     {tabContextType === 'reader'
-                        ? isStrongError ? 'Invalid File' : isUnreadable ? 'Unreadable File' : 'Current File'
+                        ? uiText(isStrongError ? "Invalid File" : isUnreadable ? "Unreadable File" : "Current File")
                         : tabContextType === 'note'
-                            ? 'Current Note'
+                            ? uiText("Current Note")
                             : displayName || '...'}
                 </span>
 

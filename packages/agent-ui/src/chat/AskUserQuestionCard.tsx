@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { PendingQuestion } from '@astermargin/agent-core/run-state/pendingQuestions';
 import type {
@@ -183,7 +184,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                             <IconButton
                                 icon={ArrowLeftIcon}
                                 variant="ghost-secondary"
-                                ariaLabel="Previous question"
+                                ariaLabel={uiText("Previous question")}
                                 onClick={() => setIndex((i) => Math.max(0, i - 1))}
                                 disabled={index === 0 || isSubmitted}
                             />
@@ -193,7 +194,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                             <IconButton
                                 icon={ArrowRightIcon}
                                 variant="ghost-secondary"
-                                ariaLabel="Next question"
+                                ariaLabel={uiText("Next question")}
                                 onClick={() => setIndex((i) => Math.min(total - 1, i + 1))}
                                 disabled={isLast || isSubmitted}
                             />
@@ -256,7 +257,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                                 <button
                                     type="button"
                                     aria-pressed={isOther}
-                                    aria-label="Other (custom answer)"
+                                    aria-label={uiText("Other (custom answer)")}
                                     disabled={isSubmitted}
                                     onClick={() => handleOtherClick(question)}
                                     className="display-flex mt-15"
@@ -279,7 +280,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                                     ref={textareaRef}
                                     className="chat-input"
                                     rows={1}
-                                    placeholder="Other..."
+                                    placeholder={uiText("Other...")}
                                     aria-label={`Custom answer for: ${question.question}`}
                                     value={draft.customTexts[question.id] ?? ''}
                                     disabled={isSubmitted}
@@ -318,11 +319,11 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                             <Button
                                 variant="outline"
                                 rightIcon={StopStrokeIcon}
-                                ariaLabel="Stop generating"
+                                ariaLabel={uiText("Stop generating")}
                                 style={{ padding: '2px 5px' }}
                                 onClick={onStop}
                             >
-                                Stop
+                                {uiText("Stop")}
                             </Button>
                         </Tooltip>
                     )}
@@ -334,19 +335,19 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                         disabled={isSubmitted || (isLast && disabled)}
                         title={isLast && disabled ? heldCaption : undefined}
                     >
-                        Skip
+                        {uiText("Skip")}
                     </Button>
                     <Button
                         variant="solid"
-                        ariaLabel={isLast ? 'Submit answers' : 'Next question'}
+                        ariaLabel={isLast ? 'Submit answers' : uiText("Next question")}
                         style={{ padding: '2px 5px' }}
                         onClick={handleNext}
                         disabled={!isQuestionAnswered(question, draft) || isSubmitted || (isLast && disabled)}
                         title={isLast && disabled ? heldCaption : undefined}
                     >
                         {isLast
-                            ? (<span>Submit <span className="opacity-50">⏎</span></span>)
-                            : (<span>Next <span className="opacity-50">⏎</span></span>)}
+                            ? (<span>{uiText("Submit")}{' '}<span className="opacity-50">⏎</span></span>)
+                            : (<span>{uiText("Next")}{' '}<span className="opacity-50">⏎</span></span>)}
                     </Button>
                 </div>
             </div>

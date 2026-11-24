@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { CancelIcon, Icon } from '../../icons/icons';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
@@ -26,7 +27,7 @@ const FeatureTipContent: React.FC<FeatureTipContentProps> = ({ tipId, onDismiss 
                     <Icon icon={tip.icon} size={18} className="font-color-secondary" />
                     <span className="font-color-primary text-lg font-medium truncate">{tip.title}</span>
                 </div>
-                <IconButton icon={CancelIcon} variant="ghost-secondary" onClick={onDismiss} ariaLabel="Dismiss" />
+                <IconButton icon={CancelIcon} variant="ghost-secondary" onClick={onDismiss} ariaLabel={uiText("Dismiss")} />
             </div>
 
             <div className="font-color-secondary text-base">{tip.text}</div>
@@ -38,7 +39,7 @@ const FeatureTipContent: React.FC<FeatureTipContentProps> = ({ tipId, onDismiss 
                     ? <Actions dismiss={onDismiss} />
                     : (
                         <Button variant="outline" onClick={onDismiss} style={{ padding: '3px 10px' }}>
-                            Got it
+                            {uiText("Got it")}
                         </Button>
                     )}
             </div>

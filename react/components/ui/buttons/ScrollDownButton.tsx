@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { Icon, ArrowDownIcon } from '../../icons/icons';
 import { activeDialogAtom, hasPopupMessagesAtom } from '../../../atoms/ui';
@@ -78,7 +79,7 @@ export const ScrollDownButton: React.FC<ScrollDownButtonProps> = ({
                 <div className="absolute top-0 left-1/2 -translate-x-1/2 z-10">
                     <button
                         onClick={onClick}
-                        aria-label="Scroll to latest message"
+                        aria-label={uiText("Scroll to latest message")}
                         aria-hidden={!isVisible}
                         tabIndex={isVisible ? 0 : -1}
                         className={`scroll-down-button variant-ghost-secondary ${isStreaming ? 'is-streaming' : ''} ${className || ''}`}

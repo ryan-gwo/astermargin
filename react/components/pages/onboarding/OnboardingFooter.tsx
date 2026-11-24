@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from "react";
 import { Spinner, ArrowRightIcon, ArrowLeftIcon } from "../../icons/icons";
 import Button, { ButtonVariant } from "@astermargin/agent-ui/primitives/Button";
@@ -84,14 +85,14 @@ const OnboardingFooter: React.FC<OnboardingFooterProps> = ({
                                 className="text-link cursor-pointer" 
                                 onClick={() => Zotero.launchURL(process.env.WEBAPP_BASE_URL + '/terms')}
                             >
-                                Terms of Service
+                                {uiText("Terms of Service")}
                             </a>
                             {` and `}
                             <a 
                                 className="text-link cursor-pointer" 
                                 onClick={() => Zotero.launchURL(process.env.WEBAPP_BASE_URL + '/privacy-policy')}
                             >
-                                Privacy Policy
+                                {uiText("Privacy Policy")}
                             </a>.
                         </>
                     ) : (

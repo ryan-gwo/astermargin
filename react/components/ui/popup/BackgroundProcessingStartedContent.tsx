@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { useSetAtom } from 'jotai';
 import Button from '@astermargin/agent-ui/primitives/Button';
@@ -46,14 +47,14 @@ export default function BackgroundProcessingStartedContent(props: {
                         showPreferences();
                     }}
                 >
-                    Track progress
+                    {uiText("Track progress")}
                 </a>
                 <div className="display-flex flex-row gap-2">
                     <Button variant="outline" onClick={dismiss}>
-                        Wait for idle
+                        {uiText("Wait for idle")}
                     </Button>
                     <Button variant="solid" rightIcon={PlayIcon} onClick={startNow}>
-                        Start now
+                        {uiText("Start now")}
                     </Button>
                 </div>
             </div>

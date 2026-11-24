@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { useSetAtom } from 'jotai';
 import Button from '@astermargin/agent-ui/primitives/Button';
@@ -53,7 +54,7 @@ export default function BackgroundProcessingWelcomeContent(props: {
             <CloudFeatureList />
             <div className="display-flex flex-row gap-2 justify-end flex-wrap pt-2">
                 <Button variant="outline" onClick={later}>
-                    Not now
+                    {uiText("Not now")}
                 </Button>
                 <Button variant="solid" onClick={enable}>
                     Accept and turn on

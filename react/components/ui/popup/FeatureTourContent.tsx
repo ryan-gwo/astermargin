@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useState, useCallback } from 'react';
 import { FeatureStep, ExamplePrompt } from '../../../constants/versionUpdateMessages';
 import Button from '@astermargin/agent-ui/primitives/Button';
@@ -147,7 +148,7 @@ const FeatureTourContent: React.FC<FeatureTourContentProps> = ({ steps, onComple
                             Zotero.launchURL(step.learnMoreUrl!);
                         }}
                     >
-                        Learn more →
+                        {uiText("Learn more →")}
                     </a>
                 )}
                 
@@ -176,7 +177,7 @@ const FeatureTourContent: React.FC<FeatureTourContentProps> = ({ steps, onComple
                                 variant="ghost-secondary" 
                                 onClick={onComplete}
                             >
-                                Skip
+                                {uiText("Skip")}
                             </Button>
                         )}
                         <Button 

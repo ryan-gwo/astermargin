@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useAtom } from 'jotai';
 import { CSSIcon, LibraryIcon } from '../icons/icons';
@@ -40,7 +41,7 @@ export const MessageViewButton: React.FC<MessageViewButtonProps> = ({
         canEdit: true,
         disabled,
         extraMenuItems: [{
-            label: 'Reveal in Library',
+            label: uiText("Reveal in Library"),
             icon: LibraryIcon,
             onClick: revealView,
         }],
@@ -57,7 +58,7 @@ export const MessageViewButton: React.FC<MessageViewButtonProps> = ({
         icon,
         title: view.name,
         subtitle: { text: kindLabel },
-        action: { icon: LibraryIcon, label: 'Reveal in library' },
+        action: { icon: LibraryIcon, label: uiText("Reveal in library") },
     };
 
     return (

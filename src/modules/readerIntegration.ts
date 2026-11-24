@@ -11,6 +11,7 @@
  * Lives in the esbuild bundle — must NOT import from react/store or Jotai.
  */
 
+import { getString } from "../utils/locale";
 import { captureReaderActionLocation } from '../runtime/readerActionLocation';
 import { resolveChatWindow } from '../runtime/navigation';
 
@@ -115,7 +116,7 @@ function onRenderTextSelectionPopup(event: any): void {
     const explainBtn = doc.createElement('button');
     explainBtn.className = 'toolbar-button wide-button';
     explainBtn.style.cssText = 'flex: 1;';
-    explainBtn.textContent = 'Explain';
+    explainBtn.textContent = getString("reader-explain");
     explainBtn.addEventListener('click', () => {
         void dispatchReaderAction('explain', annotationText, page, readerItemID, reader).catch(Zotero.logError);
     });
@@ -123,7 +124,7 @@ function onRenderTextSelectionPopup(event: any): void {
     const askBtn = doc.createElement('button');
     askBtn.className = 'toolbar-button wide-button';
     askBtn.style.cssText = 'flex: 1;';
-    askBtn.textContent = 'Ask...';
+    askBtn.textContent = getString("reader-ask");
     askBtn.addEventListener('click', () => {
         void dispatchReaderAction('ask', annotationText, page, readerItemID, reader).catch(Zotero.logError);
     });
@@ -168,7 +169,7 @@ function onCreateViewContextMenu(event: any): void {
     // Flat items — append does not support submenu/groups nesting
     append(
         {
-            label: 'Explain with AsterMargin',
+            label: getString("reader-explain-with"),
             disabled: !hasSelection,
             persistent: true,
             onCommand: () => {
@@ -178,7 +179,7 @@ function onCreateViewContextMenu(event: any): void {
             },
         },
         {
-            label: 'Ask AsterMargin...',
+            label: getString("reader-ask-with"),
             disabled: !hasSelection,
             persistent: true,
             onCommand: () => {
@@ -225,14 +226,14 @@ function onCreateAnnotationContextMenu(event: any): void {
     // Flat items: disabled "AsterMargin" header + action items (submenus not supported here)
     append(
         {
-            label: 'Explain with AsterMargin...',
+            label: getString("reader-explain-with") + "…",
             persistent: true,
             onCommand: () => {
                 void dispatchAnnotationAction('explain', annotationIds, readerItemID, reader).catch(Zotero.logError);
             },
         },
         {
-            label: 'Ask AsterMargin...',
+            label: getString("reader-ask-with"),
             persistent: true,
             onCommand: () => {
                 void dispatchAnnotationAction('ask', annotationIds, readerItemID, reader).catch(Zotero.logError);

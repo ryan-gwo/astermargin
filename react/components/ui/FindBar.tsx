@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useRef } from 'react';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
 import { ArrowDownIcon, ArrowUpIcon, CancelIcon, SearchIcon } from '../icons/icons';
@@ -83,14 +84,14 @@ const FindBar: React.FC<FindBarProps> = ({
     const hasMatches = matchCount > 0;
 
     return (
-        <div ref={barRef} className="astermargin-find-bar" role="search" aria-label="Find in chat">
+        <div ref={barRef} className="astermargin-find-bar" role="search" aria-label={uiText("Find in chat")}>
             <SearchIcon width={13} height={13} className="astermargin-find-bar-icon" />
             <input
                 ref={inputRef}
                 type="text"
                 className="astermargin-find-bar-input"
-                placeholder="Find in chat"
-                aria-label="Find in chat"
+                placeholder={uiText("Find in chat")}
+                aria-label={uiText("Find in chat")}
                 value={query}
                 onChange={(event) => onQueryChange(event.target.value)}
                 onKeyDown={handleKeyDown}
@@ -105,23 +106,23 @@ const FindBar: React.FC<FindBarProps> = ({
                 variant="ghost"
                 onClick={onPrevious}
                 disabled={!hasMatches}
-                ariaLabel="Previous match"
-                title="Previous match (Shift+Enter)"
+                ariaLabel={uiText("Previous match")}
+                title={uiText("Previous match (Shift+Enter)")}
             />
             <IconButton
                 icon={ArrowDownIcon}
                 variant="ghost"
                 onClick={onNext}
                 disabled={!hasMatches}
-                ariaLabel="Next match"
-                title="Next match (Enter)"
+                ariaLabel={uiText("Next match")}
+                title={uiText("Next match (Enter)")}
             />
             <IconButton
                 icon={CancelIcon}
                 variant="ghost"
                 onClick={onClose}
-                ariaLabel="Close find bar"
-                title="Close (Esc)"
+                ariaLabel={uiText("Close find bar")}
+                title={uiText("Close (Esc)")}
             />
         </div>
     );

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useCallback, useEffect, useState } from "react";
 import Button from "@astermargin/agent-ui/primitives/Button";
@@ -373,7 +374,7 @@ const BillingSection: React.FC = () => {
     return (
         <>
             <div className="font-color-secondary text-base mb-2 ml-1">
-                Credits power AsterMargin's AI. Most messages cost 1 credit. Some actions such as external search or batch extraction cost extra. <DocLink path="credits">Learn more &rarr;</DocLink>
+                Credits power AsterMargin's AI. Most messages cost 1 credit. Some actions such as external search or batch extraction cost extra. <DocLink path="credits">{uiText("Learn more →")}</DocLink>
             </div>
 
             {/* --- Section 1: Plan Card --- */}
@@ -404,7 +405,7 @@ const BillingSection: React.FC = () => {
                 {!hasPlan ? (
                     <>
                         <div className="text-2xl font-color-primary font-bold">
-                            No active plan
+                            {uiText("No active plan")}
                         </div>
                         <div className="text-base font-color-secondary" style={{ marginBottom: '12px' }}>
                             Subscribe to get monthly credits and Plus Tools (external search, batch extraction, and more).
@@ -419,7 +420,7 @@ const BillingSection: React.FC = () => {
                         {plansError && (
                             <div className="display-flex flex-row items-center gap-3 flex-wrap ml-1 -mt-3" style={{ padding: '12px 0' }}>
                                 <span className="font-color-secondary">{plansError}</span>
-                                <Button variant="ghost-secondary" onClick={fetchPlans} style={{ padding: '4px 6px' }}>Retry</Button>
+                                <Button variant="ghost-secondary" onClick={fetchPlans} style={{ padding: '4px 6px' }}>{uiText("Retry")}</Button>
                             </div>
                         )}
 
@@ -540,7 +541,7 @@ const BillingSection: React.FC = () => {
                         target="_blank"
                         rel="noopener noreferrer"
                     >
-                        Terms of Service
+                        {uiText("Terms of Service")}
                     </a>
                     {' '}and{' '}
                     <a
@@ -550,7 +551,7 @@ const BillingSection: React.FC = () => {
                         target="_blank"
                         rel="noopener noreferrer"
                     >
-                        Privacy Policy
+                        {uiText("Privacy Policy")}
                     </a>.
                 </div>
             )}
@@ -635,7 +636,7 @@ const BillingSection: React.FC = () => {
                     title="Credit Limit"
                     description={
                         <>
-                            Ask before a single request uses more than this many credits in total. Leave empty to never ask. Only relevant when using AsterMargin credits. <DocLink path="credits">Learn more</DocLink>
+                            Ask before a single request uses more than this many credits in total. Leave empty to never ask. Only relevant when using AsterMargin credits. <DocLink path="credits">{uiText("Learn more")}</DocLink>
                         </>
                     }
                     control={

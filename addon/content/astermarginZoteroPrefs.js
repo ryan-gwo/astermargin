@@ -19,6 +19,15 @@ document.l10n.addResourceIds(["astermargin-addon.ftl"]);
 
 const { Zotero: prefsZotero } = ChromeUtils.importESModule("chrome://zotero/content/zotero.mjs");
 
+const paneObserver = new window.MutationObserver(() => {
+    const pane = document.getElementById("astermargin-zotero-prefpane");
+    if (!pane) return;
+    paneObserver.disconnect();
+    prefsZotero.AsterMargin?.hooks.onLocalizePluginElements(pane);
+});
+paneObserver.observe(document.documentElement, { childList: true, subtree: true });
+window.addEventListener("unload", () => paneObserver.disconnect(), { once: true });
+
 document.addEventListener("command", async (event) => {
     const target = event.target;
     if (!target || target.id !== "astermargin-open-prefs-btn") {
@@ -29,8 +38,9 @@ document.addEventListener("command", async (event) => {
         await prefsZotero.AsterMargin.hooks.onOpenPreferences();
     } catch (error) {
         prefsZotero.logError(error);
-        const title = await document.l10n.formatValue("astermargin-preferences-pane-label");
-        const message = await document.l10n.formatValue("astermargin-preferences-pane-open-failed");
+        const hooks = prefsZotero.AsterMargin?.hooks;
+        const title = hooks?.getString("preferences-pane-label") ?? "AsterMargin";
+        const message = hooks?.getString("preferences-pane-open-failed") ?? String(error);
         prefsZotero.alert(window, title, message);
     }
 });

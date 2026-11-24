@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useCallback } from 'react';
 import { useSetAtom } from 'jotai';
 import { SpeedIcon, CancelIcon, Icon } from '../icons/icons';
@@ -65,7 +66,7 @@ const CreditInfoBar: React.FC<CreditInfoBarProps> = ({ warning }) => {
             <IconButton
                 variant="ghost-secondary"
                 icon={CancelIcon}
-                ariaLabel="Dismiss credit info"
+                ariaLabel={uiText("Dismiss credit info")}
                 onClick={handleDismiss}
                 className="scale-85"
             />

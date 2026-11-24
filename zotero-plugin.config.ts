@@ -3,6 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { defineConfig } from "zotero-plugin-scaffold";
 import pkg from "./package.json";
+import manifest from "./addon/manifest.json";
 
 const { mode, definitions } = loadBuildEnvironment();
 
@@ -36,9 +37,7 @@ export default defineConfig({
   xpiName: "astermargin",
   id: pkg.config.addonID,
   namespace: pkg.config.addonRef,
-  updateURL: `https://github.com/{{owner}}/{{repo}}/releases/download/release/${
-    pkg.version.includes("-") ? "update-beta.json" : "update.json"
-  }`,
+  updateURL: manifest.applications.zotero.update_url,
   xpiDownloadLink:
     "https://github.com/{{owner}}/{{repo}}/releases/download/v{{version}}/{{xpiName}}.xpi",
 

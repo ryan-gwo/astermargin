@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 
 type ActionStatus = 'pending' | 'applied' | 'rejected' | 'undone' | 'error' | 'awaiting';
@@ -40,7 +41,7 @@ export const ConfirmExtractionPreview: React.FC<ConfirmExtractionPreviewProps> =
                 ) : (
                     <span>
                         {label ? (
-                            <>Extracting{' '}
+                            <>{uiText("Extracting")}{' '}
                             <span className="font-color-primary font-medium">{label}</span>
                             {' '}from{' '}
                             <span className="font-color-primary font-medium">{attachmentCount} paper{attachmentCount !== 1 ? 's' : ''}</span></>

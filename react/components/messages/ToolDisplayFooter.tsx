@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from 'react';
 import { Icon, ArrowUpIcon } from '../icons/icons';
 
@@ -19,7 +20,7 @@ export const ToolDisplayFooter = React.memo(function ToolDisplayFooter(props: To
             <Icon
                 icon={ArrowUpIcon}
                 className={`scale-75 -mb-1 transition-colors duration-150 ${isHovered ? 'font-color-primary' : 'font-color-secondary'}`}
-                aria-label="Toggle content"
+                aria-label={uiText("Toggle content")}
             />
         </div>
     );

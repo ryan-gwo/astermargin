@@ -25,6 +25,8 @@
  */
 
 import { isTableItem, type TableRef } from '../services/artifacts/tableItemIdentity';
+import { interfaceLocaleOverridesHost } from '../utils/interfaceLanguage';
+import { localizePluginElement } from '../utils/locale';
 
 /** Zotero's l10n id for its "Open <type> in New Tab/Window" item menu entries. */
 const ZOTERO_VIEW_ATTACHMENT_L10N_ID = 'item-menu-viewAttachment';
@@ -38,7 +40,7 @@ const TABLE_WINDOW_ENTRY_ATTR = 'data-astermargin-table-window';
 export type TableWindowOpen = (ref: TableRef) => Promise<{ error: string } | { ok: true }>;
 
 /** Interface languages AsterMargin has translated strings for. */
-const ASTERMARGIN_UI_LANGUAGES = ['en'];
+const ASTERMARGIN_UI_LANGUAGES = ['en', 'zh'];
 
 interface ViewAttachmentArgs {
     attachmentType?: unknown;
@@ -48,7 +50,7 @@ interface ViewAttachmentArgs {
 function uiLanguageSupported(): boolean {
     const locale = typeof Zotero.locale === 'string' ? Zotero.locale : '';
     const language = locale.split(/[-_]/)[0].toLowerCase();
-    return ASTERMARGIN_UI_LANGUAGES.includes(language);
+    return ASTERMARGIN_UI_LANGUAGES.includes(language) || interfaceLocaleOverridesHost();
 }
 
 function parseArgs(raw: string | null): ViewAttachmentArgs | null {
@@ -97,6 +99,7 @@ export function labelTableOpenEntries(
     if (!l10n) return;
     for (const { entry, openIn } of snapshotOpenEntries(popup)) {
         l10n.setAttributes(entry, TABLE_VIEW_L10N_ID, { count: items.length, openIn });
+        if (interfaceLocaleOverridesHost()) localizePluginElement(entry);
     }
 }
 

@@ -849,6 +849,8 @@ export type TableDisplay =
     | { status: 'unavailable'; reason: string };
 
 export interface ClientHost {
+    /** Translate UI copy in the host's active interface language. */
+    translate?: (message: string) => string;
     navigation?: NavigationHost;
     itemData?: ItemDataHost;
     documentExport?: DocumentExportHost;

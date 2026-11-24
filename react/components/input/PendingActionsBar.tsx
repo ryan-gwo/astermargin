@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useAtomValue } from 'jotai';
 import { pendingApprovalsAtom } from '../../agents/agentActions';
@@ -68,7 +69,7 @@ const PendingActionsBar: React.FC<PendingActionsBarProps> = ({
                     title={heldCaption ? RECONNECT_UNAVAILABLE_TOOLTIP : undefined}
                     style={{ padding: '2px 8px', fontSize: '0.875rem' }}
                 >
-                    Reject All
+                    {uiText("Reject All")}
                 </Button>
                 <Button
                     variant="outline"
@@ -77,7 +78,7 @@ const PendingActionsBar: React.FC<PendingActionsBarProps> = ({
                     title={heldCaption ? RECONNECT_UNAVAILABLE_TOOLTIP : undefined}
                     style={{ padding: '2px 8px', fontSize: '0.875rem' }}
                 >
-                    Approve All
+                    {uiText("Approve All")}
                 </Button>
             </div>
         </div>

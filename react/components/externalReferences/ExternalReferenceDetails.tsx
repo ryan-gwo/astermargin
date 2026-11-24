@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { ExternalReference } from '@astermargin/agent-core/types/externalReferences';
 import { externalRecordPresentation } from '@astermargin/agent-core/citations/externalRecordDisplay';
@@ -20,7 +21,7 @@ const GenericReferenceDetails: React.FC<ExternalReferenceDetailsProps> = ({ item
             header={(
                 <>
                     <div className="text-lg font-bold font-color-primary leading-tight pr-8">{item.title || 'Untitled Item'}</div>
-                    {item.is_retracted && <RecordTags><RecordBadge label="Retracted" tone="red" /></RecordTags>}
+                    {item.is_retracted && <RecordTags><RecordBadge label={uiText("Retracted")} tone="red" /></RecordTags>}
                     {authors && (
                         <div className="font-color-primary">{authors}</div>
                     )}
@@ -36,7 +37,7 @@ const GenericReferenceDetails: React.FC<ExternalReferenceDetailsProps> = ({ item
             )}
             footer={<DetailsActions item={item} />}
         >
-            {item.abstract && <DetailsSection title="Abstract">{item.abstract.trim()}</DetailsSection>}
+            {item.abstract && <DetailsSection title={uiText("Abstract")}>{item.abstract.trim()}</DetailsSection>}
         </DetailsFrame>
     );
 };

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from "react";
 
 interface OnboardingHeaderProps {
@@ -21,7 +22,7 @@ const OnboardingHeader: React.FC<OnboardingHeaderProps> = ({
                 <img 
                     src="chrome://astermargin/content/icons/astermargin.png" 
                     style={{ width: '4rem', height: '4rem' }} 
-                    alt="AsterMargin logo"
+                    alt={uiText("AsterMargin logo")}
                 />
                 <div className="display-flex flex-row gap-1 items-center">
                 <div className="text-2xl font-semibold mb-2">{title}</div>

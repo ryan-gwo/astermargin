@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from "react";
 import { useAtomValue } from "jotai";
 import IconButton from "@astermargin/agent-ui/primitives/IconButton";
@@ -28,7 +29,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ emailInputRef }) => {
                     <IconButton
                         variant="ghost"
                         icon={SettingsIcon}
-                        ariaLabel="Settings"
+                        ariaLabel={uiText("Settings")}
                         onClick={() => openPreferencesWindow('models')}
                     />
                 </Tooltip>
@@ -67,7 +68,7 @@ const LoginPage: React.FC<LoginPageProps> = ({ emailInputRef }) => {
                             target='_blank'
                             rel='noopener noreferrer'
                         >
-                            Learn more
+                            {uiText("Learn more")}
                         </a>
                     </span>
                 </div>

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from "react";
 import { useAtomValue } from "jotai";
 import { profileSyncStatusAtom } from "../../atoms/profile";
@@ -56,7 +57,7 @@ const ProfileLoadingPage: React.FC = () => {
                             variant="outline"
                             onClick={() => triggerProfileRefresh()}
                         >
-                            Try again
+                            {uiText("Try again")}
                         </Button>
                         {isFatal && status.helpUrl && (
                             <a

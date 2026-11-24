@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import { useSurfaceWindow } from '../runtime/SurfaceWindowContext';
 import React, { useRef, useCallback } from 'react';
 import { CancelIcon, PlusSignIcon, PictureInPictureIcon, ChattingIcon } from './icons/icons';
@@ -77,7 +78,7 @@ const Header: React.FC<HeaderProps> = ({ onClose, isWindow = false }) => {
                             icon={CancelIcon}
                             onClick={handleClose}
                             className="scale-14"
-                            ariaLabel="Close AsterMargin panel"
+                            ariaLabel={uiText("Close AsterMargin panel")}
                         />
                     </Tooltip>
                 )}
@@ -90,7 +91,7 @@ const Header: React.FC<HeaderProps> = ({ onClose, isWindow = false }) => {
                             icon={ChattingIcon}
                             onClick={() => setIsThreadListView(!isThreadListView)}
                             className={`scale-14 ${isThreadListView ? 'thread-list-toggle-active' : ''}`}
-                            ariaLabel="Show chat history"
+                            ariaLabel={uiText("Show chat history")}
                         />
                     </Tooltip>
                     <Tooltip content="New chat" secondaryContent={newChatShortcut} showArrow singleLine>
@@ -98,7 +99,7 @@ const Header: React.FC<HeaderProps> = ({ onClose, isWindow = false }) => {
                             icon={PlusSignIcon}
                             onClick={handleNewThread}
                             className="scale-14"
-                            ariaLabel="New chat"
+                            ariaLabel={uiText("New chat")}
                             disabled={runsCount === 0}
                         />
                     </Tooltip>
@@ -113,7 +114,7 @@ const Header: React.FC<HeaderProps> = ({ onClose, isWindow = false }) => {
                         {threadId && !isFirstRunVisible && (
                             <ThreadMenuButton
                                 className="scale-14"
-                                ariaLabel="Chat actions"
+                                ariaLabel={uiText("Chat actions")}
                             />
                         )}
                         {/* Open in separate window */}
@@ -123,7 +124,7 @@ const Header: React.FC<HeaderProps> = ({ onClose, isWindow = false }) => {
                                     icon={PictureInPictureIcon}
                                     onClick={() => openAsterMarginWindow()}
                                     className="scale-14"
-                                    ariaLabel="Open in separate window"
+                                    ariaLabel={uiText("Open in separate window")}
                                 />
                             </Tooltip>
                         )}

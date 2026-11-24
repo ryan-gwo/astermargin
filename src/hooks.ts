@@ -49,7 +49,8 @@ import { cancelAllActiveTasks } from "./utils/backgroundTasks";
 import { compareVersions } from "./utils/compareVersions";
 import { resolveLocalMode } from "./utils/backendConfiguration";
 import { configurePDFForAsterMargin } from "./utils/configurePDFForAsterMargin";
-import { getString, initLocale } from "./utils/locale";
+import { getString, initLocale, localizePluginElement } from "./utils/locale";
+import { interfaceLocaleOverridesHost, normalizeInterfaceLanguage, resolveInterfaceLocale } from "./utils/interfaceLanguage";
 import { clearPref, getPref, setPref } from "./utils/prefs";
 import { addPendingVersionNotification } from "./utils/versionNotificationPrefs";
 import { createZToolkit } from "./utils/ztoolkit";
@@ -362,6 +363,10 @@ async function onStartup() {
     if (process.env.BUILD_ENV === 'staging' && !Zotero.Debug.storing) {
         Zotero.Debug.setStore(true);
     }
+    addon.interfaceLocale = resolveInterfaceLocale(
+        normalizeInterfaceLanguage(getPref("interfaceLanguage")),
+        Zotero.locale,
+    );
     initLocale();
     ztoolkit.log("Startup");
 
@@ -550,11 +555,13 @@ function onStandaloneWindowLoad(win: Window): void {
     if (win.closed || addon.runtime.getWindow(win)) return;
     addon.runtime.attachWindow(win, "standalone");
     registerMainWindowFtl(win);
+    onLocalizePluginElements(win.document);
     AsterMarginUIFactory.registerChatPanel(win);
 }
 
 /** A table window loaded: its table (`tableWindow.ts`), and AsterMargin's shortcuts. */
 function onTableWindowLoaded(win: Window): void {
+    onLocalizePluginElements(win.document);
     onTableWindowLoad(win);
     AsterMarginUIFactory.attachShortcuts(win);
 }
@@ -1233,7 +1240,18 @@ async function onOpenPreferences(): Promise<void> {
     }
 }
 
+/** Use the plugin locale for its controls while leaving Zotero-owned controls alone. */
+function onLocalizePluginElements(root: ParentNode): void {
+    if (!interfaceLocaleOverridesHost()) return;
+    const elements = root.querySelectorAll<Element>('[data-l10n-id^="astermargin-"]');
+    for (let i = 0; i < elements.length; i++) {
+        localizePluginElement(elements[i]);
+    }
+}
+
 export default {
+    onLocalizePluginElements,
+    getString,
     onOpenPreferences,
     onStartup,
     onShutdown,

@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom, useStore } from 'jotai';
 import { logger } from '@astermargin/agent-core/platform/logger';
@@ -250,7 +251,7 @@ export const ChangesCard: React.FC<ChangesCardProps> = ({ runId, rows }) => {
                             iconClassName="font-color-red"
                             onClick={handleBulkReject}
                             disabled={bulkDisabled}
-                            ariaLabel="Reject all"
+                            ariaLabel={uiText("Reject all")}
                         />
                     </Tooltip>
                     {showBulkApply && (
@@ -261,7 +262,7 @@ export const ChangesCard: React.FC<ChangesCardProps> = ({ runId, rows }) => {
                                 iconClassName="font-color-green scale-14"
                                 onClick={handleBulkApply}
                                 disabled={bulkDisabled}
-                                ariaLabel="Apply all"
+                                ariaLabel={uiText("Apply all")}
                             />
                         </Tooltip>
                     )}

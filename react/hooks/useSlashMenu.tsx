@@ -1,3 +1,5 @@
+import { uiText } from "../utils/interfaceText";
+import { actionDisplayText } from "../utils/actionDisplayText";
 import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { useAtom, useSetAtom, useAtomValue } from 'jotai';
 import { PlusSignIcon, BookSearchIcon, LayersIcon, HighlighterIcon, ZapIcon, QuillWriteIcon } from '../components/icons/icons';
@@ -99,7 +101,7 @@ export function useSlashMenu(
 
         // "Create Action" footer
         const createActionItem: SearchMenuItem = {
-            label: 'Create Action',
+            label: uiText("Create Action"),
             icon: PlusSignIcon,
             onClick: () => {
                 slashTriggerRef.current = null;
@@ -112,7 +114,9 @@ export function useSlashMenu(
         // The typed query matches against both the action title and its
         // /command name (what the pill will actually insert).
         const queryPosition = (a: Action): number => {
-            const inTitle = a.title.toLowerCase().indexOf(query);
+            const originalTitle = a.title.toLowerCase().indexOf(query);
+            const displayTitle = actionDisplayText(a, "title").toLowerCase().indexOf(query);
+            const inTitle = originalTitle < 0 ? displayTitle : originalTitle;
             const inCommand = getActionCommand(a).toLowerCase().indexOf(query);
             if (inTitle === -1) return inCommand;
             if (inCommand === -1) return inTitle;
@@ -194,7 +198,7 @@ export function useSlashMenu(
             for (const group of [...globalFirstGroups].reverse()) {
                 for (const action of group.filtered) {
                     items.push({
-                        label: action.title,
+                        label: actionDisplayText(action, "title"),
                         icon: categoryIcon(action.category),
                         onClick: () => handleSlashSelect(action, group.targetType),
                     });
@@ -217,7 +221,7 @@ export function useSlashMenu(
                 }
                 for (const action of group.filtered) {
                     items.push({
-                        label: action.title,
+                        label: actionDisplayText(action, "title"),
                         icon: categoryIcon(action.category),
                         onClick: () => handleSlashSelect(action, group.targetType),
                     });

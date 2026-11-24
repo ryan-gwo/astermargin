@@ -1,4 +1,5 @@
 import React from 'react';
+import { uiText } from "../../utils/interfaceText";
 import { VersionHistory, type TableVersionListEntry } from '@astermargin/agent-ui/layouts';
 import { getTablesApi } from '../../../src/services/artifacts/tablesApi';
 import type { TableRef, TableVersionEntry } from '../../../src/services/artifacts/tableItemIdentity';
@@ -54,9 +55,9 @@ export function TableVersionHistory({
     const { libraryID, key } = tableRef;
 
     const commands = React.useCallback(() => {
-        if (!win || win.closed) throw new Error('The originating window is closed.');
+        if (!win || win.closed) throw new Error(uiText("The originating window is closed."));
         const api = getTablesApi();
-        if (!api) throw new Error('Version history is unavailable right now.');
+        if (!api) throw new Error(uiText("Version history is unavailable right now."));
         return api.local.commands(win);
     }, [win]);
 
@@ -86,12 +87,12 @@ export function TableVersionHistory({
         try {
             const result = await commands().revert(ref, version);
             if (!result.ok) {
-                setError('The table changed while restoring, so nothing was restored. Check the updated history and try again.');
+                setError(uiText("The table changed while restoring, so nothing was restored. Check the updated history and try again."));
             } else {
                 setStatus(
                     result.saved
-                        ? `Restored version ${version} as version ${result.version}.`
-                        : `Restored version ${version} as version ${result.version}, but its version history could not be updated. Reopen the table to repair it; do not restore again.`,
+                        ? uiText("Restored version {from} as version {to}.", { from: version, to: result.version })
+                        : uiText("Restored version {from} as version {to}, but its version history could not be updated. Reopen the table to repair it; do not restore again.", { from: version, to: result.version }),
                 );
             }
         } catch (failure) {
@@ -110,7 +111,7 @@ export function TableVersionHistory({
             restoreDisabledReason={restoreDisabledReason}
             status={status}
             error={error}
-            note={readOnly ? 'This library is read-only, so versions cannot be restored here.' : undefined}
+            note={readOnly ? uiText("This library is read-only, so versions cannot be restored here.") : undefined}
         />
     );
 }

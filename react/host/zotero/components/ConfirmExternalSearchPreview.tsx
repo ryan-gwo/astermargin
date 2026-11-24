@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 
 type ActionStatus = 'pending' | 'applied' | 'rejected' | 'undone' | 'error' | 'awaiting';
@@ -29,7 +30,7 @@ export const ConfirmExternalSearchPreview: React.FC<ConfirmExternalSearchPreview
         <div className={`confirm-extraction-preview overflow-hidden ${isRejectedOrUndone ? 'opacity-60' : ''}`}>
             <div className="px-3 py-3 text-sm font-color-secondary">
                 {isApplied ? (
-                    <span>Approved external literature search{label ? ` — ${label}` : ''}.</span>
+                    <span>{uiText("Approved external literature search")}{label ? ` — ${label}` : ''}.</span>
                 ) : isRejectedOrUndone ? (
                     <span>Declined external literature search{label ? ` — ${label}` : ''}.</span>
                 ) : (

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { isTitleAbstractOnly, type TableSpec } from '@astermargin/agent-core/layouts/table';
 import { addColumnBlockedReason } from '@astermargin/agent-core/layouts/tableMutations';
@@ -455,7 +456,7 @@ export default function TableTabView({
     });
 
     if (state.kind === 'loading') {
-        return <div className="p-4 font-color-secondary">Loading table…</div>;
+        return <div className="p-4 font-color-secondary">{uiText("Loading table…")}</div>;
     }
     if (state.kind === 'error') {
         return (

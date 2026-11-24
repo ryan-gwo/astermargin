@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import type { TableSpec } from '@astermargin/agent-core/layouts/table';
 import { cellsToFill, pendingWork, retryableFailedRows } from '@astermargin/agent-core/layouts/tableFill';
@@ -239,7 +240,7 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
                     icon={stopping ? <Spinner size={12} /> : StopIcon}
                     disabled={stopping}
                     title={timeLeftText(job.seconds_left) ?? undefined}
-                    ariaLabel={stopping ? runningLabel(job) : `Stop the fill, ${job.rows_done} of ${job.rows_total} rows done`}
+                    ariaLabel={stopping ? runningLabel(job) : uiText("Stop the fill, {done} of {total} rows done", { done: job.rows_done, total: job.rows_total })}
                     onClick={() => Zotero.AsterMargin.tableFills?.stop(job.job_id)}
                 >
                     {runningLabel(job)}
@@ -253,24 +254,24 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
     const selected = selectedRowIds.length;
     const menuItems: MenuItem[] = [
         {
-            label: 'Fill everything pending',
+            label: uiText("Fill everything pending"),
             shortcut: count(pending.rows),
             onClick: () => void openPlan({ kind: 'pending' }),
         },
         {
-            label: 'Try on 5 rows first',
+            label: uiText("Try on 5 rows first"),
             shortcut: count(Math.min(TRIAL_ROWS, pending.rows)),
             disabled: pending.rows === 0,
             onClick: () => void openPlan({ kind: 'pending', limit: TRIAL_ROWS }),
         },
         {
-            label: 'Fill selected rows',
+            label: uiText("Fill selected rows"),
             shortcut: selected ? count(selected) : 'Select rows first',
             disabled: selected === 0,
             onClick: () => void openPlan({ kind: 'cells', rows: selectedRowIds }),
         },
         {
-            label: 'Retry rows that failed',
+            label: uiText("Retry rows that failed"),
             shortcut: count(retryRows),
             onClick: () => void openPlan({ kind: 'retry_failed' }),
             disabled: retryRows === 0,
@@ -285,7 +286,7 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
                     icon={PlayIcon}
                     className={`bt-fill-main${lit ? '' : ' bt-fill-idle'}`}
                     disabled={!!disabledReason}
-                    title={disabledReason ?? (lit ? undefined : 'Everything is up to date')}
+                    title={disabledReason ?? (lit ? undefined : uiText("Everything is up to date"))}
                     onClick={() => void openPlan({ kind: 'pending' })}
                 >
                     {fillButtonLabel(rows)}
@@ -295,7 +296,7 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
                     variant={lit ? 'solid' : 'surface'}
                     icon={ArrowDownIcon}
                     className={`bt-fill-more${lit ? '' : ' bt-fill-idle'}`}
-                    ariaLabel="More ways to fill"
+                    ariaLabel={uiText("More ways to fill")}
                     disabled={!!disabledReason}
                     width="17rem"
                 />
@@ -333,13 +334,13 @@ function FillPopover({
         body = (
             <div className="bt-fill-status">
                 <Spinner size={12} />
-                <span>Working out what to fill…</span>
+                <span>{uiText("Working out what to fill…")}</span>
             </div>
         );
     } else if (popover.state === 'error') {
         body = <div className="bt-fill-error" role="alert">{popover.message}</div>;
     } else if (popover.plan.rows === 0) {
-        body = <div className="bt-fill-status">Everything is up to date.</div>;
+        body = <div className="bt-fill-status">{uiText("Everything is up to date.")}</div>;
     } else {
         const plan = popover.plan;
         const lines = pendingLines(plan, answeredColumns);
@@ -392,9 +393,9 @@ function FillPopover({
                     onClick={onTrial}
                     disabled={starting}
                     loading={starting && popover.trial}
-                    title={`Fill the first ${TRIAL_ROWS} rows now to check the answers`}
+                    title={uiText("Fill the first {count} rows now to check the answers", { count: TRIAL_ROWS })}
                 >
-                    Try {TRIAL_ROWS} first
+                    {uiText("Try {count} first", { count: TRIAL_ROWS })}
                 </Button>
             );
         action = (
@@ -404,7 +405,7 @@ function FillPopover({
         );
     }
     return (
-        <div className="bt-fill-popover" role="dialog" aria-label="Fill the table">
+        <div className="bt-fill-popover" role="dialog" aria-label={uiText("Fill the table")}>
             {body}
             <div className="bt-fill-actions">
                 {trial}
@@ -437,7 +438,7 @@ export function TableFillBanner({ job, showingFailed, onShowFailed, onDismiss }:
                     {showingFailed ? 'Show all' : 'Show'}
                 </button>
             ) : null}
-            <button type="button" className="bt-fill-banner-close" aria-label="Dismiss" onClick={onDismiss}>
+            <button type="button" className="bt-fill-banner-close" aria-label={uiText("Dismiss")} onClick={onDismiss}>
                 <Icon icon={CancelIcon} size={10} />
             </button>
         </span>
@@ -537,7 +538,7 @@ export function useFillResultBanner(
                         : `Showing the ${failedFilter.rows.size.toLocaleString('en-US')} rows that couldn't be read`}
                 </span>
                 <button type="button" className="bt-fill-banner-link" onClick={showAllRows}>
-                    Show all
+                    {uiText("Show all")}
                 </button>
             </span>
         ) : null;

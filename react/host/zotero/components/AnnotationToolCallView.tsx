@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useSetAtom, useAtomValue } from 'jotai';
 import { AgentRunStatus, ToolCallPart } from '@astermargin/agent-core/agents/types';
@@ -292,7 +293,7 @@ const AnnotationListItem: React.FC<AnnotationListItemProps> = ({
                             variant="ghost-secondary"
                             onClick={handleReject}
                             className="p-1"
-                            title="Delete annotation"
+                            title={uiText("Delete annotation")}
                             icon={CancelIcon}
                             loading={isBusy}
                         />
@@ -306,7 +307,7 @@ const AnnotationListItem: React.FC<AnnotationListItemProps> = ({
                             variant="ghost-secondary"
                             onClick={handleReAdd}
                             className="p-1 scale-13"
-                            title="Add annotation"
+                            title={uiText("Add annotation")}
                             icon={TickIcon}
                             loading={isBusy}
                         />
@@ -320,7 +321,7 @@ const AnnotationListItem: React.FC<AnnotationListItemProps> = ({
                             variant="ghost-tertiary"
                             onClick={handleReject}
                             className="p-1"
-                            title="Reject annotation"
+                            title={uiText("Reject annotation")}
                             icon={CancelIcon}
                             loading={isBusy}
                         />
@@ -328,7 +329,7 @@ const AnnotationListItem: React.FC<AnnotationListItemProps> = ({
                             variant="ghost-tertiary"
                             onClick={handleReAdd}
                             className="p-1 scale-13"
-                            title="Add annotation"
+                            title={uiText("Add annotation")}
                             icon={TickIcon}
                             loading={isBusy}
                         />
@@ -704,7 +705,7 @@ export const AnnotationToolCallView: React.FC<AnnotationToolCallViewProps> = ({ 
 
                 {readOnlyLibrary && (
                     <div className="text-sm font-color-tertiary mt-015">
-                        Read-only library
+                        {uiText("Read-only library")}
                     </div>
                 )}
 

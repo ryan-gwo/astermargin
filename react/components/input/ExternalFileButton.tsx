@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { forwardRef } from 'react';
 import { CSSItemTypeIcon, CSSIcon, Icon } from "../icons/icons";
 import { useRemoveContextMenu } from '../../hooks/useRemoveContextMenu';
@@ -89,8 +90,8 @@ export const ExternalFileButton = forwardRef<HTMLButtonElement, ExternalFileButt
         // in Finder/Explorer. Each no-ops gracefully when the copy is
         // unavailable on this device.
         const fileMenuItems: MenuItem[] = [
-            { label: 'Open File', icon: FileViewIcon, onClick: openFile },
-            { label: 'Show File', icon: FolderDetailIcon, onClick: showFile },
+            { label: uiText("Open File"), icon: FileViewIcon, onClick: openFile },
+            { label: uiText("Show File"), icon: FolderDetailIcon, onClick: showFile },
         ];
 
         const { isRemoveMenuOpen, contextMenuHandlers, removeHandlers, removeMenu } = useRemoveContextMenu({
@@ -118,7 +119,7 @@ export const ExternalFileButton = forwardRef<HTMLButtonElement, ExternalFileButt
             ),
             title: filename,
             subtitle: { text: 'External file' },
-            action: { icon: ExternalLinkIcon, label: 'Open external file', iconClassName: 'scale-75' },
+            action: { icon: ExternalLinkIcon, label: uiText("Open external file"), iconClassName: 'scale-75' },
         };
 
         return (

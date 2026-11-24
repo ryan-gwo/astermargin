@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAtomValue, useSetAtom, useStore } from 'jotai';
 import Button from '@astermargin/agent-ui/primitives/Button';
@@ -125,7 +126,7 @@ export const CreatedNoteCard: React.FC<{ row: ReviewRow }> = ({ row }) => {
                                 disabled={busy}
                                 className="flex-none whitespace-nowrap"
                             >
-                                Reject
+                                {uiText("Reject")}
                             </Button>
                             {decide('Create')}
                         </>
@@ -135,7 +136,7 @@ export const CreatedNoteCard: React.FC<{ row: ReviewRow }> = ({ row }) => {
                     {card.move === 'open' && (
                         <>
                             <RunArtifactExportButton items={items} exporting={exporting} />
-                            {openTarget && <RunArtifactOpenButton label="Open note" onClick={handleOpen} />}
+                            {openTarget && <RunArtifactOpenButton label={uiText("Open note")} onClick={handleOpen} />}
                         </>
                     )}
                 </>
@@ -203,7 +204,7 @@ export const EditedNoteCard: React.FC<{ summary: NoteEditSummary }> = ({ summary
             actions={
                 <>
                     <RunArtifactExportButton items={items} exporting={exporting} />
-                    <RunArtifactOpenButton label="Open note" onClick={handleOpen} />
+                    <RunArtifactOpenButton label={uiText("Open note")} onClick={handleOpen} />
                 </>
             }
         />

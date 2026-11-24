@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useRef } from 'react';
 import { useAtom } from 'jotai';
 import { 
@@ -142,13 +143,13 @@ const ErrorReportDialog: React.FC = () => {
         >
             {/* Header */}
             <div className="display-flex flex-row items-center justify-between p-4 pb-3">
-                <div className="text-lg font-semibold">Report Error</div>
+                <div className="text-lg font-semibold">{uiText("Report Error")}</div>
                 <IconButton
                     icon={CancelIcon}
                     onClick={handleClose}
                     disabled={isSending}
                     className="scale-12"
-                    ariaLabel="Close dialog"
+                    ariaLabel={uiText("Close dialog")}
                 />
             </div>
 
@@ -161,7 +162,7 @@ const ErrorReportDialog: React.FC = () => {
                         ref={textareaRef}
                         value={errorText}
                         onChange={handleTextareaChange}
-                        placeholder="Describe the issue you encountered..."
+                        placeholder={uiText("Describe the issue you encountered...")}
                         className="chat-input"
                         rows={4}
                         disabled={isSending}
@@ -181,7 +182,7 @@ const ErrorReportDialog: React.FC = () => {
                         onClick={handleClose}
                         disabled={isSending}
                     >
-                        Cancel
+                        {uiText("Cancel")}
                     </Button>
                     <Button
                         variant="solid"

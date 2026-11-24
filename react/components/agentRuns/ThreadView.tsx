@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useEffect, useRef, forwardRef, useLayoutEffect, useCallback } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
@@ -650,7 +651,7 @@ export const ThreadView = forwardRef<HTMLDivElement, ThreadViewProps>(
                     className={`display-flex flex-col flex-1 min-h-0 items-center justify-center ${className || ''}`}
                     ref={setScrollContainerRef}
                 >
-                    <p className="text-secondary">No messages yet</p>
+                    <p className="text-secondary">{uiText("No messages yet")}</p>
                 </div>
             );
         }
@@ -659,7 +660,7 @@ export const ThreadView = forwardRef<HTMLDivElement, ThreadViewProps>(
             <div
                 id="astermargin-thread-view"
                 role="log"
-                aria-label="Chat history"
+                aria-label={uiText("Chat history")}
                 className={`display-flex flex-col flex-1 min-h-0 overflow-y-auto scrollbar min-w-0 pb-4 ${className || ''}`}
                 onScroll={handleScroll}
                 ref={setScrollContainerRef}

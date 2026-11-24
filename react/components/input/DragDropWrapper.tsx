@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState, useRef } from 'react';
 import { getPref } from '../../../src/utils/prefs';
 import { ZoteroIcon, ZOTERO_ICONS } from '../icons/ZoteroIcon';
@@ -455,7 +456,7 @@ const DragDropWrapper: React.FC<DragDropWrapperProps> = ({
                 : '';
             addPopupMessage({
                 type: 'info',
-                title: 'Action added',
+                title: uiText("Action added"),
                 text: `"${action.title}" was added to your message. Type /${command} to use it again.${renamedNote}`,
                 expire: false,
                 button: {

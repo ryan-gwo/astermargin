@@ -1,4 +1,5 @@
 import { config } from "../../package.json";
+import { interfaceLocale } from "./interfaceLanguage";
 
 export { initLocale, getString, getLocaleID };
 
@@ -6,11 +7,17 @@ export { initLocale, getString, getLocaleID };
  * Initialize locale data
  */
 function initLocale() {
+  const locale = interfaceLocale();
   const l10n = new (
     typeof Localization === "undefined"
       ? ztoolkit.getGlobal("Localization")
       : Localization
-  )([`${config.addonRef}-addon.ftl`], true);
+  )(
+    [`${config.addonRef}-addon.ftl`, `${config.addonRef}-mainWindow.ftl`],
+    true,
+    undefined,
+    locale === "en" ? ["en-US"] : [locale, "en-US"],
+  );
   addon.data.locale = {
     current: l10n,
   };
@@ -85,4 +92,21 @@ function _getString(
 
 function getLocaleID(id: string) {
   return `${config.addonRef}-${id}`;
+}
+
+/** Format only AsterMargin-owned Fluent elements using its own localization. */
+export function localizePluginElement(element: Element): void {
+    const id = element.getAttribute("data-l10n-id")
+        ?? element.getAttribute("data-astermargin-l10n-id");
+    if (!id?.startsWith(`${config.addonRef}-`)) return;
+    const rawArgs = element.getAttribute("data-l10n-args");
+    const args = rawArgs ? JSON.parse(rawArgs) : undefined;
+    const message = addon.data.locale?.current.formatMessagesSync([{ id, args }])[0];
+    if (!message) return;
+    element.removeAttribute("data-l10n-id");
+    element.setAttribute("data-astermargin-l10n-id", id);
+    if (message.value != null) element.textContent = message.value;
+    for (const { name, value } of message.attributes ?? []) {
+        element.setAttribute(name, value);
+    }
 }

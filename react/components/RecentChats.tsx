@@ -1,3 +1,4 @@
+import { interfaceLocale, uiText } from "../utils/interfaceText";
 import ChatLoadFailure from './ChatLoadFailure';
 import { useChatReconnect } from '../hooks/useChatReconnect';
 import { useSurfaceWindow } from '../runtime/SurfaceWindowContext';
@@ -35,12 +36,16 @@ function formatCompactTime(utcDateString: string): string {
     const diffDays = Math.floor(diffMs / 86_400_000);
     const diffWeeks = Math.floor(diffDays / 7);
 
-    if (diffMin < 1) return 'now';
-    if (diffMin < 60) return `${diffMin}m`;
-    if (diffHours < 24) return `${diffHours}h`;
-    if (diffDays < 7) return `${diffDays}d`;
-    if (diffWeeks < 5) return `${diffWeeks}w`;
-    return `${Math.floor(diffDays / 30)}mo`;
+    if (diffMin < 1) return uiText("now");
+    const [value, unit, symbol] = diffMin < 60 ? [diffMin, "minute", "m"] as const
+        : diffHours < 24 ? [diffHours, "hour", "h"] as const
+        : diffDays < 7 ? [diffDays, "day", "d"] as const
+        : diffWeeks < 5 ? [diffWeeks, "week", "w"] as const
+        : [Math.floor(diffDays / 30), "month", "mo"] as const;
+    const locale = interfaceLocale();
+    return locale === "en"
+        ? `${value}${symbol}`
+        : new Intl.RelativeTimeFormat(locale, { style: "short" }).format(-value, unit);
 }
 
 const RecentChats: React.FC = () => {
@@ -137,7 +142,7 @@ const RecentChats: React.FC = () => {
         <div className={`pt-2 recent-chats${hasPopupMessages ? ' recent-chats-faded' : ''}`}>
             <div className="recent-chats-header">
                 <span className="recent-chats-label">
-                    {headerLabel}
+                    {uiText(headerLabel)}
                     {isFetching && threads.length > 0 && (
                         <Spinner size={11} />
                     )}
@@ -147,7 +152,7 @@ const RecentChats: React.FC = () => {
                     onClick={handleViewAll}
                     style={{ padding: '0px' }}
                 >
-                    View All
+                    {uiText("View All")}
                 </Button>
             </div>
             {fetchError && <ChatLoadFailure error={fetchError} retry={retry} loading={isFetching} />}
@@ -157,7 +162,7 @@ const RecentChats: React.FC = () => {
                     className="recent-chats-item"
                     role="button"
                     tabIndex={0}
-                    aria-label={`${thread.name || 'Unnamed conversation'}, ${formatCompactTime(thread.updatedAt)}${thread.awaitingInput ? `, ${awaitingInputLabel(thread.awaitingInput).toLowerCase()}` : ''}`}
+                    aria-label={`${thread.name || uiText("Unnamed conversation")}, ${formatCompactTime(thread.updatedAt)}${thread.awaitingInput ? `, ${uiText(awaitingInputLabel(thread.awaitingInput)).toLocaleLowerCase()}` : ''}`}
                     onClick={() => handleSelectThread(thread)}
                     onKeyDown={(e) => {
                         if (e.key === 'Enter' || e.key === ' ') {
@@ -168,7 +173,7 @@ const RecentChats: React.FC = () => {
                 >
                     <span className="recent-chats-item-title">
                         <span className="recent-chats-item-name truncate">
-                            {thread.name || 'Unnamed conversation'}
+                            {thread.name || uiText("Unnamed conversation")}
                         </span>
                         {thread.awaitingInput && <AwaitingInputDot awaiting={thread.awaitingInput} />}
                     </span>

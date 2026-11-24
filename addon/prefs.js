@@ -9,6 +9,7 @@ pref("showHighTokenUsageWarningMessage", true);
 pref("authMethod", "otp");
 
 // App settings
+pref("interfaceLanguage", "auto");
 pref("keyboardShortcut", "y");
 pref("statefulChat", true);
 pref("addSelectedItemsOnOpen", true);

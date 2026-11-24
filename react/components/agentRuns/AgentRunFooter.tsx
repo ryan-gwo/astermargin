@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { threadReadOnlyAtom } from '../../runtime/threadProjection';
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useMemo, useEffect, useState, useCallback } from 'react';
@@ -148,7 +149,7 @@ export const AgentRunFooter: React.FC<AgentRunFooterProps> = ({ run }) => {
 
         const items: MenuItem[] = [
             {
-                label: 'Copy',
+                label: uiText("Copy"),
                 icon: CopyIcon,
                 onClick: () => handleCopy()
             },
@@ -324,7 +325,7 @@ export const AgentRunFooter: React.FC<AgentRunFooterProps> = ({ run }) => {
                     {isResolvingCitations && uniqueCitations.length === 0 ? (
                         <div className="display-flex items-center gap-2 font-color-secondary">
                             <Spinner size={12} />
-                            <span className="text-sm font-color-secondary">Linking sources...</span>
+                            <span className="text-sm font-color-secondary">{uiText("Linking sources...")}</span>
                         </div>
                     ) : uniqueCitations.length > 0 ? (
                         <Button
@@ -334,7 +335,7 @@ export const AgentRunFooter: React.FC<AgentRunFooterProps> = ({ run }) => {
                             iconClassName="mr-0 scale-12 -ml-1"
                         >
                             <span>
-                                {uniqueCitations.length} Source{uniqueCitations.length === 1 ? '' : 's'}
+                                {uniqueCitations.length}{' '}{uiText("Source")}{uniqueCitations.length === 1 ? '' : 's'}
                             </span>
                         </Button>
                     ) : null}
@@ -348,11 +349,11 @@ export const AgentRunFooter: React.FC<AgentRunFooterProps> = ({ run }) => {
                         iconClassName="scale-12"
                         menuItems={getShareMenuItems()}
                         className="scale-11"
-                        ariaLabel="Share"
+                        ariaLabel={uiText("Share")}
                         variant="ghost"
                         positionAdjustment={{ x: 0, y: 0 }}
                         toggleCallback={handleMenuToggle}
-                        tooltipContent="More options"
+                        tooltipContent={uiText("More options")}
                     />
 
                     {/* Usage display */}
@@ -370,7 +371,7 @@ export const AgentRunFooter: React.FC<AgentRunFooterProps> = ({ run }) => {
                             icon={RepeatIcon}
                             onClick={handleRegenerate}
                             className="scale-11"
-                            ariaLabel="Retry"
+                            ariaLabel={uiText("Retry")}
                             loading={isRetryPending}
                             disabled={threadReadOnly || isRunReconnecting}
                         />

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { resolveCollection } from '../../../../src/services/collections/collectionIdentity';
 import React, { useEffect, useState } from 'react';
 import { CSSIcon } from '../../../components/icons/icons';
@@ -162,7 +163,7 @@ export const OrganizeItemsPreview: React.FC<OrganizeItemsPreviewProps> = ({
                         </ChipWithListPopup>
                     )}
                     {resolvedItems.length === 0 && itemCount > 0 && (
-                        <span className="text-sm font-color-secondary">Loading {itemCount} item{itemCount !== 1 ? 's' : ''}...</span>
+                        <span className="text-sm font-color-secondary">{uiText("Loading")}{' '}{itemCount} item{itemCount !== 1 ? 's' : ''}...</span>
                     )}
                 </div>
 
@@ -170,7 +171,7 @@ export const OrganizeItemsPreview: React.FC<OrganizeItemsPreviewProps> = ({
                 {hasTagChanges && tagsToAdd.length > 0 && (
                     <div className="display-flex flex-col gap-3">
                         <div className="text-sm font-color-primary font-medium uppercase display-flex flex-row items-center gap-2">
-                            <div>Adding Tags</div>
+                            <div>{uiText("Adding Tags")}</div>
                         </div>
                         
                         {/* Tags to add */}
@@ -190,7 +191,7 @@ export const OrganizeItemsPreview: React.FC<OrganizeItemsPreviewProps> = ({
                 {hasTagChanges && tagsToRemove.length > 0 && (
                     <div className="display-flex flex-col gap-2">
                         <div className="text-sm font-color-primary font-medium uppercase display-flex flex-row items-center gap-2">
-                            <div>Removing Tags</div>
+                            <div>{uiText("Removing Tags")}</div>
                         </div>
                         
                         {/* Tags to remove */}
@@ -211,7 +212,7 @@ export const OrganizeItemsPreview: React.FC<OrganizeItemsPreviewProps> = ({
                 {hasCollectionChanges && collectionsToAdd.length > 0 && (
                     <div className="display-flex flex-col gap-2">
                         <div className="text-sm font-color-primary font-medium uppercase display-flex flex-row items-center gap-2">
-                            <div>Adding to Collections</div>
+                            <div>{uiText("Adding to Collections")}</div>
                         </div>
 
                         {/* Collections to add */}
@@ -234,7 +235,7 @@ export const OrganizeItemsPreview: React.FC<OrganizeItemsPreviewProps> = ({
                 {hasCollectionChanges && collectionsToRemove.length > 0 && (
                     <div className="display-flex flex-col gap-2">
                         <div className="text-sm font-color-primary font-medium uppercase display-flex flex-row items-center gap-2">
-                            <div>Removing from Collections</div>
+                            <div>{uiText("Removing from Collections")}</div>
                         </div>
 
                         {/* Collections to remove */}
@@ -257,7 +258,7 @@ export const OrganizeItemsPreview: React.FC<OrganizeItemsPreviewProps> = ({
                 {/* Items the apply left alone: not found on this device (or, in older records, failed) */}
                 {isApplied && notAppliedCount > 0 && (
                     <div className="text-sm text-red-600 mt-1">
-                        Not applied: {notAppliedCount} item{notAppliedCount !== 1 ? 's' : ''}
+                        {uiText("Not applied:")}{' '}{notAppliedCount} item{notAppliedCount !== 1 ? 's' : ''}
                     </div>
                 )}
             </div>

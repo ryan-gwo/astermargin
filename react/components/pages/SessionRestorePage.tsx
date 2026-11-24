@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from "react";
 import { useAtomValue } from "jotai";
 import { sessionRestoreAtom } from "../../atoms/auth";
@@ -74,7 +75,7 @@ const SessionRestorePage: React.FC = () => {
                                 disabled={retrying}
                                 onClick={() => void handleRetry()}
                             >
-                                Try again
+                                {uiText("Try again")}
                             </Button>
                         )}
                         <a

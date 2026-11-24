@@ -55,7 +55,7 @@ vi.mock('../../src/modules/zoteroContextMenu', () => ({
     cleanupContextMenus: mockCleanupContextMenus,
 }));
 
-vi.mock('../../src/utils/locale', () => ({ initLocale: vi.fn() }));
+vi.mock('../../src/utils/locale', () => ({ initLocale: vi.fn(), getString: vi.fn() }));
 vi.mock('../../src/utils/ztoolkit', () => ({ createZToolkit: vi.fn() }));
 vi.mock('../../src/services/CitationService', () => ({
     CitationService: class MockCitationService {},

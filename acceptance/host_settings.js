@@ -1,7 +1,10 @@
 /* Loaded by host_smoke.py only for a locale check in its disposable profile. */
 const settingsExpectations = {
     "en-US": {
-        native: ["Open AsterMargin Settings", "Open the settings window for AsterMargin"],
+        native: [
+            "Open AsterMargin Settings",
+            "Open the settings window for AsterMargin",
+        ],
         title: "AsterMargin Settings",
         general: [
             "Keyboard Shortcut",
@@ -183,27 +186,100 @@ function requireCopy(copy, expected, section) {
     }
 }
 
-async function inspectSettings(locale) {
-    if (Zotero.locale !== locale)
+async function chooseSettingsLanguage(hostLocale, targetLocale) {
+    if (Zotero.locale !== hostLocale)
+        throw Error("Unexpected host locale: " + Zotero.locale);
+    const prefs = Zotero.Utilities.Internal.openPreferences(
+        "astermargin-prefpane",
+    );
+    const nativeButton = await waitFor(
+        () => prefs.document.getElementById("astermargin-open-prefs-btn"),
+        "Zotero preferences button",
+    );
+    nativeButton.doCommand();
+    const settings = await waitFor(
+        () => Services.wm.getMostRecentWindow("astermargin:preferences"),
+        "settings window",
+    );
+    const select = await waitFor(
+        () =>
+            settings.document.getElementById("astermargin-interface-language"),
+        "interface language selector",
+    );
+    const value = targetLocale === "en-US" ? "en" : targetLocale;
+    if (select.value !== "auto")
+        throw Error("A fresh profile must follow Zotero");
+    select.value = value;
+    select.dispatchEvent(new settings.Event("change", { bubbles: true }));
+    const key = "extensions.zotero.astermargin.interfaceLanguage";
+    await waitFor(
+        () => Zotero.Prefs.get(key, true) === value,
+        "saved language choice",
+    );
+    const expected = {
+        "en-US": "Language saved.",
+        "zh-CN": "语言已保存。",
+        "zh-TW": "語言已儲存。",
+    };
+    await waitFor(
+        () =>
+            settings.document
+                .getElementById("astermargin-preferences-panel")
+                .textContent.includes(expected[hostLocale]),
+        "restart message",
+    );
+    settings.close();
+    prefs.close();
+}
+
+async function inspectSettings(locale, hostLocale) {
+    if (Zotero.locale !== hostLocale)
         throw Error("Unexpected Zotero locale: " + Zotero.locale);
+    const activeLocale = Zotero.AsterMargin.interfaceLocale;
+    if (activeLocale !== (locale === "en-US" ? "en" : locale))
+        throw Error("Unexpected AsterMargin locale: " + activeLocale);
     const expected = settingsExpectations[locale];
     const mainWindow = Zotero.getMainWindow();
     const findSettings = () => {
         const win = Services.wm.getMostRecentWindow("astermargin:preferences");
-        return win && !win.closed && win.document.getElementById("astermargin-preferences-panel")
-            ? win : null;
+        return win &&
+            !win.closed &&
+            win.document.getElementById("astermargin-preferences-panel")
+            ? win
+            : null;
     };
-    const settingsLabel = { "en-US": "Settings", "zh-CN": "设置", "zh-TW": "設定" }[locale];
-    const sidebarMenu = await waitFor(() => Array.from(mainWindow.document.querySelectorAll(
-        "#astermargin-react-root-sidebar button[aria-haspopup='menu']",
-    )).find(button => button.getAttribute("aria-label") === expected.title ||
-        button.getAttribute("aria-label") === "AsterMargin settings"), "sidebar settings menu");
+    const settingsLabel = {
+        "en-US": "Settings",
+        "zh-CN": "设置",
+        "zh-TW": "設定",
+    }[locale];
+    const sidebarMenu = await waitFor(
+        () =>
+            Array.from(
+                mainWindow.document.querySelectorAll(
+                    "#astermargin-react-root-sidebar button[aria-haspopup='menu']",
+                ),
+            ).find(
+                (button) =>
+                    button.getAttribute("aria-label") === expected.title ||
+                    button.getAttribute("aria-label") ===
+                        "AsterMargin settings",
+            ),
+        "sidebar settings menu",
+    );
     sidebarMenu.click();
-    const settingsItem = await waitFor(() => Array.from(mainWindow.document.querySelectorAll(
-        "[role='menuitem']",
-    )).find(item => item.textContent.trim() === settingsLabel), "sidebar settings command");
+    const settingsItem = await waitFor(
+        () =>
+            Array.from(
+                mainWindow.document.querySelectorAll("[role='menuitem']"),
+            ).find((item) => item.textContent.trim() === settingsLabel),
+        "sidebar settings command",
+    );
     settingsItem.click();
-    const sidebarSettings = await waitFor(findSettings, "settings opened by sidebar menu");
+    const sidebarSettings = await waitFor(
+        findSettings,
+        "settings opened by sidebar menu",
+    );
     sidebarSettings.close();
     await waitFor(() => !findSettings(), "sidebar settings closed");
 
@@ -223,7 +299,10 @@ async function inspectSettings(locale) {
             .textContent;
     requireCopy(nativeCopy, expected.native, "native pane");
     nativeButton.doCommand();
-    const win = await waitFor(findSettings, "settings opened by Zotero preferences button");
+    const win = await waitFor(
+        findSettings,
+        "settings opened by Zotero preferences button",
+    );
     nativeWindow.close();
     const doc = win.document;
     const panel = await waitFor(
@@ -313,5 +392,12 @@ async function inspectSettings(locale) {
         }
     }
     win.close();
-    return { locale, title, native: nativeCopy.trim(), entryPoints: ["sidebar menu", "Zotero preferences button"], sections };
+    return {
+        locale,
+        hostLocale,
+        title,
+        native: nativeCopy.trim(),
+        entryPoints: ["sidebar menu", "Zotero preferences button"],
+        sections,
+    };
 }

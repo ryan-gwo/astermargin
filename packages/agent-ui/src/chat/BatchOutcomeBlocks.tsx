@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useState } from 'react';
 import type {
     BatchItemGroup,
@@ -412,7 +413,7 @@ export const BatchTallyRow: React.FC<{
                         padding: '0 3px',
                         lineHeight: 1.2,
                     }}
-                    title="Created by this run"
+                    title={uiText("Created by this run")}
                 >
                     {NEW_BADGE}
                 </span>

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { ThinkingPart } from '@astermargin/agent-core/agents/types';
@@ -75,7 +76,7 @@ export const ThinkingPartView: React.FC<ThinkingPartViewProps> = ({
                         </div>
                         
                         <div className={`display-flex ${isExpanded ? 'font-color-primary' : ''} ${isThinking ? 'shimmer-text' : ''}`}>
-                            Thinking
+                            {uiText("Thinking")}
                         </div>
                     </div>
                 </button>

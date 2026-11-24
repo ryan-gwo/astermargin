@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useCallback } from 'react';
 import type { BatchProgressEntry } from '@astermargin/agent-core/run-state/batchProgress';
 import { ArrowDownIcon, Icon, LayersIcon, TickIcon } from '../icons';
@@ -106,7 +107,7 @@ export const BatchProgressBar: React.FC<BatchProgressBarProps> = ({
             className="composer-docked-bar batch-progress-bar border-bottom-quinary"
             style={{ position: 'relative' }}
             role="group"
-            aria-label="Batch job progress"
+            aria-label={uiText("Batch job progress")}
         >
             {/* Overlay so it does not stack on the composer's 1px top border.
                 Hidden while expanded: the body draws the full track then, and

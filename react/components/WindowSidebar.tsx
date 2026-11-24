@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import React from 'react';
 import { useAtomValue } from 'jotai';
 import Sidebar from './Sidebar';
@@ -55,7 +56,7 @@ const WindowSidebar = () => {
         <>
             <NoteExportTipTrigger />
             <div className={`astermargin-window-app ${navCollapsed ? 'astermargin-window-app-nav-collapsed' : ''}`}>
-                <aside className="astermargin-window-nav" aria-label="Chat history sidebar">
+                <aside className="astermargin-window-nav" aria-label={uiText("Chat history sidebar")}>
                     {hasHistory && <WindowNav collapsed={navCollapsed} />}
                 </aside>
                 <div className="astermargin-window-main">

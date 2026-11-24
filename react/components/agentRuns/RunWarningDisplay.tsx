@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useSetAtom } from 'jotai';
 import { Icon, AlertIcon, CancelIcon } from '../icons/icons';
@@ -80,7 +81,7 @@ export const RunWarningDisplay: React.FC<RunWarningDisplayProps> = ({ warning })
                         className="mt-020"
                         onClick={() => openPreferencesWindow('models')}
                     >
-                        Disable Plus Tools
+                        {uiText("Disable Plus Tools")}
                     </Button>
                 </div>
             )}

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import Button from '@astermargin/agent-ui/primitives/Button';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
@@ -76,7 +77,7 @@ const FileExportMessageContent: React.FC<FileExportMessageContentProps> = ({ mes
                     icon={CancelIcon}
                     variant="ghost-secondary"
                     onClick={onDismiss}
-                    ariaLabel="Dismiss"
+                    ariaLabel={uiText("Dismiss")}
                     className="flex-shrink-0"
                 />
             </div>
@@ -85,12 +86,12 @@ const FileExportMessageContent: React.FC<FileExportMessageContentProps> = ({ mes
                 <div className="display-flex flex-row gap-2 justify-end w-full">
                     {data.onReveal && (
                         <Button variant="outline" onClick={runAndDismiss(data.onReveal)}>
-                            Show File
+                            {uiText("Show File")}
                         </Button>
                     )}
                     {data.onOpen && (
                         <Button variant="solid" rightIcon={ArrowUpRightIcon} onClick={runAndDismiss(data.onOpen)}>
-                            Open
+                            {uiText("Open")}
                         </Button>
                     )}
                 </div>

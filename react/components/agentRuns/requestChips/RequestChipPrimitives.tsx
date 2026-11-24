@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { CSSIcon, CSSItemTypeIcon, Icon, LibraryIcon, NoteIcon, HighlighterIcon, ExternalLinkIcon, TableIcon } from '../../icons/icons';
 import { ZoteroIcon, ZOTERO_ICONS } from '../../icons/ZoteroIcon';
@@ -171,7 +172,7 @@ export function ItemChip({
                 icon: <CSSItemTypeIcon itemType={iconName} className="scale-90" />,
                 title: displayName,
                 subtitle,
-                action: { icon: LibraryIcon, label: 'Reveal in library' },
+                action: { icon: LibraryIcon, label: uiText("Reveal in library") },
             }}
             onClick={() => getHost().navigation?.revealInLibrary(itemRef)}
             remove={remove}
@@ -251,7 +252,7 @@ export function NoteChip({
                 icon: <CSSItemTypeIcon itemType="note" className="scale-90" />,
                 title: displayName,
                 subtitle,
-                action: { icon: NoteIcon, label: 'Open note' },
+                action: { icon: NoteIcon, label: uiText("Open note") },
             }}
             onClick={() => getHost().navigation?.openSource(noteRef)}
             remove={remove}
@@ -288,7 +289,7 @@ export function CollectionChip({
                 ),
                 title: name,
                 subtitle: { text: isFilter ? 'Search filter' : 'Collection' },
-                action: { icon: LibraryIcon, label: 'Reveal in library' },
+                action: { icon: LibraryIcon, label: uiText("Reveal in library") },
             }}
             onClick={() => getHost().navigation?.revealCollection(collectionRef)}
             remove={remove}
@@ -327,7 +328,7 @@ export function ViewChip({
                 icon,
                 title: view.name,
                 subtitle: { text: kindLabel },
-                action: { icon: LibraryIcon, label: 'Reveal in library' },
+                action: { icon: LibraryIcon, label: uiText("Reveal in library") },
             }}
             onClick={() => void getHost().navigation?.revealView?.(view)}
             remove={remove}
@@ -408,7 +409,7 @@ export function ExternalFileChip({
                 icon: <CSSItemTypeIcon itemType={iconName} className="scale-90" />,
                 title: filename,
                 subtitle: { text: 'External file' },
-                action: { icon: ExternalLinkIcon, label: 'Open external file', iconClassName: 'scale-75' },
+                action: { icon: ExternalLinkIcon, label: uiText("Open external file"), iconClassName: 'scale-75' },
             }}
             onClick={() => getHost().navigation?.launchExternalFile(extKey)}
             remove={remove}

@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useEffect, useState } from 'react';
 import type { BatchItemGroup, BatchPopulationItem, BatchPopulationLookup } from '@astermargin/agent-core/run-state/batchProgress';
 import { batchItemReference, batchPopulationItemFor } from '@astermargin/agent-core/run-state/batchProgress';
@@ -329,7 +330,7 @@ export const BatchItemFilter: React.FC<{
             type="text"
             value={value}
             placeholder={`Filter ${count.toLocaleString()} rows…`}
-            aria-label="Filter rows"
+            aria-label={uiText("Filter rows")}
             onChange={(e) => onChange(e.target.value)}
             onClick={(e) => e.stopPropagation()}
             onKeyDown={(e) => e.stopPropagation()}

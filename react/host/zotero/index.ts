@@ -7,6 +7,7 @@ import { zoteroNoteWriter } from './noteWriter';
 import { zoteroConfig } from './config';
 import { zoteroComponents } from './components';
 import { zoteroDialogs } from './dialogs';
+import { uiText } from '../../utils/interfaceText';
 
 /**
  * Assemble and register the Zotero client host. Call once at webpack bundle
@@ -16,6 +17,7 @@ import { zoteroDialogs } from './dialogs';
  */
 export function registerZoteroHost(): void {
     setHost({
+        translate: uiText,
         navigation: zoteroNavigation,
         itemData: zoteroItemData,
         documentExport: { ...zoteroDocumentExport, ...zoteroFileExport },

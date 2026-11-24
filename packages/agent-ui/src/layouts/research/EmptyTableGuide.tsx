@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React from "react";
 import { Icon, LayersIcon, MagicWandIcon, PlayIcon, PlusSignIcon, TableIcon, TickIcon } from "../../icons";
 
@@ -52,9 +53,9 @@ export function EmptyTableGuide({
                   title: itemCount === 1 ? "1 item added" : `${itemCount.toLocaleString("en-US")} items added`,
                   text: (
                       <>
-                          Each item is a row. Add more with{" "}
+                          {uiText("Each item is a row. Add more with")}{" "}
                           <span className="rt-nowrap">
-                              <Icon icon={PlusSignIcon} size={11} className="rt-empty-inline-icon" /> Items
+                              <Icon icon={PlusSignIcon} size={11} className="rt-empty-inline-icon" />{' '}{uiText("Items")}
                           </span>
                           , or drag them onto the table.
                       </>
@@ -65,7 +66,7 @@ export function EmptyTableGuide({
             : {
                   key: "items",
                   icon: LayersIcon,
-                  title: "Add items",
+                  title: uiText("Add items"),
                   text: "Each item from your library is a row. Drag items, a collection or a tag onto the table, or pick them.",
                   action: addItems ?? null,
               },
@@ -86,7 +87,7 @@ export function EmptyTableGuide({
                         onClick={onAddColumn}
                     >
                         <Icon icon={PlusSignIcon} size={13} />
-                        <span>Column</span>
+                        <span>{uiText("Column")}</span>
                     </button>
                 </span>
             ),
@@ -95,7 +96,7 @@ export function EmptyTableGuide({
         steps.push({
             key: "ask",
             icon: MagicWandIcon,
-            title: "Ask AsterMargin",
+            title: uiText("Ask AsterMargin"),
             text: hasItems
                 ? "Describe what you want to compare. AsterMargin suggests columns for these items."
                 : onAddColumn
@@ -104,7 +105,7 @@ export function EmptyTableGuide({
             action: (
                 <button type="button" className="rt-empty-action" onClick={onAskAsterMargin}>
                     <Icon icon={MagicWandIcon} size={13} />
-                    <span>Ask AsterMargin</span>
+                    <span>{uiText("Ask AsterMargin")}</span>
                 </button>
             ),
         });
@@ -112,7 +113,7 @@ export function EmptyTableGuide({
     return (
         <div className={`rt-empty-guide${hasItems ? " rt-empty-guide-beside" : ""}`} data-empty-table-guide="">
             <div className="rt-empty-guide-inner">
-                <h2 className="rt-empty-guide-title">Start your table</h2>
+                <h2 className="rt-empty-guide-title">{uiText("Start your table")}</h2>
                 <ul className="rt-empty-steps">
                     {steps.map((step) => (
                         <li
@@ -133,8 +134,7 @@ export function EmptyTableGuide({
                 </ul>
                 {canFill ? (
                     <p className="rt-empty-guide-foot">
-                        Then <Icon icon={PlayIcon} size={12} className="rt-empty-inline-icon" /> Fill has AsterMargin answer
-                        every cell.
+                        Then <Icon icon={PlayIcon} size={12} className="rt-empty-inline-icon" />{' '}{uiText("Fill has AsterMargin answer every cell.")}
                     </p>
                 ) : null}
             </div>

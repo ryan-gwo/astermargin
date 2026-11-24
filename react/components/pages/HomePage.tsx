@@ -23,14 +23,14 @@ const AllLibrariesExcludedMessage = () => (
         style={{ color: 'var(--tag-red-secondary)', border: '1px solid var(--tag-red-tertiary)', background: 'var(--tag-red-quinary)' }}
     >
         <span className="flex-1">
-            AsterMargin can't access any libraries. You've excluded all of them.
+            {uiText("AsterMargin can't access any libraries. You've excluded all of them.")}
         </span>
         <Button
             variant="error"
             icon={SettingsIcon}
             onClick={() => openPreferencesWindow('sync')}
         >
-            Open Settings
+            {uiText("Open Settings")}
         </Button>
     </div>
 );
@@ -87,8 +87,8 @@ const HomePage: React.FC<HomePageProps> = ({ isWindow = false, inputRef }) => {
 
                 {isBeta && (
                     <div className="text-sm font-color-secondary mb-2 bg-quinary p-2 rounded-md">
-                        You're using a beta version. Please report any issues to{" "}
-                        <a href="mailto:contact@astermarginapp.ai">contact@astermarginapp.ai</a>.
+                        {uiText("You're using a beta version. Please report any issues.")}{" "}
+                        <a href="mailto:contact@astermarginapp.ai">contact@astermarginapp.ai</a>
                     </div>
                 )}
             </div>

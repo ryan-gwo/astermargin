@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { BatchJobView } from '@astermargin/agent-core/run-state/toolResultViews';
 import { Icon, SecurityWarningIcon } from '@astermargin/agent-ui/icons';
@@ -67,7 +68,7 @@ export const BatchJobResultView: React.FC<{ view: BatchJobView }> = ({ view }) =
                         border: '1px solid var(--tag-orange-tertiary)',
                     }}
                     role="note"
-                    aria-label="What this batch removes or overwrites"
+                    aria-label={uiText("What this batch removes or overwrites")}
                 >
                     <Icon
                         icon={SecurityWarningIcon}

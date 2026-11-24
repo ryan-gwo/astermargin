@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React from "react";
 import { Icon, Spinner, UndoIcon } from "../../icons";
 
@@ -117,11 +118,11 @@ export function VersionHistory({
                 error ? null : (
                     <p className="rt-history-loading">
                         <Spinner size={12} />
-                        Loading versions…
+                        {uiText("Loading versions…")}
                     </p>
                 )
             ) : !versions.length ? (
-                <p className="rt-inspector-empty">No saved versions yet.</p>
+                <p className="rt-inspector-empty">{uiText("No saved versions yet.")}</p>
             ) : (
                 <VersionList
                     versions={versions}
@@ -172,7 +173,7 @@ function VersionList({
                                     <div className="rt-history-text">
                                         <div className="rt-history-title">
                                             <span className="rt-history-change">{title}</span>
-                                            {current ? <span className="rt-history-badge">Current</span> : null}
+                                            {current ? <span className="rt-history-badge">{uiText("Current")}</span> : null}
                                         </div>
                                         <div className="rt-history-meta">
                                             {details.join(" · ")}
@@ -190,7 +191,7 @@ function VersionList({
                                                 onClick={() => onRestore(entry.version)}
                                             >
                                                 {restoring === entry.version ? <Spinner size={12} /> : <Icon icon={UndoIcon} size={12} />}
-                                                Restore
+                                                {uiText("Restore")}
                                             </button>
                                         </span>
                                     ) : null}

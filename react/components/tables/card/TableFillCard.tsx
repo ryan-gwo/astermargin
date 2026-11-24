@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { tableCardDraftsAtom } from '@astermargin/agent-core/run-state/pendingTableCards';
@@ -97,12 +98,12 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
             <Button
                 variant="outline"
                 rightIcon={StopStrokeIcon}
-                ariaLabel="Stop generating"
+                ariaLabel={uiText("Stop generating")}
                 style={{ padding: '2px 5px' }}
                 onClick={onStop}
                 className="flex-none"
             >
-                Stop
+                {uiText("Stop")}
             </Button>
         </Tooltip>
     );
@@ -119,9 +120,9 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                     type="button"
                     className="table-card-head-action flex-none"
                     onClick={openTable}
-                    title="Open the table in a AsterMargin tab"
+                    title={uiText("Open the table in a AsterMargin tab")}
                 >
-                    <span>Open table</span>
+                    <span>{uiText("Open table")}</span>
                     <Icon icon={ArrowUpRightIcon} />
                 </button>
             </div>
@@ -133,7 +134,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
             <div
                 className="user-message-display table-card"
                 role="group"
-                aria-label="Cancel the fill"
+                aria-label={uiText("Cancel the fill")}
                 aria-live="assertive"
                 onKeyDown={(e) => {
                     // An IME composing text owns Escape: it dismisses the candidate.
@@ -148,8 +149,8 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                     <div className="table-card-header-body">
                         <AutoGrowTextarea
                             value={draft.instructions}
-                            placeholder="Optional: What should AsterMargin do instead?"
-                            aria-label="What AsterMargin should do instead (optional)"
+                            placeholder={uiText("Optional: What should AsterMargin do instead?")}
+                            aria-label={uiText("What AsterMargin should do instead (optional)")}
                             autoFocus
                             disabled={locked}
                             style={{ minHeight: '3.6em' }}
@@ -166,13 +167,13 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                         disabled={locked}
                         className="flex-none whitespace-nowrap"
                     >
-                        Back
+                        {uiText("Back")}
                     </Button>
                     {stopButton}
                     <div className="flex-1" />
                     <Button
                         variant={hasInstructions ? 'solid' : 'outline'}
-                        ariaLabel={hasInstructions ? 'Decline the fill and send instructions' : 'Cancel the fill'}
+                        ariaLabel={hasInstructions ? 'Decline the fill and send instructions' : uiText("Cancel the fill")}
                         onClick={() => decide(false)}
                         disabled={locked}
                         className="flex-none whitespace-nowrap"
@@ -187,7 +188,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
 
     const runLabel = fillActionLabel(request);
     return (
-        <div className="user-message-display table-card" role="group" aria-label="Proposed fill" aria-live="assertive">
+        <div className="user-message-display table-card" role="group" aria-label={uiText("Proposed fill")} aria-live="assertive">
             <div className="table-card-top">{header}</div>
             <div className="table-card-body" style={{ gap: '0.85rem' }}>
                 {request.description && (
@@ -197,7 +198,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                 )}
                 <div className="table-card-step">
                     <div className="table-card-step-head">
-                        <span className="font-semibold font-color-primary">Columns</span>
+                        <span className="font-semibold font-color-primary">{uiText("Columns")}</span>
                         <span className="table-card-count">{request.columns.length.toLocaleString('en-US')}</span>
                     </div>
                     <div className="display-flex flex-col min-w-0" style={{ gap: '0.3rem' }}>
@@ -224,7 +225,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                     disabled={locked}
                     className="flex-none whitespace-nowrap"
                 >
-                    Cancel
+                    {uiText("Cancel")}
                 </Button>
                 {stopButton}
                 <div className="flex-1" />

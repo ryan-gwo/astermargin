@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { isImeKeyEvent } from '@astermargin/agent-ui/primitives/ime';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
@@ -135,7 +136,7 @@ const Header: React.FC<{
                 icon={CancelIcon}
                 variant="ghost-secondary"
                 onClick={card.onDismiss}
-                ariaLabel="Close"
+                ariaLabel={uiText("Close")}
             />
         </div>
     </div>
@@ -348,7 +349,7 @@ const CompletedView: React.FC<{ card: CompletedCard }> = ({ card }) => {
                     {card.changes !== null && (
                         <button type="button" className="astermargin-run-status-popup__row" onClick={card.onReviewChanges}>
                             <Icon icon={LibraryIcon} className="font-color-secondary" />
-                            <span className="astermargin-run-status-popup__row-text astermargin-run-status-popup__row-text--fixed font-color-primary">Review library changes</span>
+                            <span className="astermargin-run-status-popup__row-text astermargin-run-status-popup__row-text--fixed font-color-primary">{uiText("Review library changes")}</span>
                             {card.changes && (
                                 <span className="astermargin-run-status-popup__row-trail font-color-tertiary" title={card.changes}>
                                     {card.changes}
@@ -361,7 +362,7 @@ const CompletedView: React.FC<{ card: CompletedCard }> = ({ card }) => {
             <div className="astermargin-run-status-popup__footer">
                 <div className="flex-1" />
                 <Button variant="outline" style={FOOTER_BUTTON_STYLE} rightIcon={ArrowRightIcon} onClick={card.onOpen}>
-                    Open AsterMargin
+                    {uiText("Open AsterMargin")}
                 </Button>
             </div>
         </>

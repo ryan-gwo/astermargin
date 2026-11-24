@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { collectionReferenceKey } from '@astermargin/agent-core/types/zotero';
 import { normalizeBackendCollection } from '@astermargin/agent-core/run-state/toolResultTypes';
 import React, { useState } from 'react';
@@ -20,7 +21,7 @@ export const CollectionListResultView: React.FC<{ view: CollectionListView }> = 
     if (collections.length === 0) {
         return (
             <div className="p-3 text-sm font-color-tertiary">
-                No collections found
+                {uiText("No collections found")}
             </div>
         );
     }
@@ -47,7 +48,7 @@ export const CollectionListResultView: React.FC<{ view: CollectionListView }> = 
                         onContextMenu={ref ? (event) => openCollectionMenu(ref, event) : undefined}
                         onMouseEnter={() => setHoveredKey(compositeKey)}
                         onMouseLeave={() => setHoveredKey(null)}
-                        title="Click to reveal in Zotero"
+                        title={uiText("Click to reveal in Zotero")}
                     >
                         <div className="display-flex items-center justify-center flex-shrink-0 rounded-md ml-05 mt-010">
                             <CSSIcon name="collection" className="icon-16 scale-90" />

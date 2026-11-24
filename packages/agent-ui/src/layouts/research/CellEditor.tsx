@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Cell, CellValue, Column } from "@astermargin/agent-core/layouts/table";
 import { Icon, TickIcon } from "../../icons";
@@ -143,7 +144,7 @@ function TextEditor({ column, cell, onSave, onCancel, inline }: EditorProps): Re
         >
             <label className="rt-cell-editor-field">
                 {/* In the inspector, the section's own heading names the field. */}
-                {inline ? null : <span className="rt-cell-editor-label">Answer</span>}
+                {inline ? null : <span className="rt-cell-editor-label">{uiText("Answer")}</span>}
                 <textarea
                     ref={answerRef}
                     className="rt-cell-editor-input rt-cell-editor-answer"
@@ -155,18 +156,18 @@ function TextEditor({ column, cell, onSave, onCancel, inline }: EditorProps): Re
                 />
             </label>
             <label className="rt-cell-editor-field">
-                <span className="rt-cell-editor-label">Note</span>
+                <span className="rt-cell-editor-label">{uiText("Note")}</span>
                 <input
                     type="text"
                     className="rt-cell-editor-input"
                     value={note}
                     maxLength={NOTE_MAX}
-                    placeholder="Why you changed it (optional)"
+                    placeholder={uiText("Why you changed it (optional)")}
                     disabled={saving}
                     onChange={(event) => setNote(event.target.value)}
                 />
             </label>
-            <p className="rt-cell-editor-hint">Fills won’t change your answer.</p>
+            <p className="rt-cell-editor-hint">{uiText("Fills won’t change your answer.")}</p>
             {error ? (
                 <p className="rt-cell-editor-error" role="alert">
                     {error}
@@ -176,17 +177,17 @@ function TextEditor({ column, cell, onSave, onCancel, inline }: EditorProps): Re
                 <Button
                     variant="ghost-secondary"
                     disabled={saving}
-                    title="The item does not say"
+                    title={uiText("The item does not say")}
                     onClick={() => void save({ op: "not_reported", note: noteText })}
                 >
-                    Not reported
+                    {uiText("Not reported")}
                 </Button>
                 <span className="rt-spacer" />
                 <Button variant="outline" disabled={saving} onClick={onCancel}>
-                    Cancel
+                    {uiText("Cancel")}
                 </Button>
                 <Button variant="solid" disabled={saving || !trimmed} loading={saving} onClick={submit}>
-                    Save
+                    {uiText("Save")}
                 </Button>
             </div>
         </div>
@@ -222,7 +223,7 @@ function choices(column: Column, cell: Cell | undefined): Choice[][] {
         [
             {
                 key: "not_reported",
-                label: "Not reported",
+                label: uiText("Not reported"),
                 current: cell?.outcome === "not_reported",
                 input: { op: "not_reported" },
                 muted: true,

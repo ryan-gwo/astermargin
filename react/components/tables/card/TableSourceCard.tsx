@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useEffect, useRef, useState } from 'react';
 import type { ItemDisplayRow } from '@astermargin/agent-core/protocol/agentProtocol';
 import type { DraftSource } from '@astermargin/agent-core/run-state/tableCardDraft';
@@ -96,7 +97,7 @@ function ItemRow({
             className={`table-card-item ${onReveal ? 'table-card-item-link' : ''}`}
             role={onReveal ? 'button' : undefined}
             tabIndex={onReveal ? 0 : undefined}
-            title={onReveal ? 'Show in Zotero' : undefined}
+            title={onReveal ? uiText("Show in Zotero") : undefined}
             aria-label={onReveal ? `Show ${row.display_name} in Zotero` : undefined}
             onClick={onReveal}
             onKeyDown={
@@ -119,7 +120,7 @@ function ItemRow({
                 <div className="font-color-primary truncate">{row.display_name}</div>
                 {row.subtitle && <div className="text-sm font-color-secondary truncate">{row.subtitle}</div>}
             </div>
-            {row.has_pdf === false && <span className="table-card-chip flex-none">No attachment</span>}
+            {row.has_pdf === false && <span className="table-card-chip flex-none">{uiText("No attachment")}</span>}
             {action}
         </div>
     );
@@ -230,10 +231,10 @@ export const TableSourceCard: React.FC<TableSourceCardProps> = ({
                     {rows === undefined ? (
                         <div className="display-flex flex-row items-center gap-2 text-sm font-color-secondary px-1 py-1">
                             <Spinner size={12} />
-                            <span>Loading items…</span>
+                            <span>{uiText("Loading items…")}</span>
                         </div>
                     ) : rows.length === 0 && !error ? (
-                        <div className="text-sm font-color-secondary px-1 py-1">No items.</div>
+                        <div className="text-sm font-color-secondary px-1 py-1">{uiText("No items.")}</div>
                     ) : (
                         <div className="table-card-item-list">
                             {rows.slice(0, shown).map((row) => (
@@ -292,7 +293,7 @@ export const TableSourceCard: React.FC<TableSourceCardProps> = ({
                                         ariaLabel={`Undo removing ${row.display_name}`}
                                         className="flex-none"
                                     >
-                                        Undo
+                                        {uiText("Undo")}
                                     </Button>
                                 </div>
                             ))}

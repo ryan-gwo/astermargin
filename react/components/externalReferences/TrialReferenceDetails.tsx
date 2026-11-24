@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { trialDetails, type ExternalReference } from '@astermargin/agent-core/types/externalReferences';
 import {
@@ -48,7 +49,7 @@ const TrialReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item }) 
             )}
             footer={<DetailsActions item={item} />}
         >
-            <DetailsSection title="Study">
+            <DetailsSection title={uiText("Study")}>
                 <RecordFacts facts={[
                     ['Official title', officialTitle],
                     ['Sponsor', details.lead_sponsor],
@@ -60,12 +61,12 @@ const TrialReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item }) 
                 ]} />
             </DetailsSection>
             {item.abstract && (
-                <DetailsSection title="Brief summary">
+                <DetailsSection title={uiText("Brief summary")}>
                     <div style={{ whiteSpace: 'pre-wrap' }}>{registryText(item.abstract.trim())}</div>
                 </DetailsSection>
             )}
             {(details.conditions?.length ?? 0) > 0 && (
-                <DetailsSection title="Conditions">
+                <DetailsSection title={uiText("Conditions")}>
                     <div className="display-flex flex-row flex-wrap gap-1">
                         {details.conditions!.map((condition, index) => (
                             <span key={`${condition}-${index}`} className="ext-chip">{condition}</span>
@@ -85,7 +86,7 @@ const TrialReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item }) 
                 </DetailsSection>
             )}
             {documents.length > 0 && (
-                <DetailsSection title="Documents">
+                <DetailsSection title={uiText("Documents")}>
                     <div className="display-flex flex-col gap-1 text-sm">
                         {documents.map((document, index) => {
                             const label = trialDocumentLabel(document);
@@ -102,7 +103,7 @@ const TrialReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item }) 
             )}
             {details.data_as_of && (
                 <div className="text-sm font-color-secondary">
-                    Data as of {formatRegistryDate(details.data_as_of)} · Source: ClinicalTrials.gov
+                    {uiText("Data as of")}{' '}{formatRegistryDate(details.data_as_of)} · Source: ClinicalTrials.gov
                 </div>
             )}
         </DetailsFrame>

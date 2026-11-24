@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { interfaceLocale } from "../../../react/utils/interfaceText";
+import { interfaceLocale, uiText } from "../../../react/utils/interfaceText";
+import {
+    normalizeInterfaceLanguage,
+    resolveInterfaceLocale,
+} from "../../../src/utils/interfaceLanguage";
 import { settingsText } from "../../../react/utils/settingsText";
 import { actionDisplayText } from "../../../react/utils/actionDisplayText";
 import { ALL_BUILTIN_ACTIONS } from "../../../react/types/builtinActions";
@@ -9,6 +13,40 @@ import { DEFAULT_MAX_ROUNDS } from "@astermargin/agent-local/config/localAgentCo
 afterEach(() => vi.unstubAllGlobals());
 
 describe("settings localization", () => {
+    it("prefers the plugin's language while retaining the host's locale", () => {
+        vi.stubGlobal("Zotero", {
+            locale: "en-US",
+            AsterMargin: { interfaceLocale: "zh-TW" },
+        });
+        expect(interfaceLocale()).toBe("zh-TW");
+        expect(settingsText("Interface language")).toBe("介面語言");
+        expect(uiText("Search chats")).toBe("搜尋對話");
+        expect(uiText("Current File")).toBe("目前檔案");
+        expect(uiText("Filter by Collections")).toBe("依分類篩選");
+        expect(uiText("Unreadable File")).toBe("無法讀取檔案");
+        expect(uiText("Edit column")).toBe("編輯欄");
+        expect(uiText("Fill {count} rows", { count: 3 })).toBe("填寫 3 列");
+        expect(Zotero.locale).toBe("en-US");
+    });
+
+    it("falls back to Zotero for invalid or missing saved values", () => {
+        expect(
+            resolveInterfaceLocale(
+                normalizeInterfaceLanguage(undefined),
+                "zh-TW",
+            ),
+        ).toBe("zh-TW");
+        expect(
+            resolveInterfaceLocale(
+                normalizeInterfaceLanguage("bad-value"),
+                "zh-CN",
+            ),
+        ).toBe("zh-CN");
+        expect(
+            resolveInterfaceLocale(normalizeInterfaceLanguage("en"), "zh-CN"),
+        ).toBe("en");
+    });
+
     it.each([
         ["en-US", "en"],
         ["de-DE", "en"],

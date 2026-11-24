@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { tableCardDraftsAtom } from '@astermargin/agent-core/run-state/pendingTableCards';
@@ -629,8 +630,8 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                     ref={titleRef}
                     className="table-card-title flex-1 min-w-0"
                     value={draft.title}
-                    placeholder="Untitled table"
-                    ariaLabel="Table title"
+                    placeholder={uiText("Untitled table")}
+                    ariaLabel={uiText("Table title")}
                     editLabel="Edit title"
                     disabled={locked}
                     onChange={(title) => setDraft((prev) => setTitle(prev, title))}
@@ -659,8 +660,8 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             <InlineEditableText
                 className="table-card-description"
                 value={draft.description}
-                placeholder="Add a description"
-                ariaLabel="Table description"
+                placeholder={uiText("Add a description")}
+                ariaLabel={uiText("Table description")}
                 editLabel="Edit description"
                 multiline
                 disabled={locked}
@@ -699,7 +700,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                         </span>
                     </>
                 ) : (
-                    <span className="font-color-orange">No library to save the table in</span>
+                    <span className="font-color-orange">{uiText("No library to save the table in")}</span>
                 )}
             </div>
         </div>
@@ -731,7 +732,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             triggerContent={
                 <>
                     <Icon icon={PlusSignIcon} />
-                    <span>Add source</span>
+                    <span>{uiText("Add source")}</span>
                 </>
             }
         />
@@ -744,7 +745,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             disabled={locked || draft.columns.length >= MAX_MODEL_COLUMNS}
         >
             <Icon icon={PlusSignIcon} />
-            <span>Add column</span>
+            <span>{uiText("Add column")}</span>
         </button>
     );
 
@@ -773,7 +774,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             <Icon icon={CheckmarkCircleIcon} className="table-card-step-done-icon flex-none" />
             <span className="font-medium font-color-primary flex-none">{STEP_LABELS[step]}</span>
             <span className="font-color-secondary truncate flex-1 min-w-0">{stepSummary(draft, step, request)}</span>
-            {!locked && <span className="table-card-step-edit flex-none">Edit</span>}
+            {!locked && <span className="table-card-step-edit flex-none">{uiText("Edit")}</span>}
         </button>
     ));
 
@@ -787,7 +788,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             )}
             {draft.sources.length === 0 && (
                 <div className="text-sm font-color-secondary">
-                    No sources yet. Add items, a collection or a tag, or drag them onto the card.
+                    {uiText("No sources yet. Add items, a collection or a tag, or drag them onto the card.")}
                 </div>
             )}
             {draft.sources.map((source) => (
@@ -820,7 +821,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
     const screeningStep = (
         <div className="display-flex flex-col min-w-0" style={{ gap: '0.45rem' }}>
             <div className="text-sm font-color-secondary">
-                Screening criteria are not available yet. The table is created without screening.
+                {uiText("Screening criteria are not available yet. The table is created without screening.")}
             </div>
             <Button
                 variant="ghost"
@@ -828,7 +829,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                 disabled={locked}
                 style={{ alignSelf: 'flex-start', marginLeft: '-6px' }}
             >
-                Remove screening
+                {uiText("Remove screening")}
             </Button>
         </div>
     );
@@ -851,12 +852,12 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
     // quiet line rather than a warning.
     const blockerAction = ((): { label: string; run: () => void } | null => {
         if (!blockerReason || blockerReason.pending) return null;
-        if (blockerReason.part === 'title') return { label: 'Edit title', run: () => titleRef.current?.edit() };
+        if (blockerReason.part === 'title') return { label: uiText("Edit title"), run: () => titleRef.current?.edit() };
         if (blockerReason.part === 'sources')
-            return draft.step === 'sources' ? null : { label: 'Edit sources', run: () => setDraft((prev) => goToStep(prev, 'sources')) };
-        if (!draft.columns.length) return { label: 'Add column', run: () => columnsRef.current?.add() };
+            return draft.step === 'sources' ? null : { label: uiText("Edit sources"), run: () => setDraft((prev) => goToStep(prev, 'sources')) };
+        if (!draft.columns.length) return { label: uiText("Add column"), run: () => columnsRef.current?.add() };
         if (draft.columns.some((column) => columnProblem(column)))
-            return { label: 'Show', run: () => columnsRef.current?.openFirstIncomplete() };
+            return { label: uiText("Show"), run: () => columnsRef.current?.openFirstIncomplete() };
         return null;
     })();
 
@@ -938,7 +939,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             ) : cost ? (
                 <TableCardReceipt cost={cost} upperBound={upperBound} prices={prices} disabled={locked} />
             ) : runUnpriced ? (
-                <span className="table-card-receipt table-card-receipt-quiet">Waiting for the price</span>
+                <span className="table-card-receipt table-card-receipt-quiet">{uiText("Waiting for the price")}</span>
             ) : null}
         </div>
     ) : null;
@@ -948,12 +949,12 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             <Button
                 variant="outline"
                 rightIcon={StopStrokeIcon}
-                ariaLabel="Stop generating"
+                ariaLabel={uiText("Stop generating")}
                 style={{ padding: '2px 5px' }}
                 onClick={onStop}
                 className="flex-none"
             >
-                Stop
+                {uiText("Stop")}
             </Button>
         </Tooltip>
     );
@@ -970,7 +971,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                 ref={containerRef}
                 className="user-message-display table-card"
                 role="group"
-                aria-label="Cancel the proposed table"
+                aria-label={uiText("Cancel the proposed table")}
                 aria-live="assertive"
                 onKeyDown={(e) => {
                     // An IME composing text owns Escape: it dismisses the candidate.
@@ -995,8 +996,8 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                         {/* <span className="font-color-secondary">Cancel this table?</span> */}
                         <AutoGrowTextarea
                             value={draft.instructions}
-                            placeholder="Optional: What should AsterMargin do instead?"
-                            aria-label="What AsterMargin should do instead (optional)"
+                            placeholder={uiText("Optional: What should AsterMargin do instead?")}
+                            aria-label={uiText("What AsterMargin should do instead (optional)")}
                             autoFocus
                             disabled={locked}
                             style={{ minHeight: '3.6em' }}
@@ -1013,7 +1014,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                         disabled={locked}
                         className="flex-none whitespace-nowrap"
                     >
-                        Back to table
+                        {uiText("Back to table")}
                     </Button>
                     {stopButton}
                     <div className="flex-1" />
@@ -1048,7 +1049,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
             ref={containerRef}
             className="user-message-display table-card"
             role="group"
-            aria-label="Proposed table"
+            aria-label={uiText("Proposed table")}
             aria-live="assertive"
         >
             {/* The title row and the footer stay in place; everything between
@@ -1084,7 +1085,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                             disabled={locked}
                             className="flex-none whitespace-nowrap"
                         >
-                            Back
+                            {uiText("Back")}
                         </Button>
                     )}
                     <Button
@@ -1093,7 +1094,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                         disabled={locked}
                         className="flex-none whitespace-nowrap"
                     >
-                        Cancel
+                        {uiText("Cancel")}
                     </Button>
                     {/* "Add screening" joins this row when screening exists (P4). */}
                     <div className="flex-1" />
@@ -1109,7 +1110,7 @@ export const TableCard: React.FC<TableCardProps> = ({ request, onSubmit, disable
                             className="flex-none whitespace-nowrap"
                             style={{ padding: '3px 8px' }}
                         >
-                            Next
+                            {uiText("Next")}
                         </Button>
                     ) : (
                         <Button

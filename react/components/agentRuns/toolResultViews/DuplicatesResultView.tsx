@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useState } from 'react';
 import type {
     DuplicateGroup,
@@ -46,7 +47,7 @@ const MemberRow: React.FC<{ member: DuplicateMember; index: number; lines: Membe
             role="button"
             tabIndex={0}
             className="duplicate-member-row display-flex flex-row items-start gap-2 px-2 py-1 rounded-md cursor-pointer"
-            title="Click to reveal in Zotero"
+            title={uiText("Click to reveal in Zotero")}
             onClick={() => revealMember(member)}
             onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
@@ -164,7 +165,7 @@ const DuplicateGroupView: React.FC<{ group: DuplicateGroup }> = ({ group }) => {
 
 export const DuplicatesResultView: React.FC<{ view: View }> = ({ view }) => {
     if (!view.groups.length) {
-        return <div className="p-3 text-sm font-color-secondary">No duplicate items found</div>;
+        return <div className="p-3 text-sm font-color-secondary">{uiText("No duplicate items found")}</div>;
     }
     const shown = view.groups.length;
     // The view carries no offset; recover it from where the page ends.
@@ -179,7 +180,7 @@ export const DuplicatesResultView: React.FC<{ view: View }> = ({ view }) => {
             ))}
             {view.total_count > shown && (
                 <div className="px-3 py-2 text-sm font-color-secondary border-top-quinary">
-                    Showing groups {start}–{end} of {view.total_count}
+                    {uiText("Showing groups")}{' '}{start}–{end} of {view.total_count}
                 </div>
             )}
         </div>

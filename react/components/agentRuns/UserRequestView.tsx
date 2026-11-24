@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { threadReadOnlyAtom } from '../../runtime/threadProjection';
 import { chatLineSpacingAtom } from '../../atoms/preferences';
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
@@ -750,7 +751,7 @@ export const UserRequestView: React.FC<UserRequestViewProps> = ({
                         setSearchQuery={setSlashSearchQuery}
                         onSearch={() => {}}
                         noResultsText="No actions found"
-                        placeholder="Search actions..."
+                        placeholder={uiText("Search actions...")}
                         closeOnSelect={false}
                         showSearchInput={false}
                         selectOnTab={true}
@@ -769,8 +770,8 @@ export const UserRequestView: React.FC<UserRequestViewProps> = ({
                                 onPillsChange={setEditedPills}
                                 onSubmit={handleEditorSubmit}
                                 resolveAction={resolveAction}
-                                placeholder="Edit your message..."
-                                ariaLabel="Edit message"
+                                placeholder={uiText("Edit your message...")}
+                                ariaLabel={uiText("Edit message")}
                                 // The `@` menu has no search field of its own.
                                 inlineHint={
                                     isAddSourcesMenuOpen
@@ -799,13 +800,13 @@ export const UserRequestView: React.FC<UserRequestViewProps> = ({
                                 variant="ghost"
                                 onClick={handleCancel}
                             >
-                                Cancel
+                                {uiText("Cancel")}
                             </Button>
                             <IconButton
                                 icon={ArrowUpLineIcon}
                                 variant="solid"
                                 className="composer-send"
-                                ariaLabel="Send edited message"
+                                ariaLabel={uiText("Send edited message")}
                                 title={isRunReconnecting ? RECONNECT_UNAVAILABLE_TOOLTIP : undefined}
                                 onClick={handleSubmit}
                                 disabled={

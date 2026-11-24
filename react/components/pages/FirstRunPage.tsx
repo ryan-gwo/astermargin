@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import {
@@ -92,7 +93,7 @@ const FirstRunPage: React.FC<FirstRunPageProps> = () => {
 
     const headerMessage = isSuggestionsMode ? (
         <div className="display-flex flex-col gap-2 py-2 mt-3">
-            <div className="text-lg font-semibold">Ideas for your library</div>
+            <div className="text-lg font-semibold">{uiText("Ideas for your library")}</div>
         </div>
     ) : isLibraryEmpty ? (
         <div className="display-flex flex-col gap-2 py-2 mt-2">

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import type { DuplicateGroup, DuplicateMember } from '@astermargin/agent-core/protocol/duplicates';
 import { formatFieldName } from '../../../utils/fieldLabels';
@@ -229,7 +230,7 @@ export function groupMemberLines(group: DuplicateGroup, contents?: string[]): Me
 /** Record letter; announced as "Record A" since it links values to their record. */
 export const MemberBadge: React.FC<{ index: number }> = ({ index }) => (
     <span className="duplicate-member-badge">
-        <span className="sr-only">Record </span>
+        <span className="sr-only">{uiText("Record")}{' '}</span>
         {memberLetter(index)}
     </span>
 );
@@ -237,7 +238,7 @@ export const MemberBadge: React.FC<{ index: number }> = ({ index }) => (
 /** Field value clamped to a few lines; empty values render as a muted placeholder. */
 export const FieldValue: React.FC<{ value: unknown; lines?: number }> = ({ value, lines = 3 }) => {
     const text = duplicateFieldText(value);
-    if (text == null) return <span className="font-color-secondary font-italic">Empty</span>;
+    if (text == null) return <span className="font-color-secondary font-italic">{uiText("Empty")}</span>;
     return (
         <span className="duplicate-field-value" style={{ WebkitLineClamp: lines }} title={text}>
             {text}

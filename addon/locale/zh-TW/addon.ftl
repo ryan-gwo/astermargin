@@ -16,3 +16,10 @@ preferences-pane-open =
     .label = 開啟星箋設定
 preferences-pane-help = 開啟星箋的獨立設定視窗。
 preferences-pane-open-failed = 星箋無法開啟設定視窗。請重新開啟 Zotero 後再試。
+
+reader-explain = 解釋
+reader-ask = 提問…
+reader-explain-with = 用星箋解釋
+reader-ask-with = 向星箋提問…
+reader-ask-document = 詢問星箋
+reader-actions = 動作

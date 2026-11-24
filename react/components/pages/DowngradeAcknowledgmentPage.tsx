@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from "react";
 import { useAtomValue } from "jotai";
 import { profileWithPlanAtom, dataDeletionScheduledForAtom } from "../../atoms/profile";
@@ -63,7 +64,7 @@ const DowngradeAcknowledgmentPage: React.FC = () => {
                 <div className="display-flex flex-col gap-4 ml-1">
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
-                        <span>Sentence-level citations</span>
+                        <span>{uiText("Sentence-level citations")}</span>
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
@@ -76,7 +77,7 @@ const DowngradeAcknowledgmentPage: React.FC = () => {
                 <div className="display-flex flex-col gap-4 ml-1">
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
-                        <span>Chat with your entire library</span>
+                        <span>{uiText("Chat with your entire library")}</span>
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
@@ -84,11 +85,11 @@ const DowngradeAcknowledgmentPage: React.FC = () => {
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
-                        <span>Discover New Research</span>
+                        <span>{uiText("Discover New Research")}</span>
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
-                        <span>Organize and Edit your library</span>
+                        <span>{uiText("Organize and Edit your library")}</span>
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
@@ -100,15 +101,15 @@ const DowngradeAcknowledgmentPage: React.FC = () => {
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
-                        <span>Metadata & semantic search</span>
+                        <span>{uiText("Metadata & semantic search")}</span>
                     </div>
                     <div className="display-flex flex-row gap-2 items-start">
                         <Icon icon={TickIcon} className="scale-09 font-color-secondary mt-020" />
-                        <span>Local file processing</span>
+                        <span>{uiText("Local file processing")}</span>
                     </div>
                 </div>
                 <div className="mt-2 text-lg">
-                    No longer included
+                    {uiText("No longer included")}
                 </div>
                 <div className="display-flex flex-col gap-4 ml-1">
                     <div className="display-flex flex-row gap-2 items-start">

@@ -1,3 +1,4 @@
+import { uiText } from "./interfaceText";
 /**
  * Action visibility — determines whether an action should be shown
  * (enabled) given the current context (Zotero state + manually attached items).
@@ -297,7 +298,7 @@ export function computeActionGroups(allActions: Action[], ctx: ActionContext): A
         const noteActions = allActions.filter(a => a.targets.includes('note'));
         if (noteActions.length > 0) {
             const noteItem = ctx.zotero.noteItem;
-            const label = noteItem ? getNoteLabel(noteItem) : 'Note';
+            const label = noteItem ? getNoteLabel(noteItem) : uiText("Note");
             groups.push({ id: 'note', label, actions: noteActions, targetType: 'note', iconInfo: { type: 'css-icon', name: 'note' } });
         }
     }
@@ -440,36 +441,23 @@ export function resolveActionBinding(action: Action, active: ActiveTarget | null
 // ---------------------------------------------------------------------------
 
 function formatItemNames(items: Zotero.Item[], source: 'selected' | 'attached'): string {
-    const prefix = source === 'selected' ? 'selected' : 'attached';
     if (items.length > MAX_LABEL_ITEMS) {
-        if (source === 'attached' && items.some(i => i.isAttachment()) && items.some(i => i.isRegularItem())) {
-            return `${items.length} ${prefix} items and attachments`;
-        }
-        if (items.every(i => i.isAttachment())) {
-            return `${items.length} ${prefix} attachments`;
-        }
-        if (items.every(i => i.isNote())) {
-            return `${items.length} ${prefix} notes`;
-        }
-        return `${items.length} ${prefix} items`;
+        if (source === 'attached') return getManualLabel(items);
+        if (items.every(i => i.isNote())) return uiText("{count} selected notes", { count: items.length });
+        return getSelectedLabel(items);
     }
-    const names = items
-        .slice(0, MAX_LABEL_ITEMS)
-        .map(i => getItemLabel(i));
-    const remaining = items.length - MAX_LABEL_ITEMS;
-    if (remaining > 0) names.push(`+${remaining} more`);
-    return names.join(', ');
+    return items.map(getItemLabel).join(', ');
 }
 
 function getManualLabel(items: Zotero.Item[]): string {
     if (items.length <= MAX_LABEL_ITEMS) {
         const names = items.map(i => getItemLabel(i));
-        return `${names.join(', ')} (attached)`;
+        return uiText("{names} (attached)", { names: names.join(", ") });
     }
-    if (items.every(i => i.isAttachment())) return `${items.length} attached attachments`;
-    if (items.every(i => i.isRegularItem())) return `${items.length} attached items`;
-    if (items.every(i => i.isNote())) return `${items.length} attached notes`;
-    return `${items.length} attached items and attachments`;
+    if (items.every(i => i.isAttachment())) return uiText("{count} attached attachments", { count: items.length });
+    if (items.every(i => i.isRegularItem())) return uiText("{count} attached items", { count: items.length });
+    if (items.every(i => i.isNote())) return uiText("{count} attached notes", { count: items.length });
+    return uiText("{count} attached items and attachments", { count: items.length });
 }
 
 /**
@@ -479,14 +467,14 @@ function getManualLabel(items: Zotero.Item[]): string {
  */
 function getCollectionLabel({ collections, views }: CollectionTargetSelection): string {
     if (collections.length === 1 && views.length === 0) {
-        return truncateText(collections[0].collectionName || 'Collection', MAX_LABEL_ITEM_LENGTH);
+        return truncateText(collections[0].collectionName || uiText("Collection"), MAX_LABEL_ITEM_LENGTH);
     }
     if (views.length === 1 && collections.length === 0) {
-        const fallback = views[0].type === 'search' ? 'Saved search' : 'Collection';
+        const fallback = uiText(views[0].type === 'search' ? 'Saved search' : 'Collection');
         return truncateText(views[0].name || fallback, MAX_LABEL_ITEM_LENGTH);
     }
-    if (views.length === 0) return `${collections.length} collections selected`;
-    return `${collections.length + views.length} views selected`;
+    if (views.length === 0) return uiText("{count} collections selected", { count: collections.length });
+    return uiText("{count} views selected", { count: collections.length + views.length });
 }
 
 /** Collections-pane icon for a collection-target selection. */
@@ -503,9 +491,8 @@ function getSelectedLabel(items: Zotero.Item[]): string {
         const names = items.map(i => getItemLabel(i));
         return `${names.join(', ')}`;
     }
-    if (items.every(i => i.isAttachment())) return `${items.length} selected attachments`;
-    if (items.every(i => i.isRegularItem())) return `${items.length} selected items`;
-    return `${items.length} selected items`;
+    if (items.every(i => i.isAttachment())) return uiText("{count} selected attachments", { count: items.length });
+    return uiText("{count} selected items", { count: items.length });
 }
 
 /**
@@ -515,7 +502,7 @@ function getSelectedLabel(items: Zotero.Item[]): string {
  * the data and re-renders with the real one.
  */
 function getItemLabel(item: Zotero.Item): string {
-    const fallback = item.isNote() ? 'Note' : item.isAttachment() ? 'Attachment' : 'Item';
+    const fallback = uiText(item.isNote() ? 'Note' : item.isAttachment() ? 'Attachment' : 'Item');
     return readOrFallback(() => {
         if (item.isRegularItem()) {
             return truncateText(getDisplayNameFromItem(item), MAX_LABEL_ITEM_LENGTH);
@@ -525,7 +512,7 @@ function getItemLabel(item: Zotero.Item): string {
 }
 
 function getNoteLabel(note: Zotero.Item): string {
-    return readOrFallback(() => truncateText(note.getNoteTitle(), MAX_LABEL_ITEM_LENGTH), 'Note');
+    return readOrFallback(() => truncateText(note.getNoteTitle(), MAX_LABEL_ITEM_LENGTH), uiText("Note"));
 }
 
 // ---------------------------------------------------------------------------

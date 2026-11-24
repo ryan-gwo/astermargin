@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { forwardRef } from 'react'
 import { Icon, TextAlignLeftIcon, FileViewIcon } from "../icons/icons"
 import { useAtomValue, useSetAtom } from 'jotai'
@@ -77,7 +78,7 @@ export const TextSelectionButton = forwardRef<HTMLButtonElement, TextSelectionBu
             const selectionText = truncateText(selection.text.replace(/\s+/g, ' ').trim(), MAX_TEXT_SELECTION_TOOLTIP_TEXT_LENGTH);
             return {
                 icon: <Icon icon={TextAlignLeftIcon} className="scale-90 font-color-primary mt-020" />,
-                title: 'Text Selection',
+                title: uiText("Text Selection"),
                 subtitle: selectionText ? { text: selectionText } : null,
                 action: { icon: FileViewIcon, label: revealLabel },
             };
@@ -112,7 +113,7 @@ export const TextSelectionButton = forwardRef<HTMLButtonElement, TextSelectionBu
                         />
                     ) : normalIcon}
                     <span className={`truncate`}>
-                        Text Selection
+                        {uiText("Text Selection")}
                     </span>
                 </ChipButton>
             </ChipWithPopup>

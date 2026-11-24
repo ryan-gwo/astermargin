@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { AgentRunStatus, ToolCallPart } from '@astermargin/agent-core/agents/types';
@@ -881,7 +882,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     variant="ghost-secondary"
                                     iconClassName="font-color-red"
                                     onClick={handleRejectAll}
-                                    ariaLabel="Reject all"
+                                    ariaLabel={uiText("Reject all")}
                                 />
                             </Tooltip>
                             <Tooltip content={isStaleOnlyDecision ? STALE_APPLY_ANYWAY_TOOLTIP : 'Apply all'} showArrow singleLine>
@@ -890,7 +891,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     variant="ghost-secondary"
                                     iconClassName="font-color-green scale-14"
                                     onClick={isStaleOnlyDecision ? handleApplyAnyway : handleApplyAll}
-                                    ariaLabel={isStaleOnlyDecision ? 'Apply anyway' : 'Apply all'}
+                                    ariaLabel={isStaleOnlyDecision ? uiText("Apply anyway") : uiText("Apply all")}
                                 />
                             </Tooltip>
                         </>
@@ -902,7 +903,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                 variant="ghost-secondary"
                                 iconClassName="font-color-secondary scale-10"
                                 onClick={() => openNoteByKey(resolvedTarget.libraryId, resolvedTarget.zoteroKey)}
-                                ariaLabel="Open note"
+                                ariaLabel={uiText("Open note")}
                             />
                         </Tooltip>
                     )}
@@ -980,7 +981,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                         onClick={handlePreviewInEditor}
                                         style={{ padding: '3px 6px' }}
                                         disabled={isProcessing}
-                                        ariaLabel="Preview"
+                                        ariaLabel={uiText("Preview")}
                                     />
                                 </Tooltip>
                             ) : (
@@ -992,7 +993,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     disabled={isProcessing}
                                     className="flex-none whitespace-nowrap"
                                 >
-                                    Preview
+                                    {uiText("Preview")}
                                 </Button>
                             ))}
 
@@ -1004,7 +1005,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     disabled={isProcessing}
                                     className="flex-none whitespace-nowrap"
                                 >
-                                    Reject All
+                                    {uiText("Reject All")}
                                 </Button>
                             )}
 
@@ -1016,7 +1017,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     disabled={isProcessing}
                                     className="flex-none whitespace-nowrap"
                                 >
-                                    Undo All
+                                    {uiText("Undo All")}
                                 </Button>
                             )}
 
@@ -1029,7 +1030,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     disabled={isProcessing}
                                     className="flex-none whitespace-nowrap"
                                 >
-                                    Retry All
+                                    {uiText("Retry All")}
                                 </Button>
                             )}
 
@@ -1039,10 +1040,10 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     onClick={handleApplyAnyway}
                                     loading={isProcessing && clickedButton === 'applyAnyway'}
                                     disabled={isProcessing}
-                                    title="Make the edit even though the note changed since it was proposed"
+                                    title={uiText("Make the edit even though the note changed since it was proposed")}
                                     className="flex-none whitespace-nowrap"
                                 >
-                                    Apply anyway
+                                    {uiText("Apply anyway")}
                                 </Button>
                             )}
 
@@ -1054,7 +1055,7 @@ export const EditNoteGroupView: React.FC<EditNoteGroupViewProps> = ({
                                     disabled={isProcessing}
                                     className="flex-none whitespace-nowrap"
                                 >
-                                    <span>Apply All</span>
+                                    <span>{uiText("Apply All")}</span>
                                 </Button>
                             )}
                         </div>

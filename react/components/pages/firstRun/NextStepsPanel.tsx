@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useEffect, useRef } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { firstRunReturnRequestedAtom } from '../../../atoms/firstRun';
@@ -106,13 +107,13 @@ const NextStepsPanel: React.FC<NextStepsPanelProps> = ({ origin, onDismiss }) =>
                         className="font-color-primary text-sm font-semibold uppercase"
                         style={{ letterSpacing: '0.05em' }}
                     >
-                        Guided next steps
+                        {uiText("Guided next steps")}
                     </div>
                     <Tooltip content="Dismiss next steps" showArrow singleLine>
                         <IconButton
                             icon={CancelIcon}
                             onClick={onDismiss}
-                            ariaLabel="Dismiss next steps"
+                            ariaLabel={uiText("Dismiss next steps")}
                             variant="ghost-secondary"
                         />
                     </Tooltip>

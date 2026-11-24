@@ -1,3 +1,5 @@
+import { actionDisplayText } from "../utils/actionDisplayText";
+import { uiText } from "../utils/interfaceText";
 import React from "react";
 import Button from "@astermargin/agent-ui/primitives/Button";
 import { useAtomValue } from "jotai";
@@ -101,7 +103,7 @@ const ActionSuggestions: React.FC<ActionSuggestionsProps> = ({ showGlobal = true
             style={{ padding: '6px 6px' }}
         >
             <span className="text-base truncate">
-                {action.title}
+                {actionDisplayText(action, "title")}
             </span>
         </Button>
     ));
@@ -110,7 +112,7 @@ const ActionSuggestions: React.FC<ActionSuggestionsProps> = ({ showGlobal = true
         <div className="display-flex flex-row gap-1 items-start font-color-tertiary mt-3">
             <Icon icon={AlertIcon} className="mt-010" />
             <div className="text-sm">
-                This library is not synced with AsterMargin
+                {uiText("This library is not synced with AsterMargin")}
             </div>
         </div>
     ) : null;
@@ -123,7 +125,7 @@ const ActionSuggestions: React.FC<ActionSuggestionsProps> = ({ showGlobal = true
             <div className="display-flex flex-col gap-05 px-1" style={style}>
                 {actions.length > 0 ? actionButtons : (
                     <div className="font-color-tertiary text-sm px-1 py-2">
-                        No actions available for the current selection.
+                        {uiText("No actions available for the current selection.")}
                     </div>
                 )}
                 <div className="display-flex flex-row items-center gap-2 mt-2 pt-2 border-top-quinary">
@@ -134,8 +136,8 @@ const ActionSuggestions: React.FC<ActionSuggestionsProps> = ({ showGlobal = true
                         variant="ghost-tertiary"
                         onClick={() => openPreferencesWindow('actions')}
                         icon={SettingsIcon}
-                        ariaLabel="Edit actions"
-                        title="Edit actions"
+                        ariaLabel={uiText("Edit actions")}
+                        title={uiText("Edit actions")}
                     />
                 </div>
                 {notSyncedWarning}
@@ -149,7 +151,7 @@ const ActionSuggestions: React.FC<ActionSuggestionsProps> = ({ showGlobal = true
                 <Icon icon={ZapIcon} />
                 <div className="display-flex flex-row gap-1 items-center min-w-0">
                     <div className="font-color-tertiary font-semibold flex-shrink-0" style={{ whiteSpace: 'nowrap', fontSize: '0.925rem' }}>
-                        Actions {contextLabel ? `for` : ''}
+                        {uiText("Actions")}{' '}{contextLabel ? `for` : ''}
                     </div>
                     {contextLabelElement}
                 </div>

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import ReferenceMetadataDisplay from '../../../components/externalReferences/ReferenceMetadataDisplay';
 import { AgentAction } from '../../../agents/agentActions';
@@ -91,7 +92,7 @@ const CreateItemPreviewRow: React.FC<{
     if (!item) {
         return (
             <div className="text-sm font-color-secondary">
-                No item data available
+                {uiText("No item data available")}
             </div>
         );
     }
@@ -125,7 +126,7 @@ const CreateItemPreviewRow: React.FC<{
                 {pdfStatus.isLoading && (
                     <div className="display-flex items-center gap-1 font-color-secondary text-sm">
                         <Spinner size={12} />
-                        <span>Fetching PDF…</span>
+                        <span>{uiText("Fetching PDF…")}</span>
                     </div>
                 )}
             </div>

@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useCallback, useRef, useState } from 'react';
 import type { PendingBatchApproval } from '@astermargin/agent-core/run-state/pendingBatchApprovals';
 import type {
@@ -168,7 +169,7 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
             className="user-message-display"
             style={{ minHeight: 'fit-content', padding: '0.8rem' }}
             role="group"
-            aria-label="Batch job approval"
+            aria-label={uiText("Batch job approval")}
             // The instructions field can take focus but nothing here announces
             // itself, so this is what tells a screen reader the run has stopped
             // and is waiting on a decision.
@@ -264,7 +265,7 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
                             border: '1px solid var(--tag-orange-tertiary)',
                         }}
                         role="note"
-                        aria-label="What this batch removes or overwrites"
+                        aria-label={uiText("What this batch removes or overwrites")}
                     >
                         <Icon
                             icon={SecurityWarningIcon}
@@ -320,8 +321,8 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
                     revealLabel={ADD_INSTRUCTIONS_LABEL}
                     revealAriaLabel="Add instructions for this batch"
                     heading={INSTRUCTIONS_HEADING}
-                    placeholder="What to change, or what you want done instead"
-                    ariaLabel="Instructions for this batch (optional)"
+                    placeholder={uiText("What to change, or what you want done instead")}
+                    ariaLabel={uiText("Instructions for this batch (optional)")}
                     disabled={isDecided}
                     // A card that opens with the prefill already showing was
                     // not opened by the user, so nothing asked for the caret.
@@ -355,7 +356,7 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
                                 heading={MODE_HEADING}
                                 disabled={isDecided}
                                 iconOnly={modeIconOnly}
-                                tooltipContent="How this batch's changes are approved"
+                                tooltipContent={uiText("How this batch's changes are approved")}
                                 style={{ padding: '2px 6px', fontSize: '0.95rem' }}
                             />
                         </div>
@@ -365,12 +366,12 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
                             <Button
                                 variant="outline"
                                 rightIcon={StopStrokeIcon}
-                                ariaLabel="Stop generating"
+                                ariaLabel={uiText("Stop generating")}
                                 style={{ padding: '2px 5px' }}
                                 onClick={onStop}
                                 className="flex-none"
                             >
-                                Stop
+                                {uiText("Stop")}
                             </Button>
                         </Tooltip>
                     )}
@@ -389,7 +390,7 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
                     </Button>
                     <Button
                         variant="solid"
-                        ariaLabel="Approve batch job"
+                        ariaLabel={uiText("Approve batch job")}
                         style={{ padding: '3px 5px' }}
                         onClick={handleApprove}
                         disabled={isDecided || disabled}

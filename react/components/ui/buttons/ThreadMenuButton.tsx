@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { canOpenFinishedChatAtom, refreshFinishedChatAvailabilityAtom } from '../../../runtime/windowCommands';
 import { RESPONSE_FINISH_MESSAGE } from '../../../../src/services/threads/finishedChat';
 import { AsterMarginUIFactory } from "../../../../src/ui/ui";
@@ -336,13 +337,13 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
         // and files made from it, and last, apart, deleting it.
         const items: MenuItem[] = [
             {
-                label: 'Rename chat…',
+                label: uiText("Rename chat…"),
                 icon: EditIcon,
                 onClick: handleRenameChat,
                 disabled: !threadId,
             },
             {
-                label: isPinned ? 'Unpin chat' : 'Pin chat',
+                label: isPinned ? uiText("Unpin chat") : uiText("Pin chat"),
                 icon: isPinned ? PinOffIcon : PinIcon,
                 onClick: handleTogglePin,
                 disabled: !threadId || isPinned === null || pinPending,
@@ -357,7 +358,7 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
             },
             menuDivider('thread-actions-divider'),
             {
-                label: 'Find in chat',
+                label: uiText("Find in chat"),
                 icon: SearchIcon,
                 // Display only: the chord itself is handled by the sidebar.
                 shortcut: Zotero.isMac ? '⌘F' : 'Ctrl+F',
@@ -366,14 +367,14 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
                 disabled: !hasRuns || !findControls.isAvailable,
             },
             ...(!inWindow ? [{
-                label: "Open in AsterMargin window",
+                label: uiText("Open in AsterMargin window"),
                 icon: PictureInPictureIcon,
                 disabled: !canOpenFinishedChat,
                 customContent: !canOpenFinishedChat && !availabilityPending ? (
                     <span className="display-flex items-start gap-2">
                         <Icon icon={PictureInPictureIcon} size={14} className="mt-010" />
                         <span>
-                            <div>Open in AsterMargin window</div>
+                            <div>{uiText("Open in AsterMargin window")}</div>
                             <div className="text-xs">{RESPONSE_FINISH_MESSAGE}</div>
                         </span>
                     </span>
@@ -387,13 +388,13 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
             }] : []),
             menuDivider('clipboard-divider'),
             {
-                label: 'Copy chat',
+                label: uiText("Copy chat"),
                 icon: CopyIcon,
                 onClick: handleCopyThread,
                 disabled: !hasRuns,
             },
             {
-                label: 'Copy link to chat',
+                label: uiText("Copy link to chat"),
                 icon: LinkIcon,
                 onClick: handleCopyThreadUrl,
                 disabled: !threadId,
@@ -420,7 +421,7 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
             ] : []),
             menuDivider('delete-divider'),
             {
-                label: 'Delete chat…',
+                label: uiText("Delete chat…"),
                 icon: DeleteIcon,
                 onClick: handleDeleteChat,
                 disabled: !threadId,
@@ -437,7 +438,7 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
             ariaLabel={ariaLabel}
             variant="ghost"
             toggleCallback={handleMenuToggle}
-            tooltipContent="Chat actions"
+            tooltipContent={uiText("Chat actions")}
             showArrow={true}
         />
     );

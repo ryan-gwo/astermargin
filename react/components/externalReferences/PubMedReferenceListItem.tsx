@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import type { ExternalReference } from '@astermargin/agent-core/types/externalReferences';
 import { getHost } from '@astermargin/agent-ui/host';
@@ -27,7 +28,7 @@ export const PubMedTags: React.FC<{ item: ExternalReference }> = ({ item }) => {
     const pmcid = item.identifiers?.pmcid;
     return (
         <RecordTags>
-            {item.is_retracted && <RecordBadge label="Retracted" tone="red" />}
+            {item.is_retracted && <RecordBadge label={uiText("Retracted")} tone="red" />}
             {publicationTypeBadges(item).map((badge) => <RecordBadge key={badge} label={badge} />)}
             {pmcid && isFreePmcArticle(item) && (
                 <RecordLink url={pmcUrl(pmcid)}><RecordBadge label="Free PMC article" tone="green" /></RecordLink>

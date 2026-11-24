@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import React, { useEffect, useState } from 'react';
 import { getRecentAsync, loadFullItemData } from '../../../../../src/utils/zoteroUtils';
@@ -104,9 +105,9 @@ export const useSourcesMenu = ({
     verticalPosition = 'above',
     entries,
 }: UseSourcesMenuOptions): UseSourcesMenuResult => {
-    const collectionsLabel = entries?.scopeVerb === 'add' ? 'Add Collection' : 'Filter by Collections';
-    const tagsLabel = entries?.scopeVerb === 'add' ? 'Add Tag' : 'Filter by Tags';
-    const savedSearchesLabel = entries?.scopeVerb === 'add' ? 'Add Saved Search' : 'Filter by Saved Searches';
+    const collectionsLabel = uiText(entries?.scopeVerb === 'add' ? 'Add Collection' : 'Filter by Collections');
+    const tagsLabel = uiText(entries?.scopeVerb === 'add' ? 'Add Tag' : 'Filter by Tags');
+    const savedSearchesLabel = uiText(entries?.scopeVerb === 'add' ? 'Add Saved Search' : 'Filter by Saved Searches');
     const [menuItems, setMenuItems] = useState<SearchMenuItem[]>([]);
     const [builtFrom, setBuiltFrom] = useState<Zotero.Item[] | null>(null);
 
@@ -163,7 +164,8 @@ export const useSourcesMenu = ({
         const itemSection = (title: string | null, rows: SearchMenuItem[]): SearchMenuItem[] => {
             if (rows.length === 0) return [];
             if (!title) return rows;
-            return verticalPosition === 'above' ? [...rows, header(title)] : [header(title), ...rows];
+            const section = header(uiText(title));
+            return verticalPosition === 'above' ? [...rows, section] : [section, ...rows];
         };
 
         /** The rows for a typed query: matching items, nothing else. */
@@ -261,7 +263,7 @@ export const useSourcesMenu = ({
 
             if (searchableLibraryIds.length > 1 && entries?.libraries !== false) {
                 filterItems.push({
-                    label: '"Filter by Library"',
+                    label: `"${uiText("Filter by Library")}"`,
                     onClick: async () => {
                         onNavigateToLibraries();
                     },
@@ -269,7 +271,7 @@ export const useSourcesMenu = ({
                         <div className={'display-flex flex-row flex-1 items-start font-color-secondary'}>
                             <div className="display-flex flex-row gap-2">
                                 <CSSIcon name="library" className="icon-16 font-color-secondary scale-90" />
-                                <div>Filter by Library</div>
+                                <div>{uiText("Filter by Library")}</div>
                             </div>
                             <div className="flex-1" />
                             <Icon icon={ArrowRightIcon} className="scale-12 mt-020" />
@@ -354,7 +356,7 @@ export const useSourcesMenu = ({
             });
 
             if (entries?.notes !== false) filterItems.push({
-                label: '"Add Note"',
+                label: `"${uiText("Add Note")}"`,
                 onClick: async () => {
                     onNavigateToNotes();
                 },
@@ -362,7 +364,7 @@ export const useSourcesMenu = ({
                     <div className={'display-flex flex-row flex-1 items-start font-color-secondary'}>
                         <div className="display-flex flex-row gap-2">
                             <CSSIcon name="note" className="icon-16 font-color-secondary scale-90" />
-                            <div>Add Note</div>
+                            <div>{uiText("Add Note")}</div>
                         </div>
                         <div className="flex-1" />
                         <Icon icon={ArrowRightIcon} className="scale-12 mt-020" />
@@ -371,7 +373,7 @@ export const useSourcesMenu = ({
             });
 
             if (entries?.files !== false) filterItems.push({
-                label: '"Add File"',
+                label: `"${uiText("Add File")}"`,
                 onClick: async () => {
                     onSelectFiles();
                 },
@@ -380,7 +382,7 @@ export const useSourcesMenu = ({
                         <div className="display-flex flex-row gap-2">
                             {/* <CSSIcon name="attachment-file" className="icon-16 font-color-secondary scale-90" /> */}
                             <Icon icon={FileLinkIcon} className="font-color-secondary mt-015 ml-05 scale-11" />
-                            <div>Add External File…</div>
+                            <div>{uiText("Add External File…")}</div>
                         </div>
                         <div className="flex-1" />
                     </div>

@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React from 'react';
 import type { PendingCreditConfirmation } from '@astermargin/agent-core/run-state/pendingCreditConfirmations';
 import Button from '../primitives/Button';
@@ -127,11 +128,11 @@ export const CreditConfirmationCard: React.FC<CreditConfirmationCardProps> = ({
                     <Button
                         variant="outline"
                         rightIcon={StopStrokeIcon}
-                        ariaLabel="Stop generating"
+                        ariaLabel={uiText("Stop generating")}
                         style={{ padding: '2px 5px' }}
                         onClick={onStop}
                     >
-                        Stop
+                        {uiText("Stop")}
                     </Button>
                 </Tooltip>
                 <div className="flex-1" />

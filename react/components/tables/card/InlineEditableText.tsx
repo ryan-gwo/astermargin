@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
 import { isImeKeyEvent } from '@astermargin/agent-ui/primitives/ime';
@@ -153,13 +154,13 @@ export const InlineEditableText = forwardRef<InlineEditableTextHandle, InlineEdi
                         icon={CancelIcon}
                         variant="ghost-secondary"
                         onClick={discard}
-                        ariaLabel="Discard changes"
+                        ariaLabel={uiText("Discard changes")}
                     />
                     <IconButton
                         icon={TickIcon}
                         variant="ghost-secondary"
                         onClick={confirm}
-                        ariaLabel="Save changes"
+                        ariaLabel={uiText("Save changes")}
                         className="scale-12"
                     />
                 </div>

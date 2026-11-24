@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue } from 'jotai';
 import type { RemovedPaper, SourceEntry, TableSpec } from '@astermargin/agent-core/layouts/table';
@@ -163,22 +164,22 @@ export function TableAddSources({
 
 /** A source entry's name: the scope's, or "Added papers" for the papers picked by hand. */
 export function sourceEntryName(entry: SourceEntry): string {
-    if (entry.type === 'items') return 'Added items';
+    if (entry.type === 'items') return uiText("Added items");
     const scope = entry.scope;
-    if (!scope) return 'Source';
-    if (scope.kind === 'tag') return scope.tag ?? 'Tag';
-    return scope.name ?? (scope.kind === 'collection' ? 'Collection' : 'Saved search');
+    if (!scope) return uiText("Source");
+    if (scope.kind === 'tag') return scope.tag ?? uiText("Tag");
+    return scope.name ?? uiText(scope.kind === 'collection' ? "Collection" : "Saved search");
 }
 
 const KIND_NAMES: Record<string, string> = { collection: 'Collection', tag: 'Tag', saved_search: 'Saved search' };
 
 /** "Collection · My Library · 38 papers"; "Picked by hand · 8 papers". */
 function sourceEntryLine(entry: SourceEntry, rows: number): string {
-    const papers = `${rows.toLocaleString('en-US')} ${rows === 1 ? 'item' : 'items'}`;
-    if (entry.type === 'items' || !entry.scope) return `Picked by hand · ${papers}`;
+    const papers = uiText(rows === 1 ? "{count} item" : "{count} items", { count: rows.toLocaleString('en-US') });
+    if (entry.type === 'items' || !entry.scope) return uiText("Picked by hand · {items}", { items: papers });
     const libraryID = resolveLibraryRef({ library_ref: entry.scope.library_ref });
     const library = libraryID ? (Zotero.Libraries.get(libraryID) as Zotero.Library | false) : false;
-    return [KIND_NAMES[entry.scope.kind] ?? 'Source', library ? library.name : null, papers].filter(Boolean).join(' · ');
+    return [uiText(KIND_NAMES[entry.scope.kind] ?? "Source"), library ? library.name : null, papers].filter(Boolean).join(' · ');
 }
 
 /**
@@ -254,8 +255,8 @@ export function TableSourcesPopover({
 
     return (
         <div className="rt-sources">
-            <div className="rt-sources-heading">Sources</div>
-            {(spec.sources ?? []).length === 0 ? <div className="rt-sources-empty">No sources yet.</div> : null}
+            <div className="rt-sources-heading">{uiText("Sources")}</div>
+            {(spec.sources ?? []).length === 0 ? <div className="rt-sources-empty">{uiText("No sources yet.")}</div> : null}
             {(spec.sources ?? []).map((entry) => {
                 const name = sourceEntryName(entry);
                 const fresh = newBySource.get(entry.id) ?? 0;
@@ -280,7 +281,7 @@ export function TableSourcesPopover({
                                         title={disabledReason ?? `Add the new items in ${name}`}
                                         onClick={() => onRefresh(entry)}
                                     >
-                                        Add
+                                        {uiText("Add")}
                                     </button>
                                 </div>
                             ) : null}
@@ -300,8 +301,8 @@ export function TableSourcesPopover({
             })}
             {removed.length > 0 ? (
                 <>
-                    <div className="rt-sources-heading rt-sources-removed-heading">Removed items · {removed.length}</div>
-                    <p className="rt-sources-note">Removed items stay out when a source refreshes.</p>
+                    <div className="rt-sources-heading rt-sources-removed-heading">{uiText("Removed items ·")}{' '}{removed.length}</div>
+                    <p className="rt-sources-note">{uiText("Removed items stay out when a source refreshes.")}</p>
                     <div className="rt-removed-list">
                         {removed.map((paper, index) => {
                             const id = removedPaperId(paper);
@@ -320,7 +321,7 @@ export function TableSourcesPopover({
                                             aria-label={`Restore ${title}`}
                                             onClick={() => onRestore(paper)}
                                         >
-                                            Restore
+                                            {uiText("Restore")}
                                         </button>
                                     ) : null}
                                 </div>

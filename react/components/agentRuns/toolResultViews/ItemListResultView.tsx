@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useState } from 'react';
 import { CSSItemTypeIcon } from '../../icons/icons';
 import { truncateText } from '@astermargin/agent-ui/utils/stringUtils';
@@ -124,7 +125,7 @@ const ItemRow: React.FC<{
             onContextMenu={onContextMenu}
             onMouseEnter={onMouseEnter}
             onMouseLeave={onMouseLeave}
-            title={isExternal ? 'Click to open the file' : 'Click to reveal in Zotero'}
+            title={isExternal ? 'Click to open the file' : uiText("Click to reveal in Zotero")}
         >
             <div
                 className="display-flex items-center justify-center flex-shrink-0 rounded-md ml-05 mt-010"
@@ -184,7 +185,7 @@ export const ItemListResultView: React.FC<{ view: ItemListView; rowAction?: Item
     if (view.items.length === 0) {
         return (
             <div className="p-3 text-sm font-color-tertiary">
-                No items found
+                {uiText("No items found")}
             </div>
         );
     }

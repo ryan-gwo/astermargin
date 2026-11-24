@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useEffect, useRef } from 'react';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import {
@@ -85,7 +86,7 @@ const EmptyLibraryDiscovery: React.FC = () => {
                     value={interest}
                     onChange={handleChange}
                     onKeyDown={handleKeyDown}
-                    placeholder="Describe what you're researching…"
+                    placeholder={uiText("Describe what you're researching…")}
                     className="chat-input empty-library-discover-input"
                     rows={3}
                     maxLength={EMPTY_LIBRARY_DISCOVER_MAX_LENGTH}
@@ -117,7 +118,7 @@ const EmptyLibraryDiscovery: React.FC = () => {
                     rightIcon={isSubmitting ? Spinner : ArrowRightIcon}
                     className="fit-content whitespace-nowrap"
                 >
-                    Discover papers
+                    {uiText("Discover papers")}
                 </Button>
             </div>
 

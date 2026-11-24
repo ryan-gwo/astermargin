@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useSetAtom, useAtomValue } from 'jotai';
 import { ToolCallPart } from '@astermargin/agent-core/agents/types';
@@ -64,13 +65,13 @@ export const SuggestionsView: React.FC<SuggestionsViewProps> = ({ part, onDismis
         <div className="display-flex flex-col gap-2 pt-3">
             <div className="display-flex flex-row items-center justify-between gap-2">
                 <div className="font-color-tertiary text-xs font-semibold uppercase" style={{ letterSpacing: '0.05em' }}>
-                    Next steps
+                    {uiText("Next steps")}
                 </div>
                 {onDismiss && (
                     <IconButton
                         icon={CancelIcon}
                         onClick={onDismiss}
-                        ariaLabel="Dismiss suggestions"
+                        ariaLabel={uiText("Dismiss suggestions")}
                         variant="ghost-secondary"
                         className="scale-80"
                     />

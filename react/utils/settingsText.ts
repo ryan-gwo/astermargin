@@ -1,7 +1,17 @@
-import { interfaceLocale } from "./interfaceText";
+import { interfaceLocale } from "../../src/utils/interfaceLanguage";
 
 // Settings messages use English as their source key. Keep both Chinese translations with each key.
 const messages = {
+    "Interface language": ["界面语言", "介面語言"],
+    "Follow Zotero": ["跟随 Zotero", "跟隨 Zotero"],
+    "Choose the language of AsterMargin. Changes apply after restarting Zotero.": [
+        "选择星笺的界面语言。重启 Zotero 后生效。",
+        "選擇星箋的介面語言。重新啟動 Zotero 後生效。",
+    ],
+    "Language saved. Restart Zotero to apply it.": [
+        "语言已保存。重启 Zotero 后生效。",
+        "語言已儲存。重新啟動 Zotero 後生效。",
+    ],
     "Settings sections": ["设置分类", "設定分類"],
     "End your current session": ["结束当前会话", "結束目前的工作階段"],
     "Sign out": ["退出登录", "登出"],

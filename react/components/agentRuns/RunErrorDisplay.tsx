@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { threadReadOnlyAtom } from '../../runtime/threadProjection';
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useEffect, useRef, useState } from 'react';
@@ -224,7 +225,7 @@ export const RunErrorDisplay: React.FC<RunErrorDisplayProps> = ({ runId, error, 
                                         data-run-error-action="try-with-astermargin"
                                         data-run-error-primary-action={primaryActionAttr('try-with-astermargin')}
                                     >
-                                        Try with AsterMargin
+                                        {uiText("Try with AsterMargin")}
                                     </Button>
                                 )}
                                 {canGetAsterMarginCredits && (
@@ -249,7 +250,7 @@ export const RunErrorDisplay: React.FC<RunErrorDisplayProps> = ({ runId, error, 
                                         data-run-error-action="resume"
                                         data-run-error-primary-action={primaryActionAttr('resume')}
                                     >
-                                        Resume
+                                        {uiText("Resume")}
                                     </Button>
                                 )}
                                 {canRetry && (
@@ -263,7 +264,7 @@ export const RunErrorDisplay: React.FC<RunErrorDisplayProps> = ({ runId, error, 
                                         data-run-error-action="retry"
                                         data-run-error-primary-action={primaryActionAttr('retry')}
                                     >
-                                        <span className="font-color-red">Retry</span>
+                                        <span className="font-color-red">{uiText("Retry")}</span>
                                     </Button>
                                 )}
                             </div>

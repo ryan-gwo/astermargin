@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useMemo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import MenuButton from '@astermargin/agent-ui/primitives/MenuButton';
@@ -80,7 +81,7 @@ const DeferredToolPreferenceButton: React.FC<DeferredToolPreferenceButtonProps> 
                 fontSize: '0.90rem',
             }}
             rightIconClassName="scale-11 -ml-05"
-            ariaLabel="Select action preference"
+            ariaLabel={uiText("Select action preference")}
             tooltipContent={tooltipContent}
             disabled={disabled}
             showArrow={false}

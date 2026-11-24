@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import React, { useEffect, useRef, useState } from 'react';
 import ContextMenu, { MenuItem, MenuPosition } from '@astermargin/agent-ui/primitives/ContextMenu';
 import { getHost } from '@astermargin/agent-ui/host';
@@ -141,7 +142,7 @@ export function useRemoveContextMenu({
                 ? [{ label: 'divider', isDivider: true, onClick: () => {} }]
                 : []),
             {
-                label: 'Remove',
+                label: uiText("Remove"),
                 icon: CancelIcon,
                 onClick: () => onRemove(),
             },

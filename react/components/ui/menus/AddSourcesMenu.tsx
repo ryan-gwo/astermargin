@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { logger } from '@astermargin/agent-core/platform/logger';
 import { messageAttachmentKey } from '@astermargin/agent-core/types/attachments/apiTypes';
 import { ZoteroTag } from '@astermargin/agent-core/types/zotero';
@@ -694,7 +695,7 @@ const AddSourcesMenu = forwardRef<AddSourcesMenuHandle, AddSourcesMenuProps>(fun
                         className={triggerClassName}
                         ref={buttonRef}
                         onClick={handleButtonClick}
-                        aria-label={triggerLabel ?? "Add Sources"}
+                        aria-label={triggerLabel ?? uiText("Add Sources")}
                         aria-haspopup="menu"
                         aria-expanded={isMenuOpen}
                         disabled={disabled}
@@ -703,7 +704,7 @@ const AddSourcesMenu = forwardRef<AddSourcesMenuHandle, AddSourcesMenuProps>(fun
                     </button>
                 </Tooltip>
             ) : (
-            <Tooltip content="Add Sources" showArrow singleLine>
+            <Tooltip content={uiText("Add Sources")} showArrow singleLine>
                 <button
                     // The control row lives inside the composer's <form>, so a
                     // button with no type would default to submit and send the
@@ -712,7 +713,7 @@ const AddSourcesMenu = forwardRef<AddSourcesMenuHandle, AddSourcesMenuProps>(fun
                     className={triggerLabel ? "variant-ghost display-flex flex-row items-center gap-1" : "variant-ghost composer-add-sources"}
                     ref={buttonRef}
                     onClick={handleButtonClick}
-                    aria-label={triggerLabel ?? "Add Sources"}
+                    aria-label={triggerLabel ?? uiText("Add Sources")}
                     aria-haspopup="menu"
                     aria-expanded={isMenuOpen}
                     disabled={disabled}
@@ -734,9 +735,9 @@ const AddSourcesMenu = forwardRef<AddSourcesMenuHandle, AddSourcesMenuProps>(fun
                 // The query drives an effect above, so the menu's own field
                 // needs no separate search callback.
                 onSearch={() => {}}
-                noResultsText={noResultsText}
+                noResultsText={uiText(noResultsText)}
                 isLoading={menuMode === 'sources' && (isSearching || sourcesMenu.isBuilding)}
-                placeholder={ownsSearchField ? placeholderText : ''}
+                placeholder={ownsSearchField ? uiText(placeholderText) : ''}
                 closeOnSelect={false}
                 searchQuery={searchQuery}
                 setSearchQuery={onQueryChange}

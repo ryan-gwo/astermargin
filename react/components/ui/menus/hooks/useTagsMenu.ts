@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import { ZoteroTag } from '@astermargin/agent-core/types/zotero';
 import { SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import { useEffect, useState } from 'react';
@@ -131,10 +132,10 @@ export const useTagsMenu = ({
             createTagMenuItem(tag, tagMenuItemContext, searchQuery)
         );
 
-        let headerLabel = 'Select Tags';
+        let headerLabel = uiText("Select Tags");
         if (libraryId) {
             const library = Zotero.Libraries.get(libraryId);
-            headerLabel = library ? `Tags in ${library.name}` : headerLabel;
+            headerLabel = library ? uiText("Tags in {library}", { library: library.name }) : headerLabel;
         }
 
         const header: SearchMenuItem = { label: headerLabel, isGroupHeader: true, onClick: () => {} };

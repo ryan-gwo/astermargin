@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useMemo } from 'react';
 import PermissionMenu, { PermissionMenuOption } from '@astermargin/agent-ui/primitives/PermissionMenu';
 import HandIcon from '@astermargin/agent-ui/icons/HandIcon';
@@ -111,8 +112,8 @@ const RunPermissionButton: React.FC<RunPermissionButtonProps> = ({
             onFootnoteClick={() => openPreferencesWindow('permissions')}
             disabled={disabled}
             iconOnly={iconOnly}
-            ariaLabel="How library changes are approved for this run"
-            tooltipContent="How library changes are approved for this run"
+            ariaLabel={uiText("How library changes are approved for this run")}
+            tooltipContent={uiText("How library changes are approved for this run")}
             style={{ padding: '2px 6px', fontSize: '0.95rem' }}
         />
     );

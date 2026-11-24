@@ -1,3 +1,5 @@
+import { uiText } from "../utils/interfaceText";
+import { actionDisplayText } from "../utils/actionDisplayText";
 import React from "react";
 import { useAtomValue } from "jotai";
 import Button from "@astermargin/agent-ui/primitives/Button";
@@ -55,14 +57,14 @@ const CategoryPanel: React.FC<CategoryPanelProps> = ({ category, style }) => {
 
     const renderAction = (action: Action) => {
         const popup = buildActionPopup({
-            title: action.title,
-            description: action.description,
+            title: actionDisplayText(action, "title"),
+            description: actionDisplayText(action, "description"),
             prompt: action.text,
             category: action.category ?? category ?? undefined,
         });
         popup.action = {
             icon: ArrowUpRightIcon,
-            label: "Click to run action",
+            label: uiText("Click to run action"),
         };
 
         return (
@@ -83,7 +85,7 @@ const CategoryPanel: React.FC<CategoryPanelProps> = ({ category, style }) => {
                     style={{ padding: '6px 6px' }}
                     rightIcon={ArrowUpRightIcon}
                 >
-                    <span className="text-base truncate">{action.title}</span>
+                    <span className="text-base truncate">{actionDisplayText(action, "title")}</span>
                 </Button>
             </Tooltip>
         );
@@ -95,7 +97,7 @@ const CategoryPanel: React.FC<CategoryPanelProps> = ({ category, style }) => {
         <div className="display-flex flex-col gap-4 p-1" style={style}>
             {!hasAny && (
                 <div className="font-color-secondary text-sm px-2 py-2">
-                    Create repeatable workflows for common research tasks
+                    {uiText("Create repeatable workflows for common research tasks")}
                 </div>
             )}
 
@@ -109,7 +111,7 @@ const CategoryPanel: React.FC<CategoryPanelProps> = ({ category, style }) => {
             {targetActions.length > 0 && (
                 <div className={`display-flex flex-col gap-0 ${globalActions.length > 0 ? 'border-top-quinary' : ''}`}>
                     <SectionHeader
-                        label={active?.label ?? (active ? TARGET_TYPE_LABELS[active.targetType] : '')}
+                        label={active?.label ?? (active ? uiText(TARGET_TYPE_LABELS[active.targetType]) : '')}
                         iconInfo={active?.iconInfo}
                     />
                     {targetActions.map(renderAction)}
@@ -124,11 +126,11 @@ const CategoryPanel: React.FC<CategoryPanelProps> = ({ category, style }) => {
                     onClick={() => openPreferencesWindow('actions', categoryFilter)}
                     rightIcon={ArrowRightIcon}
                     iconClassName="mt-010"
-                    ariaLabel="Add custom action"
-                    title="Add custom action"
+                    ariaLabel={uiText("Add custom action")}
+                    title={uiText("Add custom action")}
                     style={{ padding: '4px 6px', gap: '4px' }}
                 >
-                    Add Custom Action
+                    {uiText("Add Custom Action")}
                 </Button>
             </div>
         </div>

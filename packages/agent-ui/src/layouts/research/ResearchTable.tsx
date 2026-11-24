@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React, { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { isColumnSortable, toPlainText, type Column, type Row, type TableSort, type TableSpec } from "@astermargin/agent-core/layouts/table";
 import { cellsToFill } from "@astermargin/agent-core/layouts/tableFill";
@@ -478,14 +479,14 @@ export function ResearchTable({
             const items: MenuItem[] = [];
             if (fill)
                 items.push({
-                    label: "Refill row",
+                    label: uiText("Refill row"),
                     icon: RepeatIcon,
                     disabled: !!fill.disabledReason,
                     onClick: () => fill.onFillRows([row.id]),
                 });
             if (cellEditing?.onChooseDocument && row.ref?.kind === "item")
                 items.push({
-                    label: "Choose document…",
+                    label: uiText("Choose document…"),
                     icon: FileIcon,
                     disabled: !!cellEditing.disabledReason,
                     onClick: () => cellEditing.onChooseDocument!(row),
@@ -503,18 +504,18 @@ export function ResearchTable({
             const year = column === columns.year;
             const items: MenuItem[] = [
                 {
-                    label: `Sort ${sortOrderLabel("asc", year)}`,
+                    label: uiText("Sort {order}", { order: uiText(sortOrderLabel("asc", year)) }),
                     icon: ArrowUpIcon,
                     onClick: () => state.setSort({ column_id: column.id, direction: "asc" }),
                 },
                 {
-                    label: `Sort ${sortOrderLabel("desc", year)}`,
+                    label: uiText("Sort {order}", { order: uiText(sortOrderLabel("desc", year)) }),
                     icon: ArrowDownIcon,
                     onClick: () => state.setSort({ column_id: column.id, direction: "desc" }),
                 },
             ];
             if (state.sort?.column_id === column.id)
-                items.push({ label: "Clear sort", icon: CancelIcon, onClick: () => state.setSort(undefined) });
+                items.push({ label: uiText("Clear sort"), icon: CancelIcon, onClick: () => state.setSort(undefined) });
             return items;
         },
         [state, columns.year],
@@ -529,11 +530,11 @@ export function ResearchTable({
             const items: MenuItem[] = [];
             const disabled = !!editing?.disabledReason;
             if (editing?.onEditColumn)
-                items.push({ label: "Edit column…", icon: EditIcon, disabled, onClick: () => editing.onEditColumn!(column) });
+                items.push({ label: uiText("Edit column…"), icon: EditIcon, disabled, onClick: () => editing.onEditColumn!(column) });
             if (fill) {
                 const cells = fillable.get(column.id) ?? 0;
                 items.push({
-                    label: cells ? `Fill this column (${cells.toLocaleString("en-US")})` : "Fill this column",
+                    label: cells ? uiText("Fill this column ({count})", { count: cells.toLocaleString("en-US") }) : uiText("Fill this column"),
                     icon: PlayIcon,
                     disabled: !!fill.disabledReason,
                     onClick: () => fill.onFillColumn(column),
@@ -541,16 +542,16 @@ export function ResearchTable({
             }
             if (items.length) items.push({ label: "", isDivider: true, onClick: () => {} });
             items.push(...sortEntries(column));
-            items.push({ label: "Hide column", icon: ViewIcon, onClick: () => state.toggleColumn(column.id) });
+            items.push({ label: uiText("Hide column"), icon: ViewIcon, onClick: () => state.toggleColumn(column.id) });
             if (editing?.onChangeType) {
                 const current = COLUMN_TYPE_LABELS.find((entry) => entry.type === column.type);
                 items.push({
-                    label: "Change type",
+                    label: uiText("Change type"),
                     icon: current?.icon ?? TextIcon,
                     disabled,
                     onClick: () => {},
                     submenu: COLUMN_TYPE_LABELS.filter((entry) => entry.type !== column.type).map((entry) => ({
-                        label: entry.label,
+                        label: uiText(entry.label),
                         icon: entry.icon,
                         onClick: () => editing.onChangeType!(column, entry.type),
                     })),
@@ -559,13 +560,13 @@ export function ResearchTable({
             if (editing?.onRemoveColumn) {
                 items.push({ label: "", isDivider: true, onClick: () => {} });
                 items.push({
-                    label: "Remove column",
+                    label: uiText("Remove column"),
                     disabled,
                     // Drawn like an item's own icon and label, in the danger colour.
                     customContent: (
                         <span className="display-flex items-center gap-2 w-full min-w-0 rt-menu-danger">
                             <Icon icon={DeleteIcon} size={14} className="flex-shrink-0" />
-                            <span className="flex-1 text-base truncate">Remove column</span>
+                            <span className="flex-1 text-base truncate">{uiText("Remove column")}</span>
                         </span>
                     ),
                     onClick: () => editing.onRemoveColumn!(column),
@@ -684,7 +685,7 @@ export function ResearchTable({
                       <button
                           type="button"
                           className="rt-icon-button rt-inspector-edit"
-                          aria-label="Edit answer"
+                          aria-label={uiText("Edit answer")}
                           disabled={disabled}
                           title={title ?? "Edit answer"}
                           onClick={() => openEditor({ rowId: row.id, columnId: column.id }, "inspector")}
@@ -716,7 +717,7 @@ export function ResearchTable({
                       title={cellEditing.disabledReason ?? "Choose the document this row is read from"}
                       onClick={() => cellEditing.onChooseDocument!(row)}
                   >
-                      Change
+                      {uiText("Change")}
                   </button>
               ) : null
         : undefined;
@@ -733,17 +734,17 @@ export function ResearchTable({
         onCopy?.(toPlainText(table, state.rows, visible));
     };
     const moreItems: MenuItem[] = [];
-    if (onCopy) moreItems.push({ label: "Copy as text", icon: CopyIcon, onClick: copyAsText });
+    if (onCopy) moreItems.push({ label: uiText("Copy as text"), icon: CopyIcon, onClick: copyAsText });
     if (onExport)
         moreItems.push(
-            { label: "Export to Excel", icon: DownloadIcon, onClick: () => onExport("xlsx", state.sort) },
-            { label: "Export CSV", icon: DownloadIcon, onClick: () => onExport("csv", state.sort) },
+            { label: uiText("Export to Excel"), icon: DownloadIcon, onClick: () => onExport("xlsx", state.sort) },
+            { label: uiText("Export CSV"), icon: DownloadIcon, onClick: () => onExport("csv", state.sort) },
         );
-    if (onShowInLibrary) moreItems.push({ label: "Show in library", icon: LibraryIcon, onClick: onShowInLibrary });
+    if (onShowInLibrary) moreItems.push({ label: uiText("Show in library"), icon: LibraryIcon, onClick: onShowInLibrary });
     if (onOpenInWindow)
-        moreItems.push({ label: "Open in new window", icon: PictureInPictureIcon, onClick: onOpenInWindow });
+        moreItems.push({ label: uiText("Open in new window"), icon: PictureInPictureIcon, onClick: onOpenInWindow });
     if (renderVersionHistory)
-        moreItems.push({ label: "Version history", icon: ClockIcon, onClick: () => setPanel({ kind: "history" }) });
+        moreItems.push({ label: uiText("Version history"), icon: ClockIcon, onClick: () => setPanel({ kind: "history" }) });
 
     const selectedIds = state.rows.filter((row) => state.selectedRows.has(row.id)).map((row) => row.id);
 
@@ -830,8 +831,8 @@ export function ResearchTable({
                                     as="h1"
                                     className="rt-title"
                                     value={table.title || ""}
-                                    placeholder="Table"
-                                    label="Rename table"
+                                    placeholder={uiText("Table")}
+                                    label={uiText("Rename table")}
                                     disabledReason={editDisabled}
                                     onSave={editing.onTitle}
                                 />
@@ -842,8 +843,8 @@ export function ResearchTable({
                                 <InlineText
                                     className="rt-description"
                                     value={table.description ?? ""}
-                                    placeholder="Add a description"
-                                    label="Edit description"
+                                    placeholder={uiText("Add a description")}
+                                    label={uiText("Edit description")}
                                     multiline
                                     disabledReason={editDisabled}
                                     onSave={editing.onDescription}
@@ -859,7 +860,7 @@ export function ResearchTable({
                                     variant="surface"
                                     icon={MoreHorizontalIcon}
                                     className="rt-more"
-                                    ariaLabel="More actions"
+                                    ariaLabel={uiText("More actions")}
                                 />
                             ) : null}
                             {typeof headerEnd === "function" ? headerEnd(selectedIds) : headerEnd}
@@ -870,7 +871,7 @@ export function ResearchTable({
                         {selectedIds.length > 0 ? (
                             <div className="rt-selectionbar">
                                 <span className="rt-selection-count" role="status">
-                                    {selectedIds.length} selected
+                                    {uiText("{count} selected", { count: selectedIds.length })}
                                 </span>
                                 {fill ? (
                                     <button
@@ -890,7 +891,7 @@ export function ResearchTable({
                                 <button
                                     type="button"
                                     className="rt-icon-button"
-                                    aria-label="Clear selection"
+                                    aria-label={uiText("Clear selection")}
                                     onClick={state.clearSelection}
                                 >
                                     <Icon icon={CancelIcon} size={12} />
@@ -901,7 +902,7 @@ export function ResearchTable({
                                 {editing?.renderSources ? (
                                     <AnchoredPopover
                                         open={sourcesOpen}
-                                        label="Sources"
+                                        label={uiText("Sources")}
                                         className="rt-sources-popover"
                                         onClose={() => setSourcesOpen(false)}
                                         anchor={
@@ -940,7 +941,7 @@ export function ResearchTable({
                                                 title={editDisabled ?? "Add them to the table"}
                                                 onClick={editing.onAddNewPapers}
                                             >
-                                                Add
+                                                {uiText("Add")}
                                             </button>
                                         ) : null}
                                     </span>
@@ -952,12 +953,12 @@ export function ResearchTable({
                                         <button
                                             type="button"
                                             className="rt-add-column-action"
-                                            aria-label="Add column"
+                                            aria-label={uiText("Add column")}
                                             disabled={!!addColumnDisabled}
                                             onClick={editing.onAddColumn}
                                         >
                                             <Icon icon={PlusSignIcon} size={13} />
-                                            <span>Column</span>
+                                            <span>{uiText("Column")}</span>
                                         </button>
                                     </span>
                                 ) : null}
@@ -980,7 +981,7 @@ export function ResearchTable({
                             <button
                                 type="button"
                                 className="rt-hidden-columns rt-hidden-added"
-                                title="The search or filters hide them"
+                                title={uiText("The search or filters hide them")}
                                 onClick={() => {
                                     state.clearFilters();
                                     setShowingAdded(true);
@@ -998,8 +999,8 @@ export function ResearchTable({
                                     <Icon icon={SearchIcon} size={14} />
                                     <input
                                         type="text"
-                                        placeholder="Search rows"
-                                        aria-label="Search rows"
+                                        placeholder={uiText("Search rows")}
+                                        aria-label={uiText("Search rows")}
                                         value={state.quickFilter}
                                         onChange={(event) => state.setQuickFilter(event.target.value)}
                                     />
@@ -1009,9 +1010,9 @@ export function ResearchTable({
                                         menuItems={filterItems}
                                         variant={state.filters.length ? "surface" : "ghost-secondary"}
                                         icon={FilterIcon}
-                                        buttonLabel="Filter"
+                                        buttonLabel={uiText("Filter")}
                                         className="rt-toolbar-button"
-                                        ariaLabel="Filter rows"
+                                        ariaLabel={uiText("Filter rows")}
                                         maxHeight="24rem"
                                         width="16rem"
                                     />
@@ -1023,22 +1024,22 @@ export function ResearchTable({
                                         icon={ChevronIcon}
                                         buttonLabel={
                                             sortColumn
-                                                ? `Sort: ${sortColumn.header} ${state.sort!.direction === "asc" ? "↑" : "↓"}`
-                                                : "Sort"
+                                                ? uiText("Sort: {column} {direction}", { column: sortColumn.header, direction: state.sort!.direction === "asc" ? "↑" : "↓" })
+                                                : uiText("Sort")
                                         }
                                         className="rt-toolbar-button"
-                                        ariaLabel="Sort rows"
+                                        ariaLabel={uiText("Sort rows")}
                                         maxHeight="24rem"
                                         width="16rem"
                                     />
                                 ) : null}
-                                <div className="rt-density" role="group" aria-label="Row height">
+                                <div className="rt-density" role="group" aria-label={uiText("Row height")}>
                                     {DENSITY_OPTIONS.map((option) => (
                                         <button
                                             key={option.density}
                                             type="button"
-                                            aria-label={option.label}
-                                            title={option.label}
+                                            aria-label={uiText(option.label)}
+                                            title={uiText(option.label)}
                                             aria-pressed={state.density === option.density}
                                             className={state.density === option.density ? "rt-active" : ""}
                                             onClick={() => state.setDensity(option.density)}
@@ -1119,14 +1120,14 @@ export function ResearchTable({
                                 documentAction={documentAction}
                             />
                         ) : panel?.kind === "history" && renderVersionHistory ? (
-                            <aside className="rt-inspector rt-history" aria-label="Version history">
+                            <aside className="rt-inspector rt-history" aria-label={uiText("Version history")}>
                                 <div className="rt-inspector-head">
                                     <div className="rt-inspector-nav">
-                                        <span className="rt-inspector-paper rt-panel-title">Version history</span>
+                                        <span className="rt-inspector-paper rt-panel-title">{uiText("Version history")}</span>
                                         <button
                                             type="button"
                                             className="rt-icon-button"
-                                            aria-label="Close version history"
+                                            aria-label={uiText("Close version history")}
                                             onClick={() => setPanel(null)}
                                         >
                                             <Icon icon={CancelIcon} size={14} />
@@ -1198,7 +1199,7 @@ function useSelectionCopy(
         },
         menu: menu ? (
             <ContextMenu
-                menuItems={[{ label: "Copy", icon: CopyIcon, onClick: () => onCopy(menu.text) }]}
+                menuItems={[{ label: uiText("Copy"), icon: CopyIcon, onClick: () => onCopy(menu.text) }]}
                 isOpen
                 onClose={() => setMenu(null)}
                 position={menu.position}

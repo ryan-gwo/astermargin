@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { Column, TableSpec } from '@astermargin/agent-core/layouts/table';
 import { columnProblem, type DraftColumn } from '@astermargin/agent-core/run-state/tableCardDraft';
@@ -98,7 +99,7 @@ export function TableColumnEditor({
                     <div className="rt-dialog-title">{column ? 'Edit column' : 'Add column'}</div>
                     <ColumnFields
                         column={draft.column}
-                        label="Column"
+                        label={uiText("Column")}
                         disabled={saving}
                         typeControl="segmented"
                         refs={{ header: headerRef }}
@@ -111,11 +112,11 @@ export function TableColumnEditor({
                     ) : null}
                     {askAnswers ? (
                         <fieldset className="rt-existing-answers">
-                            <legend className="rt-existing-legend">The question changed. Existing answers:</legend>
+                            <legend className="rt-existing-legend">{uiText("The question changed. Existing answers:")}</legend>
                             <label>
                                 <input type="radio" name="existing-answers" checked={keepAnswers} onChange={() => setKeep(true)} />
                                 <span>
-                                    <span>Keep them</span>
+                                    <span>{uiText("Keep them")}</span>
                                     <span className="rt-hint">
                                         {answers.stale
                                             ? 'For small wording fixes. Answers already out of date stay out of date.'
@@ -127,11 +128,11 @@ export function TableColumnEditor({
                                 <input type="radio" name="existing-answers" checked={!keepAnswers} onChange={() => setKeep(false)} />
                                 <span>
                                     <span>
-                                        Mark out of date
+                                        {uiText("Mark out of date")}
                                         {answers.model ? <span className="rt-hint"> · {plural(answers.model, 'answer')}</span> : null}
                                     </span>
                                     <span className="rt-hint">
-                                        They stay visible and update on the next Fill.
+                                        {uiText("They stay visible and update on the next Fill.")}
                                         {answers.user
                                             ? ` Your ${answers.user === 1 ? '1 edited answer is' : `${answers.user} edited answers are`} kept.`
                                             : ''}
@@ -151,7 +152,7 @@ export function TableColumnEditor({
                 </div>
                 <div className="rt-dialog-actions">
                     <Button variant="outline" onClick={onCancel}>
-                        Cancel
+                        {uiText("Cancel")}
                     </Button>
                     <Button variant="solid" onClick={save} disabled={!!problem || saving || unchanged}>
                         {column ? 'Save' : 'Add column'}

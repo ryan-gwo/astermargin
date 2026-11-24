@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useState } from 'react';
 import type { AgentAction } from '../../../agents/agentActions';
 import {
@@ -180,7 +181,7 @@ const ImportItemDetails: React.FC<{
             {abstract && (
                 <div className="display-flex flex-col gap-05">
                     <div className="import-item-section-label">
-                        Abstract{enrichment ? <span className="font-color-tertiary"> · {enrichment}</span> : null}
+                        {uiText("Abstract")}{enrichment ? <span className="font-color-tertiary"> · {enrichment}</span> : null}
                     </div>
                     <div className={`import-item-abstract${clampAbstract ? ' import-item-abstract-clamped' : ''}`}>{abstract}</div>
                     {abstract.length > LONG_ABSTRACT && (
@@ -192,7 +193,7 @@ const ImportItemDetails: React.FC<{
             )}
             {warnings.length > 0 && (
                 <div className="display-flex flex-col gap-05">
-                    <div className="import-item-section-label">Notes</div>
+                    <div className="import-item-section-label">{uiText("Notes")}</div>
                     <ul className="import-item-notes">
                         {warnings.map((warning, index) => <li key={index}>{warning}</li>)}
                     </ul>
@@ -281,7 +282,7 @@ const ImportItemRow: React.FC<{
                                     <span
                                         className="import-item-reveal"
                                         role="button"
-                                        aria-label="Reveal in Zotero"
+                                        aria-label={uiText("Reveal in Zotero")}
                                         onClick={(event) => {
                                             event.stopPropagation();
                                             revealSource(createdRef, data.collection_ids?.[0] ?? data.collection_keys?.[0]);

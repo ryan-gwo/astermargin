@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useCallback, useEffect, useRef } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
@@ -51,7 +52,7 @@ const SIDEBAR_ROOTS = '#astermargin-react-root-sidebar';
 const CloseButton: React.FC<{ onClose: () => void }> = ({ onClose }) => (
     <div className="astermargin-quick-prompt__dismiss">
         <Tooltip content="Close" secondaryContent="Esc" showArrow singleLine>
-            <IconButton icon={CancelIcon} variant="ghost-secondary" onClick={onClose} ariaLabel="Close" />
+            <IconButton icon={CancelIcon} variant="ghost-secondary" onClick={onClose} ariaLabel={uiText("Close")} />
         </Tooltip>
     </div>
 );
@@ -77,7 +78,7 @@ const NoticeCard: React.FC<{
         <div className="astermargin-quick-prompt__footer">
             <div className="flex-1" />
             <Button variant="outline" style={FOOTER_BUTTON_STYLE} rightIcon={ArrowRightIcon} onClick={openAsterMargin}>
-                Open AsterMargin
+                {uiText("Open AsterMargin")}
             </Button>
         </div>
     </div>
@@ -95,7 +96,7 @@ const BusyNotice: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     return (
         <NoticeCard
             mark={<RunPulse />}
-            title="AsterMargin is still working"
+            title={uiText("AsterMargin is still working")}
             detail={`Wait for “${name}” to finish, or open AsterMargin to start another chat.`}
             onClose={onClose}
         />
@@ -313,7 +314,7 @@ const QuickPromptPopup: React.FC = () => {
                     <DragDropWrapper overlayBorderRadius={12}>
                         <div className="astermargin-quick-prompt__composer">
                             <PopupOverlayContainer />
-                            <InputArea inputRef={inputRef} verticalPosition="above" placeholder="Ask AsterMargin" />
+                            <InputArea inputRef={inputRef} verticalPosition="above" placeholder={uiText("Ask AsterMargin")} />
                         </div>
                     </DragDropWrapper>
                 </div>

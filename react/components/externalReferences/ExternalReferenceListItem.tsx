@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { ExternalReference } from '@astermargin/agent-core/types/externalReferences';
 import { useAtomValue } from 'jotai';
@@ -82,7 +83,7 @@ const ExternalReferenceListItem: React.FC<ExternalReferenceListItemProps> = ({
             publicationTitle={item.journal?.name || item.venue}
             year={item.year}
         />
-        {item.is_retracted && <RecordTags><RecordBadge label="Retracted" tone="red" /></RecordTags>}
+        {item.is_retracted && <RecordTags><RecordBadge label={uiText("Retracted")} tone="red" /></RecordTags>}
         {getHost().components?.externalReferenceActions({
             item,
             detailsButtonMode: 'icon-only',

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react';
 import type { DraftColumn } from '@astermargin/agent-core/run-state/tableCardDraft';
 import { columnProblem } from '@astermargin/agent-core/run-state/tableCardDraft';
@@ -140,7 +141,7 @@ const ColumnCard: React.FC<ColumnCardProps> = ({
                     >
                         {column.header.trim() || 'Untitled column'}
                     </span>
-                    {problem && <span className="table-card-badge-warning flex-none">Incomplete</span>}
+                    {problem && <span className="table-card-badge-warning flex-none">{uiText("Incomplete")}</span>}
                     <span className="flex-none">
                         <ColumnTypeTag type={column.type} />
                     </span>
@@ -189,11 +190,11 @@ const ColumnCard: React.FC<ColumnCardProps> = ({
                     ariaLabel={`Remove column ${name}`}
                     style={{ marginLeft: '-6px' }}
                 >
-                    Remove
+                    {uiText("Remove")}
                 </Button>
                 <div className="flex-1" />
                 <Button variant="outline" onClick={onClose} style={{ padding: '2px 8px' }}>
-                    Done
+                    {uiText("Done")}
                 </Button>
             </div>
         </div>
@@ -265,7 +266,7 @@ export const TableColumnsStep = React.forwardRef<TableColumnsStepHandle, TableCo
         <div className="display-flex flex-col min-w-0" style={{ gap: '0.45rem' }}>
             {columns.length === 0 && (
                 <div className="text-sm font-color-secondary">
-                    No columns yet. Use Add column to ask a question of every item.
+                    {uiText("No columns yet. Use Add column to ask a question of every item.")}
                 </div>
             )}
             {columns.map((column, index) => (

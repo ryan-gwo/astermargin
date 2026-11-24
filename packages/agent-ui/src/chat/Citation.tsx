@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React from 'react';
 import Tooltip from '../primitives/Tooltip';
 import { useAtomValue } from 'jotai';
@@ -498,7 +499,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={LibraryIcon} className="font-color-secondary" />
                             <span className="text-sm font-color-secondary">
-                                Reveals item in library
+                                {uiText("Reveals item in library")}
                             </span>
                         </span>
                     </span>
@@ -515,7 +516,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={GlobalSearchIcon} className="font-color-secondary" />
                             <span className="text-sm font-color-secondary">
-                                View details
+                                {uiText("View details")}
                             </span>
                         </span>
                     </span>
@@ -525,7 +526,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={ExternalLinkIcon} className="font-color-secondary scale-90" />
                             <span className="text-sm font-color-secondary">
-                                Opens external file
+                                {uiText("Opens external file")}
                             </span>
                         </span>
                     </span>
@@ -535,7 +536,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={NoteIcon} className="font-color-secondary" />
                             <span className="text-sm font-color-secondary">
-                                Opens note
+                                {uiText("Opens note")}
                             </span>
                         </span>
                     </span>
@@ -545,7 +546,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={HighlighterIcon} className="font-color-secondary" />
                             <span className="text-sm font-color-secondary">
-                                Opens annotation in PDF
+                                {uiText("Opens annotation in PDF")}
                             </span>
                         </span>
                     </span>
@@ -569,7 +570,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={TextAlignLeftIcon} className="font-color-secondary scale-90" />
                             <span className="text-sm font-color-secondary">
-                                Opens text file (external application)
+                                {uiText("Opens text file (external application)")}
                             </span>
                         </span>
                     </span>
@@ -589,7 +590,7 @@ const Citation: React.FC<CitationProps> = (props) => {
                         <span className="display-flex flex-row items-center gap-15">
                             <Icon icon={LibraryIcon} className="font-color-secondary" />
                             <span className="text-sm font-color-secondary">
-                                Reveals item in library
+                                {uiText("Reveals item in library")}
                             </span>
                         </span>
                     </span>

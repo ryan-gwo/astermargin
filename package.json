@@ -4,10 +4,10 @@
   "upstreamVersion": "0.27.0-beta.4",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jlegewie/beaver-zotero.git"
+    "url": "git+https://github.com/ryan-gwo/astermargin.git"
   },
   "type": "module",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "AI-assisted literature reading in Zotero",
   "config": {
     "addonName": "AsterMargin",
@@ -26,7 +26,7 @@
     "check:bundle": "node scripts/check-esbuild-graph.mjs",
     "lint:check": "prettier --check . && eslint .",
     "lint:fix": "prettier --write . && eslint . --fix",
-    "release": "zotero-plugin release",
+    "release": "node scripts/publish-release.mjs",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:integration": "vitest run --config vitest.integration.config.ts",

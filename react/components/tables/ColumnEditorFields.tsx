@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useLayoutEffect, useRef, useState } from 'react';
 import type { DraftColumn, DraftOption } from '@astermargin/agent-core/run-state/tableCardDraft';
 import { insertOptions, newOptionKey, pasteIntoOption } from '@astermargin/agent-core/run-state/tableCardDraft';
@@ -155,13 +156,13 @@ export const OptionsEditor = React.forwardRef<HTMLInputElement, {
                                     style={{ padding: '0 5px' }}
                                     disabled={disabled}
                                     ariaLabel={`Add a definition for ${optionName(row, index)}`}
-                                    title="Say what counts as this category"
+                                    title={uiText("Say what counts as this category")}
                                     onClick={() => {
                                         pendingFocus.current = { key: row.key, field: 'definition' };
                                         setDefiningKey(row.key, true);
                                     }}
                                 >
-                                    Define
+                                    {uiText("Define")}
                                 </Button>
                             )}
                             <IconButton
@@ -182,7 +183,7 @@ export const OptionsEditor = React.forwardRef<HTMLInputElement, {
                                 }}
                                 className="table-card-option-definition"
                                 value={row.description}
-                                placeholder="What counts as this category?"
+                                placeholder={uiText("What counts as this category?")}
                                 aria-label={`Definition of ${optionName(row, index)}`}
                                 disabled={disabled}
                                 onChange={(e) => update(row.key, { description: e.target.value })}
@@ -214,7 +215,7 @@ export const OptionsEditor = React.forwardRef<HTMLInputElement, {
                 disabled={disabled}
                 onClick={() => addAfter(rows.length - 1)}
             >
-                Add option
+                {uiText("Add option")}
             </Button>
         </div>
     );
@@ -269,7 +270,7 @@ export function ColumnFields({
                 ref={refs?.header}
                 className="table-card-field font-medium"
                 value={column.header}
-                placeholder="e.g. Sample size"
+                placeholder={uiText("e.g. Sample size")}
                 aria-label={`${label} name`}
                 disabled={disabled}
                 onKeyDown={keepEnter}
@@ -285,7 +286,7 @@ export function ColumnFields({
                     {/* Not a <label>: the menu renders inside this wrapper, and a label
                         forwards clicks on its items to the button, reopening the menu. */}
                     <div className="table-card-label flex-none">
-                        <span>Type</span>
+                        <span>{uiText("Type")}</span>
                         <MenuButton
                             menuItems={typeItems}
                             customContent={
@@ -307,7 +308,7 @@ export function ColumnFields({
                 <>
                     {nameField}
                     <div className="table-card-label" role="group" aria-label={`${label} type`}>
-                        <span>Type</span>
+                        <span>{uiText("Type")}</span>
                         <div className="column-type-segments">
                             {COLUMN_TYPES.map((entry) => (
                                 <button
@@ -327,13 +328,13 @@ export function ColumnFields({
                 </>
             )}
             <label className="table-card-label">
-                <span>Question</span>
+                <span>{uiText("Question")}</span>
                 <AutoGrowTextarea
                     bare
                     ref={refs?.question}
                     className="table-card-field text-sm"
                     value={column.description}
-                    placeholder="The question asked of every item"
+                    placeholder={uiText("The question asked of every item")}
                     aria-label={`${label} question`}
                     disabled={disabled}
                     onChange={(e) => onUpdate({ description: e.target.value })}
@@ -342,7 +343,7 @@ export function ColumnFields({
             {column.type === 'select' && (
                 // Not a <label>: it holds several fields and buttons.
                 <div className="table-card-label" role="group" aria-label={`${label} options`}>
-                    <span>Options</span>
+                    <span>{uiText("Options")}</span>
                     <OptionsEditor
                         ref={refs?.options}
                         options={column.options}

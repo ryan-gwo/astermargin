@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import React from 'react';
 import { DownloadIcon } from '@astermargin/agent-ui/icons';
 import type { MenuItem } from '@astermargin/agent-ui/primitives/ContextMenu';
@@ -119,7 +120,7 @@ export const RunArtifactExportButton: React.FC<{ items: MenuItem[]; exporting: b
             iconClassName="font-color-secondary scale-11"
             onClick={() => {}}
             loading
-            ariaLabel="Exporting"
+            ariaLabel={uiText("Exporting")}
         />
     ) : (
         <MenuButton
@@ -127,8 +128,8 @@ export const RunArtifactExportButton: React.FC<{ items: MenuItem[]; exporting: b
             variant="ghost-secondary"
             iconClassName="font-color-secondary scale-11"
             menuItems={items}
-            tooltipContent="Export"
-            ariaLabel="Export"
+            tooltipContent={uiText("Export")}
+            ariaLabel={uiText("Export")}
         />
     );
 
@@ -157,7 +158,7 @@ export const RunArtifactToggleButton: React.FC<{ expanded: boolean; onClick: () 
         className="run-artifact-open"
         iconClassName="font-color-secondary scale-11"
         onClick={onClick}
-        ariaLabel={expanded ? 'Hide' : 'Show all'}
+        ariaLabel={expanded ? uiText("Hide") : uiText("Show all")}
     />
 );
 

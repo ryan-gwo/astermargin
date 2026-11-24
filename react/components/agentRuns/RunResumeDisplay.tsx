@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 
 interface RunResumeDisplayProps {
@@ -12,7 +13,7 @@ export const RunResumeDisplay: React.FC<RunResumeDisplayProps> = ({ runId }) => 
         <div className="px-4">
             <div className="display-flex flex-col gap-3">
                 <div className="text-base font-color-tertiary">
-                    Resuming interrupted request...
+                    {uiText("Resuming interrupted request...")}
                 </div>
             </div>
         </div>

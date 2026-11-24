@@ -72,3 +72,4 @@ docs-zotero
 
 !/scripts/build-addon.mjs
 !/scripts/verify-xpi.mjs
+!/scripts/publish-release.mjs

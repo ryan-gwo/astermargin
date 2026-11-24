@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { CSSItemTypeIcon, NoteIcon, LibraryIcon } from '../icons/icons';
 import type { ChipListPopupContent, ChipPopupAction, ChipPopupContent, ChipPopupStatus, ChipPopupSubtitle } from '@astermargin/agent-ui/chat/ChipPopup';
@@ -10,7 +11,7 @@ import {
     summarizeRegularItemReadability,
 } from '../../utils/attachmentReadabilityCopy';
 
-function safeDisplayName(item: Zotero.Item, fallback = 'Item'): string {
+function safeDisplayName(item: Zotero.Item, fallback = uiText("Item")): string {
     try {
         return getDisplayNameFromItem(item) || item.getDisplayTitle() || fallback;
     } catch {
@@ -70,12 +71,12 @@ function itemSubtitle(item: Zotero.Item): ChipPopupSubtitle | null {
         if (item.isAttachment()) {
             const parent = item.parentItem;
             if (parent) {
-                return { prefix: 'Attached to ', text: safeDisplayName(parent), italic: true };
+                return { prefix: uiText("Attached to "), text: safeDisplayName(parent), italic: true };
             }
-            return { text: 'Standalone attachment' };
+            return { text: uiText("Standalone attachment") };
         }
         if (item.isNote()) {
-            return item.parentItem ? { text: 'Attached note' } : { text: 'Standalone note' };
+            return { text: uiText(item.parentItem ? "Attached note" : "Standalone note") };
         }
         if (item.isRegularItem()) {
             const firstCreator = item.firstCreator || '';
@@ -131,12 +132,12 @@ function itemIconName(item: Zotero.Item, validation?: ItemValidationState): stri
 function itemAction(item: Zotero.Item): ChipPopupAction {
     try {
         if (item.isNote()) {
-            return { icon: NoteIcon, label: 'Open note' };
+            return { icon: NoteIcon, label: uiText("Open note") };
         }
     } catch {
         // Fall through to the default reveal action.
     }
-    return { icon: LibraryIcon, label: 'Reveal in library' };
+    return { icon: LibraryIcon, label: uiText("Reveal in library") };
 }
 
 /**
@@ -154,12 +155,12 @@ function readabilityStatus(
             if (!getValidation) return null;
             const infos = safeChildAttachments(item).map((a) => toReadabilityInfo(getValidation(a)));
             const summary = summarizeRegularItemReadability(infos);
-            return summary.label ? { label: summary.label } : null;
+            return summary.label ? { label: uiText(summary.label) } : null;
         }
         if (item.isAttachment()) {
             const info = toReadabilityInfo(validation);
             if (info.state === 'checking' || info.state === 'readable') return null;
-            return { label: attachmentIssueLabel(info) };
+            return { label: uiText(attachmentIssueLabel(info)) };
         }
     } catch {
         return null;
@@ -200,7 +201,7 @@ export function buildItemsSummaryListPopup(items: Zotero.Item[]): ChipListPopupC
 
     const remaining = items.length - rows.length;
     const footer = remaining > 0
-        ? `${remaining} more attachment${remaining === 1 ? '' : 's'}`
+        ? uiText(remaining === 1 ? "{count} more attachment" : "{count} more attachments", { count: remaining })
         : null;
 
     return { rows, footer };

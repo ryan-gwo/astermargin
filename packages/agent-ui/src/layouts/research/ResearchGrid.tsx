@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
     cellIdFor,
@@ -231,7 +232,7 @@ export function ResearchGrid({
                             {selectable ? (
                                 <SelectBox
                                     checked={state.allInViewSelected}
-                                    label={state.allInViewSelected ? "Clear selection" : "Select all rows"}
+                                    label={state.allInViewSelected ? uiText("Clear selection") : "Select all rows"}
                                     onToggle={state.toggleSelectAll}
                                 />
                             ) : null}
@@ -279,13 +280,13 @@ export function ResearchGrid({
                                 <button
                                     type="button"
                                     className={labelAdd ? "rt-add-column rt-add-column-labeled" : "rt-icon-button rt-add-column"}
-                                    aria-label="Add column"
+                                    aria-label={uiText("Add column")}
                                     title={addColumnDisabledReason ?? "Add column"}
                                     disabled={!!addColumnDisabledReason}
                                     onClick={onAddColumn}
                                 >
                                     <Icon icon={PlusSignIcon} size={14} />
-                                    {labelAdd ? <span>Add column</span> : null}
+                                    {labelAdd ? <span>{uiText("Add column")}</span> : null}
                                 </button>
                             </th>
                         ) : null}
@@ -522,7 +523,7 @@ function ColumnHeader({
                 ) : null}
                 {badges && badges.newCells > 0 ? (
                     <Badge className="rt-badge rt-badge-new" text={newBadgeText(badges.newCells)}>
-                        New
+                        {uiText("New")}
                     </Badge>
                 ) : null}
             </div>
@@ -877,10 +878,10 @@ export function CellBody({
             text = full ? <span className="rt-muted">{row.failure ? "Not answered" : "Not filled yet"}</span> : null;
             break;
         case "not_reported":
-            text = <span className="rt-muted">Not reported</span>;
+            text = <span className="rt-muted">{uiText("Not reported")}</span>;
             break;
         case "cleared":
-            text = <span className="rt-muted">Cleared</span>;
+            text = <span className="rt-muted">{uiText("Cleared")}</span>;
             break;
         case "failed":
             text = <span className="rt-failed">{cell?.outcome === "failed" ? cell.error : ""}</span>;
@@ -963,7 +964,7 @@ function QuestionCell({
                                     }}
                                 >
                                     <Icon icon={EditIcon} size={12} />
-                                    Edit
+                                    {uiText("Edit")}
                                 </button>
                             ) : null}
                         </div>

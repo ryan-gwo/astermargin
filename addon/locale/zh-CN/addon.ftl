@@ -16,3 +16,10 @@ preferences-pane-open =
     .label = 打开星笺设置
 preferences-pane-help = 打开星笺的独立设置窗口。
 preferences-pane-open-failed = 星笺无法打开设置窗口。请重新打开 Zotero 后再试。
+
+reader-explain = 解释
+reader-ask = 提问…
+reader-explain-with = 用星笺解释
+reader-ask-with = 向星笺提问…
+reader-ask-document = 询问星笺
+reader-actions = 动作

@@ -123,6 +123,7 @@ declare namespace Zotero {
          * settings; the `localMode` pref cannot turn it off.
          */
         const localModeForced: boolean | undefined;
+        const interfaceLocale: import("../src/utils/interfaceLanguage").InterfaceLocale | undefined;
 
         const data: {
             env: "development" | "production";

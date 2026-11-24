@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import type { TableCardColumnType } from '@astermargin/agent-core/protocol/tableCardProtocol';
 import {
@@ -11,9 +12,9 @@ type IconComponent = React.ComponentType<React.SVGProps<SVGSVGElement>>;
 
 /** Question column types in menu order, with the names the table view uses. */
 export const COLUMN_TYPES: { value: TableCardColumnType; label: string; icon: IconComponent }[] = [
-    { value: 'text', label: 'Text', icon: TextIcon },
-    { value: 'boolean', label: 'Yes / no', icon: CheckmarkCircleIcon },
-    { value: 'select', label: 'Category', icon: ListBulletIcon },
+    { value: 'text', label: uiText("Text"), icon: TextIcon },
+    { value: 'boolean', label: uiText("Yes / no"), icon: CheckmarkCircleIcon },
+    { value: 'select', label: uiText("Category"), icon: ListBulletIcon },
 ];
 
 /** The type entry for a column type; an unknown type reads as text. */
@@ -39,7 +40,7 @@ export const ColumnOptionChips: React.FC<{
     /** Labels, or options with a definition the chip shows as its tooltip. */
     options: ReadonlyArray<string | { label: string; description?: string | null }>;
 }> = ({ options }) => (
-    <div className="table-card-options" aria-label="Options">
+    <div className="table-card-options" aria-label={uiText("Options")}>
         {options.slice(0, PREVIEW_OPTIONS).map((option, i) => {
             const label = typeof option === 'string' ? option : option.label;
             const definition = typeof option === 'string' ? null : option.description || null;

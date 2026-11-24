@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useState } from 'react';
 import { rowReference } from '@astermargin/agent-core/layouts/tableCitations';
 import type { Row } from '@astermargin/agent-core/layouts/table';
@@ -102,7 +103,7 @@ export function TableDocumentChooser({
             <div
                 role="dialog"
                 aria-modal="true"
-                aria-label="Choose document"
+                aria-label={uiText("Choose document")}
                 className="rt-dialog rt-document-chooser"
                 onKeyDown={(event) => {
                     if (isImeKeyEvent(event.nativeEvent)) return;
@@ -114,18 +115,18 @@ export function TableDocumentChooser({
                 }}
             >
                 <div className="rt-dialog-body">
-                    <div className="rt-dialog-title">Choose document</div>
+                    <div className="rt-dialog-title">{uiText("Choose document")}</div>
                     <div className="rt-document-paper">{title}</div>
                     {lookupError ? (
                         <div className="rt-dialog-error" role="alert">
                             {lookupError}
                         </div>
                     ) : choices === null ? (
-                        <div className="rt-hint">Looking up the item’s attachments…</div>
+                        <div className="rt-hint">{uiText("Looking up the item’s attachments…")}</div>
                     ) : choices.length === 0 ? (
-                        <div className="rt-hint">This item has no PDF, EPUB or snapshot attachment.</div>
+                        <div className="rt-hint">{uiText("This item has no PDF, EPUB or snapshot attachment.")}</div>
                     ) : (
-                        <div className="rt-document-choices" role="radiogroup" aria-label="Documents">
+                        <div className="rt-document-choices" role="radiogroup" aria-label={uiText("Documents")}>
                             {choices.map((entry, index) => (
                                 <label key={entry.id} className="rt-document-choice">
                                     <input
@@ -142,7 +143,7 @@ export function TableDocumentChooser({
                         </div>
                     )}
                     <div className="rt-hint">
-                        AsterMargin’s answers in this row become out of date until you refill the row. Your own answers stay.
+                        {uiText("AsterMargin’s answers in this row become out of date until you refill the row. Your own answers stay.")}
                     </div>
                     {error ? (
                         <div className="rt-dialog-error" role="alert">
@@ -152,7 +153,7 @@ export function TableDocumentChooser({
                 </div>
                 <div className="rt-dialog-actions">
                     <Button variant="outline" onClick={onCancel}>
-                        Cancel
+                        {uiText("Cancel")}
                     </Button>
                     <Button
                         variant="solid"
@@ -160,7 +161,7 @@ export function TableDocumentChooser({
                         loading={saving}
                         onClick={() => choice && onChoose(choice)}
                     >
-                        Use this document
+                        {uiText("Use this document")}
                     </Button>
                 </div>
             </div>

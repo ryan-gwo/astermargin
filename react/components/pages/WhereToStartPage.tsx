@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useRef, useState } from 'react';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import {
@@ -307,24 +308,24 @@ const WhereToStartPage: React.FC = () => {
                     
                     {/* Heading */}
                     <div className="where-to-start-heading">
-                        <div className="where-to-start-title">Let's dig into your library</div>
-                        <div className="where-to-start-subtitle">Here are a few good places to start.</div>
+                        <div className="where-to-start-title">{uiText("Let's dig into your library")}</div>
+                        <div className="where-to-start-subtitle">{uiText("Here are a few good places to start.")}</div>
                     </div>
 
                     {/* Options */}
                     <div className="where-to-start-card">
                         {showLoading ? (
-                            <div className="where-to-start-loader" aria-label="Loading starting points">
+                            <div className="where-to-start-loader" aria-label={uiText("Loading starting points")}>
                                 <div className="where-to-start-loader-row" />
                                 <div className="where-to-start-loader-row" />
                                 <div className="where-to-start-loader-row" />
                             </div>
                         ) : options.length === 0 ? (
                             <div className="font-color-secondary text-base p-3">
-                                No starting points available.
+                                {uiText("No starting points available.")}
                             </div>
                         ) : (
-                            <div className="where-to-start-options" aria-label="First task options">
+                            <div className="where-to-start-options" aria-label={uiText("First task options")}>
                                 {options.map((opt, i) => (
                                     <StartOptionRow
                                         key={opt.actionId}
@@ -346,7 +347,7 @@ const WhereToStartPage: React.FC = () => {
 
             <OnboardingFooter
                 message={footerError ?? undefined}
-                buttonLabel="Start"
+                buttonLabel={uiText("Start")}
                 onButtonClick={() => void handleStart()}
                 isLoading={isSubmitting}
                 disabled={!canStart || isSkipping}

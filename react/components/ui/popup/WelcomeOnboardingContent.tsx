@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { Icon, CancelIcon, PdfIcon, SearchIcon, FolderAddIcon, GlobalSearchIcon } from '../../icons/icons';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
@@ -53,7 +54,7 @@ const WelcomeOnboardingContent: React.FC<WelcomeOnboardingContentProps> = ({ onD
                 />
                 <div className="display-flex flex-col gap-1">
                     <div className="font-color-primary text-xl font-semibold mt-15">
-                        Welcome to AsterMargin
+                        {uiText("Welcome to AsterMargin")}
                     </div>
                     <div className="font-color-tertiary text-base">
                         Your AI research assistant for Zotero
@@ -101,7 +102,7 @@ const WelcomeOnboardingContent: React.FC<WelcomeOnboardingContentProps> = ({ onD
                     className="items-center"
                     style={{ padding: '5px 6px', width: '100%', alignItems: 'center', justifyContent: 'center', fontSize: "0.95rem" }}
                 >
-                    Open AsterMargin &rarr;
+                    {uiText("Open AsterMargin →")}
                 </Button>
 
                 {/* Try it later */}
@@ -109,7 +110,7 @@ const WelcomeOnboardingContent: React.FC<WelcomeOnboardingContentProps> = ({ onD
                     variant="ghost-secondary"
                     onClick={onDismiss}
                 >
-                    Try it later
+                    {uiText("Try it later")}
                 </Button>
             </div>
 

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { TagListView, TagRowView } from '@astermargin/agent-core/run-state/toolResultViews';
 
@@ -31,7 +32,7 @@ export const TagListResultView: React.FC<{ view: TagListView }> = ({ view }) => 
     if (tags.length === 0) {
         return (
             <div className="p-3 text-sm font-color-tertiary">
-                No tags found
+                {uiText("No tags found")}
             </div>
         );
     }

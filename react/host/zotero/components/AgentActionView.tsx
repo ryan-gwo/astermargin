@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { useSurfaceWindow } from '../../../runtime/SurfaceWindowContext';
 import { getMergedItemReference } from '../../../atoms/mergeItemsChoices';
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
@@ -805,7 +806,7 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                                     variant="ghost-secondary"
                                     iconClassName="font-color-red"
                                     onClick={isAwaitingApproval ? handleReject : handleRejectPending}
-                                    ariaLabel="Reject"
+                                    ariaLabel={uiText("Reject")}
                                     disabled={isDecisionHeld}
                                 />
                             </Tooltip>
@@ -815,7 +816,7 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                                     variant="ghost-secondary"
                                     iconClassName="font-color-green scale-14"
                                     onClick={isAwaitingApproval ? handleApprove : isStaleDecision ? handleApplyAnyway : handleApplyPending}
-                                    ariaLabel={isStaleDecision ? 'Apply anyway' : 'Apply'}
+                                    ariaLabel={isStaleDecision ? uiText("Apply anyway") : 'Apply'}
                                     disabled={isDecisionHeld}
                                 />
                             </Tooltip>
@@ -828,7 +829,7 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                             iconClassName="font-color-secondary scale-10"
                             onClick={() => {}}
                             loading
-                            ariaLabel="Exporting"
+                            ariaLabel={uiText("Exporting")}
                         />
                     ) : (
                         <MenuButton
@@ -836,8 +837,8 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                             variant="ghost-secondary"
                             iconClassName="font-color-secondary scale-10"
                             menuItems={fileExportFormatMenuItems(handleExportNote)}
-                            tooltipContent="Export"
-                            ariaLabel="Export"
+                            tooltipContent={uiText("Export")}
+                            ariaLabel={uiText("Export")}
                         />
                     ))}
                     {headerLinkAction && !showDecisionButtons && (
@@ -869,7 +870,7 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                         />
                     ) : (
                         <div className="text-sm font-color-secondary">
-                            No preview available
+                            {uiText("No preview available")}
                         </div>
                     )}
 
@@ -917,7 +918,7 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                                 title={heldTooltip ?? undefined}
                                 className="flex-none whitespace-nowrap"
                             >
-                                Reject
+                                {uiText("Reject")}
                             </Button>
                         )}
 
@@ -928,7 +929,7 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                                 disabled={isProcessing}
                                 className="flex-none whitespace-nowrap"
                             >
-                                Reveal
+                                {uiText("Reveal")}
                             </Button>
                         )}
 
@@ -963,10 +964,10 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                                 onClick={handleRefresh}
                                 loading={isProcessing && clickedButton === 'refresh'}
                                 disabled={isProcessing}
-                                title="Check the records again and show the current merge for review"
+                                title={uiText("Check the records again and show the current merge for review")}
                                 className="flex-none whitespace-nowrap"
                             >
-                                Refresh
+                                {uiText("Refresh")}
                             </Button>
                         )}
 
@@ -976,10 +977,10 @@ export const AgentActionView: React.FC<AgentActionViewProps> = ({
                                 onClick={handleApplyAnyway}
                                 loading={isProcessing && clickedButton === 'applyAnyway'}
                                 disabled={isProcessing}
-                                title="Make the change even though the library changed since it was proposed"
+                                title={uiText("Make the change even though the library changed since it was proposed")}
                                 className="flex-none whitespace-nowrap"
                             >
-                                Apply anyway
+                                {uiText("Apply anyway")}
                             </Button>
                         )}
 

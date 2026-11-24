@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React from "react";
 import {
     cellValueText,
@@ -64,7 +65,7 @@ export function paperOpenAction(
             run: () => void navigation.openSource(documentRef),
         };
     const handler = rowActionHandler(row, "open");
-    return handler ? { label: "Open", run: handler } : undefined;
+    return handler ? { label: uiText("Open"), run: handler } : undefined;
 }
 
 function PaperIcon({ row, className }: { row: Row; className?: string }): React.ReactElement {
@@ -132,8 +133,8 @@ export function PaperCell({
                     </span>
                 ) : isNew ? (
                     <span className="rt-row-flags">
-                        <span className="rt-tag rt-tag-new" title="Added since the last fill">
-                            New item
+                        <span className="rt-tag rt-tag-new" title={uiText("Added since the last fill")}>
+                            {uiText("New item")}
                         </span>
                     </span>
                 ) : null}
@@ -187,7 +188,7 @@ export function PaperActions({
                     onClick={run(() => navigation.revealInLibrary(item))}
                 >
                     <Icon icon={LibraryIcon} size={12} />
-                    Show in library
+                    {uiText("Show in library")}
                 </button>
             ) : null}
             {open ? (
@@ -203,7 +204,7 @@ export function PaperActions({
                     variant="rt"
                     icon={MoreHorizontalIcon}
                     className={`${buttonClassName} rt-row-menu`}
-                    ariaLabel="Row actions"
+                    ariaLabel={uiText("Row actions")}
                 />
             ) : null}
         </div>

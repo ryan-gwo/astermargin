@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React, { useLayoutEffect, useRef, useState } from "react";
 import type { Column, Row, TableSpec } from "@astermargin/agent-core/layouts/table";
 import { rowReference } from "@astermargin/agent-core/layouts/tableCitations";
@@ -136,7 +137,7 @@ export function CellInspector({
             <>
                 {column.description && (
                     <section className="rt-inspector-section">
-                        <div className="rt-inspector-heading">Question</div>
+                        <div className="rt-inspector-heading">{uiText("Question")}</div>
                         <p className="rt-inspector-text rt-inspector-question">{column.description}</p>
                     </section>
                 )}
@@ -189,7 +190,7 @@ export function CellInspector({
     return (
         <aside
             className="rt-inspector"
-            aria-label="Cell details"
+            aria-label={uiText("Cell details")}
             data-view={column ? "cell" : "paper"}
             data-row-id={row.id}
             data-column-id={column?.id ?? paperColumnId}
@@ -203,7 +204,7 @@ export function CellInspector({
                     <button
                         type="button"
                         className="rt-icon-button"
-                        aria-label="Previous row"
+                        aria-label={uiText("Previous row")}
                         disabled={!onPrevious}
                         onClick={onPrevious}
                     >
@@ -212,13 +213,13 @@ export function CellInspector({
                     <button
                         type="button"
                         className="rt-icon-button"
-                        aria-label="Next row"
+                        aria-label={uiText("Next row")}
                         disabled={!onNext}
                         onClick={onNext}
                     >
                         <Icon icon={ArrowDownIcon} size={14} />
                     </button>
-                    <button type="button" className="rt-icon-button" aria-label="Close details" onClick={onClose}>
+                    <button type="button" className="rt-icon-button" aria-label={uiText("Close details")} onClick={onClose}>
                         <Icon icon={CancelIcon} size={14} />
                     </button>
                 </div>
@@ -385,7 +386,7 @@ function AnswerSection({
                             {answer.outcome === "answered" ? (
                                 <CellValue cell={answer.cell} column={column} renderText={renderText} />
                             ) : (
-                                <span className="rt-muted">Not reported</span>
+                                <span className="rt-muted">{uiText("Not reported")}</span>
                             )}
                         </div>
                         {edit}
@@ -409,7 +410,7 @@ function AnswerSection({
             </section>
             {answer.reasoning ? (
                 <section className="rt-inspector-section">
-                    <div className="rt-inspector-heading">Explanation</div>
+                    <div className="rt-inspector-heading">{uiText("Explanation")}</div>
                     <Explanation key={answer.reasoning}>{renderText(answer.reasoning)}</Explanation>
                 </section>
             ) : null}
@@ -518,7 +519,7 @@ function PaperDetails({
                     {row.failure.message}
                 </div>
             ) : isNew ? (
-                <p className="rt-inspector-note">New item: added since the last fill.</p>
+                <p className="rt-inspector-note">{uiText("New item: added since the last fill.")}</p>
             ) : null}
             <div className="rt-paper-questions">
                 {questions.map((column) => {

@@ -1,3 +1,8 @@
+import { interfaceLocale } from "../../src/utils/interfaceLanguage";
+import { knownSettingsText } from "./settingsText";
+import { findUiMessage } from "./uiMessages";
+export { interfaceLocale } from "../../src/utils/interfaceLanguage";
+
 const words: Record<string, readonly [string, string]> = {
     "How can I help you?": ["想读哪篇文献？", "想讀哪篇文獻？"],
     General: ["通用", "通用"],
@@ -92,17 +97,9 @@ const words: Record<string, readonly [string, string]> = {
     Input: ["输入", "輸入"],
     "AsterMargin Status": ["星笺状态", "星箋狀態"],
 };
-export function interfaceLocale(): "en" | "zh-CN" | "zh-TW" {
-    const lang = String(typeof Zotero === "undefined" ? "" : Zotero.locale);
-    if (!/^zh(?:[-_]|$)/i.test(lang)) return "en";
-    return /(?:^|[-_])(?:Hant|TW|HK|MO)(?:[-_]|$)/i.test(lang)
-        ? "zh-TW"
-        : "zh-CN";
-}
-
-export function uiText(english: string) {
+export function uiText(english: string, args?: Record<string, string | number>): string {
     const locale = interfaceLocale();
-    return locale === "en"
-        ? english
-        : (words[english]?.[locale === "zh-TW" ? 1 : 0] ?? english);
+    const pair = Object.hasOwn(words, english) ? words[english] : findUiMessage(english);
+    const text = locale === "en" ? english : pair?.[locale === "zh-TW" ? 1 : 0] ?? knownSettingsText(english);
+    return args ? text.replace(/\{(\w+)\}/g, (token, name) => String(args[name] ?? token)) : text;
 }

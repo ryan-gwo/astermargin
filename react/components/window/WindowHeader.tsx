@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { currentThreadIdAtom, currentThreadNameAtom } from '@astermargin/agent-core/run-state/atoms';
@@ -72,7 +73,7 @@ const WindowHeader: React.FC<WindowHeaderProps> = ({ showChat, navForceCollapsed
                         <div className="astermargin-window-header-title-group">
                             <h1 className="astermargin-window-header-title" title={title}>{title}</h1>
                             {threadId && (
-                                <ThreadMenuButton className="scale-14 astermargin-window-header-thread-menu" ariaLabel="Chat actions" inWindow />
+                                <ThreadMenuButton className="scale-14 astermargin-window-header-thread-menu" ariaLabel={uiText("Chat actions")} inWindow />
                             )}
                         </div>
                     </>

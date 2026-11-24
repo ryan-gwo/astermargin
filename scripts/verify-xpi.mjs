@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import Zip from "adm-zip";
 
+const source = JSON.parse(await readFile(new URL("../addon/manifest.json", import.meta.url), "utf8"));
+const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
 const path = process.argv[2] ?? "dist/astermargin.xpi";
 const bytes = await readFile(path);
 const z = new Zip(bytes);
@@ -10,11 +13,13 @@ assert(z.test(), "ZIP integrity check failed");
 const manifest = JSON.parse(z.readAsText("manifest.json")),
     host = manifest.applications.zotero;
 assert.equal(manifest.name, "AsterMargin");
-assert.equal(host.id, "astermargin@astermargin.local");
-assert.equal(host.strict_min_version, "7.0");
-assert.equal(host.strict_max_version, "10.0.*");
-assert.equal(host.update_url, "https://updates.astermargin.invalid/update.json",
-    "Zotero requires a distinct update URL even for a manually distributed build");
+assert.equal(host.id, pkg.config.addonID);
+assert.equal(manifest.version, pkg.version);
+assert.equal(lock.version, pkg.version);
+assert.equal(lock.packages[""].version, pkg.version);
+for (const field of ["strict_min_version", "strict_max_version", "update_url"]) {
+    assert.equal(host[field], source.applications.zotero[field]);
+}
 for (const f of [
     "bootstrap.js",
     "prefs.js",

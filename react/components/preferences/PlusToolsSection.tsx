@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useCallback } from "react";
 import Button from "@astermargin/agent-ui/primitives/Button";
 import { SettingsGroup, SettingsRow, SectionLabel, DocLink } from "./components/SettingsElements";
@@ -67,7 +68,7 @@ const PlusToolsSection: React.FC = () => {
                             <>
                                 Plus tools include external search, batch extraction, and AI ranking with your own key for improved performance.
                                 {/* <DocLink path="credits">See the benchmarks</DocLink> */}
-                                {' '}<DocLink path="credits">Learn more</DocLink>
+                                {' '}<DocLink path="credits">{uiText("Learn more")}</DocLink>
                                 <br /><br />
                                 <span className="font-semibold font-color-primary text-lg">{remainingAsterMarginCredits.toLocaleString()}</span>
                                 {' '}<span className="font-color-primary text-base">credits left</span>
@@ -79,7 +80,7 @@ const PlusToolsSection: React.FC = () => {
                         }
                         control={
                             <Button variant="outline" className="mt-1" onClick={handleRequestPlusToolsToggle} style={{ padding: '4px 6px' }}>
-                                Disable
+                                {uiText("Disable")}
                             </Button>
                         }
                     />
@@ -95,7 +96,7 @@ const PlusToolsSection: React.FC = () => {
                                 <br />
                                 <br />
                                 <Button variant="outline" className="mt-1" onClick={handleRequestPlusToolsToggle} style={{ padding: '4px 6px' }}>
-                                    Disable Plus Tools
+                                    {uiText("Disable Plus Tools")}
                                 </Button>
                             </>
                         }
@@ -114,7 +115,7 @@ const PlusToolsSection: React.FC = () => {
                             <>
                                 Plus tools include external search, batch extraction, and AI ranking with your own key for improved performance.
                                 {/* <DocLink path="credits">See the benchmarks</DocLink> */}
-                                {' '}<DocLink path="credits">Learn more</DocLink>
+                                {' '}<DocLink path="credits">{uiText("Learn more")}</DocLink>
                                 <br /><br />
                                 <span className="font-semibold font-color-primary text-lg">{remainingAsterMarginCredits.toLocaleString()}</span>
                                 {' '}<span className="font-color-primary text-base">credits ready to use</span>
@@ -126,7 +127,7 @@ const PlusToolsSection: React.FC = () => {
                         }
                         control={
                             <Button variant="solid" className="mt-1" onClick={handleRequestPlusToolsToggle} style={{ padding: '4px 6px' }}>
-                                Enable
+                                {uiText("Enable")}
                             </Button>
                         }
                     />
@@ -139,7 +140,7 @@ const PlusToolsSection: React.FC = () => {
                             <>
                                 Plus tools include external search, batch extraction, and AI ranking with your own key for improved performance.
                                 Costs 0.25 credits per message. Some actions cost extra.{' '}
-                                <DocLink path="credits">Learn more</DocLink>
+                                <DocLink path="credits">{uiText("Learn more")}</DocLink>
                             </>
                         }
                         control={

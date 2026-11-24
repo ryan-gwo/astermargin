@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { viewAttachment } from '../../../runtime/navigation';
 import { getContextWindow } from '../../../runtime/windowRuntime';
 import React, { useEffect, useState, useCallback } from 'react';
@@ -247,7 +248,7 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                     icon={InformationCircleIcon}
                     className={`font-color-secondary ${className}`}
                     iconClassName="scale-90"
-                    ariaLabel="Show details"
+                    ariaLabel={uiText("Show details")}
                     onClick={handleShowDetails}
                     style={{ padding: '2px' }}
                 />
@@ -260,7 +261,7 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                         variant={buttonVariant}
                         icon={ArrowUpRightIcon}
                         className={`font-color-secondary ${className}`}
-                        ariaLabel="Open website"
+                        ariaLabel={uiText("Open website")}
                         onClick={handleOpenWeb}
                         style={{ padding: '2px' }}
                     />
@@ -274,7 +275,7 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                         variant={buttonVariant}
                         icon={PdfIcon}
                         className={`font-color-secondary ${className}`}
-                        ariaLabel="Open PDF"
+                        ariaLabel={uiText("Open PDF")}
                         onClick={handleOpenPdf}
                         style={{ padding: '2px' }}
                     />
@@ -287,12 +288,12 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                     onClick={() => Zotero.launchURL(`${CITED_BY_URL}${item.source_id}`)}
                     className="text-link-muted text-sm"
                 >
-                    Cited by {item.citation_count!.toLocaleString()}
+                    {uiText("Cited by")}{' '}{item.citation_count!.toLocaleString()}
                 </a>
             )}
             {showCitedBy && item.citation_count === 0 && (
                 <div className="font-color-tertiary text-sm">
-                    Cited by {item.citation_count!.toLocaleString()}
+                    {uiText("Cited by")}{' '}{item.citation_count!.toLocaleString()}
                 </div>
             )}
 
@@ -309,7 +310,7 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                         icon={AlertIcon}
                         className={`font-color-secondary ${className}`}
                         iconClassName="scale-90"
-                        ariaLabel="Error creating item"
+                        ariaLabel={uiText("Error creating item")}
                         onClick={onApply}
                         disabled={isLoading}
                         style={{ padding: '2px' }}
@@ -325,7 +326,7 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                         icon={CancelIcon}
                         className={`font-color-secondary ${className}`}
                         iconClassName="scale-90"
-                        ariaLabel="Reject Item"
+                        ariaLabel={uiText("Reject Item")}
                         onClick={onReject}
                         disabled={isLoading}
                         style={{ padding: '2px' }}
@@ -343,7 +344,7 @@ const AgentActionItemButtons: React.FC<AgentActionItemButtonsProps> = ({
                         className={`font-color-secondary ${className}`}
                         style={{ padding: '2px' }}
                         onClick={onApply}
-                        ariaLabel="Add to library"
+                        ariaLabel={uiText("Add to library")}
                         disabled={isLoading}
                     />
                 </Tooltip>

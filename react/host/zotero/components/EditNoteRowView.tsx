@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useMemo } from 'react';
 import { AgentRunStatus, ToolCallPart } from '@astermargin/agent-core/agents/types';
 import {
@@ -288,7 +289,7 @@ const EditNoteRowViewComponent: React.FC<EditNoteRowViewProps> = ({
                         applies whatever the cause.
                     */}
                     <div className="text-sm font-color-secondary" style={{ lineHeight: '1.4' }}>
-                        {displayedUndoError} You can revert manually in the note editor.
+                        {displayedUndoError}{' '}{uiText("You can revert manually in the note editor.")}
                     </div>
                 </div>
             )}

@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, {
   createContext,
   useContext,
@@ -215,7 +216,7 @@ export const TagCloseTrigger = forwardRef<HTMLButtonElement, TagCloseTriggerProp
         type="button"
         ref={ref}
         onClick={handleClick}
-        aria-label="Close tag"
+        aria-label={uiText("Close tag")}
         style={{
           cursor: "pointer",
           background: "transparent",

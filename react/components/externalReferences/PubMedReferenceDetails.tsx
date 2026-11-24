@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from 'react';
 import { workDetails, type ExternalReference, type MeshTerm } from '@astermargin/agent-core/types/externalReferences';
 import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
@@ -29,13 +30,13 @@ const MeshTerms: React.FC<{ terms: MeshTerm[] }> = ({ terms }) => {
         <div className="display-flex flex-col gap-2">
             {main.length > 0 && (
                 <div className="display-flex flex-col gap-1">
-                    <div className="ext-subheading">Main topics</div>
+                    <div className="ext-subheading">{uiText("Main topics")}</div>
                     {chips(main, false)}
                 </div>
             )}
             {other.length > 0 && (showAll || !main.length) && (
                 <div className="display-flex flex-col gap-1">
-                    {main.length > 0 && <div className="ext-subheading">Other terms</div>}
+                    {main.length > 0 && <div className="ext-subheading">{uiText("Other terms")}</div>}
                     {chips(other, true)}
                 </div>
             )}
@@ -71,7 +72,7 @@ const PubMedReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item })
             footer={<DetailsActions item={item} />}
         >
             {sections.length > 0 ? (
-                <DetailsSection title="Abstract">
+                <DetailsSection title={uiText("Abstract")}>
                     <div className="display-flex flex-col gap-3">
                         {sections.map((section, index) => (
                             <div key={index} className="display-flex flex-col gap-05">
@@ -82,14 +83,14 @@ const PubMedReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item })
                     </div>
                 </DetailsSection>
             ) : item.abstract ? (
-                <DetailsSection title="Abstract">{item.abstract.trim()}</DetailsSection>
+                <DetailsSection title={uiText("Abstract")}>{item.abstract.trim()}</DetailsSection>
             ) : null}
             {mesh.length > 0 && (
                 <DetailsSection
                     title="MeSH terms"
                     aside={(
                         <Tooltip content={MESH_HELP}>
-                            <span className="font-color-secondary text-sm cursor-default">What are these?</span>
+                            <span className="font-color-secondary text-sm cursor-default">{uiText("What are these?")}</span>
                         </Tooltip>
                     )}
                 >

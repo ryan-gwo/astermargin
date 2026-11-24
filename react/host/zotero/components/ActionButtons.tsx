@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { viewAttachment } from '../../../runtime/navigation';
 import { tryGetWindowRuntime } from '../../../runtime/windowRuntime';
 import React, { useEffect, useState, useCallback } from 'react';
@@ -497,12 +498,12 @@ const ActionButtons: React.FC<ExternalReferenceActionsProps> = ({
                     onClick={() => Zotero.launchURL(`${CITED_BY_URL}${item.source_id}`)}
                     className="text-link-muted text-sm"
                 >
-                    Cited by {item.citation_count!.toLocaleString()}
+                    {uiText("Cited by")}{' '}{item.citation_count!.toLocaleString()}
                 </a>
             )}
             {showCitedBy && item.citation_count === 0 && (
                 <div className="font-color-tertiary text-sm">
-                    Cited by {item.citation_count.toLocaleString()}
+                    {uiText("Cited by")}{' '}{item.citation_count.toLocaleString()}
                 </div>
             )}
             {((

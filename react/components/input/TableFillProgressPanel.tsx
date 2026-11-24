@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useCallback, useEffect } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { currentThreadIdAtom } from '@astermargin/agent-core/run-state/atoms';
@@ -99,28 +100,28 @@ const TableFillProgressPanel: React.FC = () => {
                     <IconButton
                         icon={ArrowUpRightIcon}
                         variant="ghost-secondary"
-                        ariaLabel="Open table"
-                        title="Open table"
+                        ariaLabel={uiText("Open table")}
+                        title={uiText("Open table")}
                         onClick={(event) => void openTable(event)}
                     />
                     {finished ? (
                         <IconButton
                             icon={CancelIcon}
                             variant="ghost-secondary"
-                            ariaLabel="Dismiss"
+                            ariaLabel={uiText("Dismiss")}
                             onClick={() => dismiss(snapshot.job_id)}
                         />
                     ) : (
                         <Button
                             variant="ghost"
                             rightIcon={StopStrokeIcon}
-                            ariaLabel="Stop fill"
+                            ariaLabel={uiText("Stop fill")}
                             onClick={stopFill}
                             disabled={stopping}
                             className="flex-none"
                             style={{ padding: '1px 4px' }}
                         >
-                            Stop
+                            {uiText("Stop")}
                         </Button>
                     )}
                 </div>

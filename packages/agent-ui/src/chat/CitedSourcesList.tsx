@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useState, useEffect } from 'react';
 import { useAtomValue } from 'jotai';
 import { ArrowUpRightIcon, ExternalLinkIcon, FileIcon, Icon, LibraryIcon, PdfIcon, TableIcon } from '../icons';
@@ -208,8 +209,8 @@ const CitedSourcesList: React.FC<CitedSourcesListProps> = ({
                                                             getHost().navigation?.launchExternalFile(ref.ext_key);
                                                         }
                                                     }}
-                                                    ariaLabel="Open file"
-                                                    title="Open file"
+                                                    ariaLabel={uiText("Open file")}
+                                                    title={uiText("Open file")}
                                                     className="display-flex scale-11"
                                                 />
                                             </Tooltip>
@@ -228,8 +229,8 @@ const CitedSourcesList: React.FC<CitedSourcesListProps> = ({
                                                             const target = mappedZoteroItem || zoteroRef;
                                                             if (target) getHost().navigation?.revealInLibrary(target);
                                                         }}
-                                                        ariaLabel="Reveal source"
-                                                        title="Reveal in Zotero"
+                                                        ariaLabel={uiText("Reveal source")}
+                                                        title={uiText("Reveal in Zotero")}
                                                         className="display-flex scale-11"
                                                         disabled={!mappedZoteroItem && !zoteroRef}
                                                     />
@@ -245,8 +246,8 @@ const CitedSourcesList: React.FC<CitedSourcesListProps> = ({
                                                                     event.currentTarget.ownerDocument.defaultView,
                                                                 );
                                                             }}
-                                                            ariaLabel="Open table"
-                                                            title="Open table"
+                                                            ariaLabel={uiText("Open table")}
+                                                            title={uiText("Open table")}
                                                             className="display-flex scale-11"
                                                         />
                                                     </Tooltip>
@@ -260,8 +261,8 @@ const CitedSourcesList: React.FC<CitedSourcesListProps> = ({
                                                                 const target = mappedZoteroItem || zoteroRef;
                                                                 if (target) getHost().navigation?.openSource(target);
                                                             }}
-                                                            ariaLabel="Open PDF"
-                                                            title="Open PDF"
+                                                            ariaLabel={uiText("Open PDF")}
+                                                            title={uiText("Open PDF")}
                                                             className="display-flex scale-12"
                                                             disabled={!isPdfButtonEnabled(citation, mappedZoteroItem)}
                                                         />

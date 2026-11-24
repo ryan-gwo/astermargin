@@ -11,7 +11,7 @@
   "applications": {
     "zotero": {
       "id": "__addonID__",
-      "update_url": "https://updates.astermargin.invalid/update.json",
+      "update_url": "https://github.com/ryan-gwo/astermargin/releases/latest/download/update.json",
       "strict_min_version": "7.0",
       "strict_max_version": "10.0.*"
     }

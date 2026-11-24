@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { resolveCollection } from '../../../../src/services/collections/collectionIdentity';
 import { resolveObjectId } from '../../../../src/utils/libraryIdentity';
 import React, { useEffect, useState } from 'react';
@@ -154,7 +155,7 @@ export const CreateCollectionPreview: React.FC<CreateCollectionPreviewProps> = (
                             onContextMenu={canRevealParent ? collectionMenuHandler(parentKey) : undefined}
                             onMouseEnter={canRevealParent ? () => setHoveredRow('parent') : undefined}
                             onMouseLeave={canRevealParent ? () => setHoveredRow(null) : undefined}
-                            title={canRevealParent ? 'Click to reveal in Zotero' : undefined}
+                            title={canRevealParent ? uiText("Click to reveal in Zotero") : undefined}
                         >
                             <span className="scale-75 display-flex">
                                 <CSSIcon name="collection" className="icon-16" />
@@ -173,7 +174,7 @@ export const CreateCollectionPreview: React.FC<CreateCollectionPreviewProps> = (
                         onContextMenu={canRevealNew ? collectionMenuHandler(newCollectionKey!) : undefined}
                         onMouseEnter={canRevealNew ? () => setHoveredRow('new') : undefined}
                         onMouseLeave={canRevealNew ? () => setHoveredRow(null) : undefined}
-                        title={canRevealNew ? 'Click to reveal in Zotero' : undefined}
+                        title={canRevealNew ? uiText("Click to reveal in Zotero") : undefined}
                     >
                         <span className="scale-75 display-flex">
                             <CSSIcon name="collection" className="icon-16" />
@@ -196,12 +197,12 @@ export const CreateCollectionPreview: React.FC<CreateCollectionPreviewProps> = (
                             <span>
                                 {isApplied && resultData?.items_added !== undefined && (
                                     <span className="ml-1">
-                                        Added {resultData.items_added} item{resultData.items_added !== 1 ? 's' : ''}
+                                        {uiText("Added")}{' '}{resultData.items_added} item{resultData.items_added !== 1 ? 's' : ''}
                                     </span>
                                 )}
                                 {!isApplied && itemCount && itemCount > 0 && (
                                     <span className="ml-1">
-                                        Adding {itemCount} item{itemCount !== 1 ? 's' : ''}
+                                        {uiText("Adding")}{' '}{itemCount} item{itemCount !== 1 ? 's' : ''}
                                     </span>
                                 )}
                             </span>

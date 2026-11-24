@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import type { MetadataEdit, AppliedMetadataEdit, CreatorJSON, FailedMetadataEdit } from '@astermargin/agent-core/types/agentActions/base';
 import { resolveFieldForItemType } from '../../../../src/utils/zoteroUtils';
@@ -85,18 +86,18 @@ export const EditMetadataPreview: React.FC<EditMetadataPreviewProps> = ({
                                 {/* Old value - deletion style (show crossed out for applied, normal for others) */}
                                 <div className={`diff-line ${isApplied ? 'diff-deletion' : isRejectedOrUndone ? 'diff-neutral' : 'diff-deletion'}`}>
                                     <span className={`diff-content`}>
-                                        {currentValue ? truncateValue(currentValue) : <span className="italic opacity-60">(empty)</span>}
+                                        {currentValue ? truncateValue(currentValue) : <span className="italic opacity-60">{uiText("(empty)")}</span>}
                                     </span>
                                 </div>
                                 {/* New value - addition style (highlighted for applied, ghosted for rejected) */}
                                 <div className={`diff-line ${newValueClass(!!failure && isApplied)}`}>
                                     <span className="diff-content">
-                                        {displayValue ? truncateValue(displayValue) : <span className="italic opacity-60">(empty)</span>}
+                                        {displayValue ? truncateValue(displayValue) : <span className="italic opacity-60">{uiText("(empty)")}</span>}
                                     </span>
                                 </div>
                             </div>
                             {failure && isApplied && (
-                                <div className="text-sm font-color-red px-3">Not changed: {truncateValue(failureText(failure.error), 120)}</div>
+                                <div className="text-sm font-color-red px-3">{uiText("Not changed:")}{' '}{truncateValue(failureText(failure.error), 120)}</div>
                             )}
                         </div>
                     );
@@ -105,7 +106,7 @@ export const EditMetadataPreview: React.FC<EditMetadataPreviewProps> = ({
                 {hasCreatorChanges && (
                     <div className="flex flex-col gap-1">
                         <div className="text-sm font-color-primary font-medium px-3 py-1">
-                            Creators
+                            {uiText("Creators")}
                         </div>
                         <div className="diff-container">
                             {/* Old creators */}
@@ -113,7 +114,7 @@ export const EditMetadataPreview: React.FC<EditMetadataPreviewProps> = ({
                                 <span className="diff-content">
                                     {oldCreators && oldCreators.length > 0
                                         ? truncateValue(formatCreatorList(oldCreators))
-                                        : <span className="italic opacity-60">(empty)</span>
+                                        : <span className="italic opacity-60">{uiText("(empty)")}</span>
                                     }
                                 </span>
                             </div>
@@ -125,7 +126,7 @@ export const EditMetadataPreview: React.FC<EditMetadataPreviewProps> = ({
                             </div>
                         </div>
                         {failureFor('creators') && isApplied && (
-                            <div className="text-sm font-color-red px-3">Not changed: {truncateValue(failureText(failureFor('creators')!.error), 120)}</div>
+                            <div className="text-sm font-color-red px-3">{uiText("Not changed:")}{' '}{truncateValue(failureText(failureFor('creators')!.error), 120)}</div>
                         )}
                     </div>
                 )}

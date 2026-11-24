@@ -6,12 +6,13 @@ import { QuillWriteIcon, BookSearchIcon, LayersIcon, HighlighterIcon } from "./i
 import CategoryPanel from "./CategoryPanel";
 import { ActionCategory } from "@astermargin/agent-core/types/actions";
 import { homeLauncherCategoryAtom, HomeLauncherCategoryId } from "../atoms/ui";
+import { actionCategoryText } from "../utils/actionDisplayText";
+import { uiText } from "../utils/interfaceText";
 
 type CategoryId = HomeLauncherCategoryId;
 
 interface CategoryDef {
     id: CategoryId;
-    label: string;
     icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
     /** The skill category this launcher button maps to. */
     category: ActionCategory;
@@ -22,22 +23,22 @@ interface CategoryDef {
 
 const CATEGORIES: CategoryDef[] = [
     {
-        id: "research", label: "Research", icon: BookSearchIcon, category: "research",
+        id: "research", icon: BookSearchIcon, category: "research",
         tooltipTitle: "Ask and explore your library",
         tooltipDescription: "Grounded answers from full text, plus related work and gaps",
     },
     {
-        id: "write", label: "Write", icon: QuillWriteIcon, category: "write",
+        id: "write", icon: QuillWriteIcon, category: "write",
         tooltipTitle: "Write & synthesize",
         tooltipDescription: "Summaries, reviews, and notes drawn from your sources — every claim cited",
     },
     {
-        id: "organize", label: "Organize", icon: LayersIcon, category: "organize",
+        id: "organize", icon: LayersIcon, category: "organize",
         tooltipTitle: "Organize & edit your library",
         tooltipDescription: "Tag, sort, and fix metadata. You approve every change",
     },
     {
-        id: "annotate", label: "Annotate", icon: HighlighterIcon, category: "annotate",
+        id: "annotate", icon: HighlighterIcon, category: "annotate",
         tooltipTitle: "AI-powered PDF annotations",
         tooltipDescription: "Highlights and notes added right in your PDF, ready to review",
     },
@@ -65,16 +66,17 @@ const HomeLauncher: React.FC<{ style?: React.CSSProperties }> = ({ style }) => {
             <div className="display-flex flex-row flex-wrap gap-15 items-center justify-center">
                 {CATEGORIES.map((cat) => {
                     const isActive = expanded === cat.id;
+                    const tooltipTitle = uiText(cat.tooltipTitle);
                     return (
                         <Tooltip
                             key={cat.id}
-                            content={cat.tooltipTitle}
+                            content={tooltipTitle}
                             padding={false}
                             width="210px"
                             customContent={
                                 <div className="px-2 py-1 display-flex flex-col gap-1">
-                                    <span className="text-base font-color-secondary font-medium">{cat.tooltipTitle}</span>
-                                    <span className="text-sm font-color-secondary">{cat.tooltipDescription}</span>
+                                    <span className="text-base font-color-secondary font-medium">{tooltipTitle}</span>
+                                    <span className="text-sm font-color-secondary">{uiText(cat.tooltipDescription)}</span>
                                 </div>
                             }
                         >
@@ -86,7 +88,7 @@ const HomeLauncher: React.FC<{ style?: React.CSSProperties }> = ({ style }) => {
                                 iconClassName="flex-shrink-0 scale-11"
                                 style={{ padding: "4px 7px", borderRadius: "6px" }}
                             >
-                                <span className="font-medium">{cat.label}</span>
+                                <span className="font-medium">{actionCategoryText(cat.category)}</span>
                             </Button>
                         </Tooltip>
                     );

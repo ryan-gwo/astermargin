@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from "react";
 import type { TableRecordColumn, TableRecordSource } from "@astermargin/agent-core/protocol/artifactProtocol";
 import type { TableView } from "@astermargin/agent-core/run-state/toolResultViews";
@@ -12,7 +13,7 @@ import { DeleteIcon, EditIcon, Icon, PlusSignIcon } from "../../icons/icons";
  * colours, so a removal is visible without the whole line shouting.
  */
 const TONE_MARK: Record<TableChangeTone, { icon: React.ComponentType<React.SVGProps<SVGSVGElement>>; className: string; label: string }> = {
-    add: { icon: PlusSignIcon, className: "table-record-mark-add", label: "Added" },
+    add: { icon: PlusSignIcon, className: "table-record-mark-add", label: uiText("Added") },
     change: { icon: EditIcon, className: "table-record-mark-change", label: "Changed" },
     remove: { icon: DeleteIcon, className: "table-record-mark-remove", label: "Removed" },
 };
@@ -320,7 +321,7 @@ export function TableResultView({ view }: { view: TableView }) {
             )}
             {edits.length > 0 && (
                 <div className="table-record-section">
-                    <div className="table-record-label">Changes</div>
+                    <div className="table-record-label">{uiText("Changes")}</div>
                     <div className="table-record-list">
                         {edits.map((line, index) => (
                             <ChangeRow key={index} tone={line.tone} text={line.text} />
@@ -330,7 +331,7 @@ export function TableResultView({ view }: { view: TableView }) {
             )}
             {sources.length > 0 && (
                 <div className="table-record-section">
-                    <div className="table-record-label">Sources</div>
+                    <div className="table-record-label">{uiText("Sources")}</div>
                     <div className="table-record-list">
                         {sources.map((source) => (
                             <SourceRow key={source.id} source={source} />
@@ -340,7 +341,7 @@ export function TableResultView({ view }: { view: TableView }) {
             )}
             {columns.length > 0 && (
                 <div className="table-record-section">
-                    <div className="table-record-label">Columns</div>
+                    <div className="table-record-label">{uiText("Columns")}</div>
                     <div className="table-record-list">
                         {columns.map((column) => (
                             <ColumnRow
@@ -354,7 +355,7 @@ export function TableResultView({ view }: { view: TableView }) {
             )}
             {fillLines.length > 0 && (
                 <div className="table-record-section">
-                    <div className="table-record-label">Fill</div>
+                    <div className="table-record-label">{uiText("Fill")}</div>
                     {fillLines.map((line, index) => (
                         <div key={line} className={index === 0 ? "font-color-primary" : "font-color-secondary"}>
                             {line}

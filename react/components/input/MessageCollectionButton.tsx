@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { resolveCollection } from '../../../src/services/collections/collectionIdentity';
 import React from 'react';
 import { useSetAtom, useAtomValue } from 'jotai';
@@ -52,7 +53,7 @@ export const MessageCollectionButton: React.FC<MessageCollectionButtonProps> = (
         canEdit,
         disabled,
         extraMenuItems: [{
-            label: 'Reveal Collection',
+            label: uiText("Reveal Collection"),
             icon: LibraryIcon,
             onClick: revealCollection,
         }],
@@ -72,7 +73,7 @@ export const MessageCollectionButton: React.FC<MessageCollectionButtonProps> = (
         ),
         title: collection.name,
         subtitle: { text: 'Collection' },
-        action: { icon: LibraryIcon, label: 'Reveal in library' },
+        action: { icon: LibraryIcon, label: uiText("Reveal in library") },
     };
 
     return (

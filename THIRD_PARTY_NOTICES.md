@@ -2,7 +2,7 @@
 
 AsterMargin is distributed under GNU AGPL version 3 or later. The license text accompanies this file. AsterMargin artwork and modifications use the same license.
 
-The Zotero client, PDF/EPUB/snapshot processing, Zotero writing tools, research tables and export code derive from Beaver by J. Legewie and contributors. The source baseline is jlegewie/beaver-zotero at bfe64743c7cbb58b812881176707fe480e89ed11 (v0.27.0-beta.4). The agent-local package and local-mode integration derive from Beaver Local by chgwan and contributors at 84b648c908259349e41d54258a20fe0538185697. Both upstream projects use AGPL-3.0-or-later. Package repository metadata records the upstream source required by the scaffold. This local distribution has no public update feed.
+The Zotero client, PDF/EPUB/snapshot processing, Zotero writing tools, research tables and export code derive from Beaver by J. Legewie and contributors. The source baseline is jlegewie/beaver-zotero at bfe64743c7cbb58b812881176707fe480e89ed11 (v0.27.0-beta.4). The agent-local package and local-mode integration derive from Beaver Local by chgwan and contributors at 84b648c908259349e41d54258a20fe0538185697. Both upstream projects use AGPL-3.0-or-later. AsterMargin release tags identify the corresponding source and build instructions for each published XPI.
 
 - https://github.com/jlegewie/beaver-zotero
 - https://github.com/chgwan/beaver-zotero-local

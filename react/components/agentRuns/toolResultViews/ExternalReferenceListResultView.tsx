@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useMemo, useState } from 'react';
 import {
     ExternalReferenceListView,
@@ -160,18 +161,18 @@ const SearchDetailsPanel: React.FC<{ info: SearchViewInfo; id: string }> = ({ in
         <div
             id={id}
             role="region"
-            aria-label="Search details"
+            aria-label={uiText("Search details")}
             className="bg-senary border-bottom-quinary px-3 pt-1 pb-25 display-flex flex-col gap-2"
         >
             {query && (
                 <div className="display-flex flex-col gap-05">
-                    <div className="text-xs font-color-secondary">Query</div>
+                    <div className="text-xs font-color-secondary">{uiText("Query")}</div>
                     <div className="text-sm font-color-primary select-text">{query}</div>
                 </div>
             )}
             {filters.length > 0 && (
                 <div className="display-flex flex-col gap-05">
-                    <div className="text-xs font-color-secondary">Filters</div>
+                    <div className="text-xs font-color-secondary">{uiText("Filters")}</div>
                     <div className="display-flex flex-row flex-wrap gap-1">
                         {filters.map((filter) => <span key={filter} className="ext-chip">{filter}</span>)}
                     </div>
@@ -185,7 +186,7 @@ const SearchDetailsPanel: React.FC<{ info: SearchViewInfo; id: string }> = ({ in
                         <CopyButton
                             content={translation!}
                             className="scale-90"
-                            title="Copy query"
+                            title={uiText("Copy query")}
                             ariaLabel={`Copy the query as ${sourceName} ran it`}
                         />
                     </div>
@@ -322,7 +323,7 @@ export const ExternalReferenceListResultView: React.FC<{
                 return (
                     <React.Fragment key={key}>
                         {index === publicationsStart && (
-                            <div className="px-3 pt-3 pb-1 text-sm font-color-secondary border-top-quinary">Publications</div>
+                            <div className="px-3 pt-3 pb-1 text-sm font-color-secondary border-top-quinary">{uiText("Publications")}</div>
                         )}
                         {row}
                     </React.Fragment>

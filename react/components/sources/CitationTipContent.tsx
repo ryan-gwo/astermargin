@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 
 const citationBadge: React.CSSProperties = {
@@ -32,7 +33,7 @@ const blue: React.CSSProperties = {
 
 export const CitationTipContent: React.FC = () => (
     <div className="text-base font-color-secondary" style={{ lineHeight: '1.6' }}>
-        AsterMargin cites sources from your library and beyond.
+        {uiText("AsterMargin cites sources from your library and beyond.")}
         <br />
         <span style={gray}>1</span> points to an item in your library.
         <br />

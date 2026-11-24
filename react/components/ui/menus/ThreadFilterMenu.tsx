@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { logger } from '@astermargin/agent-core/platform/logger';
 import SearchMenu, { MenuPosition, SearchMenuItem } from '@astermargin/agent-ui/primitives/SearchMenu';
 import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
@@ -201,13 +202,13 @@ const ThreadFilterMenu: React.FC<ThreadFilterMenuProps> = ({ activeFilter, onSel
             <Tooltip content="Filter chats by Zotero item" disabled={isMenuOpen}>
                 <ChipButton
                     onClick={handleButtonClick}
-                    aria-label="Filter chats by Zotero item"
+                    aria-label={uiText("Filter chats by Zotero item")}
                     aria-haspopup="menu"
                     aria-expanded={isMenuOpen}
                     disabled={disabled}
                 >
                     <Icon icon={FilterIcon} className="scale-12" />
-                    <span>Filter</span>
+                    <span>{uiText("Filter")}</span>
                     <Icon icon={ArrowDownIcon} className="scale-11" />
                 </ChipButton>
             </Tooltip>
@@ -222,7 +223,7 @@ const ThreadFilterMenu: React.FC<ThreadFilterMenuProps> = ({ activeFilter, onSel
                 maxHeight="300px"
                 onSearch={handleSearch}
                 noResultsText="No results found"
-                placeholder="Search by author, year and title"
+                placeholder={uiText("Search by author, year and title")}
                 searchQuery={searchQuery}
                 setSearchQuery={setSearchQuery}
                 onEmptyBackspace={handleMenuClose}

@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import ChatLoadFailure from './ChatLoadFailure';
 import React, { useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
@@ -49,10 +50,10 @@ export function threadListEmptyMessage({
     filterLabel: string | null;
     localMode: boolean;
 }): string {
-    if (activeQuery) return 'No matching chats';
-    if (filterLabel) return `No chats about ${filterLabel}`;
-    if (localMode) return "No chats saved on this device yet.";
-    return 'No chats yet';
+    if (activeQuery) return uiText("No matching chats");
+    if (filterLabel) return uiText("No chats about {topic}", { topic: filterLabel });
+    if (localMode) return uiText("No chats saved on this device yet.");
+    return uiText("No chats yet");
 }
 
 const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) => {
@@ -220,15 +221,15 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
     // Item-filtered mode partitions client-side, so its count is exact.
     const hasExactHiddenCount = !!filter || !activeQuery;
     const hiddenCountSummary = !hasExactHiddenCount
-        ? 'Chats from other Zotero profiles are hidden'
+        ? uiText("Chats from other Zotero profiles are hidden")
         : hiddenInstanceCount === 1
-            ? '1 chat from a different Zotero profile is hidden'
-            : `${hiddenInstanceCount} chats from other Zotero profiles are hidden`;
+            ? uiText("1 chat from a different Zotero profile is hidden")
+            : uiText("{count} chats from other Zotero profiles are hidden", { count: hiddenInstanceCount });
     const hiddenExplanation = !hasExactHiddenCount
-        ? 'Some of your chats were created in a different Zotero profile. AsterMargin keeps chat history separate for each one.'
+        ? uiText("Some of your chats were created in a different Zotero profile. AsterMargin keeps chat history separate for each one.")
         : hiddenInstanceCount === 1
-            ? 'You have 1 chat that was created in a different Zotero profile. AsterMargin keeps chat history separate for each one.'
-            : `You have ${hiddenInstanceCount} chats that were created in a different Zotero profile. AsterMargin keeps chat history separate for each one.`;
+            ? uiText("You have 1 chat that was created in a different Zotero profile. AsterMargin keeps chat history separate for each one.")
+            : uiText("You have {count} chats that were created in a different Zotero profile. AsterMargin keeps chat history separate for each one.", { count: hiddenInstanceCount });
 
     /**
      * One chat row. Shared by the pinned group and the date groups so both
@@ -253,7 +254,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                 className={`thread-list-item ${isEditing ? 'thread-list-item-editing' : ''} ${isHovered ? 'thread-list-item-hovered' : ''}`}
                 role={isEditing ? undefined : 'button'}
                 tabIndex={isEditing ? undefined : 0}
-                aria-label={isEditing ? undefined : `${threadName}, ${formatTimeAgo(thread.updatedAt)}${isCurrent ? ', current chat' : ''}${thread.isPinned ? ', pinned' : ''}${thread.awaitingInput ? `, ${awaitingInputLabel(thread.awaitingInput).toLowerCase()}` : ''}${isForeign ? `, ${FOREIGN_THREAD_TITLE}` : ''}`}
+                aria-label={isEditing ? undefined : `${threadName}, ${formatTimeAgo(thread.updatedAt)}${isCurrent ? `, ${uiText("current chat")}` : ''}${thread.isPinned ? `, ${uiText("pinned")}` : ''}${thread.awaitingInput ? `, ${awaitingInputLabel(thread.awaitingInput).toLowerCase()}` : ''}${isForeign ? `, ${uiText(FOREIGN_THREAD_TITLE)}` : ''}`}
                 onClick={() => {
                     if (!isEditing) {
                         handleSelectThread(thread);
@@ -292,10 +293,10 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                         </div>
                     )}
                     <div className="thread-list-item-time">
-                        {formatTimeAgo(thread.updatedAt)}{isCurrent && ' (current chat)'}
+                        {formatTimeAgo(thread.updatedAt)}{isCurrent && ` (${uiText("current chat")})`}
                         {isForeign && (
-                            <span className="thread-list-item-badge" title={FOREIGN_THREAD_TITLE}>
-                                {FOREIGN_THREAD_LABEL}
+                            <span className="thread-list-item-badge" title={uiText(FOREIGN_THREAD_TITLE)}>
+                                {uiText(FOREIGN_THREAD_LABEL)}
                             </span>
                         )}
                     </div>
@@ -311,7 +312,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                                     handleCancelRename();
                                 }}
                                 className="scale-90"
-                                ariaLabel="Cancel rename"
+                                ariaLabel={uiText("Cancel rename")}
                             />
                             <IconButton
                                 icon={TickIcon}
@@ -321,7 +322,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                                     handleConfirmRename(thread.id);
                                 }}
                                 className="scale-12"
-                                ariaLabel="Confirm rename"
+                                ariaLabel={uiText("Confirm rename")}
                                 loading={isSavingRename}
                             />
                         </div>
@@ -335,7 +336,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                                     history.togglePin(thread);
                                 }}
                                 className="scale-11"
-                                ariaLabel={thread.isPinned ? 'Unpin chat' : 'Pin chat'}
+                                ariaLabel={thread.isPinned ? uiText("Unpin chat") : uiText("Pin chat")}
                                 loading={pinPending}
                             />
                             <IconButton
@@ -346,7 +347,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                                     handleStartRename(thread.id, threadName);
                                 }}
                                 className="scale-11"
-                                ariaLabel="Rename thread"
+                                ariaLabel={uiText("Rename thread")}
                             />
                             <IconButton
                                 icon={DeleteIcon}
@@ -356,7 +357,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                                     void history.deleteThread(thread.id);
                                 }}
                                 className="scale-11"
-                                ariaLabel="Delete thread"
+                                ariaLabel={uiText("Delete thread")}
                             />
                         </div>
                     )}
@@ -373,7 +374,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
             onMouseLeave={() => { pointerRef.current = null; }}
         >
             {/* Title */}
-            <div className="thread-overlay-title mb-1">Chats</div>
+            <div className="thread-overlay-title mb-1">{uiText("Chats")}</div>
 
             {/* Search bar */}
             <div className="px-3 pb-2">
@@ -386,8 +387,8 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                     <input
                         type="text"
                         className="thread-search-input"
-                        placeholder="Search chats..."
-                        aria-label="Search chats"
+                        placeholder={uiText("Search chats...")}
+                        aria-label={uiText("Search chats")}
                         value={history.searchQuery}
                         onChange={e => history.setSearchQuery(e.target.value)}
                         onKeyDown={handleSearchKeyDown}
@@ -422,7 +423,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                             <span className="truncate">{filter.label}</span>
                             <span
                                 role="button"
-                                aria-label="Remove filter"
+                                aria-label={uiText("Remove filter")}
                                 className="thread-filter-chip-remove"
                                 onClick={(e) => { e.stopPropagation(); setFilter(null); focusSearchInput(); }}
                             >
@@ -444,9 +445,9 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                         >
                             <ChipButton
                                 onClick={() => toggleShowAllInstances(false)}
-                                aria-label="Showing chats from all Zotero profiles. Show only this profile's chats"
+                                aria-label={uiText("Showing chats from all Zotero profiles. Show only this profile's chats")}
                             >
-                                <span className="truncate">All profiles</span>
+                                <span className="truncate">{uiText("All profiles")}</span>
                                 <span className="thread-filter-chip-remove" aria-hidden="true">
                                     <CSSIcon name="x-8" className="icon-16 scale-80" />
                                 </span>
@@ -457,7 +458,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
             </div>
             {filter && !isLoading && (
                 <div className="thread-filter-count">
-                    Showing {displayedCount} chat{displayedCount === 1 ? '' : 's'} related to {filter.label}
+                    {uiText(displayedCount === 1 ? "Showing {count} chat related to {topic}" : "Showing {count} chats related to {topic}", { count: displayedCount, topic: filter.label })}
                 </div>
             )}
 
@@ -465,13 +466,13 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
             <div className="flex-1 min-h-0 overflow-y-auto px-1" ref={scrollRef}>
                 {pinnedThreads.length > 0 && (
                     <div>
-                        <div className="thread-group-header">Pinned</div>
+                        <div className="thread-group-header">{uiText("Pinned")}</div>
                         {pinnedThreads.map(renderThreadRow)}
                     </div>
                 )}
                 {groups.map(group => (
-                    <div key={group.label}>
-                        <div className="thread-group-header">{group.label}</div>
+                    <div key={uiText(group.label)}>
+                        <div className="thread-group-header">{uiText(group.label)}</div>
                         {group.threads.map(renderThreadRow)}
                     </div>
                 ))}
@@ -485,7 +486,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                 {!isLoading && !hasVisibleRows && !fetchError && canShowHidden && (
                     <div className="display-flex flex-col items-center justify-center gap-3 py-6 text-center px-3 mt-2">
                         <span className="font-color-primary font-semibold text-base">
-                            {activeQuery ? 'No matching chats' : filter ? `No chats about ${filter.label}` : 'No chats on this Zotero profile'}
+                            {activeQuery ? uiText("No matching chats") : filter ? uiText("No chats about {topic}", { topic: filter.label }) : uiText("No chats on this Zotero profile")}
                         </span>
                         <span className="font-color-secondary text-base">
                             {hiddenExplanation}
@@ -496,7 +497,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                             type="button"
                             className="mt-2"
                         >
-                            Show all chats
+                            {uiText("Show all chats")}
                         </Button>
                     </div>
                 )}
@@ -519,7 +520,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
 
                 <div ref={sentinelRef} style={{ minHeight: view.hasMore ? 32 : 1 }}>
                     {isLoading && hasVisibleRows && (
-                        <div className="display-flex items-center justify-center py-2" role="status" aria-label="Loading more chats">
+                        <div className="display-flex items-center justify-center py-2" role="status" aria-label={uiText("Loading more chats")}>
                             <Spinner size={16} />
                         </div>
                     )}
@@ -540,7 +541,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                         onClick={() => toggleShowAllInstances(true)}
                         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleShowAllInstances(true); } }}
                     >
-                        Show all
+                        {uiText("Show all")}
                     </span>
                 </div>
             )}

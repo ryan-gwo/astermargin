@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import MenuButton from '@astermargin/agent-ui/primitives/MenuButton';
 import { MenuItem } from '@astermargin/agent-ui/primitives/ContextMenu';
@@ -28,10 +29,10 @@ const isAsterMarginModel = (model: Pick<ModelConfig, 'access_mode' | 'allow_app_
 
 const getAccessibleModelLabel = (model: ModelConfig | null, isRecommended = false) => {
     if (!model) {
-        return 'None Selected';
+        return uiText("None Selected");
     }
     if (isAsterMarginModel(model)) {
-        return isRecommended ? 'AsterMargin model (recommended)' : `AsterMargin model: ${model.name}`;
+        return isRecommended ? uiText("AsterMargin model (recommended)") : uiText("AsterMargin model: {model}", { model: model.name });
     }
     return model.name;
 };
@@ -58,7 +59,7 @@ const ModelMenuItemContent: React.FC<{
                     {showCreditCosts ? (
                         <div className="text-xs">{creditCost} credit${creditCost !== 1 ? 's' : ''}</div>
                     ) : showRecommended ? (
-                        <div className="text-xs">Recommended</div>
+                        <div className="text-xs">{uiText("Recommended")}</div>
                     ) : null}
                 </div>
             )}
@@ -120,7 +121,7 @@ const ModelSelectionButton: React.FC<{
 
         previousSelectedKeyRef.current = selectedKey;
         const message = selectedModel
-            ? `Selected AI model: ${selectedModelAccessibleLabel}`
+            ? uiText("Selected AI model: {model}", { model: selectedModelAccessibleLabel })
             : 'No AI model selected';
 
         if (announcementTimerRef.current) {
@@ -173,7 +174,7 @@ const ModelSelectionButton: React.FC<{
 
         if (custom_models.length > 0) {
             items.push({
-                label: 'Custom Models',
+                label: uiText("Custom Models"),
                 isGroupHeader: true,
                 onClick: () => {},
             });
@@ -200,7 +201,7 @@ const ModelSelectionButton: React.FC<{
 
         if (byok_models.length > 0) {
             items.push({
-                label: 'Your API Keys',
+                label: uiText("Your API Keys"),
                 isGroupHeader: true,
                 onClick: () => {},
             });
@@ -231,7 +232,7 @@ const ModelSelectionButton: React.FC<{
     }, [custom_models, included_models, byok_models, updateSelectedModel, selectedKey]);
 
     const getButtonLabel = () => {
-        if (!selectedModel) return 'None Selected';
+        if (!selectedModel) return uiText("None Selected");
         const name = selectedModel.name.replace(VENDOR_PREFIX, '');
         return name.length > MAX_MODEL_NAME_LENGTH
             ? `${name.slice(0, (MAX_MODEL_NAME_LENGTH - 2))}...`
@@ -284,8 +285,8 @@ const ModelSelectionButton: React.FC<{
                 style={dynamicStyle}
                 iconClassName="scale-11 -mr-015"
                 rightIconClassName="scale-11 -ml-1"
-                ariaLabel={`AI model: ${selectedModelAccessibleLabel}. Choose AI model`}
-                tooltipContent={availableModels.length === 0 ? 'No models available' : 'Choose AI model'}
+                ariaLabel={uiText("AI model: {model}. Choose AI model", { model: selectedModelAccessibleLabel })}
+                tooltipContent={uiText(availableModels.length === 0 ? "No models available" : "Choose AI model")}
                 showArrow={false}
                 disabled={disabled || availableModels.length === 0}
                 onAfterClose={handleAfterClose}

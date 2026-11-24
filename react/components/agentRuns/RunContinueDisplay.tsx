@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { threadReadOnlyAtom } from '../../runtime/threadProjection';
 import React, { useState } from 'react';
 import { useSetAtom, useAtomValue } from 'jotai';
@@ -108,7 +109,7 @@ export const RunContinueDisplay: React.FC<RunContinueDisplayProps> = ({
                                     offer.instructions_placeholder
                                     || 'Anything to change before continuing'
                                 }
-                                ariaLabel="Instructions for continuing (optional)"
+                                ariaLabel={uiText("Instructions for continuing (optional)")}
                                 // Typing opens no connection, so the field stays
                                 // live while the run finishes sending.
                                 disabled={isResuming}

@@ -16,3 +16,10 @@ preferences-pane-open =
     .label = Open AsterMargin Settings
 preferences-pane-help = Open the settings window for AsterMargin.
 preferences-pane-open-failed = AsterMargin could not open its settings window. Reopen Zotero and try again.
+
+reader-explain = Explain
+reader-ask = Ask…
+reader-explain-with = Explain with AsterMargin
+reader-ask-with = Ask AsterMargin…
+reader-ask-document = Ask AsterMargin
+reader-actions = Actions

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { UserQuestionView } from '@astermargin/agent-core/run-state/toolResultViews';
 
@@ -44,7 +45,7 @@ export const UserQuestionResultView: React.FC<{ view: UserQuestionView }> = ({ v
                             </div>
                         ) : (
                             <div className="text-sm font-color-tertiary">
-                                Not answered
+                                {uiText("Not answered")}
                             </div>
                         )}
                     </div>

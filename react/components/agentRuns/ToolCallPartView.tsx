@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { AgentRunStatus, ToolCallPart, isEmptyWriteReturn, isNotFoundWriteReturn, isUnsuccessfulToolReturn } from '@astermargin/agent-core/agents/types';
@@ -558,7 +559,7 @@ export const ToolCallPartView: React.FC<ToolCallPartViewProps> = ({ part, runId,
                                     iconClassName={`${searchDetailsOpen ? 'font-color-primary' : 'font-color-secondary'} scale-90`}
                                     className="tool-header-toggle"
                                     onClick={() => setSearchDetailsChoice(!searchDetailsOpen)}
-                                    ariaLabel="Search details"
+                                    ariaLabel={uiText("Search details")}
                                     ariaExpanded={searchDetailsOpen}
                                     ariaControls={searchDetailsId}
                                 />

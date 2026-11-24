@@ -46,13 +46,13 @@ export function useAccountMenuItems(): MenuItem[] {
             disabled: false,
         }] : []),
         ...(!localMode ? [{
-            label: "Manage Account",
+            label: uiText("Manage Account"),
             onClick: () => Zotero.launchURL(`${process.env.WEBAPP_BASE_URL}/login${user?.email ? `?email=${encodeURIComponent(user.email)}` : ''}`),
             icon: UserIcon,
             disabled: false,
         }] : []),
         ...(!updateRequired && hasCompletedFirstRun ? [{
-            label: "Get ideas",
+            label: uiText("Get ideas"),
             onClick: handleShowIdeas,
             icon: IdeaIcon,
             disabled: false,
@@ -65,13 +65,13 @@ export function useAccountMenuItems(): MenuItem[] {
         },
         ...(!localMode ? [
             {
-                label: "Report Error",
+                label: uiText("Report Error"),
                 onClick: () => setErrorReportDialogVisible(true),
                 icon: BugIcon,
                 disabled: false,
             },
             {
-                label: "Logout",
+                label: uiText("Logout"),
                 onClick: async () => {
                     logout();
                 },
@@ -97,7 +97,7 @@ const UserAccountMenuButton: React.FC<UserAccountMenuButtonProps> = ({
             icon={UserIcon}
             className={className}
             ariaLabel={ariaLabel}
-            tooltipContent="User account and settings"
+            tooltipContent={uiText("User account and settings")}
             showArrow={true}
         />
     );

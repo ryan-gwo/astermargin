@@ -1,3 +1,4 @@
+import { uiText } from "../../host/uiText";
 import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Cell, Evidence, Row } from "@astermargin/agent-core/layouts/table";
 import {
@@ -265,7 +266,7 @@ function EvidenceCard({
                     className="rt-link-button"
                     onClick={(event) => onOpen({ ownerDocument: event.currentTarget.ownerDocument })}
                 >
-                    Open in {documentKindLabel(kind)}
+                    {uiText("Open in")}{' '}{documentKindLabel(kind)}
                     <Icon icon={ArrowUpRightIcon} size={12} />
                 </button>
                 {clipped || expanded ? (

@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { MergeItemsPreview } from './MergeItemsPreview';
 import React, { useEffect, useState } from 'react';
 import type { AgentAction } from '../../../agents/agentActions';
@@ -320,7 +321,7 @@ export const ActionPreview: React.FC<{
         if (!actions || actions.length === 0) {
             return (
                 <div className="text-sm font-color-secondary px-3 py-2">
-                    No item data available
+                    {uiText("No item data available")}
                 </div>
             );
         }

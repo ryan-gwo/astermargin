@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { CancelIcon } from '../../icons/icons';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
@@ -52,7 +53,7 @@ const NoteTipContent: React.FC<NoteTipContentProps> = ({ onDismiss }) => {
                 className="items-center"
                 style={{ padding: '4px 6px', width: '100%', alignItems: 'center', justifyContent: 'center', fontSize: "0.95rem" }}
             >
-                Open AsterMargin &rarr;
+                {uiText("Open AsterMargin →")}
             </Button>
         </div>
     );

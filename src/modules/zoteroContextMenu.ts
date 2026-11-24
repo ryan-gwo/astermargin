@@ -15,6 +15,8 @@
  */
 
 import { resolveChatWindow } from '../runtime/navigation';
+import { interfaceLocaleOverridesHost } from '../utils/interfaceLanguage';
+import { localizePluginElement } from '../utils/locale';
 
 import {
     Action,
@@ -315,6 +317,22 @@ function registerMenus(): void {
     const MenuManager = (Zotero as any).MenuManager;
     if (!MenuManager) return;
 
+    function registerMenu(options: { menus: any[]; [key: string]: unknown }): string {
+        if (!interfaceLocaleOverridesHost()) return MenuManager.registerMenu(options);
+        const adapt = (menu: any): any => {
+            if (!menu.l10nID) return menu;
+            return {
+                ...menu,
+                ...(menu.menus ? { menus: menu.menus.map(adapt) } : {}),
+                onShowing(event: Event, context: any) {
+                    menu.onShowing?.(event, context);
+                    if (context.menuElem) localizePluginElement(context.menuElem);
+                },
+            };
+        };
+        return MenuManager.registerMenu({ ...options, menus: options.menus.map(adapt) });
+    }
+
     // Unregister existing menus first using stored namespaced keys
     unregisterMenus();
 
@@ -326,7 +344,7 @@ function registerMenus(): void {
     );
 
     // Always register — at minimum shows "Add custom action..."
-    const itemKey = MenuManager.registerMenu({
+    const itemKey = registerMenu({
         menuID: ITEM_MENU_ID,
         pluginID: PLUGIN_ID,
         target: 'main/library/item',
@@ -368,7 +386,7 @@ function registerMenus(): void {
     // --- Collection context menu ---
     const collectionActions = actions.filter(a => a.targets.includes('collection'));
 
-    const collectionKey = MenuManager.registerMenu({
+    const collectionKey = registerMenu({
         menuID: COLLECTION_MENU_ID,
         pluginID: PLUGIN_ID,
         target: 'main/library/collection',
@@ -386,7 +404,7 @@ function registerMenus(): void {
     if (collectionKey) registeredKeys.push(collectionKey);
 
     // --- Note export (any note, whoever wrote it) ---
-    const noteExportKey = MenuManager.registerMenu({
+    const noteExportKey = registerMenu({
         menuID: NOTE_EXPORT_MENU_ID,
         pluginID: PLUGIN_ID,
         target: 'main/library/item',
@@ -412,7 +430,7 @@ function registerMenus(): void {
 
     // --- File ▸ New AsterMargin Table, below New Note. An empty table, filed
     // like a new note in the selected library and collection ---
-    const fileKey = MenuManager.registerMenu({
+    const fileKey = registerMenu({
         menuID: NEW_TABLE_FILE_MENU_ID,
         pluginID: PLUGIN_ID,
         target: 'main/menubar/file',
@@ -445,7 +463,7 @@ function registerMenus(): void {
 
     // --- Collection menu ▸ Create AsterMargin Table, below Generate Report.
     // Rows come from the selected collections and saved searches ---
-    const collectionTableKey = MenuManager.registerMenu({
+    const collectionTableKey = registerMenu({
         menuID: NEW_TABLE_COLLECTION_MENU_ID,
         pluginID: PLUGIN_ID,
         target: 'main/library/collection',
@@ -715,7 +733,8 @@ function removeStaleMenuDOM(): void {
             if (!win?.document || win.closed) continue;
 
             const selector = ['astermargin-context-menu-', 'astermargin-note-export-']
-                .map((prefix) => `.${CUSTOM_MENU_CLASS}[data-l10n-id^="${prefix}"]`)
+                .flatMap((prefix) => ['data-l10n-id', 'data-astermargin-l10n-id']
+                    .map((attr) => `.${CUSTOM_MENU_CLASS}[${attr}^="${prefix}"]`))
                 .join(', ');
             for (const popupId of ['zotero-itemmenu', 'zotero-collectionmenu']) {
                 const popup = win.document.getElementById(popupId);

@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useCallback, useState } from 'react';
 import type {
     BatchItemsByBatch,
@@ -182,7 +183,7 @@ export const BatchDoneRows: React.FC<BatchDoneRowsProps> = ({ batches, itemsByBa
             // Clip corners here so a client without Zotero's panes gets the same card.
             className="batch-run-receipt bg-senary border-card rounded-card overflow-hidden display-flex flex-col min-w-0"
             role="group"
-            aria-label="Completed batch jobs"
+            aria-label={uiText("Completed batch jobs")}
         >
             {/* Chrome, set below the rows it frames: the approval card's caps
                 voice, a step lighter, so the batch titles are what stand out. */}

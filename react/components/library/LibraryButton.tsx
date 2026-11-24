@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useSetAtom, useAtomValue } from 'jotai';
 import { CSSIcon, LibraryIcon } from '../icons/icons';
@@ -70,7 +71,7 @@ export const LibraryButton: React.FC<LibraryButtonProps> = ({
         ),
         title: library.name,
         subtitle: { text: 'Search filter' },
-        action: { icon: LibraryIcon, label: 'Reveal in library' },
+        action: { icon: LibraryIcon, label: uiText("Reveal in library") },
     };
 
     return (

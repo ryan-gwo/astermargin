@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { trialDetails, type ExternalReference, type TrialDetails } from '@astermargin/agent-core/types/externalReferences';
 import { getHost } from '@astermargin/agent-ui/host';
@@ -35,7 +36,7 @@ export const TrialTags: React.FC<{ details: TrialDetails }> = ({ details }) => {
     return (
         <RecordTags>
             {status && <RecordBadge label={status.label} tone={status.tone} tooltip={status.hint} />}
-            {details.has_results && <RecordBadge label="Results posted" tone="blue" />}
+            {details.has_results && <RecordBadge label={uiText("Results posted")} tone="blue" />}
             {trialHasProtocolOrSap(details) && (
                 <RecordBadge label="Protocol & SAP" tooltip="The registry has the study protocol or statistical analysis plan" />
             )}

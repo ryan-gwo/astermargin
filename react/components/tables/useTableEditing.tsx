@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import type { Column, RemovedPaper, Row, SourceEntry, TableSpec } from '@astermargin/agent-core/layouts/table';
 import type { TableCellEdit, TableUserEdit } from '@astermargin/agent-core/layouts/tableEdit';
@@ -446,12 +447,12 @@ export function useTableEditing({
             title={disabledReason}
             onClick={() => removeRows(rowIds)}
         >
-            Remove from table
+            {uiText("Remove from table")}
         </button>
     );
 
     const rowMenuItems = (row: Row): MenuItem[] => [
-        { label: 'Remove from table', icon: DeleteIcon, disabled, onClick: () => removeRows([row.id]) },
+        { label: uiText("Remove from table"), icon: DeleteIcon, disabled, onClick: () => removeRows([row.id]) },
     ];
 
     const clearToast = useCallback(() => setToast(null), []);
@@ -468,10 +469,10 @@ export function useTableEditing({
                     title={fillRunning ? 'Undo is available when the fill ends.' : undefined}
                     onClick={() => void undo()}
                 >
-                    Undo
+                    {uiText("Undo")}
                 </button>
             ) : null}
-            <button type="button" className="bt-fill-banner-close rt-toast-close" aria-label="Dismiss" onClick={clearToast}>
+            <button type="button" className="bt-fill-banner-close rt-toast-close" aria-label={uiText("Dismiss")} onClick={clearToast}>
                 <Icon icon={CancelIcon} size={10} />
             </button>
         </div>

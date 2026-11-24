@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { RunUsage } from '@astermargin/agent-core/agents/types';
 import { Icon, DollarCircleIcon } from '../icons/icons';
@@ -47,13 +48,13 @@ export const TokenUsageDisplay: React.FC<TokenUsageDisplayProps> = ({ usage, cos
             </div>
             {usage.cache_read_tokens > 0 && (
                 <div className="display-flex justify-between gap-4">
-                    <span className="font-color-secondary whitespace-nowrap">Cache read</span>
+                    <span className="font-color-secondary whitespace-nowrap">{uiText("Cache read")}</span>
                     <span>{formatTokens(usage.cache_read_tokens)}</span>
                 </div>
             )}
             {usage.cache_write_tokens > 0 && (
                 <div className="display-flex justify-between gap-4">
-                    <span className="font-color-secondary whitespace-nowrap">Cache write</span>
+                    <span className="font-color-secondary whitespace-nowrap">{uiText("Cache write")}</span>
                     <span>{formatTokens(usage.cache_write_tokens)}</span>
                 </div>
             )}

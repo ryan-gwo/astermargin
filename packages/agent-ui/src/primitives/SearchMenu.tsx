@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useEffect, useRef, useState, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon, SearchIcon } from '../icons';
@@ -573,7 +574,7 @@ const SearchMenu: React.FC<SearchMenuProps> = ({
                 placeholder={placeholder}
                 className="w-full font-color-primary outline-none chat-input"
                 style={{ fontSize: '12px' }}
-                aria-label="Search"
+                aria-label={uiText("Search")}
             />
         </div>
     )

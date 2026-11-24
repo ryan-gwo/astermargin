@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import { tryGetWindowRuntime } from '../../../runtime/windowRuntime';
 import React, { useState, useCallback, useRef } from 'react';
 import { useSetAtom, useAtomValue, useStore } from 'jotai';
@@ -647,7 +648,7 @@ const CreateItemAgentActionDisplay: React.FC<CreateItemAgentActionDisplayProps> 
                                 variant="ghost-secondary"
                                 iconClassName="font-color-red"
                                 onClick={handleRejectAll}
-                                ariaLabel="Reject all"
+                                ariaLabel={uiText("Reject all")}
                             />
                         </Tooltip>
                         <Tooltip content="Add all items" showArrow singleLine>
@@ -656,7 +657,7 @@ const CreateItemAgentActionDisplay: React.FC<CreateItemAgentActionDisplayProps> 
                                 variant="ghost-secondary"
                                 iconClassName="font-color-green scale-14"
                                 onClick={handleApplyAll}
-                                ariaLabel="Add all items"
+                                ariaLabel={uiText("Add all items")}
                             />
                         </Tooltip>
                     </div>

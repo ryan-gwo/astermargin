@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useId, useState } from 'react';
 import { useAtom, useAtomValue } from 'jotai';
 import type {
@@ -273,7 +274,7 @@ export const MergeItemsPreview: React.FC<{
     const [drafts, setDrafts] = useAtom(mergeItemsChoicesAtom);
     const group = inProposalOrder(result?.preview, data.preview) ?? data.preview;
     if (!group)
-        return <div className="p-3 text-sm font-color-secondary">Preparing merge preview…</div>;
+        return <div className="p-3 text-sm font-color-secondary">{uiText("Preparing merge preview…")}</div>;
 
     const choices: MergeItemsChoices =
         actionId && drafts[actionId]
@@ -393,7 +394,7 @@ export const MergeItemsPreview: React.FC<{
 
             {listed.length > 0 && (
                 <section className="display-flex flex-col gap-1 border-top-quinary pt-3">
-                    <div className="merge-section-label">Merged metadata</div>
+                    <div className="merge-section-label">{uiText("Merged metadata")}</div>
                     {listed.map((field) => {
                         const sourceIndex = sourceIndexFor(field);
                         return (
@@ -427,7 +428,7 @@ export const MergeItemsPreview: React.FC<{
             )}
 
             <div className="text-sm font-color-secondary px-2">
-                Notes, attachments, tags and collections from all records{' '}
+                {uiText("Notes, attachments, tags and collections from all records")}{' '}
                 {result ? 'were' : notMerged ? 'would be' : 'are'} combined into the
                 kept record.
             </div>

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useEffect, useRef } from 'react';
 import { useAtom, useAtomValue } from 'jotai';
 import { 
@@ -47,7 +48,7 @@ const ExternalReferenceDetailsDialog: React.FC = () => {
                     icon={CancelIcon}
                     onClick={() => setIsVisible(false)}
                     className="scale-12"
-                    ariaLabel="Close"
+                    ariaLabel={uiText("Close")}
                 />
 
             </div>

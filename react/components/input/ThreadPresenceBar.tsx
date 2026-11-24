@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import {
     admissionUnreachableAtom,
     describeAdmissionWait,
@@ -103,11 +104,11 @@ const ThreadPresenceBar: React.FC = () => {
             <>
                 <Icon icon={DeleteIcon} className="font-color-secondary flex-none" size={15} />
                 <span className="font-color-primary text-sm truncate">
-                    This chat was deleted
+                    {uiText("This chat was deleted")}
                 </span>
                 <div className="flex-1" />
                 <Button variant="outline" onClick={handleNewChat} style={BAR_BUTTON_STYLE}>
-                    New chat
+                    {uiText("New chat")}
                 </Button>
             </>
         );
@@ -116,11 +117,11 @@ const ThreadPresenceBar: React.FC = () => {
             <>
                 <Icon icon={PictureInPictureIcon} className="font-color-secondary flex-none" size={15} />
                 <span className="font-color-primary text-sm truncate">
-                    Responding in another window
+                    {uiText("Responding in another window")}
                 </span>
                 <div className="flex-1" />
                 <Button variant="outline" rightIcon={ArrowUpRightIcon} onClick={handleGoToWindow} style={BAR_BUTTON_STYLE}>
-                    Go to window
+                    {uiText("Go to window")}
                 </Button>
             </>
         );
@@ -129,7 +130,7 @@ const ThreadPresenceBar: React.FC = () => {
             <>
                 <Spinner size={12} className="flex-none" />
                 <span className="font-color-primary text-sm truncate">
-                    Stopping the previous response…
+                    {uiText("Stopping the previous response…")}
                 </span>
             </>
         );
@@ -152,7 +153,7 @@ const ThreadPresenceBar: React.FC = () => {
                     loading={isPolling}
                     style={BAR_BUTTON_STYLE}
                 >
-                    Refresh
+                    {uiText("Refresh")}
                 </Button>
             </>
         );
@@ -174,7 +175,7 @@ const ThreadPresenceBar: React.FC = () => {
                     size={12}
                 />
                 <span className="font-color-primary text-sm truncate">
-                    This chat was updated in another window
+                    {uiText("This chat was updated in another window")}
                 </span>
                 <div className="flex-1" />
                 <Button
@@ -186,7 +187,7 @@ const ThreadPresenceBar: React.FC = () => {
                     loading={isRefreshing}
                     style={BAR_BUTTON_STYLE}
                 >
-                    Refresh
+                    {uiText("Refresh")}
                 </Button>
             </>
         );

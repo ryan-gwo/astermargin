@@ -23,6 +23,7 @@ import { NotePreviews } from './services/notePreviews';
 import { AIProvider } from "./services/OpenAIProvider";
 import { createSyncPauseService } from './services/syncPause';
 import { createZToolkit } from "./utils/ztoolkit";
+import type { InterfaceLocale } from "./utils/interfaceLanguage";
 
 class Addon {
     public localEndpoints?: import("./services/instanceLocalEndpoints").InstanceLocalEndpoints;
@@ -90,6 +91,8 @@ class Addon {
     public localMode: boolean = false;
     /** Whether local mode is on because this build has no AsterMargin server settings. */
     public localModeForced: boolean = false;
+    /** Effective UI locale for the lifetime of this plugin instance. */
+    public interfaceLocale?: InterfaceLocale;
     // Lifecycle hooks
     public hooks: typeof hooks;
     // APIs

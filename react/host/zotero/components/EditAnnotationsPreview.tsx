@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useCallback, useMemo } from 'react';
 import type {
     AnnotationEditGroup,
@@ -190,7 +191,7 @@ const ChangeDescription: React.FC<{
     if (changes?.color != null) {
         chips.push(
             <ChangeChip key="color">
-                <span>Color →</span>
+                <span>{uiText("Color →")}</span>
                 <Swatch color={ZOTERO_ANNOTATION_PALETTE_COLORS[changes.color]} />
                 <span>{changes.color}</span>
             </ChangeChip>,
@@ -227,7 +228,7 @@ const ChangeDescription: React.FC<{
         );
     }
 
-    if (!chips.length) return <ChangeChip>No changes</ChangeChip>;
+    if (!chips.length) return <ChangeChip>{uiText("No changes")}</ChangeChip>;
     return (
         <div className="display-flex flex-row flex-wrap gap-1">
             {chips}

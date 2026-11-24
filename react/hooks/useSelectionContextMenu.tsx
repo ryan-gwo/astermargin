@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import React, { useState, useEffect } from 'react';
 import { MenuItem, MenuPosition } from '@astermargin/agent-ui/primitives/ContextMenu';
 import { CopyIcon } from '../components/icons/icons';
@@ -127,7 +128,7 @@ export default function useSelectionContextMenu(
     // Generate menu items - default Copy action plus any custom items
     const menuItems: MenuItem[] = [
         {
-            label: 'Copy',
+            label: uiText("Copy"),
             icon: CopyIcon,
             onClick: defaultCopyHandler
         },

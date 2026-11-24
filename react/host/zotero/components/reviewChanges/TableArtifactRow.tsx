@@ -1,3 +1,4 @@
+import { uiText } from "../../../../utils/interfaceText";
 import React, { useCallback, useState } from 'react';
 import type { TableArtifact } from '@astermargin/agent-core/run-state/tableResults';
 import { getHost } from '@astermargin/agent-ui/host';
@@ -123,23 +124,23 @@ export const TableArtifactRow: React.FC<TableArtifactRowProps> = ({ row }) => {
                             loading={busy === 'undo'}
                             className="flex-none whitespace-nowrap"
                         >
-                            Undo
+                            {uiText("Undo")}
                         </Button>
                     )}
                     {model.stop && (
                         <Button
                             variant="outline"
                             rightIcon={StopStrokeIcon}
-                            ariaLabel="Stop fill"
+                            ariaLabel={uiText("Stop fill")}
                             onClick={handleStop}
                             disabled={job?.state === 'stopping'}
                             className="flex-none whitespace-nowrap"
                         >
-                            Stop
+                            {uiText("Stop")}
                         </Button>
                     )}
                     {model.export && <RunArtifactExportButton items={exportItems} exporting={busy === 'export'} />}
-                    {model.open && <RunArtifactOpenButton label="Open table" onClick={(event) => void handleOpen(event)} />}
+                    {model.open && <RunArtifactOpenButton label={uiText("Open table")} onClick={(event) => void handleOpen(event)} />}
                 </>
             }
         />

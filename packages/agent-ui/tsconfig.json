@@ -282,6 +282,7 @@
     "./src/layouts/research/EmptyTableGuide.tsx",
 
     "./src/host/index.ts",
+    "./src/host/uiText.ts",
     "./src/host/types.ts"
   ]
 }

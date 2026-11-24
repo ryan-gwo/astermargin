@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React, { useState } from "react";
 import { useAtomValue } from "jotai";
 import { profileWithPlanAtom } from "../../atoms/profile";
@@ -127,7 +128,7 @@ const FreeOnboardingPage: React.FC = () => {
                                 target='_blank'
                                 rel='noopener noreferrer'
                             >
-                                Learn more
+                                {uiText("Learn more")}
                             </a>
                         </span>
                         {/* Limited metadata may be processed temporarily to power search.

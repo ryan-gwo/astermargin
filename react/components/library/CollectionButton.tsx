@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { useSetAtom } from 'jotai';
 import { CSSIcon, LibraryIcon } from '../icons/icons';
@@ -36,7 +37,7 @@ export const CollectionButton: React.FC<CollectionButtonProps> = ({
         disabled,
         // Mirror the button click: select (reveal) the collection in the library.
         extraMenuItems: [{
-            label: 'Reveal Collection',
+            label: uiText("Reveal Collection"),
             icon: LibraryIcon,
             onClick: () => selectCollection(collection),
         }],
@@ -62,7 +63,7 @@ export const CollectionButton: React.FC<CollectionButtonProps> = ({
         ),
         title: collection.name,
         subtitle: { text: 'Search filter' },
-        action: { icon: LibraryIcon, label: 'Reveal in library' },
+        action: { icon: LibraryIcon, label: uiText("Reveal in library") },
     };
 
     return (

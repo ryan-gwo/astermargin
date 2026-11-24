@@ -10,6 +10,7 @@
  */
 
 import { captureReaderActionLocation } from '../runtime/readerActionLocation';
+import { getString } from "../utils/locale";
 import { resolveChatWindow } from '../runtime/navigation';
 
 import { getMergedActions } from './zoteroContextMenu';
@@ -202,7 +203,7 @@ function openAsterMarginMenu(reader: any, anchorButton: HTMLElement): void {
 
     // ---- Ask AsterMargin ----
     const askItem = xulDoc.createXULElement('menuitem');
-    askItem.setAttribute('label', 'Ask AsterMargin');
+    askItem.setAttribute('label', getString("reader-ask-document"));
     askItem.addEventListener('command', async () => {
         const readerLocation = captureReaderActionLocation(reader);
         const mainWin = await resolveChatWindow(win);
@@ -232,7 +233,7 @@ function openAsterMarginMenu(reader: any, anchorButton: HTMLElement): void {
 
             // Disabled header
             const header = xulDoc.createXULElement('menuitem');
-            header.setAttribute('label', 'Actions');
+            header.setAttribute('label', getString("reader-actions"));
             // Keep the literal 'true': Gecko 115 (Zotero 7-10) disables a
             // menuitem only on disabled="true", while Zotero 11 (Firefox 153)
             // treats the attribute as boolean and accepts any value. Writing
@@ -269,7 +270,7 @@ function openAsterMarginMenu(reader: any, anchorButton: HTMLElement): void {
     appendSeparator();
 
     const addItem = xulDoc.createXULElement('menuitem');
-    addItem.setAttribute('label', 'Add custom action\u2026');
+    addItem.setAttribute('label', getString("context-menu-add-action", "label"));
     addItem.addEventListener('command', () => {
         void resolveChatWindow(reader._window).then(mainWin =>
             openPreferencesWindow('actions', undefined, undefined, mainWin)).catch(Zotero.logError);

@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import React from 'react';
 import { AlertIcon, CancelIcon, Icon } from '../icons/icons';
 import IconButton from '@astermargin/agent-ui/primitives/IconButton';
@@ -37,7 +38,7 @@ const HighTokenUsageWarningBar: React.FC<HighTokenUsageWarningBarProps> = ({
                         onNewThread(e);
                     }}
                 >
-                    Start a new thread
+                    {uiText("Start a new thread")}
                 </a>
                 {' '}
                 {isUsingAsterMarginCredits
@@ -48,7 +49,7 @@ const HighTokenUsageWarningBar: React.FC<HighTokenUsageWarningBarProps> = ({
             <IconButton
                 variant="ghost-secondary"
                 icon={CancelIcon}
-                ariaLabel="Dismiss token usage warning"
+                ariaLabel={uiText("Dismiss token usage warning")}
                 onClick={onDismiss}
                 className="scale-85 mt-010"
             />

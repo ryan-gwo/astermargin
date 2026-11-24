@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 
 interface ExampleBubbleProps {
@@ -69,11 +70,11 @@ const ExamplePrompts: React.FC = () => {
                 className="display-flex flex-col gap-4 select-none pointer-events-none"
             >
                 <ExampleBubble side="left" delay={0.2}>
-                    Summarize methods <Highlight>across my library</Highlight> on neural plasticity
+                    {uiText("Summarize methods")}{' '}<Highlight>across my library</Highlight> on neural plasticity
                 </ExampleBubble>
                 
                 <ExampleBubble side="left" delay={0.8}>
-                    <Highlight>Organize new items</Highlight> into my collections
+                    <Highlight>{uiText("Organize new items")}</Highlight> into my collections
                 </ExampleBubble>
                 
                 <ExampleBubble side="left" delay={1.4}>
@@ -81,11 +82,11 @@ const ExamplePrompts: React.FC = () => {
                 </ExampleBubble>
 
                 <ExampleBubble side="left" delay={2.0}>
-                    <Highlight>Review citation accuracy</Highlight> in this paragraph
+                    <Highlight>{uiText("Review citation accuracy")}</Highlight> in this paragraph
                 </ExampleBubble>
                 
                 <ExampleBubble side="left" delay={2.4}>
-                    <Highlight>Find recent papers</Highlight> on AI and the labor market
+                    <Highlight>{uiText("Find recent papers")}</Highlight> on AI and the labor market
                 </ExampleBubble>
             </div>
         </>

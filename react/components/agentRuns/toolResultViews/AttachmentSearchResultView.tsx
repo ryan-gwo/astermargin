@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React, { useState } from 'react';
 import { CSSItemTypeIcon, ArrowDownIcon, ArrowRightIcon, ExternalLinkIcon, Icon } from '../../icons/icons';
 import { itemTypeToIconName, ContentKind } from '@astermargin/agent-core/types/citations';
@@ -210,7 +211,7 @@ export const AttachmentSearchResultView: React.FC<{ view: AttachmentSearchView }
     if (attachments.length === 0) {
         return (
             <div className="p-3 text-sm font-color-secondary">
-                No matches found
+                {uiText("No matches found")}
             </div>
         );
     }

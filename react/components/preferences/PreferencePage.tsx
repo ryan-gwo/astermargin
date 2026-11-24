@@ -1,6 +1,7 @@
 import { settingsText } from "../../utils/settingsText";
 import { uiText } from "../../utils/interfaceText";
 import { usePreference } from '../../hooks/usePreference';
+import { interfaceLanguages, interfaceLocale, normalizeInterfaceLanguage, resolveInterfaceLocale } from "../../../src/utils/interfaceLanguage";
 import React, { useState, useCallback, useMemo } from "react";
 import { useAtom, useAtomValue } from 'jotai';
 import { logoutAtom, userAtom } from '../../atoms/auth';
@@ -48,6 +49,10 @@ const PreferencePage: React.FC = () => {
 
     // --- State for Preferences ---
     const [citationFormat, setCitationFormat] = usePreference(() => getPref('citationFormat') === 'numeric');
+    const [language, setLanguage] = usePreference(() =>
+        normalizeInterfaceLanguage(getPref("interfaceLanguage")),
+    );
+    const languagePending = resolveInterfaceLocale(language, Zotero.locale) !== interfaceLocale();
     const [useTemporaryCitationAnnotations, setUseTemporaryCitationAnnotations] = usePreference(() => getPref('useTemporaryCitationAnnotations') === true);
     const [keyboardShortcut, setKeyboardShortcut] = usePreference(() => {
         const shortcut = getPref('keyboardShortcut');
@@ -338,6 +343,33 @@ const PreferencePage: React.FC = () => {
                 {/* ===== GENERAL TAB ===== */}
                 {effectiveActiveTab === 'general' && (
                     <>
+                        <SettingsGroup>
+                            <SettingsRow
+                                title={settingsText("Interface language")}
+                                description={settingsText(languagePending
+                                    ? "Language saved. Restart Zotero to apply it."
+                                    : "Choose the language of AsterMargin. Changes apply after restarting Zotero.")}
+                                announceDescription={languagePending}
+                                control={
+                                    <select
+                                        id="astermargin-interface-language"
+                                        className="py-1 px-2 border preference-input text-sm"
+                                        value={language}
+                                        onChange={(event) => {
+                                            const value = normalizeInterfaceLanguage(event.currentTarget.value);
+                                            setPref("interfaceLanguage", value);
+                                            setLanguage(value);
+                                        }}
+                                    >
+                                        {interfaceLanguages.map((value) => (
+                                            <option key={value} value={value} lang={value === "auto" ? undefined : value}>
+                                                {{ auto: settingsText("Follow Zotero"), en: "English", "zh-CN": "简体中文", "zh-TW": "繁體中文" }[value]}
+                                            </option>
+                                        ))}
+                                    </select>
+                                }
+                            />
+                        </SettingsGroup>
                         <SectionLabel>{settingsText("Sidebar")}</SectionLabel>
                         <SettingsGroup>
                             <SettingsRow
