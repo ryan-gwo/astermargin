@@ -10,6 +10,7 @@ import {
     installEmbeddingModel,
     modelSize,
 } from "../../runtime/semanticIndex";
+import { semanticModelCandidates } from "../../../src/services/semanticCandidates";
 export function SemanticSettings() {
     const [status, setStatus] = useState<SettingsStatusValue>(""),
         [busy, setBusy] = useState(false);
@@ -68,6 +69,11 @@ export function SemanticSettings() {
             <legend>{settingsText("Full-text semantic search")}</legend>
             <p>
                 multilingual-e5-small · {(modelSize / 1048576).toFixed(1)} MiB
+            </p>
+            <p className="text-sm font-color-secondary">
+                {settingsText("Evaluation candidates: {models}. Compare top-five retrieval, cross-language queries, latency and memory before changing the local default.", {
+                    models: semanticModelCandidates.map((candidate) => candidate.label).join(", "),
+                })}
             </p>
             <button disabled={busy} onClick={() => void work("download")}>
                 {settingsText("Download model")}

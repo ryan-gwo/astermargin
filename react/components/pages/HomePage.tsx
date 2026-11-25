@@ -1,5 +1,5 @@
 import {uiText} from "../../utils/interfaceText";
-import React from "react";
+import React, { useState } from "react";
 import { useAtomValue } from 'jotai';
 import { allLibrariesExcludedAtom } from "../../atoms/profile";
 import RecentChats from "../RecentChats";
@@ -10,6 +10,7 @@ import PopupOverlayContainer from "../PopupOverlayContainer";
 import { SettingsIcon }  from "../icons/icons";
 import { openPreferencesWindow } from "../../ui/openPreferencesWindow";
 import Button from "@astermargin/agent-ui/primitives/Button";
+import LiteratureSearchPanel from "../literature/LiteratureSearchPanel";
 
 interface HomePageProps {
     isWindow?: boolean;
@@ -37,6 +38,7 @@ const AllLibrariesExcludedMessage = () => (
 
 const HomePage: React.FC<HomePageProps> = ({ isWindow = false, inputRef }) => {
     const allLibrariesExcluded = useAtomValue(allLibrariesExcludedAtom);
+    const [showLiteratureSearch, setShowLiteratureSearch] = useState(false);
 
     // Beta versions use a pre-release tag (e.g. "0.20.0-beta.1")
     const isBeta = /-beta\.\d+$/.test(Zotero.AsterMargin?.pluginVersion ?? "");
@@ -61,11 +63,22 @@ const HomePage: React.FC<HomePageProps> = ({ isWindow = false, inputRef }) => {
                         <InputArea inputRef={inputRef} verticalPosition="below" />
                     </DragDropWrapper>
 
+                    {showLiteratureSearch ? (
+                        <LiteratureSearchPanel onClose={() => setShowLiteratureSearch(false)} />
+                    ) : null}
+
                     {/* Action launcher — category row + expandable panels */}
                     {allLibrariesExcluded ? (
                         <AllLibrariesExcludedMessage />
                     ) : (
                         <HomeLauncher />
+                    )}
+                    {!showLiteratureSearch && (
+                        <div className="display-flex justify-center">
+                            <Button variant="outline" onClick={() => setShowLiteratureSearch(true)}>
+                                {uiText("Physics literature search")}
+                            </Button>
+                        </div>
                     )}
 
                     {/* Bottom spacer */}

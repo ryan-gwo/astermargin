@@ -4,22 +4,19 @@ import { usePreference } from '../../hooks/usePreference';
 import { interfaceLanguages, interfaceLocale, normalizeInterfaceLanguage, resolveInterfaceLocale } from "../../../src/utils/interfaceLanguage";
 import React, { useState, useCallback, useMemo } from "react";
 import { useAtom, useAtomValue } from 'jotai';
-import { logoutAtom, userAtom } from '../../atoms/auth';
+import { userAtom } from '../../atoms/auth';
 import { getPref, setPref } from '../../../src/utils/prefs';
-import { UserIcon, LogoutIcon, SettingsIcon, Icon, SearchIcon, LockIcon, KeyIcon, ZapIcon, ToolsIcon, DollarCircleIcon } from '../icons/icons';
-import { useSetAtom } from 'jotai';
+import { SettingsIcon, Icon, SearchIcon, LockIcon, KeyIcon, ZapIcon, ToolsIcon, InformationCircleIcon } from '../icons/icons';
 import { runStatusPopupEnabledAtom } from '../../atoms/runStatusPopup';
-import { profileWithPlanAtom, creditPlanAtom, hasCreditPlanAtom } from "../../atoms/profile";
+import { profileWithPlanAtom } from "../../atoms/profile";
 import { activePreferencePageTabAtom } from "../../atoms/ui";
 import { logger } from "@astermargin/agent-core/platform/logger";
 import { isDiffPreviewSupported } from "../../utils/noteEditorDiffPreview";
-import { accountService } from "@astermargin/agent-core/transport/clients/accountService";
-import {SettingsGroup, SettingsRow, SectionLabel, PageHeader} from "./components/SettingsElements";
+import {SettingsGroup, SettingsRow, SectionLabel, PageHeader, SettingsSwitch} from "./components/SettingsElements";
 import ActionsPreferenceSection from "./ActionsPreferenceSection";
-import BillingSection, { formatPlanName } from "./BillingSection";
 import ApiKeysSection from "./ApiKeysSection";
 import AdvancedSection from "./AdvancedSection";
-import { UpdatesSection } from "./UpdatesSection";
+import AboutSection from "./AboutSection";
 import { WebDavSettings } from "./WebDavSettings";
 import { OcrSettings } from "./OcrSettings";
 import { SemanticSettings } from "./SemanticSettings";
@@ -43,7 +40,6 @@ interface PreferenceTabDefinition {
 const PreferencePage: React.FC = () => {
     const [user] = useAtom(userAtom);
     const [lineSpacing, setLineSpacing] = useAtom(chatLineSpacingAtom);
-    const logout = useSetAtom(logoutAtom);
 
     // --- User profile ---
     const profileWithPlan = useAtomValue(profileWithPlanAtom);
@@ -68,8 +64,6 @@ const PreferencePage: React.FC = () => {
     const diffPreviewSupported = isDiffPreviewSupported();
     const [consentToShare, setConsentToShare] = useState(() => profileWithPlan?.consent_to_share || false);
     const [emailNotifications, setEmailNotifications] = useState(() => profileWithPlan?.email_notifications || false);
-    const creditPlan = useAtomValue(creditPlanAtom);
-    const hasCreditPlan = useAtomValue(hasCreditPlanAtom);
     const [activeTab, setActiveTab] = useAtom(activePreferencePageTabAtom);
     const localMode = useAtomValue(localModeEnabledAtom);
 
@@ -188,10 +182,10 @@ const PreferencePage: React.FC = () => {
         { id: 'general', label: uiText("General"), icon: SettingsIcon },
         { id: 'sync', label: uiText("Search & Files"), icon: SearchIcon },
         { id: 'permissions', label: uiText("Permissions"), icon: LockIcon },
-        { id: 'billing', label: uiText("Plan & Usage"), icon: DollarCircleIcon },
         { id: 'models', label: uiText("API Keys"), icon: KeyIcon },
         { id: 'actions', label: uiText(settingsText("Actions")), icon: ZapIcon, ownsHeader: true },
         { id: 'advanced', label: uiText("Advanced"), icon: ToolsIcon },
+        { id: 'about', label: settingsText("About"), icon: InformationCircleIcon },
     ] as PreferenceTabDefinition[]).filter((tab) => isPreferenceTabVisible(tab.id, localMode)), [localMode]);
     const effectiveActiveTab: VisiblePreferencePageTab = resolvePreferenceTab(activeTab, localMode);
     const activeTabDefinition = tabs.find((tab) => tab.id === effectiveActiveTab) ?? tabs[0];
@@ -222,16 +216,13 @@ const PreferencePage: React.FC = () => {
 
     // Keep the persisted tab in sync with what's actually shown: corrects the
     // legacy "account" alias, and redirects away from a tab hidden in this
-    // mode (e.g. a stale "billing" request while running in local mode).
+    // mode (for example a stale legacy tab request after an upgrade).
     React.useEffect(() => {
         const resolved = resolvePreferenceTab(activeTab, localMode);
         if (resolved !== activeTab) {
             setActiveTab(resolved);
         }
     }, [activeTab, localMode, setActiveTab]);
-
-    const planLabel = hasCreditPlan ? settingsText("{plan} plan", { plan: formatPlanName(creditPlan.plan ?? undefined) }) : settingsText("No active plan");
-    const accountInitial = user?.email?.trim().charAt(0) || '?';
 
     return (
         <div
@@ -266,67 +257,6 @@ const PreferencePage: React.FC = () => {
                     ))}
                 </div>
 
-                {/* Sign out sits with the navigation, below the tabs, so the
-                    account block underneath stays a single, quiet control. */}
-                {user && (
-                    <div style={{ padding: '8px 10px' }}>
-                        <button
-                            type="button"
-                            className="astermargin-prefs-nav-item"
-                            onClick={logout}
-                            title={settingsText("End your current session")}
-                        >
-                            <Icon icon={LogoutIcon} aria-hidden="true" focusable="false" />
-                            <span className="truncate">{settingsText("Sign out")}</span>
-                        </button>
-                    </div>
-                )}
-
-                {/* Account stays visible whichever section is open; clicking it
-                    opens the Plan & Usage page. */}
-                <div className="display-flex flex-col border-top-quinary" style={{ padding: '10px 10px 10px' }}>
-                    {user ? (
-                        <button
-                            type="button"
-                            className="astermargin-prefs-account"
-                            onClick={() => setActiveTab('billing')}
-                            title={settingsText("{email} — open Plan & Usage", { email: user.email ?? "" })}
-                            aria-label={settingsText("Account {email}, {plan}. Open Plan & Usage", { email: user.email ?? "", plan: planLabel })}
-                        >
-                            <div className="astermargin-prefs-avatar" aria-hidden="true">{accountInitial}</div>
-                            <div className="display-flex flex-col min-w-0" aria-hidden="true">
-                                <div className="text-base font-color-primary font-medium truncate">
-                                    {user.email}
-                                </div>
-                                <div className="text-sm font-color-secondary truncate">{planLabel}</div>
-                            </div>
-                        </button>
-                    ) : (
-                        <div className="display-flex flex-row items-center gap-2 min-w-0" style={{ padding: '6px 8px' }}>
-                            <div className="astermargin-prefs-avatar" aria-hidden="true">
-                                <Icon icon={UserIcon} />
-                            </div>
-                            <div className="text-base font-color-secondary">{settingsText("Not signed in")}</div>
-                        </div>
-                    )}
-                    <div className="astermargin-prefs-legal display-flex flex-row items-center gap-1">
-                        <button
-                            type="button"
-                            onClick={() => Zotero.launchURL(process.env.WEBAPP_BASE_URL + '/terms')}
-                            className="text-link-muted text-xs"
-                        >
-                            {settingsText("Terms of Service")}
-                        </button>
-                        <span className="font-color-tertiary text-xs" aria-hidden="true">·</span>
-                        <button
-                            type="button"
-                            onClick={() => Zotero.launchURL(process.env.WEBAPP_BASE_URL + '/privacy-policy')}
-                            className="text-link-muted text-xs"
-                        >
-                            {settingsText("Privacy Policy")}
-                        </button>
-                    </div>
-                </div>
             </div>
 
             {/* ===== CONTENT: the selected section ===== */}
@@ -371,7 +301,6 @@ const PreferencePage: React.FC = () => {
                                 }
                             />
                         </SettingsGroup>
-                        <UpdatesSection />
                         <SectionLabel>{settingsText("Sidebar")}</SectionLabel>
                         <SettingsGroup>
                             <SettingsRow
@@ -402,13 +331,7 @@ const PreferencePage: React.FC = () => {
                                 hasBorder
                                 tooltip={settingsText("When enabled, selected Zotero items and collections are attached when you start a new conversation, including from the quick prompt.")}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={addSelectedOnNewThread}
-                                        onChange={handleAddSelectedOnNewThreadToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={addSelectedOnNewThread} onChange={() => handleAddSelectedOnNewThreadToggle()} />
                                 }
                             />
                             <SettingsRow
@@ -418,13 +341,7 @@ const PreferencePage: React.FC = () => {
                                 hasBorder
                                 tooltip={settingsText("When enabled, any items you have selected in Zotero will be automatically added as sources when you open AsterMargin.")}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={addSelectedOnOpen}
-                                        onChange={handleAddSelectedOnOpenToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={addSelectedOnOpen} onChange={() => handleAddSelectedOnOpenToggle()} />
                                 }
                             />
                             <SettingsRow
@@ -434,13 +351,7 @@ const PreferencePage: React.FC = () => {
                                 hasBorder
                                 tooltip={settingsText("When enabled, a small card in the bottom-right corner of the Zotero window shows the current run's progress, lets you approve pending changes, and reports when a response is ready.")}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={runStatusPopupEnabled}
-                                        onChange={handleRunStatusPopupToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={runStatusPopupEnabled} onChange={() => handleRunStatusPopupToggle()} />
                                 }
                             />
                         </SettingsGroup>
@@ -452,13 +363,7 @@ const PreferencePage: React.FC = () => {
                                 description={settingsText("Choose between numeric [1] or author-year (Smith, 2023) citations")}
                                 onClick={handleCitationFormatToggle}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={citationFormat}
-                                        onChange={handleCitationFormatToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={citationFormat} onChange={() => handleCitationFormatToggle()} />
                                 }
                             />
                             <SettingsRow
@@ -468,13 +373,7 @@ const PreferencePage: React.FC = () => {
                                 hasBorder
                                 tooltip={settingsText("When disabled, citations use Zotero's transient PDF position highlight instead.")}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={useTemporaryCitationAnnotations}
-                                        onChange={handleTemporaryCitationAnnotationsToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={useTemporaryCitationAnnotations} onChange={() => handleTemporaryCitationAnnotationsToggle()} />
                                 }
                             />
                         </SettingsGroup>
@@ -486,13 +385,7 @@ const PreferencePage: React.FC = () => {
                                 description={settingsText("Add a child note with a conversation link to AsterMargin conversation")}
                                 onClick={handleAddProvenanceNoteToggle}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={addProvenanceNote}
-                                        onChange={handleAddProvenanceNoteToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={addProvenanceNote} onChange={() => handleAddProvenanceNoteToggle()} />
                                 }
                             />
                             <SettingsRow
@@ -504,14 +397,7 @@ const PreferencePage: React.FC = () => {
                                 hasBorder
                                 tooltip={settingsText("When enabled, edit_note proposals appear as a colored diff directly in the note editor with Apply / Reject controls. When disabled, approvals fall back to the sidebar preview. Turn off if a Zotero update causes the in-editor preview to misbehave.")}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={showDiffPreview && diffPreviewSupported}
-                                        disabled={!diffPreviewSupported}
-                                        onChange={handleShowDiffPreviewToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: diffPreviewSupported ? 'pointer' : 'not-allowed', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={showDiffPreview && diffPreviewSupported} disabled={!diffPreviewSupported} onChange={() => handleShowDiffPreviewToggle()} />
                                 }
                             />
                         </SettingsGroup>
@@ -544,13 +430,7 @@ const PreferencePage: React.FC = () => {
                                 onClick={handleFocusResponseForScreenReadersToggle}
                                 tooltip={settingsText("When enabled, focus moves from the chat input to screen-reader-only status text while AsterMargin generates, then to a screen-reader-only copy of the completed response.")}
                                 control={
-                                    <input
-                                        type="checkbox"
-                                        checked={focusResponseForScreenReaders}
-                                        onChange={handleFocusResponseForScreenReadersToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
-                                    />
+                                    <SettingsSwitch checked={focusResponseForScreenReaders} onChange={() => handleFocusResponseForScreenReadersToggle()} />
                                 }
                             />
                         </SettingsGroup>
@@ -567,13 +447,7 @@ const PreferencePage: React.FC = () => {
                                         onClick={handleConsentToggle}
                                         tooltip={settingsText("When enabled, we use your prompts, queries, and AI responses to improve AsterMargin's features and performance. We automatically remove personal information and never share your PDFs, documents, or other files.")}
                                         control={
-                                            <input
-                                                type="checkbox"
-                                                checked={consentToShare}
-                                                onChange={handleConsentToggle}
-                                                onClick={(e) => e.stopPropagation()}
-                                                style={{ cursor: 'pointer', margin: 0 }}
-                                            />
+                                            <SettingsSwitch checked={consentToShare} onChange={() => handleConsentToggle()} />
                                         }
                                     />
                                     <SettingsRow
@@ -582,13 +456,7 @@ const PreferencePage: React.FC = () => {
                                         onClick={handleEmailToggle}
                                         hasBorder
                                         control={
-                                            <input
-                                                type="checkbox"
-                                                checked={emailNotifications}
-                                                onChange={handleEmailToggle}
-                                                onClick={(e) => e.stopPropagation()}
-                                                style={{ cursor: 'pointer', margin: 0 }}
-                                            />
+                                            <SettingsSwitch checked={emailNotifications} onChange={() => handleEmailToggle()} />
                                         }
                                     />
                                 </SettingsGroup>
@@ -613,11 +481,6 @@ const PreferencePage: React.FC = () => {
                     <PermissionsSection />
                 )}
 
-                {/* ===== PLAN & USAGE TAB ===== */}
-                {effectiveActiveTab === 'billing' && (
-                    <BillingSection />
-                )}
-
                 {/* ===== API KEYS TAB ===== */}
                 {effectiveActiveTab === 'models' && (
                     <ApiKeysSection />
@@ -632,6 +495,9 @@ const PreferencePage: React.FC = () => {
                 {effectiveActiveTab === 'advanced' && (
                     <><ReadingRule /><SemanticSettings /><OcrSettings /><WebDavSettings /><AdvancedSection /></>
                 )}
+
+                {/* ===== ABOUT TAB ===== */}
+                {effectiveActiveTab === 'about' && <AboutSection />}
                 </div>
             </div>
         </div>

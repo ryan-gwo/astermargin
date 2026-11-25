@@ -1,5 +1,6 @@
 import React from "react";
 import { getPref, setPref } from "../../../src/utils/prefs";
+import { SettingsSwitch } from "./components/SettingsElements";
 
 interface CitationFormatToggleProps {
     checked: boolean;
@@ -20,14 +21,10 @@ const CitationFormatToggle: React.FC<CitationFormatToggleProps> = ({ checked, on
             title="Switch between author-year (e.g., Smith, 2023) and numeric (e.g., [1]) citation formats"
         >
             <div className="display-flex flex-row gap-2 items-start">
-                <input
-                    type="checkbox"
-                    className="mr-1 scale-90 mt-020"
-                    style={{minWidth: 'auto'}}
+                <SettingsSwitch
                     aria-label={`Citation format: ${checked ? "Numeric" : "Author-Year"}`}
                     checked={checked}
-                    onChange={handleToggle}
-                    onClick={(e) => e.stopPropagation()}
+                    onChange={() => handleToggle()}
                 />
 
                 <div className="display-flex flex-col gap-05">
@@ -47,4 +44,4 @@ const CitationFormatToggle: React.FC<CitationFormatToggleProps> = ({ checked, on
     );
 };
 
-export default CitationFormatToggle; 
+export default CitationFormatToggle;

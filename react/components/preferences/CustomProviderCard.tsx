@@ -28,7 +28,7 @@ import {
     normalizeCustomModelFormat,
     validateProviderApiBase,
 } from "../../types/settings";
-import { DocLink, ExternalLink, INTELLIGENCE_INDEX_URL, SettingsStatus } from "./components/SettingsElements";
+import { DocLink, ExternalLink, INTELLIGENCE_INDEX_URL, SettingsStatus, SettingsSwitch } from "./components/SettingsElements";
 import {
     chatService,
     RockPaperScissorsMove,
@@ -36,7 +36,7 @@ import {
 } from "@astermargin/agent-core/transport/clients/chatService";
 import { localModeEnabledAtom } from "../../atoms/localMode";
 import { isLoopbackEndpoint } from "@astermargin/agent-local/config/localAgentConfig";
-import { plainHttpWarning, testLocalEndpoint } from "./localProviderTest";
+import { discoverLocalModels, plainHttpWarning, testLocalEndpoint } from "./localProviderTest";
 import { LocalProviderTestRunner } from "./localProviderTestRunner";
 
 interface CustomProviderCardProps {
@@ -90,6 +90,8 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
     const [testError, setTestError] = useState<string | null>(null);
     const [localTestMessage, setLocalTestMessage] = useState<string | null>(null);
     const [testingCapabilities, setTestingCapabilities] = useState(false);
+    const [discoveringModels, setDiscoveringModels] = useState(false);
+    const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
     const [contextWindowText, setContextWindowText] = useState<string>(
         model.context_window != null ? String(model.context_window) : ''
     );
@@ -241,6 +243,20 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         }
     };
 
+    const discoverModels = useCallback(async () => {
+        setDiscoveringModels(true);
+        setTestError(null);
+        try {
+            const models = await discoverLocalModels(model);
+            setDiscoveredModels(models);
+            if (models.length === 1) update({ snapshot: models[0] });
+        } catch (error) {
+            setTestError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setDiscoveringModels(false);
+        }
+    }, [model, update]);
+
     const localizedTestError = testError ? knownSettingsText(testError) : null;
     const testMenuItems: MenuItem[] = useMemo(() => [
         { label: '', isDivider: true, onClick: () => {} },
@@ -329,14 +345,32 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                 {/* Snapshot */}
                 <label className="display-flex flex-col">
                     <span className="text-sm font-color-secondary">{uiText("Model (snapshot)")}</span>
-                    <input
-                        type="text"
-                        value={model.snapshot}
-                        onChange={(e) => update({ snapshot: e.target.value })}
-                        placeholder="openai/gpt-4o"
-                        aria-label={settingsText("Model snapshot")}
-                        className="chat-input text-base font-color-primary"
-                    />
+                    <div className="display-flex flex-row gap-2">
+                        <input
+                            type="text"
+                            value={model.snapshot}
+                            onChange={(e) => update({ snapshot: e.target.value })}
+                            placeholder="openai/gpt-4o"
+                            aria-label={settingsText("Model snapshot")}
+                            className="chat-input text-base font-color-primary flex-1 min-w-0"
+                        />
+                        {localMode && (
+                            <Button variant="outline" onClick={() => void discoverModels()} disabled={discoveringModels} loading={discoveringModels} style={{ padding: '4px 6px' }}>
+                                {settingsText("List models")}
+                            </Button>
+                        )}
+                    </div>
+                    {discoveredModels.length > 0 && (
+                        <select
+                            className="preference-input text-base mt-1"
+                            value={discoveredModels.includes(model.snapshot) ? model.snapshot : ''}
+                            onChange={(event) => update({ snapshot: event.target.value })}
+                            aria-label={settingsText("Discovered models")}
+                        >
+                            <option value="">{settingsText("Choose a discovered model")}</option>
+                            {discoveredModels.map((id) => <option key={id} value={id}>{id}</option>)}
+                        </select>
+                    )}
                     <span className="text-sm font-color-tertiary">
                         {settingsText("Small or older models may struggle with tool calls. Choose a model with an Artificial Analysis score of at least 26, preferably 35 or higher.")}
                         {' '}<ExternalLink href={INTELLIGENCE_INDEX_URL}>{settingsText("Artificial Analysis Intelligence Index")}</ExternalLink>
@@ -419,6 +453,28 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     )}
                 </div>
 
+                <label className="display-flex flex-col">
+                    <span className="text-sm font-color-secondary">{settingsText("Reasoning strength")}</span>
+                    <select
+                        value={model.reasoning_effort ?? ''}
+                        onChange={(event) => update({
+                            reasoning_effort: event.target.value === 'low' || event.target.value === 'medium' || event.target.value === 'high'
+                                ? event.target.value
+                                : undefined,
+                        })}
+                        aria-label={settingsText("Reasoning strength")}
+                        className="preference-input text-base font-color-primary"
+                    >
+                        <option value="">{settingsText("Service default")}</option>
+                        <option value="low">{settingsText("Low")}</option>
+                        <option value="medium">{settingsText("Medium")}</option>
+                        <option value="high">{settingsText("High")}</option>
+                    </select>
+                    <span className="text-sm font-color-tertiary">
+                        {settingsText("Leave this at service default unless the endpoint documents a supported level. The server decides the effective setting.")}
+                    </span>
+                </label>
+
                 {/* API key. The copy button is required: Gecko's built-in reveal button
                     unmasks a password input without changing its type, and clipboard
                     copy stays blocked for as long as the input is type="password". */}
@@ -446,11 +502,10 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
 
                 {/* Supports vision */}
                 <label className="display-flex flex-row items-center gap-1 cursor-pointer">
-                    <input
-                        type="checkbox"
+                    <SettingsSwitch
                         checked={!!model.supports_vision}
-                        onChange={(e) => update({ supports_vision: e.target.checked })}
-                        style={{ minWidth: 'auto' }}
+                        onChange={(checked) => update({ supports_vision: checked })}
+                        aria-label={uiText("Supports vision (image input)")}
                     />
                     <span className="text-base font-color-primary">{uiText("Supports vision (image input)")}</span>
                 </label>

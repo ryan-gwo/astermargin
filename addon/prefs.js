@@ -232,6 +232,11 @@ pref("localExcludedLibraries", "[]");
 pref("localScholarlySearch", true);
 pref("openAlexApiKey", "");
 pref("semanticScholarApiKey", "");
+pref("nasaAdsApiKey", "");
+pref("cloudOcrPages", "3,7");
+pref("cloudOcrEndpoint", "https://api.mistral.ai/v1/ocr");
+pref("cloudOcrApiKey", "");
+pref("mcpExtendedToolsEnabled", false);
 // Local-mode web search through the model provider's own hosted search tool
 // (Anthropic, OpenAI, OpenRouter). Off by default because the provider may
 // bill per search. `localWebSearchMaxUses` caps searches per provider

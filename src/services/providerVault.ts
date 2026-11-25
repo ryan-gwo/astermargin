@@ -60,6 +60,8 @@ const secretPrefs = new Set([
     "googleGenerativeAiApiKey",
     "openAlexApiKey",
     "semanticScholarApiKey",
+    "nasaAdsApiKey",
+    "cloudOcrApiKey",
     "webdavPassword",
 ]);
 export function isSecretPref(name: string): boolean {

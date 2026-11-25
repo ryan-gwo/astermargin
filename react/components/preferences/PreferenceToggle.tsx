@@ -1,6 +1,7 @@
 import React from "react";
 import { Icon, InformationCircleIcon } from "../icons/icons";
 import { parseTextWithLinksAndNewlines } from "../../utils/parseTextWithLinksAndNewlines";
+import { SettingsSwitch } from "./components/SettingsElements";
 
 interface PreferenceToggleProps {
     checked: boolean;
@@ -58,14 +59,10 @@ const PreferenceToggle: React.FC<PreferenceToggleProps> = ({
             title={getTooltip()}
         >
             <div className="display-flex flex-row gap-2 items-start">
-                <input
-                    type="checkbox"
-                    className={`mr-1 scale-90 ${tag ? 'mt-15' : 'mt-020'}`}
-                    style={{minWidth: 'auto'}}
+                <SettingsSwitch
                     aria-label={subtitle ? `${title} ${subtitle}` : title}
                     checked={checked}
-                    onChange={handleToggle}
-                    onClick={(e) => e.stopPropagation()}
+                    onChange={() => handleToggle()}
                     disabled={disabled}
                 />
 
@@ -108,4 +105,4 @@ const PreferenceToggle: React.FC<PreferenceToggleProps> = ({
     );
 };
 
-export default PreferenceToggle; 
+export default PreferenceToggle;

@@ -51,6 +51,7 @@ import { citationLinks } from './citationLinks';
 import { localBatchTools } from './localBatch';
 import { tableTool } from './localTable';
 import { semanticTool,e5Enabled } from './semanticIndex';
+import { literatureTool } from './literatureTool';
 import { localAgentConfigInputAtom, localSearchConfigAtom, type LocalSearchConfig } from '../atoms/localAgentConfig';
 import { isLocalMode } from '../atoms/localMode';
 import { store } from '../store';
@@ -77,6 +78,7 @@ const keyOption = (key: string): { apiKey?: string } => (key.trim() ? { apiKey: 
 function buildNativeTools(search: LocalSearchConfig): NativeTool[] {
     if (!search.scholarlySearch) return [];
     return [
+        literatureTool,
         citationLinks,
         createScholarlySearchTool({
             sources: [

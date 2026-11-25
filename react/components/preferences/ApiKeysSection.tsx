@@ -1,4 +1,4 @@
-import { settingsText } from "../../utils/settingsText";
+import { knownSettingsText, settingsText } from "../../utils/settingsText";
 import { uiText } from "../../utils/interfaceText";
 import React, { useState, useCallback } from "react";
 import { v4 as uuidv4 } from "uuid";
@@ -35,12 +35,33 @@ import {
     OPENROUTER_API_BASE,
 } from "../../types/settings";
 import { useSetAtom, useAtomValue } from "jotai";
+import { PROVIDER_TEMPLATES, modelFromTemplate } from './providerTemplates';
 
 /** Editor entry: a custom model plus a stable key for React list rendering. */
 interface CustomProviderEntry {
     _id: string;
     model: CustomChatModel;
 }
+
+const LocalSettingsSwitch: React.FC<{
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+    disabled?: boolean;
+    'aria-label'?: string;
+}> = ({ checked, onChange, disabled, 'aria-label': ariaLabel }) => (
+    <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={ariaLabel}
+        disabled={disabled}
+        onClick={(event) => { event.stopPropagation(); onChange(!checked); }}
+        style={{ width: 36, height: 20, padding: 2, borderRadius: 999, border: '1px solid var(--fill-quarternary)', background: checked ? 'var(--color-accent, var(--tag-blue-secondary))' : 'var(--fill-quinary)', display: 'inline-flex', alignItems: 'center', justifyContent: checked ? 'flex-end' : 'flex-start' }}
+    >
+        <input type="checkbox" tabIndex={-1} aria-hidden="true" checked={checked} readOnly disabled={disabled} style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }} />
+        <span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: '50%', background: 'var(--material-sidepane, white)' }} />
+    </button>
+);
 
 // Uses `uuid` rather than the platform `crypto.randomUUID()`: the preferences
 // window is a separate realm and may not expose `crypto` at all.
@@ -93,6 +114,7 @@ const ApiKeysSection: React.FC = () => {
     const [scholarlySearchPref, setScholarlySearchPref] = usePreference(() => getPref('localScholarlySearch'));
     const [openAlexKey, setOpenAlexKey] = useState(() => getPref('openAlexApiKey'));
     const [semanticScholarKey, setSemanticScholarKey] = useState(() => getPref('semanticScholarApiKey'));
+    const [nasaAdsKey, setNasaAdsKey] = useState(() => String(getPref('nasaAdsApiKey') || ''));
     const [webSearchPref, setWebSearchPref] = usePreference(() => getPref('localWebSearch'));
     const [maxUsesText, setMaxUsesText] = useState<string>(() => {
         const stored = getPref('localWebSearchMaxUses');
@@ -131,6 +153,9 @@ const ApiKeysSection: React.FC = () => {
     const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null);
     // The newly added provider whose Name field should receive focus on mount.
     const [autoFocusProviderId, setAutoFocusProviderId] = useState<string | null>(null);
+    const [templateId, setTemplateId] = useState(PROVIDER_TEMPLATES[0].id);
+    const selectedTemplate = PROVIDER_TEMPLATES.find((template) => template.id === templateId) ?? PROVIDER_TEMPLATES[0];
+    const [templateModel, setTemplateModel] = useState(selectedTemplate.models[0]);
 
     // Persist the providers list to preferences and refresh the live model selector.
     const persistProviders = useCallback((entries: CustomProviderEntry[]) => {
@@ -148,6 +173,18 @@ const ApiKeysSection: React.FC = () => {
         setExpandedProviderId(id);
         setAutoFocusProviderId(id);
     }, [persistProviders]);
+
+    const handleAddTemplate = useCallback(() => {
+        const id = createProviderId();
+        const model = modelFromTemplate(selectedTemplate, templateModel);
+        setCustomProviders((prev) => {
+            const next = [{ _id: id, model }, ...prev];
+            persistProviders(next);
+            return next;
+        });
+        setExpandedProviderId(id);
+        setAutoFocusProviderId(null);
+    }, [persistProviders, selectedTemplate, templateModel]);
 
     const handleProviderChange = useCallback((id: string, model: CustomChatModel) => {
         setCustomProviders((prev) => {
@@ -199,13 +236,11 @@ const ApiKeysSection: React.FC = () => {
                     description={localModeToggle.description}
                     announceDescription={restartNeeded}
                     control={
-                        <input
-                            type="checkbox"
+                        <LocalSettingsSwitch
                             aria-label={settingsText("Run entirely on this device")}
                             checked={localModeToggle.checked}
                             disabled={localModeToggle.disabled}
-                            onChange={(e) => handleLocalModeToggle(e.target.checked)}
-                            onClick={(e) => e.stopPropagation()}
+                            onChange={handleLocalModeToggle}
                         />
                     }
                 />
@@ -254,12 +289,10 @@ const ApiKeysSection: React.FC = () => {
                             title={settingsText("Scholarly search")}
                             description={settingsText("Let the model look up published research beyond your library. Its search query is sent to OpenAlex and Semantic Scholar.")}
                             control={
-                                <input
-                                    type="checkbox"
+                                <LocalSettingsSwitch
                                     aria-label={settingsText("Scholarly search")}
                                     checked={scholarlySearchPref}
-                                    onChange={(e) => handleScholarlySearchToggle(e.target.checked)}
-                                    onClick={(e) => e.stopPropagation()}
+                                    onChange={handleScholarlySearchToggle}
                                 />
                             }
                         />
@@ -276,6 +309,21 @@ const ApiKeysSection: React.FC = () => {
                                 savePref={(newValue) => handlePrefSave('openAlexApiKey', newValue)}
                                 placeholder={settingsText("Optional")}
                                 linkUrl="https://openalex.org/settings/api"
+                            />
+                        </div>
+                        <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
+                            <div className="text-sm font-color-secondary mb-1">
+                                {settingsText("Optional. NASA ADS searches use this key and stay scoped to the current query.")}
+                            </div>
+                            <ApiKeyInput
+                                id="nasa-ads-key"
+                                label={settingsText("NASA ADS API key")}
+                                verify={false}
+                                value={nasaAdsKey}
+                                onChange={setNasaAdsKey}
+                                savePref={(newValue) => handlePrefSave('nasaAdsApiKey', newValue)}
+                                placeholder={settingsText("Optional")}
+                                linkUrl="https://ui.adsabs.harvard.edu/user/settings/token"
                             />
                         </div>
                         <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
@@ -298,12 +346,10 @@ const ApiKeysSection: React.FC = () => {
                             title={settingsText("Web search")}
                             description={localWebSearchDescription(localWebSearchStatus.kind, localWebSearchStatus.hostUnconfirmed)}
                             control={
-                                <input
-                                    type="checkbox"
+                                <LocalSettingsSwitch
                                     aria-label={settingsText("Web search")}
                                     checked={webSearchPref}
-                                    onChange={(e) => handleWebSearchToggle(e.target.checked)}
-                                    onClick={(e) => e.stopPropagation()}
+                                    onChange={handleWebSearchToggle}
                                 />
                             }
                         />
@@ -399,6 +445,39 @@ const ApiKeysSection: React.FC = () => {
                     >
                         {uiText("Add Provider")}
                     </Button>
+                </div>
+
+                <div className="rounded-card border-card bg-senary p-3 mb-2">
+                    <div className="text-base font-color-primary font-medium mb-1">{settingsText("Provider templates")}</div>
+                    <div className="text-sm font-color-secondary mb-2">
+                        {settingsText("Start with a known endpoint, then choose a model and enter its key. Local templates keep requests on this device.")}
+                    </div>
+                    <div className="display-flex flex-row flex-wrap items-center gap-2">
+                        <select
+                            className="preference-input text-base"
+                            value={templateId}
+                            onChange={(event) => {
+                                const next = PROVIDER_TEMPLATES.find((entry) => entry.id === event.target.value) ?? PROVIDER_TEMPLATES[0];
+                                setTemplateId(next.id);
+                                setTemplateModel(next.models[0]);
+                            }}
+                            aria-label={settingsText("Provider template")}
+                        >
+                            {PROVIDER_TEMPLATES.map((template) => <option key={template.id} value={template.id}>{template.label}</option>)}
+                        </select>
+                        <select
+                            className="preference-input text-base"
+                            value={templateModel}
+                            onChange={(event) => setTemplateModel(event.target.value)}
+                            aria-label={settingsText("Template model")}
+                        >
+                            {selectedTemplate.models.map((model) => <option key={model} value={model}>{model}</option>)}
+                        </select>
+                        <Button variant="outline" onClick={handleAddTemplate} style={{ padding: '4px 8px' }}>
+                            {settingsText("Use template")}
+                        </Button>
+                    </div>
+                    <div className="text-sm font-color-tertiary mt-1">{knownSettingsText(selectedTemplate.description)}</div>
                 </div>
 
                 <div className="text-base font-color-secondary mb-2" style={{ paddingLeft: '2px' }}>

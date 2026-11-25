@@ -59,6 +59,9 @@ import {
 } from './mcp/libraryAnnotationTools';
 import { generateRequestId, mcpError } from './mcp/utils';
 import { documentToReadPages } from '../documentExtraction/attachmentReadPages';
+import { searchLiterature } from '../literatureIndex';
+import { listVersions, readTable, type TableRef } from '../artifacts/tableStore';
+import { getPref } from '../../utils/prefs';
 
 // =============================================================================
 // MCP stdio bridge script
@@ -652,6 +655,46 @@ const LIST_ITEMS_TOOL = {
             },
         },
         required: [],
+    },
+};
+
+const SEARCH_EXTERNAL_LITERATURE_TOOL = {
+    name: 'search_external_literature',
+    annotations: { title: 'Search arXiv and NASA ADS', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    description: 'Search arXiv and NASA ADS for physics and astronomy papers. Returns metadata and links only. Importing or updating Zotero items requires a separate user-confirmed preview in Zotero.',
+    inputSchema: {
+        type: 'object' as const,
+        properties: {
+            query: { type: 'string', description: 'Topic, title, author, DOI, arXiv id or bibcode.' },
+            providers: { type: 'array', items: { type: 'string', enum: ['arxiv', 'ads'] } },
+            limit: { type: 'integer', minimum: 1, maximum: 25, default: 10 },
+        },
+        required: ['query'],
+    },
+};
+
+const READ_RESEARCH_TABLE_TOOL = {
+    name: 'read_research_table',
+    annotations: { title: 'Read Research Table', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    description: 'Read a stored AsterMargin research table, including columns, rows, cited evidence and version history.',
+    inputSchema: {
+        type: 'object' as const,
+        properties: { table_id: { type: 'string', description: 'Portable Zotero table item id, such as u-KEY or 1-KEY.' } },
+        required: ['table_id'],
+    },
+};
+
+const PROPOSE_TABLE_EDIT_TOOL = {
+    name: 'propose_table_edit',
+    annotations: { title: 'Propose Research Table Edit', readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    description: 'Validate and return a research-table edit proposal without writing it. Zotero must show the proposal and the user must confirm it before an edit is applied.',
+    inputSchema: {
+        type: 'object' as const,
+        properties: {
+            table_id: { type: 'string' },
+            operations: { type: 'object', description: 'A TableUserEdit object, for example move_columns, update_columns, add_columns or answer.' },
+        },
+        required: ['table_id', 'operations'],
     },
 };
 
@@ -1380,6 +1423,72 @@ async function handleListItems(args: any): Promise<any> {
     };
 }
 
+async function handleSearchExternalLiterature(args: any): Promise<any> {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) return mcpError('query is required and cannot be empty.');
+    const providers = Array.isArray(args.providers)
+        ? args.providers.filter((value: unknown): value is 'arxiv' | 'ads' => value === 'arxiv' || value === 'ads')
+        : ['arxiv', 'ads'];
+    const records = await searchLiterature(query, { providers, limit: Math.min(Math.max(args.limit ?? 10, 1), 25) });
+    return {
+        results: records.map((record) => ({
+            provider: record.provider,
+            id: record.id,
+            title: record.title,
+            authors: record.authors,
+            abstract: record.abstract ?? null,
+            year: record.year ?? null,
+            venue: record.venue ?? null,
+            doi: record.doi ?? null,
+            arxiv_id: record.arxivId ?? null,
+            bibcode: record.bibcode ?? null,
+            url: record.url,
+            pdf_url: record.pdfUrl ?? null,
+            zotero_item: record.item,
+        })),
+        write_policy: 'Use the Zotero import preview before changing a library item.',
+    };
+}
+
+function tableRefFromMcpId(value: unknown): TableRef | null {
+    const parsed = parseItemId(typeof value === 'string' ? value : null);
+    return parsed && parsed.libraryId !== UNRESOLVED_LIBRARY_ID ? { libraryID: parsed.libraryId, key: parsed.key } : null;
+}
+
+async function handleReadResearchTable(args: any): Promise<any> {
+    const ref = tableRefFromMcpId(args.table_id);
+    if (!ref) return mcpError('table_id is not a readable local AsterMargin table item id.');
+    try {
+        const current = await readTable(ref);
+        const versions = await listVersions(ref);
+        return { table_id: args.table_id, spec: current.spec, version: current.version, history: versions };
+    } catch (error) {
+        return mcpError(error instanceof Error ? error.message : 'The table could not be read.');
+    }
+}
+
+async function handleProposeTableEdit(args: any): Promise<any> {
+    const ref = tableRefFromMcpId(args.table_id);
+    if (!ref || !args.operations || typeof args.operations !== 'object') return mcpError('table_id and operations are required.');
+    let current: { spec: unknown; version: number };
+    try {
+        current = await readTable(ref);
+    } catch (error) {
+        return mcpError(error instanceof Error ? error.message : 'The table could not be read.');
+    }
+    const operations = args.operations as Record<string, unknown>;
+    const allowed = ['move_columns', 'update_columns', 'add_columns', 'remove_columns', 'remove_rows', 'answer', 'not_reported', 'clear', 'restore'];
+    const unknown = Object.keys(operations).filter((key) => !allowed.includes(key));
+    if (unknown.length) return mcpError(`Unsupported table operation(s): ${unknown.join(', ')}`);
+    return {
+        table_id: args.table_id,
+        base_version: current.version,
+        preview: { operations, current: current.spec },
+        requires_zotero_confirmation: true,
+        writes_performed: 0,
+    };
+}
+
 // =============================================================================
 // Registration
 // =============================================================================
@@ -1410,6 +1519,13 @@ export function registerMcpServer(writeToolsEnabled: boolean) {
             { def: LIST_LIBRARIES_TOOL, handler: handleListLibraries },
             { def: FIND_ANNOTATIONS_TOOL, handler: handleFindAnnotations },
         ];
+        if (getPref('mcpExtendedToolsEnabled') === true) {
+            tools.push(
+                { def: SEARCH_EXTERNAL_LITERATURE_TOOL, handler: handleSearchExternalLiterature },
+                { def: READ_RESEARCH_TABLE_TOOL, handler: handleReadResearchTable },
+                { def: PROPOSE_TABLE_EDIT_TOOL, handler: handleProposeTableEdit },
+            );
+        }
         // Mutating tools are advertised only when the user opts in. An unregistered
         // name is rejected by the dispatcher, so the gate also blocks direct calls.
         if (writeToolsEnabled) {
@@ -1426,9 +1542,9 @@ export function registerMcpServer(writeToolsEnabled: boolean) {
                 const account = Zotero.AsterMargin.account;
                 const generation = account?.getGeneration();
                 const scope = JSON.stringify(Zotero.AsterMargin.searchableLibraryIds);
-                if (!active || !account || !hasAccess()) return mcpError('MCP access unavailable');
+                if (!active || !hasAccess()) return mcpError('MCP access unavailable');
                 const result = await handler(args);
-                if (!active || !hasAccess() || generation !== account.getGeneration() || scope !== JSON.stringify(Zotero.AsterMargin.searchableLibraryIds)) return mcpError('MCP access changed');
+                if (!active || !hasAccess() || (account && generation !== account.getGeneration()) || scope !== JSON.stringify(Zotero.AsterMargin.searchableLibraryIds)) return mcpError('MCP access changed');
                 return result;
             });
         }

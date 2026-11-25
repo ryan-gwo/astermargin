@@ -6,6 +6,7 @@
  * through AsterMargin's backend — the api key and endpoint stay on this machine.
  */
 import { localConfigErrorText } from "./localModeSettings";
+import { settingsText } from "../../utils/settingsText";
 import type { CustomChatModel } from '@astermargin/agent-core/types/customChatModel';
 import { isLoopbackEndpoint, resolveLocalAgentConfig, type SupportedFormat } from '@astermargin/agent-local/config/localAgentConfig';
 import { clientForFormat } from '@astermargin/agent-local/llm/clientForFormat';
@@ -22,6 +23,19 @@ export interface LocalProviderTestResult {
      * instead of showing them as an error.
      */
     cancelled?: boolean;
+}
+
+export async function discoverLocalModels(model: CustomChatModel, signal?: AbortSignal): Promise<string[]> {
+    const resolved = resolveLocalAgentConfig({ model, maxRounds: 1 });
+    if (!resolved.ok) throw new Error(localConfigErrorText(resolved.reason));
+    const base = (resolved.config.model.api_base ?? '').replace(/\/+$/u, '');
+    const response = await fetch(`${base}/models`, {
+        signal,
+        headers: resolved.config.model.api_key?.trim() ? { Authorization: `Bearer ${resolved.config.model.api_key}` } : {},
+    });
+    if (!response.ok) throw new Error(`Model discovery failed (${response.status})`);
+    const data = await response.json() as { data?: Array<{ id?: unknown }> };
+    return (data.data ?? []).map((entry) => typeof entry.id === 'string' ? entry.id : '').filter(Boolean);
 }
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -70,7 +84,7 @@ export async function testLocalProvider(
             controller.signal,
         );
         const text = result.text.trim();
-        return { ok: true, message: text || 'The endpoint responded.' };
+        return { ok: true, message: `${settingsText("Endpoint accepted the request.")} ${text}`.trim() };
     } catch (error) {
         if (error instanceof LlmRequestError && error.kind === 'cancelled') {
             if (!timedOut) {

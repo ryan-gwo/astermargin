@@ -1,7 +1,7 @@
 import { settingsText } from "../../utils/settingsText";
 import { usePreference } from '../../hooks/usePreference';
 import React, { useCallback, useState } from "react";
-import {SettingsGroup, SettingsRow, SectionLabel, DocLink, SectionDescription} from "./components/SettingsElements";
+import {SettingsGroup, SettingsRow, SectionLabel, DocLink, SectionDescription, SettingsSwitch} from "./components/SettingsElements";
 import DeferredToolPreferenceSetting from "./DeferredToolPreferenceSetting";
 import { getPref, setPref } from "../../../src/utils/prefs";
 
@@ -117,13 +117,7 @@ const PermissionsSection: React.FC = () => {
                     onClick={handleEnableSystemNotificationsToggle}
                     hasBorder
                     control={
-                        <input
-                            type="checkbox"
-                            checked={enableSystemNotifications}
-                            onChange={handleEnableSystemNotificationsToggle}
-                            onClick={(e) => e.stopPropagation()}
-                            style={{ cursor: 'pointer', margin: 0 }}
-                        />
+                        <SettingsSwitch checked={enableSystemNotifications} onChange={() => handleEnableSystemNotificationsToggle()} />
                     }
                 />
                 <SettingsRow
@@ -132,13 +126,7 @@ const PermissionsSection: React.FC = () => {
                     onClick={handleEnableResponseCompleteNotificationsToggle}
                     hasBorder
                     control={
-                        <input
-                            type="checkbox"
-                            checked={enableResponseCompleteNotifications}
-                            onChange={handleEnableResponseCompleteNotificationsToggle}
-                            onClick={(e) => e.stopPropagation()}
-                            style={{ cursor: 'pointer', margin: 0 }}
-                        />
+                        <SettingsSwitch checked={enableResponseCompleteNotifications} onChange={() => handleEnableResponseCompleteNotificationsToggle()} />
                     }
                 />
             </SettingsGroup>
@@ -150,13 +138,7 @@ const PermissionsSection: React.FC = () => {
                     description={settingsText("Automatically apply annotations to PDFs when created by the agent (only when PDF is open)")}
                     onClick={handleAutoApplyAnnotationsToggle}
                     control={
-                        <input
-                            type="checkbox"
-                            checked={autoApplyAnnotations}
-                            onChange={handleAutoApplyAnnotationsToggle}
-                            onClick={(e) => e.stopPropagation()}
-                            style={{ cursor: 'pointer', margin: 0 }}
-                        />
+                        <SettingsSwitch checked={autoApplyAnnotations} onChange={() => handleAutoApplyAnnotationsToggle()} />
                     }
                 />
             </SettingsGroup>
@@ -169,13 +151,7 @@ const PermissionsSection: React.FC = () => {
                     onClick={handleAccessRemoteFilesToggle}
                     tooltip={settingsText("When enabled, AsterMargin will attempt to download PDFs from the Zotero server or WebDAV if the file is not on your local machine. Disable this if you experience slow responses or don't want remote file downloads.")}
                     control={
-                        <input
-                            type="checkbox"
-                            checked={accessRemoteFiles}
-                            onChange={handleAccessRemoteFilesToggle}
-                            onClick={(e) => e.stopPropagation()}
-                            style={{ cursor: 'pointer', margin: 0 }}
-                        />
+                        <SettingsSwitch checked={accessRemoteFiles} onChange={() => handleAccessRemoteFilesToggle()} />
                     }
                 />
             </SettingsGroup>

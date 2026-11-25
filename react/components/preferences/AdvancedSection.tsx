@@ -2,14 +2,14 @@ import { settingsText } from "../../utils/settingsText";
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import Button from "@astermargin/agent-ui/primitives/Button";
-import {SettingsGroup, SettingsRow, DocLink} from "./components/SettingsElements";
+import {SettingsGroup, SettingsRow, DocLink, SettingsSwitch} from "./components/SettingsElements";
 import { dataProviderEnabledAtom, mcpServerEnabledAtom, mcpWriteToolsEnabledAtom } from "../../atoms/ui";
 import { useAtom, useSetAtom } from "jotai";
 import { currentMessageExternalFilesAtom } from "../../atoms/messageComposition";
 import { ensureMcpBridgeScript } from "../../hooks/useMcpServer";
 import { copyToClipboard } from "../../utils/clipboard";
 import { logger } from "@astermargin/agent-core/platform/logger";
-import { setPref } from "../../../src/utils/prefs";
+import { getPref, setPref } from "../../../src/utils/prefs";
 import { TickIcon, CopyIcon } from "../icons/icons";
 import CustomInstructionsSection from "./CustomInstructionsSection";
 import LocalDocumentCacheRow from "./LocalDocumentCacheRow";
@@ -91,6 +91,7 @@ const AdvancedSection: React.FC = () => {
     // --- Atoms: MCP Server enabled ---
     const [mcpServerEnabled, setMcpServerEnabled] = useAtom(mcpServerEnabledAtom);
     const [mcpWriteToolsEnabled, setMcpWriteToolsEnabled] = useAtom(mcpWriteToolsEnabledAtom);
+    const [mcpExtendedToolsEnabled, setMcpExtendedToolsEnabled] = useState(() => getPref('mcpExtendedToolsEnabled') === true);
     const [mcpCopied, setMcpCopied] = useState(false);
     const [mcpHttpCopied, setMcpHttpCopied] = useState(false);
 
@@ -156,6 +157,12 @@ const AdvancedSection: React.FC = () => {
         setPref('mcpCreateNoteToolEnabled', newValue);
         setMcpWriteToolsEnabled(newValue);
     }, [mcpWriteToolsEnabled, setMcpWriteToolsEnabled]);
+
+    const handleMcpExtendedToolsToggle = useCallback(() => {
+        const next = !mcpExtendedToolsEnabled;
+        setPref('mcpExtendedToolsEnabled', next);
+        setMcpExtendedToolsEnabled(next);
+    }, [mcpExtendedToolsEnabled]);
 
     // --- Data provider (library access for other AsterMargin clients) ---
     const [dataProviderEnabled, setDataProviderEnabled] = useAtom(dataProviderEnabledAtom);
@@ -239,13 +246,10 @@ const AdvancedSection: React.FC = () => {
                             onClick={handleDataProviderToggle}
                             control={
                                 <div className="display-flex flex-row items-center gap-2">
-                                    <input
-                                        type="checkbox"
+                                    <SettingsSwitch
                                         aria-label={settingsText("Allow Library Access")}
                                         checked={dataProviderEnabled}
-                                        onChange={handleDataProviderToggle}
-                                        onClick={(e) => e.stopPropagation()}
-                                        style={{ cursor: 'pointer', margin: 0 }}
+                                        onChange={() => handleDataProviderToggle()}
                                     />
                                 </div>
                             }
@@ -271,13 +275,10 @@ const AdvancedSection: React.FC = () => {
                     tooltip={settingsText("Expose your Zotero library to MCP-compatible AI tools")}
                     control={
                         <div className="display-flex flex-row items-center gap-2">
-                            <input
-                                type="checkbox"
+                            <SettingsSwitch
                                 aria-label={settingsText("Enable MCP Server")}
                                 checked={mcpServerEnabled}
-                                onChange={handleMcpServerToggle}
-                                onClick={(e) => e.stopPropagation()}
-                                style={{ cursor: 'pointer', margin: 0 }}
+                                onChange={() => handleMcpServerToggle()}
                             />
                         </div>
                     }
@@ -290,15 +291,25 @@ const AdvancedSection: React.FC = () => {
                     tooltip={settingsText("Advertise and allow the MCP tools that write to your library")}
                     control={
                         <div className="display-flex flex-row items-center gap-2">
-                            <input
-                                type="checkbox"
+                            <SettingsSwitch
                                 aria-label={settingsText("Enable Write Tools")}
                                 checked={mcpWriteToolsEnabled}
-                                onChange={handleMcpWriteToolsToggle}
-                                onClick={(e) => e.stopPropagation()}
-                                style={{ cursor: 'pointer', margin: 0 }}
+                                onChange={() => handleMcpWriteToolsToggle()}
                             />
                         </div>
+                    }
+                />
+                <SettingsRow
+                    title={settingsText("Enable literature and table tools")}
+                    description={settingsText("Advertise arXiv and NASA ADS search, research-table reads and table edit proposals. Proposals never write without a Zotero confirmation.")}
+                    onClick={handleMcpExtendedToolsToggle}
+                    hasBorder
+                    control={
+                        <SettingsSwitch
+                            aria-label={settingsText("Enable literature and table tools")}
+                            checked={mcpExtendedToolsEnabled}
+                            onChange={() => handleMcpExtendedToolsToggle()}
+                        />
                     }
                 />
                 <SettingsRow

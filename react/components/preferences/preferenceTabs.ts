@@ -9,9 +9,8 @@ import type { PreferencePageTab } from '../../atoms/ui';
 export type VisiblePreferencePageTab = Exclude<PreferencePageTab, 'account'>;
 
 /**
- * Preference tabs hidden while running in local mode. Local mode has no
- * account or backend, so account-bound sections like billing aren't
- * reachable there.
+ * Legacy billing remains resolvable for upgrades, but is no longer exposed in
+ * the settings navigation. The About tab owns release information instead.
  */
 const LOCAL_MODE_HIDDEN_TABS: ReadonlySet<VisiblePreferencePageTab> = new Set(['billing']);
 
@@ -21,12 +20,12 @@ export function isPreferenceTabVisible(tabId: VisiblePreferencePageTab, localMod
 }
 
 /**
- * Resolves a requested tab — which may be the legacy "account" alias, or a
- * tab hidden in the current mode — to one that's actually shown, falling
+ * Resolves a requested tab — which may be the legacy "account" alias or
+ * billing tab — to one that's actually shown, falling
  * back to General.
  */
 export function resolvePreferenceTab(tab: PreferencePageTab, localMode: boolean): VisiblePreferencePageTab {
-    if (tab === 'account') {
+    if (tab === 'account' || (tab === 'billing' && localMode)) {
         return 'general';
     }
     return isPreferenceTabVisible(tab, localMode) ? tab : 'general';

@@ -55,6 +55,68 @@ export const SettingsGroup: React.FC<{ children: React.ReactNode; className?: st
     </div>
 );
 
+/**
+ * A persistent setting switch. Checkboxes remain available for multi-select
+ * lists such as library and table row selection. A switch communicates the
+ * binary enabled/disabled state and keeps the same keyboard semantics on all
+ * supported Zotero themes.
+ */
+export const SettingsSwitch: React.FC<{
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+    disabled?: boolean;
+    id?: string;
+    'aria-label'?: string;
+}> = ({ checked, onChange, disabled = false, id, 'aria-label': ariaLabel }) => (
+    <button
+        type="button"
+        id={id}
+        role="switch"
+        aria-checked={checked}
+        aria-label={ariaLabel}
+        disabled={disabled}
+        onClick={(event) => {
+            event.stopPropagation();
+            onChange(!checked);
+        }}
+        style={{
+            width: '36px',
+            height: '20px',
+            padding: '2px',
+            borderRadius: '999px',
+            border: `1px solid ${checked ? 'var(--color-accent, var(--tag-blue-secondary))' : 'var(--fill-quarternary)'}`,
+            background: checked ? 'var(--color-accent, var(--tag-blue-secondary))' : 'var(--fill-quinary)',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: checked ? 'flex-end' : 'flex-start',
+            cursor: disabled ? 'not-allowed' : 'pointer',
+            opacity: disabled ? 0.55 : 1,
+            transition: 'background-color 120ms ease, border-color 120ms ease',
+            flexShrink: 0,
+        }}
+    >
+        <input
+            type="checkbox"
+            tabIndex={-1}
+            aria-hidden="true"
+            checked={checked}
+            readOnly
+            disabled={disabled}
+            style={{ position: 'absolute', opacity: 0, pointerEvents: 'none', width: 1, height: 1 }}
+        />
+        <span
+            aria-hidden="true"
+            style={{
+                width: '14px',
+                height: '14px',
+                borderRadius: '50%',
+                background: 'var(--material-sidepane, white)',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.25)',
+            }}
+        />
+    </button>
+);
+
 interface SettingsRowProps {
     title: string;
     description?: React.ReactNode;

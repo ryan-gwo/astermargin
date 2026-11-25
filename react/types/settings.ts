@@ -98,6 +98,9 @@ export const getCustomChatModelsForEditing = (): CustomChatModel[] => {
                     name: typeof e.name === 'string' ? e.name : '',
                     snapshot: typeof e.snapshot === 'string' ? e.snapshot : '',
                     context_window: typeof e.context_window === 'number' ? e.context_window : undefined,
+                    reasoning_effort: e.reasoning_effort === 'low' || e.reasoning_effort === 'medium' || e.reasoning_effort === 'high'
+                        ? e.reasoning_effort
+                        : undefined,
                     supports_vision: typeof e.supports_vision === 'boolean' ? e.supports_vision : false,
                 } as CustomChatModel;
             });
@@ -126,6 +129,9 @@ export const saveCustomChatModelsToPreferences = async (models: CustomChatModel[
         };
         if (typeof model.context_window === 'number' && Number.isFinite(model.context_window)) {
             entry.context_window = model.context_window;
+        }
+        if (model.reasoning_effort === 'low' || model.reasoning_effort === 'medium' || model.reasoning_effort === 'high') {
+            entry.reasoning_effort = model.reasoning_effort;
         }
         return entry;
     });

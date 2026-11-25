@@ -9,8 +9,9 @@
  * `addon.libraryOperations` like every other library write.
  */
 
-import type { ImportItemSpec, ResolvedItem } from '@astermargin/agent-core/types/itemImport';
+import type { ImportItemProposedData, ImportItemSpec, ResolvedItem, ImportItemResultData } from '@astermargin/agent-core/types/itemImport';
 import { resolveImportItems, type ResolveOptions } from './resolve';
+import { writeImportItem, type WriteImportOptions } from './write';
 import { probeAllZoteroApis, type ZoteroApiName, type ZoteroApiStatus } from './zoteroApis';
 
 export class ItemImportService {
@@ -20,6 +21,12 @@ export class ItemImportService {
     async resolve(specs: ImportItemSpec[], options: ResolveOptions): Promise<ResolvedItem[]> {
         if (this.disposed) throw Object.assign(new Error('AsterMargin is shutting down'), { code: 'shutting_down' });
         return resolveImportItems(specs, options);
+    }
+
+    /** Write one user-confirmed proposal after the renderer has shown its preview. */
+    async write(data: ImportItemProposedData, options: WriteImportOptions = {}): Promise<ImportItemResultData> {
+        if (this.disposed) throw Object.assign(new Error('AsterMargin is shutting down'), { code: 'shutting_down' });
+        return writeImportItem(data, options);
     }
 
     /** Probe states of the internal Zotero APIs item import relies on. */

@@ -18,7 +18,7 @@ import type { AttachmentRef, ProcessingIssueReason } from '../../../src/services
 import Spinner from '@astermargin/agent-ui/icons/Spinner';
 import Button from '@astermargin/agent-ui/primitives/Button';
 import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
-import { ExternalLink, SettingsGroup, SettingsRow, SectionLabel } from './components/SettingsElements';
+import { ExternalLink, SettingsGroup, SettingsRow, SectionLabel, SettingsSwitch } from './components/SettingsElements';
 import ProcessingIssueGroupRow from './ProcessingIssueList';
 import { ProgressBar } from '../status/ProgressBar';
 import { describeStatus, plural, type StatusSentence, type StatusTone } from './processingStatusSentence';
@@ -383,13 +383,11 @@ export default function BackgroundProcessingSection(): React.ReactElement | null
                     title={setting.title}
                     description={setting.description}
                     onClick={() => updateEnabled(!enabled)}
-                    control={<input
-                        type="checkbox"
+                    control={<SettingsSwitch
                         aria-label={hasSearchAccess ? settingsText("Keep full-text search up to date") : settingsText("Process files in the background")}
                         disabled={locked}
                         checked={enabled}
-                        onChange={(event) => updateEnabled(event.target.checked)}
-                        onClick={(event) => event.stopPropagation()}
+                        onChange={updateEnabled}
                     />}
                 />
                 {showStatus && (

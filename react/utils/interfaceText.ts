@@ -5,6 +5,7 @@ export { interfaceLocale } from "../../src/utils/interfaceLanguage";
 
 const words: Record<string, readonly [string, string]> = {
     "How can I help you?": ["想读哪篇文献？", "想讀哪篇文獻？"],
+    "Physics literature search": ["物理文献检索", "物理文獻檢索"],
     General: ["通用", "通用"],
     "Search & Files": ["检索与文件", "檢索與檔案"],
     Permissions: ["权限", "許可權"],

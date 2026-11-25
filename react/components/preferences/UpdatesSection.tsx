@@ -16,6 +16,7 @@ import {
     SectionLabel,
     SettingsGroup,
     SettingsRow,
+    SettingsSwitch,
 } from "./components/SettingsElements";
 
 function formatDate(value: string, withTime = false): string {
@@ -55,7 +56,7 @@ function updateMessage(state: UpdateState): string {
     }
 }
 
-export function UpdatesSection() {
+export function UpdatesSection({ embedded = false }: { embedded?: boolean } = {}) {
     const [state, setState] = useState<UpdateState>();
     const [unavailable, setUnavailable] = useState(false);
     const [savingMode, setSavingMode] = useState(false);
@@ -109,7 +110,7 @@ export function UpdatesSection() {
     const message = state ? updateMessage(state) : "";
     return (
         <>
-            <SectionLabel>{settingsText("Updates")}</SectionLabel>
+            {!embedded && <SectionLabel>{settingsText("Updates")}</SectionLabel>}
             <SettingsGroup>
                 <SettingsRow
                     title={settingsText("Current version {version}", {
@@ -262,16 +263,12 @@ export function UpdatesSection() {
                     }
                     announceDescription
                     control={
-                        <input
+                        <SettingsSwitch
                             id="astermargin-auto-updates"
-                            type="checkbox"
                             checked={state?.autoUpdate ?? false}
                             disabled={unavailable || !state || savingMode}
-                            onChange={(event) => {
-                                const enabled = event.currentTarget.checked;
-                                void changeMode(() =>
-                                    setAutomaticUpdates(enabled),
-                                );
+                            onChange={(enabled) => {
+                                void changeMode(() => setAutomaticUpdates(enabled));
                             }}
                         />
                     }

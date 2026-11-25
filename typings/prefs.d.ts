@@ -104,6 +104,11 @@ declare namespace _ZoteroTypes {
       "localScholarlySearch": boolean;
       "openAlexApiKey": string;
       "semanticScholarApiKey": string;
+      "nasaAdsApiKey": string;
+      "cloudOcrPages": string;
+      "cloudOcrEndpoint": string;
+      "cloudOcrApiKey": string;
+      "mcpExtendedToolsEnabled": boolean;
       "localWebSearch": boolean;
       "localWebSearchMaxUses": number;
     };
