@@ -265,7 +265,7 @@ const ApiKeysSection: React.FC = () => {
                         />
                         <div className="border-top-quinary" style={{ padding: '8px 12px' }}>
                             <div className="text-sm font-color-secondary mb-1">
-                                {settingsText("Optional. Without a key, OpenAlex allows only a small daily search budget and may refuse requests once it's spent. A free key raises that.")}
+                                {settingsText("An OpenAlex key raises your search allowance and lets AsterMargin try a cached open-access PDF if Zotero cannot fetch one. Downloads use your OpenAlex allowance.")}
                             </div>
                             <ApiKeyInput
                                 id="openalex-key"

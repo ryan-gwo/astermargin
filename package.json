@@ -1,13 +1,13 @@
 {
   "name": "astermargin",
   "private": true,
-  "upstreamVersion": "0.27.0-beta.4",
+  "upstreamVersion": "0.27.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ryan-gwo/astermargin.git"
   },
   "type": "module",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "AI-assisted literature reading in Zotero",
   "config": {
     "addonName": "AsterMargin",

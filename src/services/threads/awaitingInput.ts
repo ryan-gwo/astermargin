@@ -43,21 +43,25 @@ function count(n: number, group: Group): string {
  * for your approval", "Waiting for your input: 1 question and 2 approvals".
  * A kind this client does not know leaves only the generic phrase.
  */
-export function awaitingInputLabel(awaiting: AwaitingInput): string {
+export function awaitingInputLabel(awaiting: AwaitingInput, translate?: (message: string, args?: Record<string, number>) => string): string {
     const groups = new Map<Group, number>();
     for (const [kind, n] of Object.entries(awaiting)) {
         const group = GROUP_OF_KIND[kind];
-        if (!group) return "Waiting for your input";
+        if (!group) return translate?.("Waiting for your input") ?? "Waiting for your input";
         groups.set(group, (groups.get(group) ?? 0) + n);
     }
+    if (translate && groups.size !== 1) return translate("Waiting for your input");
     if (groups.size === 1) {
         const [[group, n]] = [...groups];
         switch (group) {
             case "question":
+                if (translate) return translate(n === 1 ? "Waiting for your answer to a question" : "Waiting for your answers to {count} questions", { count: n });
                 return n === 1 ? "Waiting for your answer to a question" : `Waiting for your answers to ${n} questions`;
             case "approval":
+                if (translate) return translate(n === 1 ? "Waiting for your approval" : "Waiting for {count} approvals", { count: n });
                 return n === 1 ? "Waiting for your approval" : `Waiting for ${n} approvals`;
             case "table":
+                if (translate) return translate(n === 1 ? "Waiting for you to confirm a table" : "Waiting for you to confirm {count} tables", { count: n });
                 return n === 1 ? "Waiting for you to confirm a table" : `Waiting for you to confirm ${n} tables`;
         }
     }

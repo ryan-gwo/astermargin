@@ -237,6 +237,8 @@ export interface TableFillJobSnapshot {
     rows_failed: number;
     /** Requests in flight. */
     in_flight: number;
+    /** Requests dispatched to the model, including retries. */
+    request_attempts?: number;
     credits_charged: number;
     /** The plan's cost. */
     credits_planned: number;

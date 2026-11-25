@@ -49,7 +49,10 @@ assert.equal(remoteTag, `${git("rev-parse", tagRef)}\t${tagRef}`, "Push the exac
 
 const pkg = JSON.parse(await readFile("package.json", "utf8"));
 const previous = JSON.parse(git("show", "HEAD^:package.json"));
+const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
 assert.equal(pkg.version, version, "Tag does not match package.json");
+assert.equal(lock.version, version, "Tag does not match package-lock.json");
+assert.equal(lock.packages[""].version, version, "Tag does not match the lockfile root package");
 assert(compareTags(tag, `v${previous.version}`) > 0, "Tag must point to the commit that increased the version");
 const releases = JSON.parse(gh("release", "list", "--repo", repository, "--limit", "100", "--json", "tagName,isDraft,isPrerelease,isLatest"));
 for (const release of releases) {
@@ -75,6 +78,7 @@ const archive = new Zip(await readFile(xpi));
 const manifest = JSON.parse(archive.readAsText("manifest.json"));
 const host = manifest.applications.zotero;
 assert.equal(manifest.version, version);
+assert.equal(host.id, pkg.config.addonID);
 const updateEndpoint = `https://github.com/${repository}/releases/latest/download/update.json`;
 assert.equal(host.update_url, updateEndpoint);
 const updateFile = "dist/update.json";
@@ -85,6 +89,7 @@ const updates = {
                 version,
                 update_link: `https://github.com/${repository}/releases/download/${tag}/astermargin.xpi`,
                 update_hash: `sha256:${await sha256(xpi)}`,
+                update_info_url: `https://github.com/${repository}/releases/tag/${tag}`,
                 applications: {
                     zotero: {
                         strict_min_version: host.strict_min_version,

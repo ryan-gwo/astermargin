@@ -13,7 +13,7 @@ import {
     type TableSpec,
 } from "@astermargin/agent-core/layouts/table";
 import { FindHighlight } from "../../chat/highlightText";
-import { ArrowDownIcon, ArrowUpLineIcon, CancelIcon, CopyIcon, EditIcon, Icon, PlusSignIcon, RepeatIcon, TickIcon } from "../../icons";
+import { ArrowDownIcon, ArrowUpLineIcon, CancelIcon, CopyIcon, EditIcon, FilterIcon, Icon, PlusSignIcon, RepeatIcon, TickIcon } from "../../icons";
 import type { MenuItem } from "../../primitives/ContextMenu";
 import MenuButton from "../../primitives/MenuButton";
 import { selectionWithin, useHoverAnchor, useHoverLayer } from "../../primitives/HoverLayer";
@@ -31,11 +31,13 @@ import {
     sortOrderLabel,
     staleBadgeText,
     type CellFill,
+    type ColumnDrop,
     type ResearchColumns,
     type RowFill,
     type TableDocuments,
 } from "./cellModel";
 import { PaperActions, PaperCell } from "./PaperCell";
+import { useColumnDrag } from "./useColumnDrag";
 
 /** The cell the inspector is open on. */
 export interface CellAddress {
@@ -54,6 +56,11 @@ export interface ResearchGridProps {
     rowMenuItems(row: Row): MenuItem[];
     /** A column's menu (on hover over its header); an empty one shows no button. */
     columnMenuItems?(column: Column): MenuItem[];
+    /**
+     * Moves a question column dragged by its header to before another one in
+     * view, or after the last. Absent, headers cannot be dragged.
+     */
+    onMoveColumn?(columnId: string, drop: ColumnDrop): void;
     /** The (+) after the last column; absent, no add column. */
     onAddColumn?(): void;
     /** Why the (+) is disabled (a read-only library, the table's limits). */
@@ -147,6 +154,7 @@ export function ResearchGrid({
     onSelectCell,
     rowMenuItems,
     columnMenuItems,
+    onMoveColumn,
     onAddColumn,
     addColumnDisabledReason,
     virtualize = false,
@@ -164,6 +172,9 @@ export function ResearchGrid({
 }: ResearchGridProps): React.ReactElement {
     const rootRef = useRef<HTMLDivElement>(null);
     const bodyRef = useRef<HTMLTableSectionElement>(null);
+    const dropIndicatorRef = useRef<HTMLDivElement>(null);
+    const dragGhostRef = useRef<HTMLDivElement>(null);
+    const columnDrag = useColumnDrag({ rootRef, indicatorRef: dropIndicatorRef, ghostRef: dragGhostRef, onMove: onMoveColumn });
     const questions = useMemo(
         () => columns.questions.filter((column) => !state.hiddenColumns.has(column.id)),
         [columns.questions, state.hiddenColumns],
@@ -211,6 +222,7 @@ export function ResearchGrid({
             data-density={state.density}
             data-table-id={table.id}
             data-columns-guide={guide ? "" : undefined}
+            data-column-dragging={columnDrag.dragging ? "" : undefined}
         >
             <table className="bt-table rt-table" style={{ minWidth }}>
                 <colgroup>
@@ -220,13 +232,19 @@ export function ResearchGrid({
                     {questions.map((column) => (
                         <col
                             key={column.id}
-                            className={addedColumns?.has(column.id) ? "rt-col-added" : undefined}
+                            className={
+                                columnDrag.dragging === column.id
+                                    ? "rt-col-dragging"
+                                    : addedColumns?.has(column.id)
+                                      ? "rt-col-added"
+                                      : undefined
+                            }
                             style={{ width: questionWidth(column) }}
                         />
                     ))}
                     {addColumn ? <col style={{ width: flexTail ? undefined : ADD_WIDTH }} /> : null}
                 </colgroup>
-                <thead>
+                <thead onMouseDown={columnDrag.onHeadMouseDown}>
                     <tr className="rt-head-row">
                         <th className="rt-th rt-th-rail" scope="col">
                             {selectable ? (
@@ -265,9 +283,12 @@ export function ResearchGrid({
                                 column={column}
                                 kind="question"
                                 sort={state.sort}
+                                filtered={state.filters.some((filter) => filter.column_id === column.id)}
                                 badges={badges.get(column.id)!}
                                 menuItems={columnMenuItems}
                                 isAdded={!!addedColumns?.has(column.id)}
+                                isDragging={columnDrag.dragging === column.id}
+                                draggable={!!columnDrag.onHeadMouseDown}
                             />
                         ))}
                         {addColumn ? (
@@ -340,6 +361,12 @@ export function ResearchGrid({
                 </div>
             ) : null}
             {cellEditor ? <CellEditorLayer rootRef={rootRef} {...cellEditor} /> : null}
+            {onMoveColumn ? (
+                <>
+                    <div ref={dropIndicatorRef} className="rt-drop-indicator" aria-hidden="true" />
+                    <div ref={dragGhostRef} className="rt-drag-ghost" aria-hidden="true" />
+                </>
+            ) : null}
         </div>
     );
 }
@@ -464,22 +491,31 @@ function SelectBox({
 
 /**
  * A column's header: its name, the sort mark when the view is sorted by it,
- * and the column menu's button on hover. A question's header adds its badges
- * and, under the name, its question.
+ * the filter mark while a filter narrows it, and the column menu's button on
+ * hover. A question's header adds its badges and, under the name, its
+ * question.
  */
 function ColumnHeader({
     column,
     kind,
     sort,
+    filtered = false,
     badges,
     menuItems,
     isAdded = false,
+    isDragging = false,
+    draggable = false,
 }: {
     column: Column;
     /** Just added by the user: highlighted briefly. */
     isAdded?: boolean;
+    /** Being dragged to another place. */
+    isDragging?: boolean;
+    /** A press on it may start dragging the column (handled by the header row). */
+    draggable?: boolean;
     kind: "paper" | "year" | "question";
     sort: TableSort | undefined;
+    filtered?: boolean;
     badges?: ReturnType<typeof columnBadges>;
     menuItems?(column: Column): MenuItem[];
 }): React.ReactElement {
@@ -492,9 +528,10 @@ function ColumnHeader({
     const direction = sort?.column_id === column.id ? sort.direction : undefined;
     return (
         <th
-            className={`rt-th rt-th-${kind}${items.length ? " rt-th-has-menu" : ""}${menuOpen ? " rt-th-menu-open" : ""}${isAdded ? " rt-th-added" : ""}`}
+            className={`rt-th rt-th-${kind}${items.length ? " rt-th-has-menu" : ""}${menuOpen ? " rt-th-menu-open" : ""}${isAdded ? " rt-th-added" : ""}${isDragging ? " rt-th-dragging" : ""}`}
             scope="col"
             data-column-id={column.id}
+            data-column-drag={draggable ? "" : undefined}
             aria-sort={direction === "asc" ? "ascending" : direction === "desc" ? "descending" : undefined}
         >
             {items.length ? (
@@ -503,7 +540,7 @@ function ColumnHeader({
                         menuItems={items}
                         variant="ghost-secondary"
                         icon={ArrowDownIcon}
-                        ariaLabel={`Column menu: ${label}`}
+                        ariaLabel={uiText("Column menu: {column}", { column: label })}
                         width="13rem"
                         toggleCallback={setMenuOpen}
                     />
@@ -512,6 +549,11 @@ function ColumnHeader({
             <div className="rt-th-top">
                 <span className="rt-th-label">{label}</span>
                 {direction ? <SortMark direction={direction} year={kind === "year"} /> : null}
+                {filtered ? (
+                    <span className="rt-th-filter" title={uiText("Filtered")} role="img" aria-label={uiText("Filtered")}>
+                        <Icon icon={FilterIcon} size={11} aria-hidden="true" />
+                    </span>
+                ) : null}
                 {badges && badges.staleCells > 0 ? (
                     <Badge
                         className="rt-badge rt-badge-stale"

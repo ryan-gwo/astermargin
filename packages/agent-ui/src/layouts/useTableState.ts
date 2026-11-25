@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
     cellValueText,
     defaultHiddenColumnIds,
@@ -80,6 +80,8 @@ export interface TableState {
 export interface UseTableStateOptions {
     /** Initial density. The chrome's density control moves it from there. */
     density?: TableDensity;
+    initialFilters?: Filter[];
+    onFiltersChange?(filters: Filter[]): void;
     /**
      * Show only these rows, on top of the viewer's own filters — a surface
      * pointing at a set of rows ("Show" the rows a fill could not read).
@@ -159,7 +161,20 @@ export function useTableState(
         options.density ?? "cozy",
     );
     const [quickFilter, setQuickFilter] = useState("");
-    const [filters, setFilters] = useState<Filter[]>([]);
+    const [storedFilters, setFilters] = useState(() => options.initialFilters ?? []);
+    const filters = useMemo(() => {
+        const filterable = new Set(spec.columns.filter(isColumnFilterable).map((column) => column.id));
+        const active = storedFilters.filter((filter) => filterable.has(filter.column_id));
+        return active.length === storedFilters.length ? storedFilters : active;
+    }, [spec.columns, storedFilters]);
+    const lastSaved = useRef(JSON.stringify(storedFilters));
+    useEffect(() => {
+        const encoded = JSON.stringify(filters);
+        if (encoded === lastSaved.current) return;
+        lastSaved.current = encoded;
+        if (storedFilters !== filters) setFilters(filters);
+        options.onFiltersChange?.(filters);
+    }, [filters, storedFilters, options.onFiltersChange]);
     const [selectedRows, setSelectedRows] = useState<ReadonlySet<string>>(
         () => new Set(),
     );
@@ -175,6 +190,7 @@ export function useTableState(
     if (!isSameTable(hiddenFor, identity)) {
         setHiddenFor(identity);
         setColumnOverrides(new Map());
+        setFilters(options.initialFilters ?? []);
     } else if (hiddenFor.key !== identity.key) {
         // Same table, now stored: remember the key so a later table with the
         // same render id is not mistaken for it.

@@ -243,6 +243,7 @@ class FillJob {
     private rowsDone = 0;
     private rowsFailed = 0;
     private requestRowsDone = 0;
+    private requestAttempts = 0;
     private charged = 0;
     private balanceAtStart: number | null;
     private stopReason?: TableFillNotStartedReason;
@@ -332,6 +333,7 @@ class FillJob {
             rows_done: this.rowsDone,
             rows_failed: this.rowsFailed,
             in_flight: this.inFlight,
+            request_attempts: this.requestAttempts,
             credits_charged: round(this.charged),
             credits_planned: this.plan.summary.credits,
             balance: this.balanceAtStart == null ? null : round(Math.max(0, this.balanceAtStart - this.charged)),
@@ -554,7 +556,15 @@ class FillJob {
             try {
                 // The same check runs again at the dispatch itself, after the
                 // body is compressed and credentials are ready.
-                const response = await this.deps.fill(body, () => this.assertMaySend(row));
+                let dispatched = false;
+                const response = await this.deps.fill(body, () => {
+                    this.assertMaySend(row);
+                    if (!dispatched) {
+                        dispatched = true;
+                        this.requestAttempts += 1;
+                        this.publish();
+                    }
+                });
                 if (this.abandoned) {
                     // Shutdown came while the request was out: its answer has
                     // nowhere to go.

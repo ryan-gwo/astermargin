@@ -1,6 +1,6 @@
 import { uiText } from "../../utils/interfaceText";
 import React from 'react';
-import { isTitleAbstractOnly, type TableSpec } from '@astermargin/agent-core/layouts/table';
+import { isTitleAbstractOnly, type Filter, type TableSpec } from '@astermargin/agent-core/layouts/table';
 import { addColumnBlockedReason } from '@astermargin/agent-core/layouts/tableMutations';
 import { logger } from '@astermargin/agent-core/platform/logger';
 import { ResearchTable, type ResearchTableFocus, type ResearchTableHandle, type ResearchTableReveal } from '@astermargin/agent-ui/layouts';
@@ -27,6 +27,7 @@ import type {
 } from '../../../src/ui/tableTabTypes';
 import { getWindowRuntime } from '../../runtime/windowRuntime';
 import { useSurfaceWindow } from '../../runtime/SurfaceWindowContext';
+import { readTableFilters, saveTableFilters } from './tableFilterPreferences';
 import { useDocumentVisible } from '../../hooks/useDocumentVisible';
 import { describeItems } from './card/liveSources';
 import { libraryRefForLibraryID } from '../../../src/utils/libraryIdentity';
@@ -421,6 +422,11 @@ export default function TableTabView({
 
     const itemID = Zotero.Items.getIDFromLibraryAndKey(tableRef.libraryID, tableRef.key);
     const research = React.useRef<ResearchTableHandle>(null);
+    const initialFilters = React.useMemo(() => readTableFilters(tableRef), [tableRef.libraryID, tableRef.key]);
+    const rememberFilters = React.useCallback(
+        (filters: Filter[]) => saveTableFilters(tableRef, filters),
+        [tableRef.libraryID, tableRef.key],
+    );
     const onAskAsterMargin = inWindow ? () => void askAboutTableInChat(tableRef) : askAsterMargin;
     const onShowInLibrary = itemID
         ? () => void showTableInLibrary(itemID, inWindow ? null : surfaceWindow)
@@ -486,6 +492,8 @@ export default function TableTabView({
             >
                 <ResearchTable
                     table={state.table.spec}
+                    initialFilters={initialFilters}
+                    onFiltersChange={rememberFilters}
                     renderText={renderCellText}
                     documents={documents}
                     newPapers={newPapers.notice}

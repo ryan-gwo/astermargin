@@ -23,7 +23,7 @@ export interface DownloadedFile {
     accessMethod?: string;
 }
 
-async function removeDirectory(directory: string | undefined): Promise<void> {
+export async function removeDirectory(directory: string | undefined): Promise<void> {
     if (!directory) return;
     try {
         await IOUtils.remove(directory, { recursive: true, ignoreAbsent: true });
@@ -204,8 +204,20 @@ export async function fetchPdfAttachment(
     signal: AbortSignal,
     assertAccess: () => void,
     diagnostics?: PdfFetchDiagnostics,
+    fallback?: () => Promise<DownloadedFile | null>,
 ): Promise<{ attachment: Zotero.Item | null; accessMethod?: string }> {
-    const file = await downloadAttachmentFile(resolvers, signal, assertAccess, diagnostics);
+    let file: DownloadedFile | null = null;
+    let resolverFailure: { error: unknown } | undefined;
+    try {
+        file = await downloadAttachmentFile(resolvers, signal, assertAccess, diagnostics);
+    } catch (error) {
+        resolverFailure = { error };
+    }
+    if (!file && !signal.aborted) {
+        assertAccess();
+        file = await fallback?.() ?? null;
+    }
+    if (!file && resolverFailure) throw resolverFailure.error;
     if (!file) return { attachment: null };
     const version = file.props?.articleVersion;
     const title = file.title || Zotero.getString(`attachment.${

@@ -11,6 +11,7 @@ import { generateTaskId, scheduleBackgroundTask } from '../../utils/backgroundTa
 import { buildPdfResolvers, type PdfFetchOptions } from '../../utils/pdfResolvers';
 import { fetchPdfAttachment } from '../pdfAttachmentFetch';
 import { createPdfFetchDiagnostics } from '../pdfFetchDiagnostics';
+import { downloadOpenAlexPdf } from './openAlexPdf';
 
 /**
  * Filter attachment IDs to return only PDF attachments.
@@ -84,13 +85,9 @@ export function schedulePdfFetchTask(
 
                 const resolvers = buildPdfResolvers(item, options);
                 resolverCount = resolvers.length;
-                if (resolvers.length === 0) {
-                    logger(`schedulePdfFetchTask: No resolvers for ${itemKey}`, 2);
-                    return;
-                }
-
                 logger(`schedulePdfFetchTask: Trying ${resolvers.length} resolvers for ${itemKey}`, 2);
-                const outcome = await fetchPdfAttachment(item, resolvers, signal, assertAccess, diagnostics);
+                const outcome = await fetchPdfAttachment(item, resolvers, signal, assertAccess, diagnostics,
+                    () => downloadOpenAlexPdf(fetched, options.openAlexWorkId, signal, assertAccess, diagnostics));
                 if (outcome.attachment) {
                     attachedPdf = outcome.attachment;
                     accessMethod = outcome.accessMethod;
@@ -148,7 +145,7 @@ export function schedulePdfFetchTask(
                             elapsedMs: Date.now() - startedAt,
                             failureReason: attachedPdf
                                 ? undefined
-                                : diagnostics.failureReason({ resolverCount, threw }),
+                                : diagnostics.failureReason({ resolverCount: attempts.length ? undefined : resolverCount, threw }),
                             attempts: attempts.length ? attempts : undefined,
                         });
                     }

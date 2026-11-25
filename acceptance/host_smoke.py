@@ -8,6 +8,8 @@ Pass --upgrade-from /path/to/previous.xpi for manual installation over a previou
 Pass --update-from /path/to/previous.xpi to exercise Zotero's background updater
 against the final XPI's public update feed. Add --reject-update hash or compatibility
 to serve a deliberately invalid feed to a disposable Zotero profile.
+With --local-update, serve the target XPI and manifest from a disposable loopback origin.
+Use --update-center together with --settings-locale to exercise the settings controls.
 On Linux without a display, run the command under xvfb-run -a.
 """
 import argparse
@@ -27,6 +29,13 @@ from uuid import uuid4
 from zipfile import ZipFile
 
 
+def write_test_package(path, source, manifest):
+    with ZipFile(path, "w") as package:
+        for entry in source.infolist():
+            data = json.dumps(manifest) if entry.filename == "manifest.json" else source.read(entry)
+            package.writestr(entry, data)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("zotero", type=Path)
@@ -37,7 +46,17 @@ def main():
     previous.add_argument("--upgrade-from", type=Path)
     previous.add_argument("--update-from", type=Path)
     parser.add_argument("--reject-update", choices=("hash", "compatibility"))
+    parser.add_argument("--local-update", action="store_true")
+    parser.add_argument("--update-center", choices=("current", "network", "manual", "hash", "compatibility"))
+    parser.add_argument("--theme", choices=("light", "dark"))
+    parser.add_argument("--research-tables", action="store_true")
     args = parser.parse_args()
+    if args.research_tables and args.settings_locale != "en-US":
+        parser.error("--research-tables uses English menu labels")
+    if args.local_update and not args.update_from:
+        parser.error("--local-update requires --update-from")
+    if args.update_center and (not args.settings_locale or args.update_from or args.upgrade_from or args.zotero_locale):
+        parser.error("--update-center requires --settings-locale and a fresh profile")
     if args.zotero_locale and (not args.settings_locale or args.upgrade_from or args.update_from):
         parser.error("--zotero-locale requires --settings-locale and a fresh profile")
     if args.reject_update and not args.update_from:
@@ -68,8 +87,8 @@ def main():
         "extensions.zotero.astermargin.mcpServerEnabled": True,
         "extensions.autoDisableScopes": 0,
         "extensions.enabledScopes": 15,
-        "extensions.update.enabled": bool(args.update_from),
-        "extensions.update.autoUpdateDefault": bool(args.update_from),
+        "extensions.update.enabled": bool(args.update_from or args.update_center),
+        "extensions.update.autoUpdateDefault": bool(args.update_from or args.update_center),
         "app.update.auto": False,
         "extensions.zotero.firstRun": False,
         "extensions.zotero.firstRun2": False,
@@ -78,7 +97,10 @@ def main():
         "extensions.zoteroMacWordIntegration.skipInstallation": True,
         "extensions.zoteroOpenOfficeIntegration.skipInstallation": True,
     }
-    if args.reject_update:
+    if args.theme:
+        prefs["ui.systemUsesDarkTheme"] = int(args.theme == "dark")
+        prefs["extensions.zotero.colorScheme"] = args.theme
+    if args.local_update or args.update_center or args.reject_update:
         # The disposable HTTP loopback feed must be accepted by the fixture
         # add-on. Zotero still verifies the HTTPS XPI download's supplied hash.
         prefs["extensions.checkUpdateSecurity"] = False
@@ -103,7 +125,7 @@ def main():
             assert previous_manifest["applications"]["zotero"]["id"] == host["id"]
             feed_url = host["update_url"]
             assert feed_url.startswith("https://"), feed_url
-            if args.reject_update:
+            if args.reject_update and not args.local_update:
                 with build_opener(ProxyHandler({})).open(feed_url, timeout=20) as response:
                     feed = json.load(response)
                 published = feed["addons"][host["id"]]["updates"][0]
@@ -128,10 +150,56 @@ def main():
 
                 server = HTTPServer(("127.0.0.1", 0), TestFeed)
                 feed_url = f"http://127.0.0.1:{server.server_port}/update.json"
+        if args.local_update or args.update_center:
+            scenario = args.update_center or args.reject_update or "install"
+            target = xpi
+            target_version = manifest["version"]
+            if args.update_center and scenario not in ("current", "network"):
+                # An acceptance-only different version so the update center itself
+                # runs before the upgrade. The shipped XPI is unchanged.
+                target_version = "99.0.0"
+                target = root / "native-update-fixture.xpi"
+                fixture_manifest = {**manifest, "version": target_version}
+                with ZipFile(xpi) as source:
+                    write_test_package(target, source, fixture_manifest)
+
+            class LocalUpdateFeed(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    requests.append(self.path)
+                    if self.path == "/update.json":
+                        if scenario == "network":
+                            self.send_error(503)
+                            return
+                        payload, mime = feed, "application/json"
+                    elif self.path == "/astermargin.xpi":
+                        payload, mime = package_bytes, "application/x-xpinstall"
+                    else:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+            server = HTTPServer(("127.0.0.1", 0), LocalUpdateFeed)
+            origin = f"http://127.0.0.1:{server.server_port}"
+            feed_url = origin + "/update.json"
+            package_bytes = target.read_bytes()
+            target_hash = hashlib.sha256(package_bytes).hexdigest()
+            feed = json.dumps({"addons": {host["id"]: {"updates": [{
+                "version": target_version,
+                "update_link": origin + "/astermargin.xpi",
+                "update_hash": "sha256:" + ("0" * 64 if scenario == "hash" else target_hash),
+                "update_info_url": f"https://github.com/ryan-gwo/astermargin/releases/tag/v{target_version}",
+                "applications": {"zotero": {
+                    "strict_min_version": host["strict_min_version"],
+                    "strict_max_version": "9.0.*" if scenario == "compatibility" else host["strict_max_version"],
+                }},
+            }]}}}).encode()
+        if args.update_from or args.update_center:
             previous_manifest["applications"]["zotero"]["update_url"] = feed_url
-            with ZipFile(install_path, "w") as patched:
-                for entry in previous_package.infolist():
-                    patched.writestr(entry, json.dumps(previous_manifest) if entry.filename == "manifest.json" else previous_package.read(entry))
+            write_test_package(install_path, previous_package, previous_manifest)
         else:
             shutil.copy2(initial_package, install_path)
     initial_hash = hashlib.sha256(install_path.read_bytes()).hexdigest()
@@ -139,6 +207,10 @@ def main():
     driver_id = "host-smoke@astermargin.local"
     marker = "AsterMargin smoke " + uuid4().hex
     script = Path(__file__).with_name("host_smoke.js").read_text(encoding="utf-8")
+    if args.research_tables or args.local_update:
+        script += Path(__file__).with_name("host_tables.js").read_text(encoding="utf-8")
+    if args.update_center:
+        script += Path(__file__).with_name("host_updates.js").read_text(encoding="utf-8")
     if args.settings_locale:
         script += Path(__file__).with_name("host_settings.js").read_text(encoding="utf-8")
         script += Path(__file__).with_name("host_home.js").read_text(encoding="utf-8")
@@ -147,6 +219,12 @@ def main():
                        "__STOP__": str(root / "finished"), "__MARKER__": marker,
                        "__UPGRADE_XPI__": str(xpi) if args.upgrade_from else None,
                        "__BACKGROUND_UPDATE__": (args.reject_update or "install") if args.update_from else None,
+                       "__UPDATE_CENTER__": args.update_center,
+                       "__UPDATE_FIXTURE_VERSION__": target_version if args.update_center else None,
+                       "__THEME__": args.theme,
+                       "__TEST_TABLES__": args.research_tables,
+                       "__SEED_RESEARCH__": args.local_update,
+                       "__HOST_WORKBOOK__": str(root / "research-table.xlsx"),
                        "__ZOTERO_LOCALE__": args.zotero_locale,
                        "__LOCALE_SAVED__": str(root / "locale-saved"),
                        "__HOME_PDF__": str(fixture),
@@ -196,10 +274,22 @@ def main():
                     assert result["settings"]["hostLocale"] == args.zotero_locale, result
             if args.upgrade_from or args.update_from:
                 assert result["upgradedFrom"] == previous_version, result
-            if args.reject_update:
-                assert requests, "Zotero did not fetch the negative-test update manifest"
+            if args.reject_update or args.local_update or args.update_center:
+                assert "/update.json" in requests, "Zotero did not fetch the test update manifest"
+            expected_hash = initial_hash if args.reject_update else final_hash
+            if args.update_center:
+                assert result["settings"]["updates"]["scenario"] == args.update_center, result
+                expected_hash = target_hash if args.update_center == "manual" else initial_hash
+                downloads = requests.count("/astermargin.xpi")
+                assert downloads == int(args.update_center in ("manual", "hash")), requests
+            if args.local_update:
+                assert all(result["researchData"].values()), result
+            if args.research_tables:
+                with ZipFile(root / "research-table.xlsx") as workbook:
+                    assert workbook.testzip() is None
+                    assert b"Detected" in workbook.read("xl/sharedStrings.xml")
             actual_hash = hashlib.sha256(install_path.read_bytes()).hexdigest()
-            assert actual_hash == (initial_hash if args.reject_update else final_hash), "Installed XPI bytes differed from the expected archive"
+            assert actual_hash == expected_hash, "Installed XPI bytes differed from the expected archive"
             request = Request(f"http://127.0.0.1:{port}/astermargin/mcp",
                 data=json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
                     "name":"search_by_metadata","arguments":{"title_query": marker}}}).encode(),

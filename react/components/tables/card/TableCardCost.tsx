@@ -1,4 +1,7 @@
 import React from 'react';
+import { isLocalMode } from '../../../atoms/localMode';
+import { uiText } from '../../../utils/interfaceText';
+import { localFillSources } from '../localFillText';
 import { useAtomValue } from 'jotai';
 import type { TableCardCost } from '@astermargin/agent-core/protocol/tableCardProtocol';
 import type { TableFillPricing } from '@astermargin/agent-core/protocol/tableFillProtocol';
@@ -60,6 +63,14 @@ export interface TableCardCostBlockProps {
  */
 const TableCardCostBlock: React.FC<TableCardCostBlockProps> = ({ cost, upperBound = false, prices }) => {
     const balance = useCreditBalance();
+    if (isLocalMode()) {
+        return (
+            <div className="table-card-cost display-flex flex-col text-sm font-color-secondary">
+                <span>{localFillSources(cost)}</span>
+                <span>{uiText("Estimated model requests: {count}", { count: cost.documents + cost.title_abstract })}</span>
+            </div>
+        );
+    }
     const reach = upperBound
         ? null
         : balanceLine({
@@ -146,9 +157,11 @@ export const TableCardReceipt: React.FC<TableCardReceiptProps> = ({ cost, upperB
     return (
         <>
             <span className="table-card-receipt">
-                {papers} · <strong>{credits}</strong>
+                {isLocalMode()
+                    ? uiText("Estimated model requests: {count}", { count: cost.documents + cost.title_abstract })
+                    : <>{papers} · <strong>{credits}</strong></>}
             </span>
-            <button
+            {!isLocalMode() && <button
                 ref={buttonRef}
                 type="button"
                 className="table-card-receipt-info"
@@ -159,8 +172,8 @@ export const TableCardReceipt: React.FC<TableCardReceiptProps> = ({ cost, upperB
                 onClick={() => setOpen((value) => !value)}
             >
                 <Icon icon={InformationCircleIcon} />
-            </button>
-            {open && (
+            </button>}
+            {open && !isLocalMode() && (
                 <div
                     ref={popoverRef}
                     id={popoverId}

@@ -119,6 +119,19 @@ describe("editing a table", () => {
             row.cells.n = { outcome: "answered", provenance: "model", value: { kind: "text", text: "1" }, ...(row.documents ? { documents: row.documents } : {}) };
         return spec;
     };
+    it("moves a question column without changing the reference columns or a user answer", () => {
+        const spec = base();
+        spec.columns.push({ id: "method", header: "Method", type: "text" });
+        spec.rows[0].cells.n = { outcome: "answered", provenance: "user", value: { kind: "text", text: "Checked" } };
+        const resolved = { added: [], refreshed: new Map() };
+        const moved = applyEdit(spec, { move_columns: [{ id: "method", after: null }] }, resolved, NOW);
+        if (!moved.ok) throw new Error(moved.message);
+        expect(moved.spec.columns.map(({ id }) => id)).toEqual(["_reference", "_year", "_identifier", "method", "n"]);
+        expect(moved.spec.rows[0].cells.n).toEqual(spec.rows[0].cells.n);
+        expect(applyEdit(spec, { move_columns: [{ id: "n", after: "_year" }] }, resolved, NOW))
+            .toMatchObject({ ok: false, code: "unknown_column" });
+    });
+
     it("adds papers to the items entry, restores a removed paper and merges a known one", () => {
         const removed = applyEdit(base(), { remove_rows: ["r-BBBBBBBB"] }, { added: [], refreshed: new Map() }, NOW);
         if (!removed.ok) throw new Error(removed.message);

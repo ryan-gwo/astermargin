@@ -8,7 +8,7 @@ import {
 import type { WindowRuntime } from "../../src/runtime/instance";
 import type { ThreadPresenceSnapshot } from "../../src/services/threads/threadPresence";
 import { store } from "../store";
-import { recentThreadsAtom } from "../atoms/threads";
+import { recentThreadsAtom, threadScrollPositionsAtom } from "../atoms/threads";
 import {
     threadEntitiesAtom,
     threadViewsAtom,
@@ -68,6 +68,16 @@ export function attachThreadProjection(runtime: WindowRuntime): void {
     });
     const view = () => {
         const id = store.get(currentThreadIdAtom);
+        if (id) {
+            const anchor = instance.runtime.chatScrollPositions?.get(id);
+            store.set(threadScrollPositionsAtom, (positions) => {
+                if (positions[id] === anchor) return positions;
+                const next = { ...positions };
+                if (anchor) next[id] = anchor;
+                else delete next[id];
+                return next;
+            });
+        }
         instance.presence.view(runtime.id, id);
         store.set(
             viewedHistoryRevisionAtom,

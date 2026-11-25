@@ -14,6 +14,9 @@ declare namespace _ZoteroTypes {
       "showHighTokenUsageWarningMessage": boolean;
       "authMethod": string;
       "interfaceLanguage": string;
+      "lastUpdateCheck": string;
+      "requestedUpdateVersion": string;
+      "researchTableFilters": string;
       "keyboardShortcut": string;
       "statefulChat": boolean;
       "addSelectedItemsOnOpen": boolean;

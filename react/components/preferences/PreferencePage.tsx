@@ -19,6 +19,7 @@ import ActionsPreferenceSection from "./ActionsPreferenceSection";
 import BillingSection, { formatPlanName } from "./BillingSection";
 import ApiKeysSection from "./ApiKeysSection";
 import AdvancedSection from "./AdvancedSection";
+import { UpdatesSection } from "./UpdatesSection";
 import { WebDavSettings } from "./WebDavSettings";
 import { OcrSettings } from "./OcrSettings";
 import { SemanticSettings } from "./SemanticSettings";
@@ -370,6 +371,7 @@ const PreferencePage: React.FC = () => {
                                 }
                             />
                         </SettingsGroup>
+                        <UpdatesSection />
                         <SectionLabel>{settingsText("Sidebar")}</SectionLabel>
                         <SettingsGroup>
                             <SettingsRow
