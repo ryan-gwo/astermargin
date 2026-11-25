@@ -1,4 +1,5 @@
 import { uiText } from "../../../utils/interfaceText";
+import { isLocalMode } from "../../../atoms/localMode";
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { tableCardDraftsAtom } from '@astermargin/agent-core/run-state/pendingTableCards';
@@ -78,12 +79,12 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
         const origin = (event.currentTarget as Element).ownerDocument?.defaultView ?? null;
         const open = getHost().navigation?.openTable;
         if (!open) {
-            setOpenMessage('Table provider unavailable.');
+            setOpenMessage(uiText("Table provider unavailable."));
             return;
         }
-        const outcome = await open(request.table.key, origin, { onDownload: () => setOpenMessage('Downloading table…') })
+        const outcome = await open(request.table.key, origin, { onDownload: () => setOpenMessage(uiText("Downloading table…")) })
             .catch(() => ({ error: 'Table provider unavailable.' }));
-        setOpenMessage('error' in outcome ? '' : (outcome.warning ?? ''));
+        setOpenMessage('error' in outcome ? uiText(outcome.error) : (outcome.warning ? uiText(outcome.warning) : ''));
     }, [request.table.key]);
 
     const heldNotice = disabled && heldCaption ? (
@@ -94,7 +95,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
     ) : null;
 
     const stopButton = disabled && onStop && (
-        <Tooltip content="Stop the agent run" showArrow singleLine>
+        <Tooltip content={uiText("Stop the agent run")} showArrow singleLine>
             <Button
                 variant="outline"
                 rightIcon={StopStrokeIcon}
@@ -108,7 +109,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
         </Tooltip>
     );
 
-    const title = request.title || request.table.title || 'Untitled table';
+    const title = request.title || request.table.title || uiText("Untitled table");
     const header = (
         <div className="table-card-header">
             <div className="display-flex flex-row items-start min-w-0" style={{ gap: '0.45rem' }}>
@@ -173,20 +174,22 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                     <div className="flex-1" />
                     <Button
                         variant={hasInstructions ? 'solid' : 'outline'}
-                        ariaLabel={hasInstructions ? 'Decline the fill and send instructions' : uiText("Cancel the fill")}
+                        ariaLabel={uiText(hasInstructions ? "Decline the fill and send instructions" : "Cancel the fill")}
                         onClick={() => decide(false)}
                         disabled={locked}
                         className="flex-none whitespace-nowrap"
                         style={{ padding: hasInstructions ? '3px 8px' : '2px 6px' }}
                     >
-                        {hasInstructions ? 'Send' : 'Cancel fill'}
+                        {uiText(hasInstructions ? "Send" : "Cancel fill")}
                     </Button>
                 </div>
             </div>
         );
     }
 
-    const runLabel = fillActionLabel(request);
+    const runLabel = isLocalMode()
+        ? uiText("Fill {count} rows", { count: request.cost.documents + request.cost.title_abstract })
+        : fillActionLabel(request);
     return (
         <div className="user-message-display table-card" role="group" aria-label={uiText("Proposed fill")} aria-live="assertive">
             <div className="table-card-top">{header}</div>
@@ -231,7 +234,7 @@ export const TableFillCard: React.FC<TableFillCardProps> = ({ request, onSubmit,
                 <div className="flex-1" />
                 <Button
                     variant="solid"
-                    ariaLabel={`${runLabel} items`}
+                    ariaLabel={runLabel}
                     onClick={() => decide(true)}
                     disabled={locked}
                     title={disabled ? heldCaption : undefined}

@@ -65,8 +65,10 @@ async function probe() {
         let addon = await readyAddon();
         let upgradedFrom;
         let backgroundUpdate;
+        let researchData;
         if (__UPGRADE_XPI__ || __BACKGROUND_UPDATE__) {
             upgradedFrom = addon.pluginVersion;
+            const seed = __SEED_RESEARCH__ ? await seedResearchData(addon) : null;
             const { AddonManager } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
             const spacing = "extensions.zotero.astermargin.chatLineSpacing";
             const language = "extensions.zotero.astermargin.interfaceLanguage";
@@ -81,6 +83,7 @@ async function probe() {
                 backgroundUpdate = await nativeBackgroundUpdate(AddonManager, __BACKGROUND_UPDATE__, addon);
                 if (__BACKGROUND_UPDATE__ === "install") addon = await readyAddon(addon);
             }
+            if (seed) researchData = await verifyResearchData(addon, seed);
             if (Zotero.Prefs.get(spacing, true) !== "spacious" ||
                 Zotero.Prefs.get(language, true) !== previousLanguage) {
                 throw Error("Update lost an existing preference");
@@ -98,8 +101,15 @@ async function probe() {
         const sidebar = win.document.getElementById("astermargin-react-root-sidebar")?.innerText;
         const item = new Zotero.Item("journalArticle");
         item.setField("title", __MARKER__);
+        item.setField("abstractNote", "An abstract used when this fixture has no readable attachment.");
         await item.saveTx();
         const settings = __SETTINGS_LOCALE__ ? await inspectSettings(__SETTINGS_LOCALE__, __ZOTERO_LOCALE__ || __SETTINGS_LOCALE__) : null;
+        if (addon !== Zotero.AsterMargin) {
+            addon = Zotero.AsterMargin;
+            win.document.getElementById("zotero-astermargin-tb-chat-toggle").doCommand();
+            await sleep(500);
+        }
+        const tables = __TEST_TABLES__ ? await inspectResearchTable(item) : null;
         const home = settings ? await inspectHome(__SETTINGS_LOCALE__, item) : null;
         const quick = await addon.runtime.dispatchWindowCommand("/astermargin/test/quick-prompt", {toggle:true});
         const opened = await addon.runtime.dispatchWindowCommand("/astermargin/test/astermargin-window", {open:true});
@@ -110,6 +120,8 @@ async function probe() {
         if (home) result.home = home;
         if (upgradedFrom) result.upgradedFrom = upgradedFrom;
         if (backgroundUpdate) result.backgroundUpdate = backgroundUpdate;
+        if (researchData) result.researchData = researchData;
+        if (tables) result.tables = tables;
     } catch (error) {
         result = {error:String(error), stack:error.stack};
     }

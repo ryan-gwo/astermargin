@@ -254,7 +254,7 @@ const ThreadListView: React.FC<ThreadListViewProps> = ({ isWindow: _isWindow }) 
                 className={`thread-list-item ${isEditing ? 'thread-list-item-editing' : ''} ${isHovered ? 'thread-list-item-hovered' : ''}`}
                 role={isEditing ? undefined : 'button'}
                 tabIndex={isEditing ? undefined : 0}
-                aria-label={isEditing ? undefined : `${threadName}, ${formatTimeAgo(thread.updatedAt)}${isCurrent ? `, ${uiText("current chat")}` : ''}${thread.isPinned ? `, ${uiText("pinned")}` : ''}${thread.awaitingInput ? `, ${awaitingInputLabel(thread.awaitingInput).toLowerCase()}` : ''}${isForeign ? `, ${uiText(FOREIGN_THREAD_TITLE)}` : ''}`}
+                aria-label={isEditing ? undefined : `${threadName}, ${formatTimeAgo(thread.updatedAt)}${isCurrent ? `, ${uiText("current chat")}` : ''}${thread.isPinned ? `, ${uiText("pinned")}` : ''}${thread.awaitingInput ? `, ${awaitingInputLabel(thread.awaitingInput, uiText)}` : ''}${isForeign ? `, ${uiText(FOREIGN_THREAD_TITLE)}` : ''}`}
                 onClick={() => {
                     if (!isEditing) {
                         handleSelectThread(thread);

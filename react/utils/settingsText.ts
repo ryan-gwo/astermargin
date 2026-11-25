@@ -2,12 +2,85 @@ import { interfaceLocale } from "../../src/utils/interfaceLanguage";
 
 // Settings messages use English as their source key. Keep both Chinese translations with each key.
 const messages = {
+    Updates: ["更新", "更新"],
+    "Current version {version}": ["当前版本 {version}", "目前版本 {version}"],
+    "Stable channel": ["稳定版渠道", "穩定版管道"],
+    "Last manual check {time}": [
+        "上次手动检查于 {time}",
+        "上次手動檢查於 {time}",
+    ],
+    "No manual checks yet": ["尚未手动检查", "尚未手動檢查"],
+    "Automatic updates": ["自动更新", "自動更新"],
+    "Use Zotero to install stable updates automatically.": [
+        "通过 Zotero 自动安装稳定版更新。",
+        "透過 Zotero 自動安裝穩定版更新。",
+    ],
+    "Following Zotero default (on)": [
+        "跟随 Zotero 默认设置（开启）",
+        "跟隨 Zotero 預設設定（開啟）",
+    ],
+    "Following Zotero default (off)": [
+        "跟随 Zotero 默认设置（关闭）",
+        "跟隨 Zotero 預設設定（關閉）",
+    ],
+    "On for AsterMargin": ["星笺已开启自动更新", "星箋已開啟自動更新"],
+    "Off for AsterMargin": ["星笺已关闭自动更新", "星箋已關閉自動更新"],
+    "Follow Zotero default": ["跟随 Zotero 默认设置", "跟隨 Zotero 預設設定"],
+    "Background update checks are disabled in Zotero.": [
+        "Zotero 已关闭后台检查更新。",
+        "Zotero 已關閉背景檢查更新。",
+    ],
+    "Check for updates": ["检查更新", "檢查更新"],
+    "Checking for updates…": ["正在检查更新…", "正在檢查更新…"],
+    "No compatible update is available.": [
+        "没有可用的兼容更新。",
+        "目前沒有相容的更新。",
+    ],
+    "Version {version} is available": [
+        "可更新至 {version}",
+        "可更新至 {version}",
+    ],
+    "Released {date}": ["发布于 {date}", "發布於 {date}"],
+    "Release date unavailable": ["暂无发布日期", "暫無發布日期"],
+    "Release summary unavailable.": [
+        "暂时无法获取更新摘要。",
+        "暫時無法取得更新摘要。",
+    ],
+    "View release notes": ["查看发布说明", "查看發布說明"],
+    "Update now": ["立即更新", "立即更新"],
+    "Installing update…": ["正在安装更新…", "正在安裝更新…"],
+    "Update installed.": ["更新已安装。", "更新已安裝。"],
+    "Restart Zotero to finish installing the update.": [
+        "请重启 Zotero 以完成更新。",
+        "請重新啟動 Zotero 以完成更新。",
+    ],
+    "Could not check for updates. Try again.": [
+        "检查更新失败，请重试。",
+        "檢查更新失敗，請重試。",
+    ],
+    "Could not install the update. Check for updates again.": [
+        "安装更新失败，请重新检查更新。",
+        "安裝更新失敗，請重新檢查更新。",
+    ],
+    "The update file failed verification. Check for updates again.": [
+        "更新安装包校验失败，请重新检查更新。",
+        "更新安裝套件驗證失敗，請重新檢查更新。",
+    ],
+    "Could not change automatic updates.": [
+        "无法更改自动更新设置。",
+        "無法變更自動更新設定。",
+    ],
+    "Zotero update controls are unavailable.": [
+        "暂时无法访问 Zotero 的更新设置。",
+        "暫時無法存取 Zotero 的更新設定。",
+    ],
     "Interface language": ["界面语言", "介面語言"],
     "Follow Zotero": ["跟随 Zotero", "跟隨 Zotero"],
-    "Choose the language of AsterMargin. Changes apply after restarting Zotero.": [
-        "选择星笺的界面语言。重启 Zotero 后生效。",
-        "選擇星箋的介面語言。重新啟動 Zotero 後生效。",
-    ],
+    "Choose the language of AsterMargin. Changes apply after restarting Zotero.":
+        [
+            "选择星笺的界面语言。重启 Zotero 后生效。",
+            "選擇星箋的介面語言。重新啟動 Zotero 後生效。",
+        ],
     "Language saved. Restart Zotero to apply it.": [
         "语言已保存。重启 Zotero 后生效。",
         "語言已儲存。重新啟動 Zotero 後生效。",
@@ -312,10 +385,10 @@ const messages = {
             "允许模型检索库外的已发表研究。查询词会发送到 OpenAlex 和 Semantic Scholar。",
             "允許模型檢索庫外的已發表研究。查詢詞會傳送至 OpenAlex 和 Semantic Scholar。",
         ],
-    "Optional. Without a key, OpenAlex allows only a small daily search budget and may refuse requests once it's spent. A free key raises that.":
+    "An OpenAlex key raises your search allowance and lets AsterMargin try a cached open-access PDF if Zotero cannot fetch one. Downloads use your OpenAlex allowance.":
         [
-            "可选。未配置密钥时，OpenAlex 的每日检索额度较低，用尽后可能拒绝请求。免费密钥可提高额度。",
-            "選填。未設定金鑰時，OpenAlex 的每日檢索額度較低，用完時可能拒絕請求。免費金鑰可提高額度。",
+            "OpenAlex 密钥可提高检索额度。若 Zotero 无法获取 PDF，星笺会尝试下载 OpenAlex 缓存的开放获取版本。下载计入 OpenAlex 用量。",
+            "OpenAlex 金鑰可提高搜尋額度。若 Zotero 無法取得 PDF，星箋會嘗試下載 OpenAlex 快取的開放取用版本。下載計入 OpenAlex 用量。",
         ],
     "OpenAlex API key": ["OpenAlex API 密钥", "OpenAlex API 金鑰"],
     "Optional. Raises Semantic Scholar's shared rate limit for these requests.":

@@ -1,4 +1,5 @@
-import React from 'react';
+import React from "react";
+import { uiText } from "../utils/interfaceText";
 import Tooltip from '@astermargin/agent-ui/primitives/Tooltip';
 import { awaitingInputLabel, type AwaitingInput } from '../../src/services/threads/awaitingInput';
 
@@ -8,7 +9,7 @@ import { awaitingInputLabel, type AwaitingInput } from '../../src/services/threa
  * the row's label carries the same text.
  */
 const AwaitingInputDot: React.FC<{ awaiting: AwaitingInput }> = ({ awaiting }) => (
-    <Tooltip content={awaitingInputLabel(awaiting)} singleLine anchorDisplay="inline-flex">
+    <Tooltip content={awaitingInputLabel(awaiting, uiText)} singleLine anchorDisplay="inline-flex">
         <span className="thread-awaiting-input" aria-hidden="true">
             <span className="thread-awaiting-input-dot" />
         </span>

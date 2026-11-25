@@ -1,5 +1,6 @@
 import { resolveChatWindow } from './navigation';
 import { restoreReaderSidebarWidthHandler } from './readerWidth';
+import type { ScrollAnchor } from '../../react/utils/scrollAnchor';
 /** Window handles are registered only for the lifetime of their renderer. */
 export interface WindowRuntime {
     readonly id: string;
@@ -33,6 +34,8 @@ function embedderWindow(win: Window): Window | undefined {
 export class AsterMarginInstance {
     /** Singleton handle also covers the interval before its renderer attaches. */
     standaloneWindow?: Window;
+    /** Last reading position per thread, shared by this instance's chat windows. */
+    readonly chatScrollPositions = new Map<string, ScrollAnchor>();
     private windows = new Map<Window, WindowRuntime>();
     private nextId = 0;
     private readonly idPrefix = `main-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;

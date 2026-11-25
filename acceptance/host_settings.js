@@ -309,8 +309,10 @@ async function inspectSettings(locale, hostLocale) {
         () => doc.getElementById("astermargin-preferences-panel"),
         "preferences panel",
     );
-    const title = doc.documentElement.getAttribute("title");
-    requireCopy(title, [expected.title], "window title");
+    const title = await waitFor(() => {
+        const value = doc.documentElement.getAttribute("title");
+        return value?.includes(expected.title) ? value : null;
+    }, "localized preferences window title");
     const sections = {};
     const tab = (id) => doc.getElementById("astermargin-preferences-tab-" + id);
     const button = (label) =>
@@ -335,7 +337,10 @@ async function inspectSettings(locale, hostLocale) {
             id + " content",
         );
         sections[id] = copyOf(panel);
-        requireCopy(sections[id], expected[id], id);
+        const expectedCopy = id === "models" && __SEED_RESEARCH__
+            ? [...expected.models.slice(0, -1), "Isolated provider", "fixture-model"]
+            : expected[id];
+        requireCopy(sections[id], expectedCopy, id);
 
         if (id === "permissions") {
             button(expected.permissions[2]).click();
@@ -391,9 +396,25 @@ async function inspectSettings(locale, hostLocale) {
             requireCopy(sections.editor, expected.editor, "action editor");
         }
     }
-    win.close();
+    tab("general").click();
+    if (Services.vc.compare(Zotero.AsterMargin.pluginVersion, "0.1.7") >= 0) {
+        const check = await waitFor(
+            () => doc.getElementById("astermargin-check-updates"),
+            "AsterMargin update center",
+        );
+        const updateButton = { "en-US": "Check for updates", "zh-CN": "检查更新", "zh-TW": "檢查更新" }[locale];
+        const automaticToggle = { "en-US": "Automatic updates", "zh-CN": "自动更新", "zh-TW": "自動更新" }[locale];
+        requireCopy(check.textContent, [updateButton], "update check button");
+        requireCopy(copyOf(panel), [automaticToggle], "automatic updates");
+    }
+    const dark = win.matchMedia("(prefers-color-scheme: dark)").matches;
+    if (__THEME__ && dark !== (__THEME__ === "dark")) throw Error("Unexpected settings theme");
+    const updates = __UPDATE_CENTER__ ? await inspectUpdates(win, locale, __UPDATE_CENTER__, __UPDATE_FIXTURE_VERSION__) : null;
+    if (!win.closed) win.close();
     return {
         locale,
+        theme: dark ? "dark" : "light",
+        updates,
         hostLocale,
         title,
         native: nativeCopy.trim(),

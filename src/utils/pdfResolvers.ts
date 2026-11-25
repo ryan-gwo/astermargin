@@ -13,6 +13,7 @@ export interface PdfFetchOptions {
      * pdf_candidates feature.
      */
     pdfCandidates?: PdfCandidate[];
+    openAlexWorkId?: string;
     openAccessUrl?: string;
     fallbackUrl?: string;
     fileAvailable?: boolean;

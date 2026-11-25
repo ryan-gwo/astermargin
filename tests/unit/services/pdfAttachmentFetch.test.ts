@@ -105,6 +105,32 @@ it.each(['scope', 'account', 'deleted', 'cancelled'])('rechecks %s after waiting
     expect(remove).toHaveBeenCalled();
 });
 
+it('uses the cached PDF when Zotero throws, and saves it with its source URL', async () => {
+    const diagnostics = createPdfFetchDiagnostics();
+    const url = 'https://content.openalex.org/works/W123.pdf';
+    download.mockRejectedValueOnce(new Error('Resolver failed'));
+    const fallback = vi.fn(async () => {
+        diagnostics.recordSourceAttempt('openalex_content', 'content.openalex.org');
+        return { directory: '/tmp/cache-pdf', path: '/tmp/cache-pdf/file.pdf', mimeType: 'application/pdf', url, accessMethod: 'openalex_content' };
+    });
+    await expect(fetchPdfAttachment(parent, [{}], controller.signal, assertAccess, diagnostics, fallback))
+        .resolves.toMatchObject({ accessMethod: 'openalex_content', attachment: { key: 'PDFKEYAA' } });
+    expect(fallback).toHaveBeenCalledOnce();
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({ url }));
+    expect(diagnostics.attempts()).toEqual([{ accessMethod: 'openalex_content', host: 'content.openalex.org', outcome: 'ok' }]);
+});
+
+it('does not try the cached copy after library access is revoked', async () => {
+    download.mockImplementationOnce(() => {
+        allowed = false;
+        throw new Error('Resolver failed');
+    });
+    const fallback = vi.fn();
+    await expect(fetchPdfAttachment(parent, [{}], controller.signal, assertAccess, undefined, fallback))
+        .rejects.toThrow('Access revoked');
+    expect(fallback).not.toHaveBeenCalled();
+});
+
 it('uses a PDF attached during download instead of saving a duplicate', async () => {
     const existing = { key: 'EXISTING', deleted: false, isAttachment: () => true, attachmentContentType: 'application/pdf' };
     parent.getAttachments.mockReturnValue([2]);

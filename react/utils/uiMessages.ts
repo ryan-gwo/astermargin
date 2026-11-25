@@ -1,5 +1,106 @@
 // Shared copy for chat, tables and library actions. English is the source text.
 const messages = {
+    "Waiting for your answers to {count} questions": [
+        "等待你回答 {count} 个问题",
+        "等待你回答 {count} 個問題",
+    ],
+    "Waiting for {count} approvals": [
+        "还有 {count} 项待批准",
+        "還有 {count} 項待核准",
+    ],
+    "Waiting for you to confirm {count} tables": [
+        "等待你确认 {count} 张表格",
+        "等待你確認 {count} 張表格",
+    ],
+    "{count} papers in the research table": [
+        "表格包含 {count} 篇文献",
+        "表格包含 {count} 篇文獻",
+    ],
+    "Full text for {count} items": ["全文 {count} 篇", "全文 {count} 篇"],
+    "Title and abstract for {count} items": [
+        "标题和摘要 {count} 篇",
+        "標題和摘要 {count} 篇",
+    ],
+    "{count} items without readable sources": [
+        "{count} 篇缺少可读来源",
+        "{count} 篇缺少可讀來源",
+    ],
+    "Stopping with {count} rows still processing…": [
+        "正在停止，还有 {count} 行正在处理…",
+        "正在停止，仍有 {count} 列處理中…",
+    ],
+    "Stop · {done}/{total} rows": [
+        "停止 · {done}/{total} 行",
+        "停止 · {done}/{total} 列",
+    ],
+    "Model requests made: {count}": [
+        "已发出 {count} 次模型请求",
+        "已送出 {count} 次模型請求",
+    ],
+    "Estimated model requests: {count}": [
+        "预计 {count} 次模型请求",
+        "預計 {count} 次模型請求",
+    ],
+    "Fill {count} rows": ["填充 {count} 行", "填寫 {count} 列"],
+    "Fill {count} cells": ["填充 {count} 个单元格", "填寫 {count} 個儲存格"],
+    "Filled {count} rows": ["已填充 {count} 行", "已填寫 {count} 列"],
+    "{count} rows failed": ["{count} 行失败", "{count} 列失敗"],
+    "{count} rows could not be saved": [
+        "{count} 行未能保存",
+        "{count} 列未能儲存",
+    ],
+    "The model endpoint could not finish the fill.": [
+        "模型端点未能完成填充。",
+        "模型端點無法完成填寫。",
+    ],
+    "Fill stopped after {done}/{total} rows": [
+        "处理 {done}/{total} 行后已停止",
+        "處理 {done}/{total} 列後已停止",
+    ],
+    "Showing the row that couldn't be read": [
+        "正在显示无法读取的行",
+        "正在顯示無法讀取的列",
+    ],
+    "Showing the {count} rows that couldn't be read": [
+        "正在显示 {count} 个无法读取的行",
+        "正在顯示 {count} 個無法讀取的列",
+    ],
+    "Retry {count} failed rows": [
+        "重试 {count} 个失败行",
+        "重試 {count} 個失敗列",
+    ],
+    "Trial fill on {count} rows": ["试填 {count} 行", "試填 {count} 列"],
+    "Select rows first": ["请先选择行", "請先選取列"],
+    "Table provider unavailable.": [
+        "表格服务暂不可用。",
+        "表格服務暫時無法使用。",
+    ],
+    "Downloading table…": ["正在下载表格…", "正在下載表格…"],
+    "Decline the fill and send instructions": [
+        "拒绝填充并发送指令",
+        "拒絕填寫並傳送指示",
+    ],
+    "Cancel fill": ["取消填充", "取消填寫"],
+    "Move left": ["向左移动", "向左移動"],
+    "Move right": ["向右移动", "向右移動"],
+    "Moved column “{column}”": ["移动列「{column}」", "移動欄「{column}」"],
+    Filtered: ["已筛选", "已篩選"],
+    "Clear filter": ["清除筛选", "清除篩選"],
+    "Clear all filters": ["清除所有筛选", "清除所有篩選"],
+    "Remove the filter on {column}": [
+        "清除「{column}」的筛选条件",
+        "清除「{column}」的篩選條件",
+    ],
+    "Column menu: {column}": ["「{column}」列菜单", "「{column}」欄選單"],
+    "Original order": ["原始顺序", "原始順序"],
+    "Has a value": ["有值", "有值"],
+    "No value": ["无值", "無值"],
+    Yes: ["是", "是"],
+    No: ["否", "否"],
+    "No rows match the search or filters": [
+        "没有符合搜索或筛选条件的行",
+        "沒有符合搜尋或篩選條件的列",
+    ],
     "Select Collections": ["选择分类", "選擇分類"],
     "Collections in {library}": [
         "「{library}」中的分类",
@@ -866,7 +967,6 @@ const messages = {
     "Previous 30 Days": ["过去 30 天", "過去 30 天"],
     Older: ["更早", "更早"],
     "Fill {count}": ["填充 {count} 项", "填寫 {count} 項"],
-    "Fill {count} rows": ["填充 {count} 行", "填寫 {count} 列"],
     "Fill {count} item": ["填充 {count} 个条目", "填寫 {count} 個項目"],
     "Fill {count} items": ["填充 {count} 个条目", "填寫 {count} 個項目"],
     "Stop · {done}/{total}": ["停止 · {done}/{total}", "停止 · {done}/{total}"],

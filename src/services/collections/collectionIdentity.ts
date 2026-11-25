@@ -113,7 +113,7 @@ export function serializeCollectionAncestors(collection: Zotero.Collection): Col
     while (parentKey) {
         if (seen.has(parentKey) || ancestors.length >= MAX_COLLECTION_DEPTH) return undefined;
         seen.add(parentKey);
-        const parent = Zotero.Collections.getByLibraryAndKey(collection.libraryID, parentKey);
+        const parent: Zotero.Collection | false = Zotero.Collections.getByLibraryAndKey(collection.libraryID, parentKey);
         if (!parent || parent.deleted) return undefined;
         ancestors.push({
             collection_key: parent.key,

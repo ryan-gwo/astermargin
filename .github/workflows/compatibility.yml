@@ -1,0 +1,86 @@
+name: Zotero compatibility
+
+on:
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    package:
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci
+            - run: npm run build
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: compatibility-xpi
+                  path: dist/astermargin.xpi
+
+    zotero:
+        needs: package
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - { os: macos-15, platform: mac, version: 7.0.32 }
+                    - { os: macos-15, platform: mac, version: 8.0.5 }
+                    - { os: macos-15, platform: mac, version: 9.0.6 }
+                    - { os: macos-15, platform: mac, version: 10.0.9 }
+                    - {
+                          os: ubuntu-24.04,
+                          platform: linux-x86_64,
+                          version: 7.0.32,
+                      }
+                    - {
+                          os: ubuntu-24.04,
+                          platform: linux-x86_64,
+                          version: 8.0.4,
+                      }
+                    - {
+                          os: ubuntu-24.04,
+                          platform: linux-x86_64,
+                          version: 9.0.6,
+                      }
+                    - {
+                          os: ubuntu-24.04,
+                          platform: linux-x86_64,
+                          version: 10.0.8,
+                      }
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 12
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/download-artifact@v4
+              with:
+                  name: compatibility-xpi
+                  path: dist
+            - name: Run with an isolated Zotero profile
+              shell: bash
+              env:
+                  ZOTERO_VERSION: ${{ matrix.version }}
+                  DOWNLOAD_PLATFORM: ${{ matrix.platform }}
+              run: |
+                  set -euo pipefail
+                  zotero_test_dir="$(mktemp -d)"
+                  curl --fail --location --retry 2 --output "$zotero_test_dir/download" \
+                    "https://www.zotero.org/download/client/dl?channel=release&platform=$DOWNLOAD_PLATFORM&version=$ZOTERO_VERSION"
+                  if [[ "$DOWNLOAD_PLATFORM" == mac ]]; then
+                    mkdir "$zotero_test_dir/mount"
+                    hdiutil attach -readonly -nobrowse -mountpoint "$zotero_test_dir/mount" "$zotero_test_dir/download"
+                    trap 'hdiutil detach "$zotero_test_dir/mount"' EXIT
+                    python3 acceptance/host_smoke.py "$zotero_test_dir/mount/Zotero.app" dist/astermargin.xpi --settings-locale en-US
+                  else
+                    sudo apt-get update
+                    sudo apt-get install -y xvfb libgtk-3-0t64 libdbus-glib-1-2 libasound2t64
+                    tar -xf "$zotero_test_dir/download" -C "$zotero_test_dir"
+                    zotero_path="$(find "$zotero_test_dir" -maxdepth 2 -type f -name zotero -print -quit)"
+                    test -n "$zotero_path"
+                    xvfb-run -a python3 acceptance/host_smoke.py "$zotero_path" dist/astermargin.xpi --settings-locale en-US
+                  fi

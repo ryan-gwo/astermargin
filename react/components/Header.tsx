@@ -119,7 +119,7 @@ const Header: React.FC<HeaderProps> = ({ onClose, isWindow = false }) => {
                         )}
                         {/* Open in separate window */}
                         {!isWindow && showStatus && (
-                            <Tooltip content="Open in separate window" secondaryContent={openWindowShortcut} showArrow singleLine>
+                            <Tooltip content={uiText("Open in separate window")} secondaryContent={openWindowShortcut} showArrow singleLine>
                                 <IconButton
                                     icon={PictureInPictureIcon}
                                     onClick={() => openAsterMarginWindow()}

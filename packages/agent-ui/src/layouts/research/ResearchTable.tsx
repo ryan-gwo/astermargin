@@ -1,11 +1,13 @@
 import { uiText } from "../../host/uiText";
 import React, { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { isColumnSortable, toPlainText, type Column, type Row, type TableSort, type TableSpec } from "@astermargin/agent-core/layouts/table";
+import { isColumnSortable, toPlainText, type Column, type Filter, type Row, type TableSort, type TableSpec } from "@astermargin/agent-core/layouts/table";
 import { cellsToFill } from "@astermargin/agent-core/layouts/tableFill";
 import { addColumnBlockedReason } from "@astermargin/agent-core/layouts/tableMutations";
 import type { TableFillCells } from "@astermargin/agent-core/protocol/tableFillProtocol";
 import {
     ArrowDownIcon,
+    ArrowLeftIcon,
+    ArrowRightIcon,
     ArrowUpIcon,
     CancelIcon,
     CheckmarkCircleIcon,
@@ -35,12 +37,22 @@ import MenuButton from "../../primitives/MenuButton";
 import ContextMenu, { type MenuItem, type MenuPosition } from "../../primitives/ContextMenu";
 import { HoverLayerProvider, selectionWithin } from "../../primitives/HoverLayer";
 import { FindQueryProvider } from "../../chat/findContext";
-import { buildFilterMenu, buildSortMenu, FilterChips } from "../tableMenus";
+import { buildFilterMenu, buildSortMenu, columnFilterItems, FilterChips } from "../tableMenus";
 import { renderPlainText, type TableDensity, type TextRenderer } from "../tableView";
 import { useTableState } from "../useTableState";
 import { CellEditor, editsAsList, type CellEditInput } from "./CellEditor";
 import { CellInspector, type CellActionControls } from "./CellInspector";
-import { cellFill, isNewRow, PAPER_HEADER, researchColumns, rowFills, sortOrderLabel, type TableDocuments } from "./cellModel";
+import {
+    cellFill,
+    isNewRow,
+    moveAfter,
+    PAPER_HEADER,
+    researchColumns,
+    rowFills,
+    sortOrderLabel,
+    type ColumnDrop,
+    type TableDocuments,
+} from "./cellModel";
 import { EmptyTableGuide } from "./EmptyTableGuide";
 import { ResearchGrid, type CellAddress } from "./ResearchGrid";
 import { AnchoredPopover, InlineText } from "./TableEditing";
@@ -80,6 +92,13 @@ export interface ResearchTableEditing {
     onAddColumn?(): void;
     onChangeType?(column: Column, type: ResearchColumnType): void;
     onRemoveColumn?(column: Column): void;
+    /**
+     * Moves a question column: the column menu's Move left and Move right,
+     * and dragging its header. It goes just after the question column
+     * `after`, or with null before every other question. The paper and the
+     * year keep their places.
+     */
+    onMoveColumn?(column: Column, after: string | null): void;
     /** The sources popover's content, opened from the sources chip. */
     renderSources?(close: () => void): React.ReactNode;
     /** The new-papers notice's Add. */
@@ -205,6 +224,8 @@ export interface ResearchTableProps {
     onActivity?: () => void;
     /** Show only these rows (a fill's failed rows). */
     onlyRows?: ReadonlySet<string> | null;
+    initialFilters?: Filter[];
+    onFiltersChange?(filters: Filter[]): void;
     /** More actions: each is offered when its callback is present. */
     onCopy?: (text: string) => void;
     /**
@@ -281,6 +302,8 @@ export function ResearchTable({
     banner,
     onActivity,
     onlyRows,
+    initialFilters,
+    onFiltersChange,
     onCopy,
     onExport,
     onShowInLibrary,
@@ -306,7 +329,7 @@ export function ResearchTable({
         () => [columns.paper?.id, columns.year?.id].filter((id): id is string => !!id),
         [columns],
     );
-    const state = useTableState(table, { density: "cozy", onlyRows, alwaysShown });
+    const state = useTableState(table, { density: "cozy", onlyRows, alwaysShown, initialFilters, onFiltersChange });
     // The toolbar's menus and chips name the paper column as its header does.
     const menuTable = useMemo(
         () =>
@@ -521,9 +544,41 @@ export function ResearchTable({
         [state, columns.year],
     );
 
+    // Moves a question column beside another one in view.
+    const moveColumn = useMemo(() => {
+        if (!editing?.onMoveColumn || editing.disabledReason) return undefined;
+        const onMoveColumn = editing.onMoveColumn;
+        return (columnId: string, drop: ColumnDrop) => {
+            const column = columns.questions.find((candidate) => candidate.id === columnId);
+            if (column) onMoveColumn(column, moveAfter(columns.questions, columnId, drop));
+        };
+    }, [editing?.onMoveColumn, editing?.disabledReason, columns.questions]);
+    const shownQuestions = useMemo(
+        () => columns.questions.filter((column) => !state.hiddenColumns.has(column.id)),
+        [columns.questions, state.hiddenColumns],
+    );
+
+    // A category or yes/no column's Filter submenu: its choices, then Clear
+    // filter while one is active.
+    const filterEntry = useCallback(
+        (column: Column): MenuItem[] => {
+            const choices = columnFilterItems(table, column, state);
+            if (choices.length === 0) return [];
+            const submenu = state.filters.some((filter) => filter.column_id === column.id)
+                ? [
+                      ...choices,
+                      { label: "", isDivider: true, onClick: () => {} },
+                      { label: uiText("Clear filter"), icon: CancelIcon, onClick: () => state.clearFilter(column.id) },
+                  ]
+                : choices;
+            return [{ label: uiText("Filter"), icon: FilterIcon, onClick: () => {}, submenu }];
+        },
+        [table, state],
+    );
+
     // A column's menu. The paper's and the year's offer only the sort; a
     // question's has its edits (when the host makes them), then the view's
-    // own Sort and Hide.
+    // own Sort, Filter and Hide, and Move left and right.
     const columnMenu = useCallback(
         (column: Column): MenuItem[] => {
             if (column === columns.paper || column === columns.year) return sortEntries(column);
@@ -541,8 +596,26 @@ export function ResearchTable({
                 });
             }
             if (items.length) items.push({ label: "", isDivider: true, onClick: () => {} });
-            items.push(...sortEntries(column));
+            items.push(...sortEntries(column), ...filterEntry(column));
             items.push({ label: uiText("Hide column"), icon: ViewIcon, onClick: () => state.toggleColumn(column.id) });
+            if (editing?.onMoveColumn) {
+                // Beside the neighbouring columns in view, past any hidden between.
+                const at = shownQuestions.indexOf(column);
+                items.push(
+                    {
+                        label: uiText("Move left"),
+                        icon: ArrowLeftIcon,
+                        disabled: disabled || at <= 0,
+                        onClick: () => moveColumn?.(column.id, { before: shownQuestions[at - 1].id }),
+                    },
+                    {
+                        label: uiText("Move right"),
+                        icon: ArrowRightIcon,
+                        disabled: disabled || at === -1 || at >= shownQuestions.length - 1,
+                        onClick: () => moveColumn?.(column.id, { after: shownQuestions[at + 1].id }),
+                    },
+                );
+            }
             if (editing?.onChangeType) {
                 const current = COLUMN_TYPE_LABELS.find((entry) => entry.type === column.type);
                 items.push({
@@ -574,7 +647,7 @@ export function ResearchTable({
             }
             return items;
         },
-        [editing, state, fill, fillable, columns, sortEntries],
+        [editing, state, fill, fillable, columns, sortEntries, filterEntry, moveColumn, shownQuestions],
     );
     const hiddenQuestions = columns.questions.filter((column) => state.hiddenColumns.has(column.id));
 
@@ -1079,6 +1152,7 @@ export function ResearchTable({
                                     onSelectCell={onSelectCell}
                                     rowMenuItems={rowMenu}
                                     columnMenuItems={columnMenu}
+                                    onMoveColumn={moveColumn}
                                     onAddColumn={editing?.onAddColumn}
                                     addColumnDisabledReason={addColumnDisabled}
                                     onEditCell={cellEditing ? openEditor : undefined}
@@ -1094,7 +1168,7 @@ export function ResearchTable({
                                     addedColumns={addedColumns}
                                     virtualize={virtualize}
                                     emptyText="No items yet"
-                                    filteredEmptyText="No rows match the search or filters"
+                                    filteredEmptyText={uiText("No rows match the search or filters")}
                                     emptyContent={items === 0 ? startGuide : null}
                                     columnsGuide={items > 0 ? startGuide : null}
                                 />

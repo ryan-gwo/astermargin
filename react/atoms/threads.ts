@@ -182,6 +182,9 @@ export const currentThreadScrollPositionAtom = atom(
         if (!threadId) {
             return;
         }
+        const shared = Zotero.AsterMargin?.runtime?.chatScrollPositions;
+        if (anchor) shared?.set(threadId, anchor);
+        else shared?.delete(threadId);
         set(threadScrollPositionsAtom, (prevPositions) => {
             const nextPositions = { ...prevPositions };
             if (anchor === null) {

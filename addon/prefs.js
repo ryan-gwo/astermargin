@@ -10,6 +10,9 @@ pref("authMethod", "otp");
 
 // App settings
 pref("interfaceLanguage", "auto");
+pref("lastUpdateCheck", "");
+pref("requestedUpdateVersion", "");
+pref("researchTableFilters", "{}");
 pref("keyboardShortcut", "y");
 pref("statefulChat", true);
 pref("addSelectedItemsOnOpen", true);

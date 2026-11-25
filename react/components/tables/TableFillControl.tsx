@@ -29,6 +29,8 @@ import { isImeKeyEvent } from '@astermargin/agent-ui/primitives/ime';
 import MenuButton from '@astermargin/agent-ui/primitives/MenuButton';
 import type { MenuItem } from '@astermargin/agent-ui/primitives/ContextMenu';
 import type { TableRef } from '../../../src/services/artifacts/tableItemIdentity';
+import { isLocalMode } from '../../atoms/localMode';
+import { localFillProgress, localFillResult, localFillSources } from './localFillText';
 import { getWindowRuntime } from '../../runtime/windowRuntime';
 
 /**
@@ -230,7 +232,9 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
         [popover, tableRef.libraryID, tableRef.key],
     );
 
+    const local = isLocalMode();
     if (running) {
+        const label = local ? localFillProgress(job) : runningLabel(job);
         const stopping = job.state === 'stopping';
         return (
             <div className="bt-fill" ref={wrapRef}>
@@ -239,11 +243,13 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
                     className="bt-fill-main"
                     icon={stopping ? <Spinner size={12} /> : StopIcon}
                     disabled={stopping}
-                    title={timeLeftText(job.seconds_left) ?? undefined}
-                    ariaLabel={stopping ? runningLabel(job) : uiText("Stop the fill, {done} of {total} rows done", { done: job.rows_done, total: job.rows_total })}
+                    title={local
+                        ? uiText("Model requests made: {count}", { count: job.request_attempts ?? 0 })
+                        : timeLeftText(job.seconds_left) ?? undefined}
+                    ariaLabel={stopping ? label : uiText("Stop the fill, {done} of {total} rows done", { done: job.rows_done, total: job.rows_total })}
                     onClick={() => Zotero.AsterMargin.tableFills?.stop(job.job_id)}
                 >
-                    {runningLabel(job)}
+                    {label}
                 </Button>
             </div>
         );
@@ -266,7 +272,7 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
         },
         {
             label: uiText("Fill selected rows"),
-            shortcut: selected ? count(selected) : 'Select rows first',
+            shortcut: selected ? count(selected) : uiText("Select rows first"),
             disabled: selected === 0,
             onClick: () => void openPlan({ kind: 'cells', rows: selectedRowIds }),
         },
@@ -289,7 +295,7 @@ export const TableFillButton = React.forwardRef<TableFillButtonHandle, TableFill
                     title={disabledReason ?? (lit ? undefined : uiText("Everything is up to date"))}
                     onClick={() => void openPlan({ kind: 'pending' })}
                 >
-                    {fillButtonLabel(rows)}
+                    {local && rows > 0 ? uiText("Fill {count} rows", { count: rows }) : uiText(fillButtonLabel(rows))}
                 </Button>
                 <MenuButton
                     menuItems={menuItems}
@@ -338,7 +344,7 @@ function FillPopover({
             </div>
         );
     } else if (popover.state === 'error') {
-        body = <div className="bt-fill-error" role="alert">{popover.message}</div>;
+        body = <div className="bt-fill-error" role="alert">{uiText(popover.message)}</div>;
     } else if (popover.plan.rows === 0) {
         body = <div className="bt-fill-status">{uiText("Everything is up to date.")}</div>;
     } else {
@@ -346,29 +352,38 @@ function FillPopover({
         const lines = pendingLines(plan, answeredColumns);
         const labeled = lines.filter((line) => line.label);
         const sentences = lines.filter((line) => !line.label);
-        const sources = planSourcesLine(plan);
-        const reach = balanceLine(plan);
+        const local = isLocalMode();
+        const sources = local ? localFillSources(plan) : planSourcesLine(plan);
+        const reach = local ? null : balanceLine(plan);
         const starting = popover.state === 'starting';
         body = (
             <>
                 <div className="bt-fill-head">
-                    <span className="bt-fill-title">{planTitle(plan)}</span>
-                    <span className="bt-fill-cost" title={pricingSentence(plan.prices, plan.title_abstract)}>
-                        {creditsText(plan.credits)}
+                    <span className="bt-fill-title">
+                        {local ? uiText("Fill {count} cells", { count: plan.cells }) : planTitle(plan)}
                     </span>
+                    {local ? (
+                        <span>{uiText("Estimated model requests: {count}", { count: plan.documents + plan.title_abstract })}</span>
+                    ) : (
+                        <span className="bt-fill-cost" title={pricingSentence(plan.prices, plan.title_abstract)}>
+                            {creditsText(plan.credits)}
+                        </span>
+                    )}
                 </div>
                 {lines.length || sources ? (
                     <div className="bt-fill-details">
                         {sentences.map((line) => (
                             <div key={line.value} className="bt-fill-change-text">
-                                {line.value}
+                                {popover.scope.kind === 'retry_failed'
+                                    ? uiText("Retry {count} failed rows", { count: plan.rows })
+                                    : uiText("Trial fill on {count} rows", { count: plan.rows })}
                             </div>
                         ))}
                         {labeled.length ? (
                             <dl className="bt-fill-changes">
                                 {labeled.map((line) => (
                                     <React.Fragment key={line.label}>
-                                        <dt>{line.label}</dt>
+                                        <dt>{line.label && uiText(line.label)}</dt>
                                         <dd>{line.value}</dd>
                                     </React.Fragment>
                                 ))}
@@ -380,7 +395,7 @@ function FillPopover({
                 {reach ? <div className="bt-fill-reach">{reach}.</div> : null}
                 {popover.error ? (
                     <div className="bt-fill-error" role="alert">
-                        {popover.error}
+                        {uiText(popover.error)}
                     </div>
                 ) : null}
             </>
@@ -400,7 +415,7 @@ function FillPopover({
             );
         action = (
             <Button variant="solid" onClick={onStart} disabled={starting} loading={starting && !popover.trial}>
-                {fillActionLabel(plan)}
+                {local ? uiText("Fill {count} rows", { count: plan.rows }) : fillActionLabel(plan)}
             </Button>
         );
     }
@@ -411,7 +426,7 @@ function FillPopover({
                 {trial}
                 {trial ? <span className="bt-fill-actions-gap" /> : null}
                 <Button variant="ghost-secondary" onClick={onCancel}>
-                    {action ? 'Cancel' : 'Close'}
+                    {uiText(action ? "Cancel" : "Close")}
                 </Button>
                 {action}
             </div>
@@ -432,10 +447,10 @@ export function TableFillBanner({ job, showingFailed, onShowFailed, onDismiss }:
     const failed = job.result?.failed_row_ids.length ?? 0;
     return (
         <span className="bt-fill-banner">
-            <span className="bt-fill-banner-text">{resultText(job)}</span>
+            <span className="bt-fill-banner-text">{isLocalMode() ? localFillResult(job) : resultText(job)}</span>
             {failed > 0 ? (
                 <button type="button" className="bt-fill-banner-link" onClick={() => onShowFailed(!showingFailed)}>
-                    {showingFailed ? 'Show all' : 'Show'}
+                    {uiText(showingFailed ? "Show all" : "Show")}
                 </button>
             ) : null}
             <button type="button" className="bt-fill-banner-close" aria-label={uiText("Dismiss")} onClick={onDismiss}>
@@ -533,9 +548,10 @@ export function useFillResultBanner(
         failedFilter && !showFailed ? (
             <span className="bt-fill-banner">
                 <span className="bt-fill-banner-text">
-                    {failedFilter.rows.size === 1
-                        ? "Showing the row that couldn't be read"
-                        : `Showing the ${failedFilter.rows.size.toLocaleString('en-US')} rows that couldn't be read`}
+                    {uiText(
+                        failedFilter.rows.size === 1 ? "Showing the row that couldn't be read" : "Showing the {count} rows that couldn't be read",
+                        { count: failedFilter.rows.size },
+                    )}
                 </span>
                 <button type="button" className="bt-fill-banner-link" onClick={showAllRows}>
                     {uiText("Show all")}

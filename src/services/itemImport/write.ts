@@ -540,12 +540,14 @@ export async function writeImportItem(data: ImportItemProposedData, options: Wri
         // Zotero's own resolvers work from a DOI or URL; with neither and no
         // candidates there is nowhere to look.
         const hasPdfSource = (pdfCandidates?.length ?? 0) > 0
+            || (source?.provider === 'openalex' && !!source.external_id)
             || (typeof json.DOI === 'string' && !!json.DOI.trim())
             || (typeof json.url === 'string' && !!json.url.trim())
             || /(^|\n)\s*DOI:/i.test(typeof json.extra === 'string' ? json.extra : '');
         if (!WEB_CONTENT_ITEM_TYPES.has(json.itemType) && filesEditable && hasPdfSource) {
             schedulePdfFetchTask(libraryID, item.key, {
                 pdfCandidates,
+                openAlexWorkId: source?.provider === 'openalex' ? source.external_id : undefined,
                 actionId: options.actionId,
                 runId: options.runId,
                 threadId: options.threadId ?? undefined,
