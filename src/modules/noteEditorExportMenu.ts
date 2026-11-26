@@ -14,6 +14,7 @@
 
 import { exportNoteWithProgress, NOTE_EXPORT_FORMATS } from './noteExportCommand';
 import { getEditorNoteHtml } from '../utils/noteEditorIO';
+import { getString } from '../utils/locale';
 
 const NOTE_EDITOR_URL = 'resource://zotero/note-editor/editor.html';
 const ENTRY_CLASS = 'astermargin-note-export';
@@ -129,7 +130,7 @@ function addEntry(dropdown: Element): void {
     button.className = `option ${ENTRY_CLASS}`;
     button.setAttribute('aria-haspopup', 'menu');
     const label = doc.createElement('span');
-    label.textContent = 'Export with AsterMargin';
+    label.textContent = getString('note-export-submenu');
     button.append(label, createChevron(doc));
     button.addEventListener('click', (event: Event) => {
         // The dropdown closes on any click in its popup, which React handles

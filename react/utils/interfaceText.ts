@@ -97,10 +97,57 @@ const words: Record<string, readonly [string, string]> = {
     Detail: ["详情", "詳情"],
     Input: ["输入", "輸入"],
     "AsterMargin Status": ["星笺状态", "星箋狀態"],
+    "Ask and explore your library": [
+        "询问并探索你的文献库",
+        "詢問並探索你的文獻庫",
+    ],
+    "Grounded answers from full text, plus related work and gaps": [
+        "基于全文的回答，以及相关研究和研究空白",
+        "根據全文的回覆，以及相關研究和研究空白",
+    ],
+    "Write & synthesize": ["写作与综合", "寫作與綜合"],
+    "Summaries, reviews, and notes drawn from your sources — every claim cited":
+        [
+            "根据你的来源撰写摘要、综述和笔记，每项结论都有引文",
+            "根據你的來源撰寫摘要、綜述和筆記，每項結論都有引文",
+        ],
+    "Organize & edit your library": [
+        "整理和编辑你的文献库",
+        "整理和編輯你的文獻庫",
+    ],
+    "Tag, sort, and fix metadata. You approve every change": [
+        "添加标签、整理条目并修正元数据，每项更改都由你确认",
+        "加入標籤、整理項目並修正詮釋資料，每項變更都由你確認",
+    ],
+    "AI-powered PDF annotations": ["AI 辅助 PDF 批注", "AI 輔助 PDF 註解"],
+    "Highlights and notes added right in your PDF, ready to review": [
+        "直接在 PDF 中添加高亮和笔记，随后由你检查",
+        "直接在 PDF 中加入醒目提示和筆記，隨後由你檢查",
+    ],
+    "Current File": ["当前文件", "目前檔案"],
+    Research: ["研究", "研究"],
+    Write: ["写作", "寫作"],
+    Organize: ["整理", "整理"],
+    Annotate: ["批注", "註解"],
+    "Open Settings": ["打开设置", "開啟設定"],
+    "New table": ["新建表格", "新建表格"],
 };
-export function uiText(english: string, args?: Record<string, string | number>): string {
+export function uiText(
+    english: string,
+    args?: Record<string, string | number>,
+): string {
     const locale = interfaceLocale();
-    const pair = Object.hasOwn(words, english) ? words[english] : findUiMessage(english);
-    const text = locale === "en" ? english : pair?.[locale === "zh-TW" ? 1 : 0] ?? knownSettingsText(english);
-    return args ? text.replace(/\{(\w+)\}/g, (token, name) => String(args[name] ?? token)) : text;
+    const pair = Object.hasOwn(words, english)
+        ? words[english]
+        : findUiMessage(english);
+    const text =
+        locale === "en"
+            ? english
+            : (pair?.[locale === "zh-TW" ? 1 : 0] ??
+              knownSettingsText(english));
+    return args
+        ? text.replace(/\{(\w+)\}/g, (token, name) =>
+              String(args[name] ?? token),
+          )
+        : text;
 }

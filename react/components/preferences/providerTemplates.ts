@@ -6,7 +6,12 @@ export interface ProviderTemplate {
     description: string;
     apiBase: string;
     format: CustomModelFormat;
-    models: string[];
+    /**
+     * Kept for compatibility with older saved UI state. Provider templates do
+     * not ship a model catalogue because provider model IDs change frequently.
+     * The endpoint is queried after the user supplies its API key.
+     */
+    models?: readonly string[];
     apiKeyPlaceholder: string;
     local?: boolean;
 }
@@ -17,83 +22,91 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
     {
         id: "openai",
         label: "OpenAI",
-        description: "OpenAI Chat Completions or Responses",
+        description:
+            "OpenAI API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://api.openai.com/v1",
         format: "openai_responses",
-        models: ["gpt-5", "gpt-5-mini", "gpt-4.1"],
+        models: [],
         apiKeyPlaceholder: "sk-...",
     },
     {
         id: "anthropic",
         label: "Anthropic",
-        description: "Anthropic Messages API",
+        description:
+            "Anthropic Messages API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://api.anthropic.com/v1",
         format: "anthropic",
-        models: ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"],
+        models: [],
         apiKeyPlaceholder: "sk-ant-...",
     },
     {
         id: "gemini",
         label: "Google Gemini",
-        description: "Gemini OpenAI-compatible endpoint",
+        description:
+            "Gemini OpenAI-compatible API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://generativelanguage.googleapis.com/v1beta/openai",
         format: "openai",
-        models: ["gemini-2.5-pro", "gemini-2.5-flash"],
+        models: [],
         apiKeyPlaceholder: "AIza...",
     },
     {
         id: "deepseek",
         label: "DeepSeek",
-        description: "DeepSeek Chat Completions",
+        description:
+            "DeepSeek OpenAI-compatible API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://api.deepseek.com/v1",
         format: "openai",
-        models: ["deepseek-chat", "deepseek-reasoner"],
+        models: [],
         apiKeyPlaceholder: "sk-...",
     },
     {
         id: "qwen",
         label: "Alibaba Qwen",
-        description: "DashScope compatible-mode endpoint",
+        description:
+            "Qwen DashScope compatible-mode API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         format: "openai",
-        models: ["qwen-plus", "qwen-max", "qwen3-235b-a22b"],
+        models: [],
         apiKeyPlaceholder: "sk-...",
     },
     {
         id: "openrouter",
         label: "OpenRouter",
-        description: "Many hosted models behind one endpoint",
+        description:
+            "OpenRouter API. Enter the endpoint and key, then load the models available to your account.",
         apiBase: "https://openrouter.ai/api/v1",
         format: "openai",
-        models: ["openai/gpt-4.1", "anthropic/claude-sonnet-4", "google/gemini-2.5-pro"],
+        models: [],
         apiKeyPlaceholder: "sk-or-...",
     },
     {
         id: "ollama",
         label: "Ollama",
-        description: "Local models on this computer",
+        description:
+            "Ollama local API. Enter the endpoint, optionally enter a key, then load installed models.",
         apiBase: "http://127.0.0.1:11434/v1",
         format: "openai",
-        models: ["qwen3:8b", "llama3.2", "mistral"],
+        models: [],
         apiKeyPlaceholder: "Optional",
         local: true,
     },
     {
         id: "lmstudio",
         label: "LM Studio",
-        description: "Local OpenAI-compatible server",
+        description:
+            "LM Studio local OpenAI-compatible API. Enter the endpoint, optionally enter a key, then load loaded models.",
         apiBase: "http://127.0.0.1:1234/v1",
         format: "openai",
-        models: ["local-model"],
+        models: [],
         apiKeyPlaceholder: "Optional",
         local: true,
     },
 ];
 
-export function modelFromTemplate(template: ProviderTemplate, model: string): CustomChatModel {
+export function modelFromTemplate(template: ProviderTemplate): CustomChatModel {
     return {
         name: template.label,
-        snapshot: model,
+        snapshot: "",
         api_base: template.apiBase,
         format: template.format,
         api_key: "",

@@ -23,3 +23,4 @@ reader-explain-with = Explain with AsterMargin
 reader-ask-with = Ask AsterMargin…
 reader-ask-document = Ask AsterMargin
 reader-actions = Actions
+reader-toolbar-title = AsterMargin

@@ -189,6 +189,49 @@ function findUpdate(
     });
 }
 
+function responseText(response: unknown): string {
+    if (typeof response === "string") return response;
+    if (response && typeof response === "object") {
+        const value = (response as { responseText?: unknown }).responseText;
+        if (typeof value === "string") return value;
+    }
+    return "";
+}
+
+function htmlToText(value: string): string {
+    const withoutTags = value.replace(/<[^>]+>/g, " ");
+    return withoutTags
+        .replace(/&nbsp;/giu, " ")
+        .replace(/&amp;/giu, "&")
+        .replace(/&lt;/giu, "<")
+        .replace(/&gt;/giu, ">")
+        .replace(/&#39;/giu, "'")
+        .replace(/&quot;/giu, '"')
+        .replace(/\s+/gu, " ")
+        .trim();
+}
+
+export function parseReleasePage(
+    html: string,
+    version: string,
+): Partial<AvailableUpdate> {
+    const date = html.match(
+        /<relative-time[^>]+datetime=["']([^"']+)["']/iu,
+    )?.[1];
+    const body = html.match(
+        /<div[^>]+data-test-selector=["']body-content["'][^>]*>([\s\S]*?)<\/div>/iu,
+    )?.[1];
+    return {
+        ...(date && Number.isFinite(Date.parse(date))
+            ? { publishedAt: date }
+            : {}),
+        ...(body
+            ? { summary: htmlToText(body).slice(0, 1600) || undefined }
+            : {}),
+        version,
+    };
+}
+
 async function releaseDetails(version: string): Promise<AvailableUpdate> {
     const tag = `v${version}`;
     const release: AvailableUpdate = {
@@ -196,12 +239,19 @@ async function releaseDetails(version: string): Promise<AvailableUpdate> {
         notesUrl: `https://github.com/${repository}/releases/tag/${tag}`,
     };
     try {
-        const { responseText } = await Zotero.HTTP.request(
+        const response = await Zotero.HTTP.request(
             "GET",
             `https://api.github.com/repos/${repository}/releases/tags/${tag}`,
-            { timeout: 7000 },
+            {
+                timeout: 7000,
+                responseType: "text",
+                headers: {
+                    Accept: "application/vnd.github+json",
+                    "User-Agent": "AsterMargin-Zotero",
+                },
+            },
         );
-        const details = JSON.parse(responseText);
+        const details = JSON.parse(responseText(response));
         if (details.tag_name !== tag || details.draft || details.prerelease)
             return release;
         if (
@@ -212,8 +262,24 @@ async function releaseDetails(version: string): Promise<AvailableUpdate> {
         }
         if (typeof details.body === "string")
             release.summary = details.body.trim().slice(0, 1600) || undefined;
-    } catch (error) {
-        Zotero.logError(error as Error);
+    } catch (apiError) {
+        // GitHub's unauthenticated API is rate limited. The public release
+        // page carries the same date and notes, so use it when the API cannot
+        // be reached instead of showing two empty fields in the preferences.
+        try {
+            const page = await Zotero.HTTP.request(
+                "GET",
+                `https://github.com/${repository}/releases/tag/${tag}`,
+                { timeout: 7000, responseType: "text" },
+            );
+            Object.assign(
+                release,
+                parseReleasePage(responseText(page), version),
+            );
+        } catch (pageError) {
+            Zotero.logError(pageError as Error);
+            Zotero.logError(apiError as Error);
+        }
     }
     return release;
 }

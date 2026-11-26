@@ -16,7 +16,7 @@
 
 import { resolveChatWindow } from '../runtime/navigation';
 import { interfaceLocaleOverridesHost } from '../utils/interfaceLanguage';
-import { localizePluginElement } from '../utils/locale';
+import { getString, localizePluginElement } from '../utils/locale';
 
 import {
     Action,
@@ -161,6 +161,14 @@ const COLLECTION_MENU_ID = 'astermargin-collection-context-menu';
 const NOTE_EXPORT_MENU_ID = 'astermargin-note-export-menu';
 const NEW_TABLE_FILE_MENU_ID = 'astermargin-new-table-file-menu';
 const NEW_TABLE_COLLECTION_MENU_ID = 'astermargin-new-table-collection-menu';
+
+function localizedNewTableTitle(): string {
+    try {
+        return getString('new-table-title');
+    } catch {
+        return 'New table';
+    }
+}
 // Menu icons. Only for menus where Zotero shows icons on its own entries (the
 // item and collection context menus); MenuManager renders them the same way,
 // so they appear exactly where Zotero's own icons do on each platform.
@@ -454,7 +462,7 @@ function registerMenus(): void {
                     libraryID,
                     ...(collection ? { collectionID: collection.id } : {}),
                     scopes: [],
-                    title: 'New table',
+                    title: localizedNewTableTitle(),
                 });
             },
         }],

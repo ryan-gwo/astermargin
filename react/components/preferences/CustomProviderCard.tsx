@@ -36,7 +36,7 @@ import {
 } from "@astermargin/agent-core/transport/clients/chatService";
 import { localModeEnabledAtom } from "../../atoms/localMode";
 import { isLoopbackEndpoint } from "@astermargin/agent-local/config/localAgentConfig";
-import { discoverLocalModels, plainHttpWarning, testLocalEndpoint } from "./localProviderTest";
+import { discoverProviderModels, plainHttpWarning, testLocalEndpoint, type DiscoveredProviderModel } from "./localProviderTest";
 import { LocalProviderTestRunner } from "./localProviderTestRunner";
 
 interface CustomProviderCardProps {
@@ -91,7 +91,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
     const [localTestMessage, setLocalTestMessage] = useState<string | null>(null);
     const [testingCapabilities, setTestingCapabilities] = useState(false);
     const [discoveringModels, setDiscoveringModels] = useState(false);
-    const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
+    const [discoveredModels, setDiscoveredModels] = useState<DiscoveredProviderModel[]>([]);
     const [contextWindowText, setContextWindowText] = useState<string>(
         model.context_window != null ? String(model.context_window) : ''
     );
@@ -247,9 +247,16 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         setDiscoveringModels(true);
         setTestError(null);
         try {
-            const models = await discoverLocalModels(model);
+            const models = await discoverProviderModels(model);
             setDiscoveredModels(models);
-            if (models.length === 1) update({ snapshot: models[0] });
+            if (models.length === 1) {
+                const only = models[0];
+                update({
+                    snapshot: only.id,
+                    ...(only.contextWindow ? { context_window: only.contextWindow } : {}),
+                    ...(only.supportsVision ? { supports_vision: true } : {}),
+                });
+            }
         } catch (error) {
             setTestError(error instanceof Error ? error.message : String(error));
         } finally {
@@ -340,41 +347,6 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                         aria-label={settingsText("Provider name")}
                         className="chat-input text-base font-color-primary"
                     />
-                </label>
-
-                {/* Snapshot */}
-                <label className="display-flex flex-col">
-                    <span className="text-sm font-color-secondary">{uiText("Model (snapshot)")}</span>
-                    <div className="display-flex flex-row gap-2">
-                        <input
-                            type="text"
-                            value={model.snapshot}
-                            onChange={(e) => update({ snapshot: e.target.value })}
-                            placeholder="openai/gpt-4o"
-                            aria-label={settingsText("Model snapshot")}
-                            className="chat-input text-base font-color-primary flex-1 min-w-0"
-                        />
-                        {localMode && (
-                            <Button variant="outline" onClick={() => void discoverModels()} disabled={discoveringModels} loading={discoveringModels} style={{ padding: '4px 6px' }}>
-                                {settingsText("List models")}
-                            </Button>
-                        )}
-                    </div>
-                    {discoveredModels.length > 0 && (
-                        <select
-                            className="preference-input text-base mt-1"
-                            value={discoveredModels.includes(model.snapshot) ? model.snapshot : ''}
-                            onChange={(event) => update({ snapshot: event.target.value })}
-                            aria-label={settingsText("Discovered models")}
-                        >
-                            <option value="">{settingsText("Choose a discovered model")}</option>
-                            {discoveredModels.map((id) => <option key={id} value={id}>{id}</option>)}
-                        </select>
-                    )}
-                    <span className="text-sm font-color-tertiary">
-                        {settingsText("Small or older models may struggle with tool calls. Choose a model with an Artificial Analysis score of at least 26, preferably 35 or higher.")}
-                        {' '}<ExternalLink href={INTELLIGENCE_INDEX_URL}>{settingsText("Artificial Analysis Intelligence Index")}</ExternalLink>
-                    </span>
                 </label>
 
                 {/* API base */}
@@ -498,6 +470,63 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             />
                         )}
                     </div>
+                </label>
+
+                <div className="display-flex flex-row items-center gap-2">
+                    <Button
+                        variant="outline"
+                        onClick={() => void discoverModels()}
+                        disabled={discoveringModels || !apiBaseValidation.valid || (!hasApiKey && !apiKeyOptional)}
+                        loading={discoveringModels}
+                        style={{ padding: '4px 8px' }}
+                    >
+                        {settingsText("Load models from endpoint")}
+                    </Button>
+                    <span className="text-sm font-color-tertiary">
+                        {settingsText("Enter the endpoint and API key first. AsterMargin then reads the current model list and capabilities.")}
+                    </span>
+                </div>
+
+                {/* Snapshot */}
+                <label className="display-flex flex-col">
+                    <span className="text-sm font-color-secondary">{uiText("Model (snapshot)")}</span>
+                    <div className="display-flex flex-row gap-2">
+                        <input
+                            type="text"
+                            value={model.snapshot}
+                            onChange={(e) => update({ snapshot: e.target.value })}
+                            placeholder="openai/gpt-4o"
+                            aria-label={settingsText("Model snapshot")}
+                            className="chat-input text-base font-color-primary flex-1 min-w-0"
+                        />
+                        {discoveredModels.length > 0 && (
+                            <span className="text-sm font-color-green" role="status">
+                                {settingsText("{count} models loaded", { count: discoveredModels.length })}
+                            </span>
+                        )}
+                    </div>
+                    {discoveredModels.length > 0 && (
+                        <select
+                            className="preference-input text-base mt-1"
+                            value={discoveredModels.some((entry) => entry.id === model.snapshot) ? model.snapshot : ''}
+                            onChange={(event) => {
+                                const selected = discoveredModels.find((entry) => entry.id === event.target.value);
+                                update({
+                                    snapshot: event.target.value,
+                                    ...(selected?.contextWindow ? { context_window: selected.contextWindow } : {}),
+                                    ...(selected?.supportsVision ? { supports_vision: true } : {}),
+                                });
+                            }}
+                            aria-label={settingsText("Discovered models")}
+                        >
+                            <option value="">{settingsText("Choose a discovered model")}</option>
+                            {discoveredModels.map((entry) => <option key={entry.id} value={entry.id}>{entry.id}</option>)}
+                        </select>
+                    )}
+                    <span className="text-sm font-color-tertiary">
+                        {settingsText("Small or older models may struggle with tool calls. Choose a model with an Artificial Analysis score of at least 26, preferably 35 or higher.")}
+                        {' '}<ExternalLink href={INTELLIGENCE_INDEX_URL}>{settingsText("Artificial Analysis Intelligence Index")}</ExternalLink>
+                    </span>
                 </label>
 
                 {/* Supports vision */}

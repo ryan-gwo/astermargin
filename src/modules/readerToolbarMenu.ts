@@ -112,7 +112,7 @@ async function cacheIcon(): Promise<void> {
 function createToolbarButton(reader: any, doc: Document): HTMLElement {
     const button = doc.createElement('button');
     button.className = `toolbar-button toolbar-dropdown-button ${BUTTON_CLASS}`;
-    button.title = 'AsterMargin';
+    button.title = getString("reader-toolbar-title");
     button.tabIndex = -1;
     button.innerHTML = `${cachedIconSvg || ''}${DROPMARKER_SVG}`;
     button.addEventListener('click', () => {

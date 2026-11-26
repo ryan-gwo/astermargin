@@ -155,7 +155,6 @@ const ApiKeysSection: React.FC = () => {
     const [autoFocusProviderId, setAutoFocusProviderId] = useState<string | null>(null);
     const [templateId, setTemplateId] = useState(PROVIDER_TEMPLATES[0].id);
     const selectedTemplate = PROVIDER_TEMPLATES.find((template) => template.id === templateId) ?? PROVIDER_TEMPLATES[0];
-    const [templateModel, setTemplateModel] = useState(selectedTemplate.models[0]);
 
     // Persist the providers list to preferences and refresh the live model selector.
     const persistProviders = useCallback((entries: CustomProviderEntry[]) => {
@@ -176,7 +175,7 @@ const ApiKeysSection: React.FC = () => {
 
     const handleAddTemplate = useCallback(() => {
         const id = createProviderId();
-        const model = modelFromTemplate(selectedTemplate, templateModel);
+        const model = modelFromTemplate(selectedTemplate);
         setCustomProviders((prev) => {
             const next = [{ _id: id, model }, ...prev];
             persistProviders(next);
@@ -184,7 +183,7 @@ const ApiKeysSection: React.FC = () => {
         });
         setExpandedProviderId(id);
         setAutoFocusProviderId(null);
-    }, [persistProviders, selectedTemplate, templateModel]);
+    }, [persistProviders, selectedTemplate]);
 
     const handleProviderChange = useCallback((id: string, model: CustomChatModel) => {
         setCustomProviders((prev) => {
@@ -450,7 +449,7 @@ const ApiKeysSection: React.FC = () => {
                 <div className="rounded-card border-card bg-senary p-3 mb-2">
                     <div className="text-base font-color-primary font-medium mb-1">{settingsText("Provider templates")}</div>
                     <div className="text-sm font-color-secondary mb-2">
-                        {settingsText("Start with a known endpoint, then choose a model and enter its key. Local templates keep requests on this device.")}
+                        {settingsText("Choose a provider to prefill its endpoint and protocol. Enter the endpoint and API key in the card, then load the models offered by that endpoint.")}
                     </div>
                     <div className="display-flex flex-row flex-wrap items-center gap-2">
                         <select
@@ -459,22 +458,13 @@ const ApiKeysSection: React.FC = () => {
                             onChange={(event) => {
                                 const next = PROVIDER_TEMPLATES.find((entry) => entry.id === event.target.value) ?? PROVIDER_TEMPLATES[0];
                                 setTemplateId(next.id);
-                                setTemplateModel(next.models[0]);
                             }}
                             aria-label={settingsText("Provider template")}
                         >
                             {PROVIDER_TEMPLATES.map((template) => <option key={template.id} value={template.id}>{template.label}</option>)}
                         </select>
-                        <select
-                            className="preference-input text-base"
-                            value={templateModel}
-                            onChange={(event) => setTemplateModel(event.target.value)}
-                            aria-label={settingsText("Template model")}
-                        >
-                            {selectedTemplate.models.map((model) => <option key={model} value={model}>{model}</option>)}
-                        </select>
                         <Button variant="outline" onClick={handleAddTemplate} style={{ padding: '4px 8px' }}>
-                            {settingsText("Use template")}
+                            {settingsText("Use endpoint template")}
                         </Button>
                     </div>
                     <div className="text-sm font-color-tertiary mt-1">{knownSettingsText(selectedTemplate.description)}</div>
