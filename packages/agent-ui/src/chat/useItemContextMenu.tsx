@@ -1,3 +1,4 @@
+import { uiText } from "../host/uiText";
 import React, { useEffect, useRef, useState } from 'react';
 import type { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
 import ContextMenu, { type MenuItem, type MenuPosition } from '../primitives/ContextMenu';
@@ -27,7 +28,7 @@ export interface ItemContextMenu {
 export function collectionMenuItems(ref: ZoteroItemReference): MenuItem[] {
     const navigation = getHost().navigation;
     if (!navigation) return [];
-    return [{ label: 'Show in Library', icon: LibraryIcon, onClick: () => navigation.revealCollection(ref) }];
+    return [{ label: uiText("Show in Library"), icon: LibraryIcon, onClick: () => navigation.revealCollection(ref) }];
 }
 
 /**

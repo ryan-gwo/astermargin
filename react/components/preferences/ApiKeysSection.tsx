@@ -32,7 +32,6 @@ import {
     CustomChatModel,
     getCustomChatModelsForEditing,
     saveCustomChatModelsToPreferences,
-    OPENROUTER_API_BASE,
 } from "../../types/settings";
 import { useSetAtom, useAtomValue } from "jotai";
 import { PROVIDER_TEMPLATES, modelFromTemplate } from './providerTemplates';
@@ -67,12 +66,10 @@ const LocalSettingsSwitch: React.FC<{
 // window is a separate realm and may not expose `crypto` at all.
 const createProviderId = (): string => uuidv4();
 
-// New providers default to OpenRouter's endpoint, the most common custom setup.
 const emptyCustomModel = (): CustomChatModel => ({
     name: '',
     snapshot: '',
-    api_base: OPENROUTER_API_BASE,
-    format: 'openai',
+    api_base: '',
     api_key: '',
     supports_vision: false,
 });
@@ -506,7 +503,7 @@ const ApiKeysSection: React.FC = () => {
                                 onDuplicate={() => handleDuplicateProvider(entry._id)}
                                 isExpanded={entry._id === expandedProviderId}
                                 onToggleExpand={() => handleToggleExpand(entry._id)}
-                                autoFocusName={entry._id === autoFocusProviderId}
+                                autoFocusEndpoint={entry._id === autoFocusProviderId}
                             />
                         ))}
                     </div>

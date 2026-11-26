@@ -10,7 +10,7 @@ async function inspectUpdates(win, locale, scenario, fixtureVersion) {
     const automatic = button("auto-updates");
     const check = button("check-updates");
     const install = () => button("install-update");
-    const checked = (value) => automatic.checked === value && !automatic.disabled;
+    const checked = (value) => automatic.getAttribute("aria-checked") === String(value) && !automatic.disabled;
     await waitFor(() => checked(true), "follow Zotero default on first display");
     if (current.applyBackgroundUpdates !== manager.AUTOUPDATE_DEFAULT) {
         throw Error("Opening settings changed the native update policy");
@@ -49,10 +49,16 @@ async function inspectUpdates(win, locale, scenario, fixtureVersion) {
     const actualRequest = Zotero.HTTP.request;
     Zotero.HTTP.request = function(method, url, ...rest) {
         if (method === "GET" && url === "https://api.github.com/repos/ryan-gwo/astermargin/releases/tags/v" + fixtureVersion) {
+            if (scenario === "manual") return Promise.reject(Error("Fixture: release API rate limited"));
             return Promise.resolve({ responseText: JSON.stringify({
                 tag_name: "v" + fixtureVersion, body: notes, published_at: publishedAt,
                 draft: false, prerelease: false,
             }) });
+        }
+        if (method === "GET" && url === "https://github.com/ryan-gwo/astermargin/releases/tag/v" + fixtureVersion) {
+            return Promise.resolve({
+                responseText: `<relative-time datetime="${publishedAt}"></relative-time><div data-test-selector="body-content"><div><p>${notes}</p></div></div>`,
+            });
         }
         return actualRequest.call(this, method, url, ...rest);
     };

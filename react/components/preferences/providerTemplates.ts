@@ -6,13 +6,6 @@ export interface ProviderTemplate {
     description: string;
     apiBase: string;
     format: CustomModelFormat;
-    /**
-     * Kept for compatibility with older saved UI state. Provider templates do
-     * not ship a model catalogue because provider model IDs change frequently.
-     * The endpoint is queried after the user supplies its API key.
-     */
-    models?: readonly string[];
-    apiKeyPlaceholder: string;
     local?: boolean;
 }
 
@@ -26,8 +19,6 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "OpenAI API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://api.openai.com/v1",
         format: "openai_responses",
-        models: [],
-        apiKeyPlaceholder: "sk-...",
     },
     {
         id: "anthropic",
@@ -36,8 +27,6 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "Anthropic Messages API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://api.anthropic.com/v1",
         format: "anthropic",
-        models: [],
-        apiKeyPlaceholder: "sk-ant-...",
     },
     {
         id: "gemini",
@@ -46,8 +35,6 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "Gemini OpenAI-compatible API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://generativelanguage.googleapis.com/v1beta/openai",
         format: "openai",
-        models: [],
-        apiKeyPlaceholder: "AIza...",
     },
     {
         id: "deepseek",
@@ -56,8 +43,6 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "DeepSeek OpenAI-compatible API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://api.deepseek.com/v1",
         format: "openai",
-        models: [],
-        apiKeyPlaceholder: "sk-...",
     },
     {
         id: "qwen",
@@ -66,8 +51,6 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "Qwen DashScope compatible-mode API. Enter the endpoint and key, then load the models offered by your account.",
         apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         format: "openai",
-        models: [],
-        apiKeyPlaceholder: "sk-...",
     },
     {
         id: "openrouter",
@@ -76,8 +59,6 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "OpenRouter API. Enter the endpoint and key, then load the models available to your account.",
         apiBase: "https://openrouter.ai/api/v1",
         format: "openai",
-        models: [],
-        apiKeyPlaceholder: "sk-or-...",
     },
     {
         id: "ollama",
@@ -86,19 +67,15 @@ export const PROVIDER_TEMPLATES: readonly ProviderTemplate[] = [
             "Ollama local API. Enter the endpoint, optionally enter a key, then load installed models.",
         apiBase: "http://127.0.0.1:11434/v1",
         format: "openai",
-        models: [],
-        apiKeyPlaceholder: "Optional",
         local: true,
     },
     {
         id: "lmstudio",
         label: "LM Studio",
         description:
-            "LM Studio local OpenAI-compatible API. Enter the endpoint, optionally enter a key, then load loaded models.",
+            "LM Studio local OpenAI-compatible API. Enter the endpoint, optionally enter a key, then load available models.",
         apiBase: "http://127.0.0.1:1234/v1",
         format: "openai",
-        models: [],
-        apiKeyPlaceholder: "Optional",
         local: true,
     },
 ];
@@ -112,4 +89,18 @@ export function modelFromTemplate(template: ProviderTemplate): CustomChatModel {
         api_key: "",
         supports_vision: false,
     };
+}
+
+
+/** Detect only the endpoints with a dedicated authentication protocol. */
+export function formatForEndpoint(endpoint: string | undefined): CustomModelFormat {
+    try {
+        const url = new URL(endpoint?.trim() || "");
+        if (url.hostname === "api.anthropic.com") return "anthropic";
+        if (url.hostname === "generativelanguage.googleapis.com"
+            && !url.pathname.replace(/\/+$/u, "").endsWith("/openai")) return "gemini";
+    } catch {
+        // The form already reports invalid URLs.
+    }
+    return "openai";
 }

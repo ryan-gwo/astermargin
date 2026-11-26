@@ -31,6 +31,7 @@ export interface LocalProviderTestResult {
 
 export interface DiscoveredProviderModel {
     id: string;
+    displayName?: string;
     contextWindow?: number;
     supportsVision?: boolean;
     reasoningEfforts?: string[];
@@ -45,86 +46,79 @@ export async function discoverProviderModels(
     model: CustomChatModel,
     signal?: AbortSignal,
 ): Promise<DiscoveredProviderModel[]> {
-    const base = (model.api_base ?? "").trim().replace(/\/+$/u, "");
-    if (!base)
-        throw new Error(
-            settingsText("An endpoint URL is required before loading models."),
-        );
-    let url = `${base}/models`;
+    const url = new URL(model.api_base?.trim() || "");
+    url.pathname = url.pathname.replace(/\/+$/u, "") + "/models";
+    const format = model.format ?? "openai";
     const headers: Record<string, string> = { Accept: "application/json" };
     const key = model.api_key?.trim();
     if (key) {
-        if (
-            /generativelanguage\.googleapis\.com$/iu.test(
-                new URL(base).hostname,
-            )
-        ) {
-            url += `${url.includes("?") ? "&" : "?"}key=${encodeURIComponent(key)}`;
-        } else if (normalizeCustomFormat(model.format) === "anthropic") {
+        if (format === "gemini") {
+            headers["x-goog-api-key"] = key;
+        } else if (format === "anthropic") {
             headers["x-api-key"] = key;
             headers["anthropic-version"] = "2023-06-01";
         } else {
             headers.Authorization = `Bearer ${key}`;
         }
     }
-    const response = await fetch(url, { signal, headers });
-    if (!response.ok)
-        throw new Error(
-            settingsText("Model loading failed ({status}).", {
-                status: response.status,
-            }),
-        );
-    const raw = (await response.json()) as {
-        data?: Array<Record<string, unknown>>;
-        models?: Array<Record<string, unknown>>;
-    };
-    const entries = Array.isArray(raw.data)
-        ? raw.data
-        : Array.isArray(raw.models)
-          ? raw.models
-          : [];
-    return entries.flatMap((entry) => {
-        const id =
-            typeof entry.id === "string"
-                ? entry.id
-                : typeof entry.name === "string"
-                  ? entry.name
-                  : "";
-        if (!id) return [];
-        const contextWindow =
-            typeof entry.context_window === "number"
-                ? entry.context_window
-                : typeof entry.contextWindow === "number"
-                  ? entry.contextWindow
-                  : undefined;
-        const modalities = Array.isArray(entry.input_modalities)
-            ? entry.input_modalities.filter(
-                  (value): value is string => typeof value === "string",
-              )
-            : [];
-        const reasoning =
-            entry.effort && typeof entry.effort === "object"
-                ? (entry.effort as { supported_levels?: unknown })
-                      .supported_levels
-                : undefined;
-        return [
-            {
+    const results = new Map<string, DiscoveredProviderModel>();
+    const cursors = new Set<string>();
+    for (let page = 0; page < 50; page++) {
+        const response = await fetch(url.href, { signal, headers, redirect: "error" });
+        if (!response.ok) {
+            throw new Error(
+                settingsText("Model loading failed ({status}).", { status: response.status }),
+            );
+        }
+        const raw = (await response.json()) as {
+            data?: Array<Record<string, unknown>>;
+            models?: Array<Record<string, unknown>>;
+            has_more?: boolean;
+            last_id?: string;
+            nextPageToken?: string;
+        };
+        const entries = raw?.data ?? raw?.models;
+        if (!Array.isArray(entries)) {
+            throw new Error(settingsText("The endpoint did not return a model list."));
+        }
+        for (const entry of entries) {
+            if (!entry || typeof entry !== "object") continue;
+            if (format === "gemini" && Array.isArray(entry.supportedGenerationMethods)
+                && !entry.supportedGenerationMethods.includes("generateContent")) continue;
+            const id = typeof entry.id === "string" ? entry.id : entry.name;
+            if (typeof id !== "string" || !id) continue;
+            const contextWindow = entry.context_window ?? entry.contextWindow
+                ?? entry.context_length ?? entry.max_input_tokens ?? entry.inputTokenLimit;
+            const displayName = entry.display_name ?? entry.displayName;
+            const architecture = entry.architecture as { input_modalities?: unknown } | undefined;
+            const modalities = entry.input_modalities ?? architecture?.input_modalities;
+            const capabilities = entry.capabilities as {
+                image_input?: { supported?: unknown };
+                effort?: Record<string, { supported?: boolean }>;
+            } | undefined;
+            const imageInput = capabilities?.image_input?.supported;
+            const effort = entry.effort as { supported_levels?: unknown } | undefined;
+            const reasoningEfforts = Array.isArray(effort?.supported_levels)
+                ? effort.supported_levels.filter((value): value is string => typeof value === "string")
+                : Object.entries(capabilities?.effort ?? {})
+                    .filter(([, capability]) => capability?.supported === true)
+                    .map(([level]) => level);
+            results.set(id, {
                 id,
-                ...(contextWindow ? { contextWindow } : {}),
-                ...(modalities.includes("image")
-                    ? { supportsVision: true }
-                    : {}),
-                ...(Array.isArray(reasoning)
-                    ? {
-                          reasoningEfforts: reasoning.filter(
-                              (value): value is string =>
-                                  typeof value === "string",
-                          ),
-                      }
-                    : {}),
-            },
-        ];
-    });
+                displayName: typeof displayName === "string" ? displayName : undefined,
+                contextWindow: typeof contextWindow === "number" && contextWindow > 0 ? contextWindow : undefined,
+                supportsVision: Array.isArray(modalities) ? modalities.includes("image")
+                    : typeof imageInput === "boolean" ? imageInput : undefined,
+                reasoningEfforts: reasoningEfforts.length ? reasoningEfforts : undefined,
+            });
+        }
+        const cursor = format === "gemini" ? raw.nextPageToken
+            : format === "anthropic" && raw.has_more ? raw.last_id : undefined;
+        if (typeof cursor !== "string" || !cursor || cursors.has(cursor)) break;
+        cursors.add(cursor);
+        url.searchParams.set(format === "gemini" ? "pageToken" : "after_id", cursor);
+    }
+    return [...results.values()];
 }
 
 /** Backward-compatible local-only name used by older callers. */
@@ -137,10 +131,6 @@ export async function discoverLocalModels(
     return (await discoverProviderModels(resolved.config.model, signal)).map(
         (entry) => entry.id,
     );
-}
-
-function normalizeCustomFormat(format: CustomChatModel["format"]): string {
-    return typeof format === "string" ? format.toLowerCase() : "openai";
 }
 
 const DEFAULT_TIMEOUT_MS = 20_000;

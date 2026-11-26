@@ -38,7 +38,7 @@ export const TrialTags: React.FC<{ details: TrialDetails }> = ({ details }) => {
             {status && <RecordBadge label={status.label} tone={status.tone} tooltip={status.hint} />}
             {details.has_results && <RecordBadge label={uiText("Results posted")} tone="blue" />}
             {trialHasProtocolOrSap(details) && (
-                <RecordBadge label="Protocol & SAP" tooltip="The registry has the study protocol or statistical analysis plan" />
+                <RecordBadge label={uiText("Protocol & SAP")} tooltip={uiText("The registry has the study protocol or statistical analysis plan")} />
             )}
         </RecordTags>
     );

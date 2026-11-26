@@ -232,6 +232,40 @@ async function chooseSettingsLanguage(hostLocale, targetLocale) {
     prefs.close();
 }
 
+async function inspectWindowMenus(locale) {
+    const labels = {
+        "en-US": ["File", "New Chat", "Edit", "Undo", "Table", "Export to Excel…"],
+        "zh-CN": ["文件", "新对话", "编辑", "撤销", "表格", "导出为 Excel…"],
+        "zh-TW": ["檔案", "新對話", "編輯", "復原", "表格", "匯出為 Excel…"],
+    }[locale];
+    const chat = await waitFor(
+        () => Services.wm.getMostRecentWindow("astermargin:window"),
+        "standalone chat window",
+    );
+    const label = (doc, selector) => doc.querySelector(selector)?.getAttribute("label");
+    const chatLabels = () => [
+        label(chat.document, "#fileMenu"),
+        label(chat.document, "menuitem[command='cmd_astermarginNewChat']"),
+    ];
+    const chatMenu = await waitFor(() => chatLabels().every((value, i) => value === labels[i]) && chatLabels(), "localized standalone dropdown " + locale);
+    const ref = await createFixtureTable("Isolated menu fixture", Zotero.Libraries.userLibraryID);
+    const opened = await Zotero.__astermarginTables.openTable(ref, { window: Zotero.getMainWindow(), openIn: "window" });
+    if (!opened.ok) throw Error("Table window could not open: " + JSON.stringify(opened));
+    const table = await waitFor(
+        () => Services.wm.getMostRecentWindow("astermargin:table"),
+        "standalone table window",
+    );
+    const tableLabels = () => [
+        label(table.document, "#edit-menu"),
+        label(table.document, "#menu_undo"),
+        label(table.document, "#astermargin-table-menu"),
+        label(table.document, "menuitem[command='cmd_astermarginTableExportXlsx']"),
+    ];
+    const tableMenu = await waitFor(() => tableLabels().every((value, i) => value === labels[i + 2]) && tableLabels(), "localized table dropdown " + locale);
+    table.close();
+    return { chat: chatMenu, table: tableMenu };
+}
+
 async function inspectSettings(locale, hostLocale) {
     if (Zotero.locale !== hostLocale)
         throw Error("Unexpected Zotero locale: " + Zotero.locale);
@@ -304,14 +338,19 @@ async function inspectSettings(locale, hostLocale) {
         "settings opened by Zotero preferences button",
     );
     nativeWindow.close();
+    await waitFor(() => nativeWindow.closed, "Zotero preferences closed");
+    win.focus();
     const doc = win.document;
     const panel = await waitFor(
         () => doc.getElementById("astermargin-preferences-panel"),
         "preferences panel",
     );
     const title = await waitFor(() => {
-        const value = doc.documentElement.getAttribute("title");
-        return value?.includes(expected.title) ? value : null;
+        const root = doc.documentElement;
+        const value = root.getAttribute("title");
+        return root.getAttribute("lang") === activeLocale && value?.includes(expected.title)
+            ? value
+            : null;
     }, "localized preferences window title");
     const sections = {};
     const tab = (id) => doc.getElementById("astermargin-preferences-tab-" + id);
@@ -330,7 +369,7 @@ async function inspectSettings(locale, hostLocale) {
         tab(id).click();
         await waitFor(
             () => tab(id).getAttribute("aria-selected") === "true",
-            id,
+            "select settings section " + id,
         );
         await waitFor(
             () => copyOf(panel).includes(expected[id][0]),
@@ -384,6 +423,37 @@ async function inspectSettings(locale, hostLocale) {
                 "endpoint validation",
             );
             sections.validation = expected.invalidUrl;
+            if (__PROVIDER_FIXTURE_ENDPOINT__ && __UPDATE_CENTER__ === "manual") {
+                const card = input.closest(".action-card-editing");
+                const key = card.querySelector("input[type='password']");
+                const loadLabel = {
+                    "en-US": "Load models from endpoint",
+                    "zh-CN": "从端点加载模型",
+                    "zh-TW": "從端點載入模型",
+                }[locale];
+                const load = () => [...card.querySelectorAll("button")].find(node => node.textContent.trim() === loadLabel);
+                const setInput = (el, text) => {
+                    Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value").set.call(el, text);
+                    el.dispatchEvent(new win.Event("input", { bubbles: true }));
+                };
+                if (!(input.compareDocumentPosition(key) & win.Node.DOCUMENT_POSITION_FOLLOWING))
+                    throw Error("Endpoint did not precede API key");
+                setInput(input, __PROVIDER_FIXTURE_ENDPOINT__);
+                setInput(key, "isolated-provider-key");
+                (await waitFor(() => load() && !load().disabled && load(), "model discovery button")).click();
+                const model = await waitFor(
+                    () => card.querySelector('select option[value="isolated-catalogue-model"]'),
+                    "endpoint model catalogue",
+                );
+                model.parentElement.value = model.value;
+                model.parentElement.dispatchEvent(new win.Event("change", { bubbles: true }));
+                await waitFor(
+                    () => [...card.querySelectorAll("input")].some(el => el.value === "32768") &&
+                        card.querySelector("[role='switch'][aria-checked='true']"),
+                    "discovered context window and vision",
+                );
+                sections.discovery = model.value;
+            }
         } else if (id === "actions") {
             button(expected.addAction).click();
             await waitFor(
@@ -398,6 +468,7 @@ async function inspectSettings(locale, hostLocale) {
     }
     tab("general").click();
     if (Services.vc.compare(Zotero.AsterMargin.pluginVersion, "0.1.7") >= 0) {
+        if (Services.vc.compare(Zotero.AsterMargin.pluginVersion, "0.1.8") >= 0) tab("about").click();
         const check = await waitFor(
             () => doc.getElementById("astermargin-check-updates"),
             "AsterMargin update center",

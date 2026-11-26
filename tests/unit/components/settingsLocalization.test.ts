@@ -29,6 +29,16 @@ describe("settings localization", () => {
         expect(Zotero.locale).toBe("en-US");
     });
 
+    it.each([
+        ["zh-CN", "保存为笔记", "在新窗口中打开附件", "删除对话？"],
+        ["zh-TW", "儲存為筆記", "在新視窗中開啟附件", "刪除對話？"],
+    ])("localizes menus and prompts in %s", (locale, note, attachment, deletion) => {
+        vi.stubGlobal("Zotero", { locale: "en-US", AsterMargin: { interfaceLocale: locale } });
+        expect(uiText("Save as note")).toBe(note);
+        expect(uiText("Open {type} in New Window", { type: uiText("Attachment") })).toBe(attachment);
+        expect(uiText("Delete chat?")).toBe(deletion);
+    });
+
     it("falls back to Zotero for invalid or missing saved values", () => {
         expect(
             resolveInterfaceLocale(

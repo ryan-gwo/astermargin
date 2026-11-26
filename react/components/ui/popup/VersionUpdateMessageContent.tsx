@@ -1,3 +1,4 @@
+import { uiText } from "../../../utils/interfaceText";
 import React from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { plusToolsAccessAtom } from '../../../atoms/chatAccess';
@@ -39,7 +40,7 @@ const AlsoNewRow: React.FC<{ item: VersionAlsoNew }> = ({ item }) => {
     return (
         <div className="display-flex flex-col gap-2">
             <span className="text-sm font-medium font-color-tertiary" style={{ textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                Also in this release
+                {uiText("Also in this release")}
             </span>
             <div className="display-flex flex-row gap-3 items-start">
                 <Icon icon={PictureInPictureIcon} size={18} className="flex-shrink-0 mt-015 font-color-secondary" />

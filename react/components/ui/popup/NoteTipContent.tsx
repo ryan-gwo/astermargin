@@ -38,12 +38,12 @@ const NoteTipContent: React.FC<NoteTipContentProps> = ({ onDismiss }) => {
 
             {/* Primary text */}
             <div className="font-color-secondary text-base">
-                Use AsterMargin as a writing assistant for your Zotero notes.
+                {uiText("Use AsterMargin as a writing assistant for your Zotero notes.")}
             </div>
 
             {/* Secondary text */}
             <div className="font-color-tertiary text-base">
-                Summarize papers, draft sections, and find citations while you write.
+                {uiText("Summarize papers, draft sections, and find citations while you write.")}
             </div>
 
             {/* CTA button */}

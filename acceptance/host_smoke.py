@@ -173,6 +173,13 @@ def main():
                         payload, mime = feed, "application/json"
                     elif self.path == "/astermargin.xpi":
                         payload, mime = package_bytes, "application/x-xpinstall"
+                    elif self.path == "/provider/v1/models" and self.headers.get("Authorization") == "Bearer isolated-provider-key":
+                        payload, mime = json.dumps({"data": [{
+                            "id": "isolated-catalogue-model",
+                            "context_window": 32768,
+                            "input_modalities": ["text", "image"],
+                            "effort": {"supported_levels": ["low", "high"]},
+                        }]}).encode(), "application/json"
                     else:
                         self.send_error(404)
                         return
@@ -207,7 +214,7 @@ def main():
     driver_id = "host-smoke@astermargin.local"
     marker = "AsterMargin smoke " + uuid4().hex
     script = Path(__file__).with_name("host_smoke.js").read_text(encoding="utf-8")
-    if args.research_tables or args.local_update:
+    if args.research_tables or args.local_update or args.settings_locale:
         script += Path(__file__).with_name("host_tables.js").read_text(encoding="utf-8")
     if args.update_center:
         script += Path(__file__).with_name("host_updates.js").read_text(encoding="utf-8")
@@ -221,6 +228,7 @@ def main():
                        "__BACKGROUND_UPDATE__": (args.reject_update or "install") if args.update_from else None,
                        "__UPDATE_CENTER__": args.update_center,
                        "__UPDATE_FIXTURE_VERSION__": target_version if args.update_center else None,
+                       "__PROVIDER_FIXTURE_ENDPOINT__": origin + "/provider/v1" if args.update_center else None,
                        "__THEME__": args.theme,
                        "__TEST_TABLES__": args.research_tables,
                        "__SEED_RESEARCH__": args.local_update,

@@ -230,7 +230,7 @@ function choices(column: Column, cell: Cell | undefined): Choice[][] {
             },
             {
                 key: "clear",
-                label: "Clear cell",
+                label: uiText("Clear cell"),
                 current: cell?.outcome === "cleared",
                 input: { op: "clear" },
                 muted: true,

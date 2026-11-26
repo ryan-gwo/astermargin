@@ -295,7 +295,7 @@ export const BatchApprovalCard: React.FC<BatchApprovalCardProps> = ({
                             border: '1px solid var(--fill-quarternary)',
                         }}
                         role="note"
-                        aria-label="What this batch costs on your own API key"
+                        aria-label={uiText("What this batch costs on your own API key")}
                     >
                         <Icon
                             icon={DollarCircleIcon}

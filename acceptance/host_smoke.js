@@ -117,6 +117,8 @@ async function probe() {
             ready:addon.runtime.resolveWindow()?.status === "ready", sidebar:!!sidebar?.trim(),
             quick:quick.state?.mode, window:opened.surfaces?.window_open, itemKey:item.key};
         if (settings) result.settings = settings;
+        if (settings && Services.vc.compare(addon.pluginVersion, "0.1.8") >= 0)
+            result.menus = await inspectWindowMenus(__SETTINGS_LOCALE__);
         if (home) result.home = home;
         if (upgradedFrom) result.upgradedFrom = upgradedFrom;
         if (backgroundUpdate) result.backgroundUpdate = backgroundUpdate;

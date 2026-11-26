@@ -84,7 +84,7 @@ export function TableColumnEditor({
                 ref={dialogRef}
                 role="dialog"
                 aria-modal="true"
-                aria-label={column ? 'Edit column' : 'Add column'}
+                aria-label={uiText(column ? "Edit column" : "Add column")}
                 className="rt-dialog rt-column-editor"
                 onKeyDown={(event) => {
                     if (isImeKeyEvent(event.nativeEvent)) return;
@@ -96,7 +96,7 @@ export function TableColumnEditor({
                 }}
             >
                 <div className="rt-dialog-body">
-                    <div className="rt-dialog-title">{column ? 'Edit column' : 'Add column'}</div>
+                    <div className="rt-dialog-title">{uiText(column ? "Edit column" : "Add column")}</div>
                     <ColumnFields
                         column={draft.column}
                         label={uiText("Column")}
@@ -107,7 +107,7 @@ export function TableColumnEditor({
                     />
                     {column && draft.column.type !== column.type && answers.model + answers.user > 0 ? (
                         <div className="rt-dialog-warning" role="note">
-                            Changing the type clears the column’s {plural(answers.model + answers.user, 'answer')}.
+                            {uiText("Changing the type clears {count} answers in this column.", { count: answers.model + answers.user })}
                         </div>
                     ) : null}
                     {askAnswers ? (
@@ -118,9 +118,9 @@ export function TableColumnEditor({
                                 <span>
                                     <span>{uiText("Keep them")}</span>
                                     <span className="rt-hint">
-                                        {answers.stale
-                                            ? 'For small wording fixes. Answers already out of date stay out of date.'
-                                            : 'For small wording fixes. Nothing to fill.'}
+                                        {uiText(answers.stale
+                                            ? "For small wording fixes. Answers already out of date stay out of date."
+                                            : "For small wording fixes. Nothing to fill.")}
                                     </span>
                                 </span>
                             </label>

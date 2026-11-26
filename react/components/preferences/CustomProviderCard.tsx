@@ -25,10 +25,9 @@ import {
     CustomModelFormat,
     customEndpointFormatHint,
     isOpenRouterApiBase,
-    normalizeCustomModelFormat,
     validateProviderApiBase,
 } from "../../types/settings";
-import { DocLink, ExternalLink, INTELLIGENCE_INDEX_URL, SettingsStatus, SettingsSwitch } from "./components/SettingsElements";
+import { DocLink, SettingsStatus, SettingsSwitch } from "./components/SettingsElements";
 import {
     chatService,
     RockPaperScissorsMove,
@@ -37,6 +36,7 @@ import {
 import { localModeEnabledAtom } from "../../atoms/localMode";
 import { isLoopbackEndpoint } from "@astermargin/agent-local/config/localAgentConfig";
 import { discoverProviderModels, plainHttpWarning, testLocalEndpoint, type DiscoveredProviderModel } from "./localProviderTest";
+import { formatForEndpoint } from "./providerTemplates";
 import { LocalProviderTestRunner } from "./localProviderTestRunner";
 
 interface CustomProviderCardProps {
@@ -46,8 +46,8 @@ interface CustomProviderCardProps {
     onDuplicate: () => void;
     isExpanded: boolean;
     onToggleExpand: () => void;
-    /** Focus the Name field once on mount (used for newly added providers). */
-    autoFocusName?: boolean;
+    /** Focus the endpoint field once on mount (used for newly added providers). */
+    autoFocusEndpoint?: boolean;
 }
 
 type TestStatus = 'idle' | 'loading' | 'success' | 'error';
@@ -82,7 +82,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
     onDuplicate,
     isExpanded,
     onToggleExpand,
-    autoFocusName = false,
+    autoFocusEndpoint = false,
 }) => {
     const localMode = useAtomValue(localModeEnabledAtom);
     const [testStatus, setTestStatus] = useState<TestStatus>('idle');
@@ -95,16 +95,18 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
     const [contextWindowText, setContextWindowText] = useState<string>(
         model.context_window != null ? String(model.context_window) : ''
     );
-    const nameInputRef = useRef<HTMLInputElement>(null);
+    const discoveryRequest = useRef<AbortController | null>(null);
+    const [discoveryMessage, setDiscoveryMessage] = useState("");
+    const endpointInputRef = useRef<HTMLInputElement>(null);
     const testRunnerRef = useRef<LocalProviderTestRunner | null>(null);
     if (!testRunnerRef.current) testRunnerRef.current = new LocalProviderTestRunner();
 
-    // Focus the Name field when a newly added provider mounts in its expanded state.
+    // Focus the endpoint field when a newly added provider mounts in its expanded state.
     useEffect(() => {
-        if (autoFocusName) {
-            nameInputRef.current?.focus();
+        if (autoFocusEndpoint) {
+            endpointInputRef.current?.focus();
         }
-    }, [autoFocusName]);
+    }, [autoFocusEndpoint]);
 
     // Abort any in-flight local test on unmount so it can't set state afterward.
     useEffect(() => {
@@ -138,9 +140,9 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         () => validateProviderApiBase(model.api_base, { allowLocalEndpoints: localMode }),
         [model.api_base, localMode],
     );
-    const format = normalizeCustomModelFormat(model.format);
+    const format = model.format ?? formatForEndpoint(model.api_base);
     const formatHint = apiBaseValidation.valid ? customEndpointFormatHint(model.api_base, format) : null;
-    const isOpenRouter = isOpenRouterApiBase(model.api_base);
+    const isHostedOpenRouter = !localMode && isOpenRouterApiBase(model.api_base);
     const hasName = !!model.name?.trim();
     const hasSnapshot = !!model.snapshot?.trim();
     const hasApiKey = !!model.api_key?.trim();
@@ -148,6 +150,16 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
     const apiKeyOptional = localMode && isLoopbackEndpoint(model.api_base);
     const isComplete = hasName && hasSnapshot && (hasApiKey || apiKeyOptional) && apiBaseValidation.valid;
     const httpWarning = localMode && apiBaseValidation.valid ? plainHttpWarning(model.api_base) : null;
+
+    useEffect(() => {
+        setDiscoveredModels([]);
+        setDiscoveryMessage("");
+        setDiscoveringModels(false);
+        return () => {
+            discoveryRequest.current?.abort();
+            discoveryRequest.current = null;
+        };
+    }, [model.api_base, model.api_key, format]);
 
     // --- Test endpoint (hosted: rock-paper-scissors through the backend) ---
     const runTest = useCallback(async (userMove: RockPaperScissorsMove) => {
@@ -193,7 +205,8 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
             {
                 provider: model.provider,
                 api_base: model.api_base?.trim() || undefined,
-                format: normalizeCustomModelFormat(model.format),
+                format,
+                reasoning_effort: model.reasoning_effort,
                 api_key: model.api_key?.trim() ?? '',
                 name: model.name?.trim() ?? '',
                 snapshot: model.snapshot?.trim() ?? '',
@@ -214,7 +227,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
             setTestStatus('error');
             setTestError(result.message);
         }
-    }, [model]);
+    }, [model, format]);
 
     const runCapabilitiesTest = async (document: Document) => {
         setTestingCapabilities(true);
@@ -229,7 +242,7 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         signal.addEventListener("abort", abort);
         const timer = setTimeout(abort, 60_000);
         try {
-            const report = await checkModelCapabilities(model, deadline.signal, document);
+            const report = await checkModelCapabilities({ ...model, format }, deadline.signal, document);
             if (!runner.isCurrent(signal)) return;
             setLocalTestMessage(report);
             setTestStatus("success");
@@ -243,27 +256,49 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         }
     };
 
-    const discoverModels = useCallback(async () => {
+    const chooseModel = (selected: DiscoveredProviderModel) => {
+        if (selected.contextWindow !== undefined) setContextWindowText(String(selected.contextWindow));
+        update({
+            snapshot: selected.id,
+            name: model.name.trim() || selected.displayName || selected.id,
+            format,
+            ...(selected.contextWindow !== undefined ? { context_window: selected.contextWindow } : {}),
+            ...(selected.supportsVision !== undefined ? { supports_vision: selected.supportsVision } : {}),
+        });
+    };
+
+    const discoverModels = async () => {
+        discoveryRequest.current?.abort();
+        const request = new AbortController();
+        discoveryRequest.current = request;
+        const timeout = setTimeout(() => request.abort(), 15_000);
         setDiscoveringModels(true);
-        setTestError(null);
+        setDiscoveredModels([]);
+        setDiscoveryMessage("");
         try {
-            const models = await discoverProviderModels(model);
+            const models = await discoverProviderModels({ ...model, format }, request.signal);
+            if (discoveryRequest.current !== request) return;
             setDiscoveredModels(models);
-            if (models.length === 1) {
-                const only = models[0];
-                update({
-                    snapshot: only.id,
-                    ...(only.contextWindow ? { context_window: only.contextWindow } : {}),
-                    ...(only.supportsVision ? { supports_vision: true } : {}),
-                });
+            if (models.length === 0) {
+                setDiscoveryMessage(settingsText("No models were returned. You can enter a model ID manually."));
             }
         } catch (error) {
-            setTestError(error instanceof Error ? error.message : String(error));
+            if (discoveryRequest.current === request) {
+                setDiscoveryMessage(
+                    request.signal.aborted
+                        ? settingsText("Model discovery timed out. Try again or enter a model ID manually.")
+                        : error instanceof Error && error.name === "Error"
+                          ? error.message
+                          : settingsText("Could not load models from the endpoint."),
+                );
+            }
         } finally {
-            setDiscoveringModels(false);
+            clearTimeout(timeout);
+            if (discoveryRequest.current === request) setDiscoveringModels(false);
         }
-    }, [model, update]);
+    };
 
+    const reasoningLevels = discoveredModels.find((entry) => entry.id === model.snapshot)?.reasoningEfforts;
     const localizedTestError = testError ? knownSettingsText(testError) : null;
     const testMenuItems: MenuItem[] = useMemo(() => [
         { label: '', isDivider: true, onClick: () => {} },
@@ -335,24 +370,11 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
         // layout, so restore card padding inline (this card has no header/body).
         <div className="action-card action-card-editing" style={{ padding: '10px 12px' }}>
             <div className="display-flex flex-col" style={{ gap: '14px' }}>
-                {/* Name */}
-                <label className="display-flex flex-col">
-                    <span className="text-sm font-color-secondary">{uiText("Name")}</span>
-                    <input
-                        ref={nameInputRef}
-                        type="text"
-                        value={model.name}
-                        onChange={(e) => update({ name: e.target.value })}
-                        placeholder={settingsText("My Custom Model")}
-                        aria-label={settingsText("Provider name")}
-                        className="chat-input text-base font-color-primary"
-                    />
-                </label>
-
                 {/* API base */}
                 <label className="display-flex flex-col">
                     <span className="text-sm font-color-secondary">{uiText("Endpoint URL (api_base)")}</span>
                     <input
+                        ref={endpointInputRef}
                         type="text"
                         value={model.api_base ?? ''}
                         onChange={(e) => update({ api_base: e.target.value })}
@@ -382,71 +404,6 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     )}
                 </label>
 
-                {/* Format + Context window row */}
-                <div className="display-flex flex-col gap-1">
-                    <div className="display-flex flex-row gap-4">
-                        {/* Not a <label>: the menu renders inside this wrapper, and a label
-                            forwards clicks on its menu items to the button, reopening the menu. */}
-                        <div className="display-flex flex-col items-start">
-                            <span className="text-sm font-color-secondary">{uiText("Format")}</span>
-                            <MenuButton
-                                menuItems={formatMenuItems}
-                                buttonLabel={CUSTOM_MODEL_FORMAT_LABELS[format]}
-                                variant="outline"
-                                rightIcon={ArrowDownIcon}
-                                width="210px"
-                                className="text-base"
-                                ariaLabel={settingsText("API format")}
-                                disabled={isOpenRouter}
-                            />
-                        </div>
-                        <label className="display-flex flex-col flex-1">
-                            <span className="text-sm font-color-secondary">{uiText("Context window")}</span>
-                            <input
-                                type="text"
-                                inputMode="numeric"
-                                value={contextWindowText}
-                                onChange={(e) => handleContextWindowChange(e.target.value)}
-                                placeholder="128000"
-                                aria-label={uiText("Context window")}
-                                className="chat-input text-base font-color-primary"
-                            />
-                            {contextWindowError && (
-                                <span className="text-sm" style={{ color: 'var(--tag-red-secondary)' }}>
-                                    {settingsText("Enter a number (e.g. 128000).")}
-                                </span>
-                            )}
-                        </label>
-                    </div>
-                    {isOpenRouter && (
-                        <span className="text-sm font-color-tertiary">
-                            {settingsText("OpenRouter uses AsterMargin's built-in OpenRouter connection, so Format does not apply.")}
-                        </span>
-                    )}
-                </div>
-
-                <label className="display-flex flex-col">
-                    <span className="text-sm font-color-secondary">{settingsText("Reasoning strength")}</span>
-                    <select
-                        value={model.reasoning_effort ?? ''}
-                        onChange={(event) => update({
-                            reasoning_effort: event.target.value === 'low' || event.target.value === 'medium' || event.target.value === 'high'
-                                ? event.target.value
-                                : undefined,
-                        })}
-                        aria-label={settingsText("Reasoning strength")}
-                        className="preference-input text-base font-color-primary"
-                    >
-                        <option value="">{settingsText("Service default")}</option>
-                        <option value="low">{settingsText("Low")}</option>
-                        <option value="medium">{settingsText("Medium")}</option>
-                        <option value="high">{settingsText("High")}</option>
-                    </select>
-                    <span className="text-sm font-color-tertiary">
-                        {settingsText("Leave this at service default unless the endpoint documents a supported level. The server decides the effective setting.")}
-                    </span>
-                </label>
-
                 {/* API key. The copy button is required: Gecko's built-in reveal button
                     unmasks a password input without changing its type, and clipboard
                     copy stays blocked for as long as the input is type="password". */}
@@ -472,11 +429,33 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     </div>
                 </label>
 
+                {/* API protocol */}
+                <div className="display-flex flex-col gap-1">
+                    <div className="display-flex flex-col items-start">
+                        <span className="text-sm font-color-secondary">{uiText("Format")}</span>
+                        <MenuButton
+                            menuItems={formatMenuItems}
+                            buttonLabel={CUSTOM_MODEL_FORMAT_LABELS[format]}
+                            variant="outline"
+                            rightIcon={ArrowDownIcon}
+                            width="210px"
+                            className="text-base"
+                            ariaLabel={settingsText("API format")}
+                            disabled={isHostedOpenRouter}
+                        />
+                    </div>
+                    {isHostedOpenRouter && (
+                        <span className="text-sm font-color-tertiary">
+                            {settingsText("OpenRouter uses AsterMargin's built-in OpenRouter connection, so Format does not apply.")}
+                        </span>
+                    )}
+                </div>
+
                 <div className="display-flex flex-row items-center gap-2">
                     <Button
                         variant="outline"
                         onClick={() => void discoverModels()}
-                        disabled={discoveringModels || !apiBaseValidation.valid || (!hasApiKey && !apiKeyOptional)}
+                        disabled={discoveringModels || !model.api_base?.trim() || !apiBaseValidation.valid || (!hasApiKey && !apiKeyOptional)}
                         loading={discoveringModels}
                         style={{ padding: '4px 8px' }}
                     >
@@ -487,6 +466,10 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                     </span>
                 </div>
 
+                {discoveryMessage && (
+                    <span role="status" className="text-sm font-color-secondary">{discoveryMessage}</span>
+                )}
+
                 {/* Snapshot */}
                 <label className="display-flex flex-col">
                     <span className="text-sm font-color-secondary">{uiText("Model (snapshot)")}</span>
@@ -494,8 +477,8 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                         <input
                             type="text"
                             value={model.snapshot}
-                            onChange={(e) => update({ snapshot: e.target.value })}
-                            placeholder="openai/gpt-4o"
+                            onChange={(e) => update({ snapshot: e.target.value, format })}
+                            placeholder={settingsText("Enter a model ID manually")}
                             aria-label={settingsText("Model snapshot")}
                             className="chat-input text-base font-color-primary flex-1 min-w-0"
                         />
@@ -511,21 +494,78 @@ const CustomProviderCard: React.FC<CustomProviderCardProps> = ({
                             value={discoveredModels.some((entry) => entry.id === model.snapshot) ? model.snapshot : ''}
                             onChange={(event) => {
                                 const selected = discoveredModels.find((entry) => entry.id === event.target.value);
-                                update({
-                                    snapshot: event.target.value,
-                                    ...(selected?.contextWindow ? { context_window: selected.contextWindow } : {}),
-                                    ...(selected?.supportsVision ? { supports_vision: true } : {}),
-                                });
+                                if (selected) chooseModel(selected);
                             }}
                             aria-label={settingsText("Discovered models")}
                         >
                             <option value="">{settingsText("Choose a discovered model")}</option>
-                            {discoveredModels.map((entry) => <option key={entry.id} value={entry.id}>{entry.id}</option>)}
+                            {discoveredModels.map((entry) => (
+                                <option key={entry.id} value={entry.id}>
+                                    {entry.displayName && entry.displayName !== entry.id
+                                        ? `${entry.displayName} · ${entry.id}`
+                                        : entry.id}
+                                </option>
+                            ))}
                         </select>
                     )}
+                </label>
+
+                {/* Name */}
+                <label className="display-flex flex-col">
+                    <span className="text-sm font-color-secondary">{uiText("Name")}</span>
+                    <input
+                        type="text"
+                        value={model.name}
+                        onChange={(e) => update({ name: e.target.value })}
+                        placeholder={settingsText("My Custom Model")}
+                        aria-label={settingsText("Provider name")}
+                        className="chat-input text-base font-color-primary"
+                    />
+                </label>
+
+                <label className="display-flex flex-col">
+                    <span className="text-sm font-color-secondary">{uiText("Context window")}</span>
+                    <input
+                        type="text"
+                        inputMode="numeric"
+                        value={contextWindowText}
+                        onChange={(e) => handleContextWindowChange(e.target.value)}
+                        placeholder="128000"
+                        aria-label={uiText("Context window")}
+                        className="chat-input text-base font-color-primary"
+                    />
+                    {contextWindowError && (
+                        <span className="text-sm" style={{ color: 'var(--tag-red-secondary)' }}>
+                            {settingsText("Enter a number (e.g. 128000).")}
+                        </span>
+                    )}
+                </label>
+                <label className="display-flex flex-col">
+                    <span className="text-sm font-color-secondary">{settingsText("Reasoning strength")}</span>
+                    <select
+                        value={model.reasoning_effort ?? ''}
+                        onChange={(event) => update({
+                            reasoning_effort: event.target.value === 'low' || event.target.value === 'medium' || event.target.value === 'high'
+                                ? event.target.value
+                                : undefined,
+                        })}
+                        aria-label={settingsText("Reasoning strength")}
+                        className="preference-input text-base font-color-primary"
+                    >
+                        <option value="">{settingsText("Service default")}</option>
+                        <option value="low">{settingsText("Low")}</option>
+                        <option value="medium">{settingsText("Medium")}</option>
+                        <option value="high">{settingsText("High")}</option>
+                    </select>
+                    {reasoningLevels?.length ? (
+                        <span className="text-sm font-color-tertiary">
+                            {settingsText("The endpoint lists these reasoning levels: {levels}", {
+                                levels: reasoningLevels.join(", "),
+                            })}
+                        </span>
+                    ) : null}
                     <span className="text-sm font-color-tertiary">
-                        {settingsText("Small or older models may struggle with tool calls. Choose a model with an Artificial Analysis score of at least 26, preferably 35 or higher.")}
-                        {' '}<ExternalLink href={INTELLIGENCE_INDEX_URL}>{settingsText("Artificial Analysis Intelligence Index")}</ExternalLink>
+                        {settingsText("Leave this at service default unless the endpoint documents a supported level. The server decides the effective setting.")}
                     </span>
                 </label>
 

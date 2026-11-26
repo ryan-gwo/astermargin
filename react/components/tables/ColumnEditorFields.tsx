@@ -265,7 +265,7 @@ export function ColumnFields({
     }));
     const nameField = (
         <label className="table-card-label flex-1 min-w-0">
-            <span>Name</span>
+            <span>{uiText("Name")}</span>
             <input
                 ref={refs?.header}
                 className="table-card-field font-medium"

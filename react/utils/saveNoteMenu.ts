@@ -1,3 +1,4 @@
+import { uiText } from "./interfaceText";
 import type { MenuItem } from '@astermargin/agent-ui/primitives/ContextMenu';
 import { NoteIcon } from '@astermargin/agent-ui/icons';
 
@@ -27,17 +28,17 @@ export function saveAsNoteMenuItem(options: {
 }): MenuItem {
     const { onSaveStandalone, onSaveChild, hasParent, parentTitle, disabled = false } = options;
     const childLabel = !hasParent
-        ? 'Child note (no item selected)'
+        ? uiText("Child note (no item selected)")
         : parentTitle?.trim()
-            ? `Child note of “${shortTitle(parentTitle)}”`
-            : 'Child note';
+            ? uiText("Child note of “{title}”", { title: shortTitle(parentTitle) })
+            : uiText("Child note");
     return {
-        label: 'Save as note',
+        label: uiText("Save as note"),
         icon: NoteIcon,
         onClick: () => {},
         disabled,
         submenu: [
-            { label: 'Standalone note', onClick: onSaveStandalone, disabled },
+            { label: uiText("Standalone note"), onClick: onSaveStandalone, disabled },
             { label: childLabel, onClick: onSaveChild, disabled: disabled || !hasParent },
         ],
     };

@@ -1,3 +1,4 @@
+import { uiText } from "./interfaceText";
 import { currentThreadIdAtom } from '@astermargin/agent-core/run-state/atoms';
 import { getCredentialGeneration } from '@astermargin/agent-core/transport/credentials';
 import { store } from '../store';
@@ -11,8 +12,8 @@ import { getWindowRuntime } from '../runtime/windowRuntime';
 export async function confirmAndDeleteThread(threadId: string, win: Window): Promise<boolean> {
     const buttonIndex = Zotero.Prompt.confirm({
         window: win,
-        title: 'Delete chat?',
-        text: 'Are you sure you want to delete this chat? This action cannot be undone.',
+        title: uiText("Delete chat?"),
+        text: uiText("Are you sure you want to delete this chat? This action cannot be undone."),
         button0: Zotero.Prompt.BUTTON_TITLE_YES,
         button1: Zotero.Prompt.BUTTON_TITLE_NO,
         defaultButton: 1,

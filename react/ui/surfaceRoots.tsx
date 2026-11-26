@@ -1,3 +1,4 @@
+import { uiText } from "../utils/interfaceText";
 import { getTransportConfigurationError } from '@astermargin/agent-core/transport/config';
 import { Provider } from 'jotai';
 import React from 'react';
@@ -22,10 +23,10 @@ export function mountSurface(domElement: HTMLElement, children: React.ReactNode)
             <SurfaceWindowContext.Provider value={domElement.ownerDocument.defaultView}>
                 {getTransportConfigurationError() ? (
                     <div role="alert" style={{ padding: 20 }}>
-                        <strong>AsterMargin couldn’t start</strong>
+                        <strong>{uiText("AsterMargin couldn’t start")}</strong>
                         <p>{getTransportConfigurationError()}</p>
                         <p>
-                            Restart Zotero. If this continues, reinstall AsterMargin.
+                            {uiText("Restart Zotero. If this continues, reinstall AsterMargin.")}
                         </p>
                     </div>
                 ) : children}

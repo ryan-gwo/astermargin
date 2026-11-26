@@ -75,7 +75,7 @@ const TrialReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item }) 
                 </DetailsSection>
             )}
             {interventions.length > 0 && (
-                <DetailsSection title="Interventions">
+                <DetailsSection title={uiText("Interventions")}>
                     <div className="display-flex flex-row flex-wrap gap-1">
                         {interventions.map((intervention, index) => (
                             <span key={`${intervention.name}-${index}`} className="ext-chip">

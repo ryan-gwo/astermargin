@@ -57,7 +57,7 @@ export const TagListResultView: React.FC<{ view: TagListView }> = ({ view }) => 
             </div>
             {view.total_count > tags.length && (
                 <div className="px-15 py-2 text-xs font-color-tertiary border-t border-primary">
-                    Showing {tags.length} of {view.total_count} tags
+                    {uiText("Showing {done} of {total} tags", { done: tags.length, total: view.total_count })}
                 </div>
             )}
         </div>

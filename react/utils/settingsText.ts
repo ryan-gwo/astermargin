@@ -1256,7 +1256,27 @@ const messages = {
         "請先填寫端點與 API 金鑰。星箋接著會讀取該端點目前的模型清單與能力資訊。",
     ],
     "{count} models loaded": ["已加载 {count} 个模型", "已載入 {count} 個模型"],
-    "An endpoint URL is required before loading models.": ["加载模型前必须填写端点地址。", "載入模型前必須填寫端點位址。"],
+    "No models were returned. You can enter a model ID manually.": [
+        "端点没有返回模型，可手动输入模型 ID。",
+        "端點未傳回模型，可手動輸入模型 ID。",
+    ],
+    "Model discovery timed out. Try again or enter a model ID manually.": [
+        "加载模型超时，请重试或手动输入模型 ID。",
+        "載入模型逾時，請重試或手動輸入模型 ID。",
+    ],
+    "Could not load models from the endpoint.": [
+        "无法从端点加载模型。",
+        "無法從端點載入模型。",
+    ],
+    "Enter a model ID manually": ["手动输入模型 ID", "手動輸入模型 ID"],
+    "The endpoint lists these reasoning levels: {levels}": [
+        "端点列出的推理强度为 {levels}",
+        "端點列出的推理強度為 {levels}",
+    ],
+    "The endpoint did not return a model list.": [
+        "端点未返回模型列表。",
+        "端點未傳回模型清單。",
+    ],
     "Model loading failed ({status}).": ["模型加载失败（{status}）。", "模型載入失敗（{status}）。"],
     "Template model": ["模板模型", "範本模型"],
     "Use template": ["使用模板", "使用範本"],
@@ -1267,7 +1287,7 @@ const messages = {
     "Qwen DashScope compatible-mode API. Enter the endpoint and key, then load the models offered by your account.": ["通义千问百炼兼容模式 API。填写端点和密钥后，加载账户可用的模型。", "通義千問百煉相容模式 API。填寫端點與金鑰後，載入帳戶可用的模型。"],
     "OpenRouter API. Enter the endpoint and key, then load the models available to your account.": ["OpenRouter API。填写端点和密钥后，加载账户可用的模型。", "OpenRouter API。填寫端點與金鑰後，載入帳戶可用的模型。"],
     "Ollama local API. Enter the endpoint, optionally enter a key, then load installed models.": ["Ollama 本机 API。填写端点，可选填密钥，然后加载已安装的模型。", "Ollama 本機 API。填寫端點，可選填金鑰，然後載入已安裝的模型。"],
-    "LM Studio local OpenAI-compatible API. Enter the endpoint, optionally enter a key, then load loaded models.": ["LM Studio 本机 OpenAI 兼容 API。填写端点，可选填密钥，然后加载已载入的模型。", "LM Studio 本機 OpenAI 相容 API。填寫端點，可選填金鑰，然後載入已載入的模型。"],
+    "LM Studio local OpenAI-compatible API. Enter the endpoint, optionally enter a key, then load available models.": ["LM Studio 本机 OpenAI 兼容 API。填写端点，可选填密钥，然后加载已载入的模型。", "LM Studio 本機 OpenAI 相容 API。填寫端點，可選填金鑰，然後載入已載入的模型。"],
     "Reasoning strength": ["推理强度", "推理強度"],
     "Service default": ["服务端默认", "服務端預設"],
     Low: ["低", "低"],

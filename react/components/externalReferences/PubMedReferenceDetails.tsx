@@ -87,7 +87,7 @@ const PubMedReferenceDetails: React.FC<{ item: ExternalReference }> = ({ item })
             ) : null}
             {mesh.length > 0 && (
                 <DetailsSection
-                    title="MeSH terms"
+                    title={uiText("MeSH terms")}
                     aside={(
                         <Tooltip content={MESH_HELP}>
                             <span className="font-color-secondary text-sm cursor-default">{uiText("What are these?")}</span>

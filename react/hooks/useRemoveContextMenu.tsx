@@ -148,7 +148,7 @@ export function useRemoveContextMenu({
             },
             ...(onRemoveAll
                 ? [{
-                    label: 'Remove all',
+                    label: uiText("Remove all"),
                     icon: DeleteIcon,
                     onClick: () => onRemoveAll(),
                 }]

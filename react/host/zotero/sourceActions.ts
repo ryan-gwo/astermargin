@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import { logger } from '@astermargin/agent-core/platform/logger';
 import { store } from '../../store';
 import { addPopupMessageAtom } from '../../utils/popupMessageUtils';
@@ -8,8 +9,8 @@ function notifyExternalFileUnavailable(): void {
         store.set(addPopupMessageAtom, {
             id: 'external-file-unavailable',
             type: 'warning',
-            title: 'File Not Available',
-            text: 'This file is not available on this computer. It was removed or attached on another device.',
+            title: uiText("File Not Available"),
+            text: uiText("This file is not available on this computer. It was removed or attached on another device."),
         });
     } catch (e) {
         logger(`notifyExternalFileUnavailable: failed to surface popup: ${e}`, 2);
@@ -123,8 +124,8 @@ export function notifyReferenceUnavailable(
         store.set(addPopupMessageAtom, {
             id: `reference-unavailable-${kind}-${cause}`,
             type: 'warning',
-            title,
-            text,
+            title: uiText(title),
+            text: uiText(text),
         });
     } catch (e) {
         logger(`notifyReferenceUnavailable: failed to surface popup: ${e}`, 2);
@@ -137,8 +138,8 @@ export function notifyTableOpenFailed(message: string): void {
         store.set(addPopupMessageAtom, {
             id: 'table-open-failed',
             type: 'warning',
-            title: 'Table Not Available',
-            text: message,
+            title: uiText("Table Not Available"),
+            text: uiText(message),
         });
     } catch (e) {
         logger(`notifyTableOpenFailed: failed to surface popup: ${e}`, 2);

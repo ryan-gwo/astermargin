@@ -151,7 +151,7 @@ const ThreadFilterMenu: React.FC<ThreadFilterMenuProps> = ({ activeFilter, onSel
             rows.push(createThreadFilterMenuItem(contextItem, ctx));
         }
         if (recentItems.length > 0) {
-            rows.push({ label: 'Recent Items', isGroupHeader: true, onClick: () => {} });
+            rows.push({ label: uiText("Recent Items"), isGroupHeader: true, onClick: () => {} });
             rows.push(...recentItems.map((item) => createThreadFilterMenuItem(item, ctx)));
         }
         return rows;

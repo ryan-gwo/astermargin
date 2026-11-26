@@ -104,10 +104,11 @@ await writeFile(updateFile, JSON.stringify(updates, null, 2) + "\n");
 
 const scratch = await mkdtemp(join(tmpdir(), "astermargin-release-"));
 if (!releases.some(release => release.tagName === tag)) {
+    const body = git("for-each-ref", "--format=%(contents:body)", tagRef);
     const notes = join(scratch, "release-notes.md");
-    await writeFile(notes, git("for-each-ref", "--format=%(contents)", tagRef) + "\n");
+    if (body) await writeFile(notes, body + "\n");
     gh("release", "create", tag, "--repo", repository, "--draft", "--verify-tag",
-        "--title", tag, "--notes-file", notes);
+        "--title", tag, ...(body ? ["--notes-file", notes] : ["--generate-notes"]));
 }
 const draft = JSON.parse(gh("release", "view", tag, "--repo", repository, "--json", "isDraft"));
 assert(draft.isDraft, "Only draft assets can be uploaded");

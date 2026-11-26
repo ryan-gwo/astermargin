@@ -31,10 +31,9 @@ export default function BackgroundProcessingStartedContent(props: {
 
     return (
         <div className="display-flex flex-col gap-4 w-full">
-            <CloudFeaturesHeader eyebrow={props.eyebrow} title="AsterMargin will prepare your library" />
+            <CloudFeaturesHeader eyebrow={props.eyebrow} title={uiText("AsterMargin will prepare your library")} />
             <div className="font-color-secondary text-base">
-                Files are processed in the background once your computer has been idle for 30 seconds.
-                Large libraries can take a while, so you can also start right away.
+                {uiText("Files are processed in the background once your computer has been idle for 30 seconds. Large libraries can take a while, so you can also start right away.")}
             </div>
             <div
                 className="display-flex flex-row items-center justify-between pt-2"

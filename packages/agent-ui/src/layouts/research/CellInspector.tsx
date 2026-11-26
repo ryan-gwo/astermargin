@@ -302,7 +302,7 @@ function CellDetails({
                     <section className="rt-inspector-section rt-inspector-answer-section">
                         <div className="rt-inspector-heading">
                             <Icon icon={EditIcon} size={12} />
-                            <span>Your answer</span>
+                            <span>{uiText("Your answer")}</span>
                         </div>
                         {actions?.editor ?? (
                             <>

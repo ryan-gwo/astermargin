@@ -63,7 +63,7 @@ export const CollectionListResultView: React.FC<{ view: CollectionListView }> = 
             })}
             {view.total_count > collections.length && (
                 <div className="px-15 py-2 text-xs font-color-tertiary border-t border-primary">
-                    Showing {collections.length} of {view.total_count} collections
+                    {uiText("Showing {done} of {total} collections", { done: collections.length, total: view.total_count })}
                 </div>
             )}
             {itemMenu}

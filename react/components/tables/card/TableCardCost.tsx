@@ -165,7 +165,7 @@ export const TableCardReceipt: React.FC<TableCardReceiptProps> = ({ cost, upperB
                 ref={buttonRef}
                 type="button"
                 className="table-card-receipt-info"
-                aria-label="How this is priced"
+                aria-label={uiText("How this is priced")}
                 aria-expanded={open}
                 aria-controls={open ? popoverId : undefined}
                 disabled={disabled}
@@ -179,7 +179,7 @@ export const TableCardReceipt: React.FC<TableCardReceiptProps> = ({ cost, upperB
                     id={popoverId}
                     className="table-card-pricing-popover"
                     role="dialog"
-                    aria-label="How this is priced"
+                    aria-label={uiText("How this is priced")}
                     style={position ? { bottom: position.bottom, right: position.right } : { visibility: 'hidden' }}
                 >
                     <div className="table-card-pricing-rows">

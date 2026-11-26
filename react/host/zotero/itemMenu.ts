@@ -1,3 +1,4 @@
+import { uiText } from "../../utils/interfaceText";
 import type { MenuItem } from '@astermargin/agent-ui/primitives/ContextMenu';
 import type { ZoteroItemReference } from '@astermargin/agent-core/types/zotero';
 import { logger } from '@astermargin/agent-core/platform/logger';
@@ -13,14 +14,14 @@ const READER_TYPE_LABELS: Record<string, string> = { pdf: 'PDF', epub: 'EPUB', s
 
 /** "Open <type> in New Tab" / "… in New Window", the preferred one first. */
 function openEntries(typeLabel: string, prefersWindow: boolean, openIn: (window: boolean) => void): MenuItem[] {
-    const inTab: MenuItem = { label: `Open ${typeLabel} in New Tab`, icon: FileViewIcon, onClick: () => openIn(false) };
-    const inWindow: MenuItem = { label: `Open ${typeLabel} in New Window`, icon: ExternalLinkIcon, onClick: () => openIn(true) };
+    const inTab: MenuItem = { label: uiText("Open {type} in New Tab", { type: typeLabel }), icon: FileViewIcon, onClick: () => openIn(false) };
+    const inWindow: MenuItem = { label: uiText("Open {type} in New Window", { type: typeLabel }), icon: ExternalLinkIcon, onClick: () => openIn(true) };
     return prefersWindow ? [inWindow, inTab] : [inTab, inWindow];
 }
 
 function showFileEntry(file: Zotero.Item): MenuItem {
     return {
-        label: Zotero.isMac ? 'Show in Finder' : 'Show File',
+        label: Zotero.isMac ? uiText("Show in Finder") : uiText("Show File"),
         icon: FolderDetailIcon,
         onClick: () => void showAttachmentInFilesystem(file.id),
     };
@@ -48,16 +49,16 @@ async function annotationEntries(annotation: Zotero.Item): Promise<MenuItem[]> {
     // The parent may not be in memory yet; the synchronous `parentItem` would miss it.
     const attachment = annotation.parentID ? await Zotero.Items.getAsync(annotation.parentID) : null;
     if (!attachment) return [];
-    const typeLabel = READER_TYPE_LABELS[attachment.attachmentReaderType] ?? 'Attachment';
+    const typeLabel = uiText(READER_TYPE_LABELS[attachment.attachmentReaderType] ?? "Attachment");
     const entries: MenuItem[] = [
         {
-            label: `Show in ${typeLabel}`,
+            label: uiText("Show in {type}", { type: typeLabel }),
             icon: FileViewIcon,
             onClick: () => void navigateToAnnotation(annotation)
                 .catch((error) => logger(`itemMenuItems: navigateToAnnotation: ${error}`, 2)),
         },
         {
-            label: 'Show in Library',
+            label: uiText("Show in Library"),
             icon: LibraryIcon,
             onClick: () => void revealAnnotation(annotation, attachment),
         },
@@ -87,7 +88,7 @@ export async function itemMenuItems(ref: ZoteroItemReference): Promise<MenuItem[
     if (item.isAnnotation()) return annotationEntries(item);
 
     const entries: MenuItem[] = [{
-        label: 'Show in Library',
+        label: uiText("Show in Library"),
         icon: LibraryIcon,
         onClick: () => revealSource({ ...ref, library_id: libraryID }),
     }];
@@ -95,19 +96,19 @@ export async function itemMenuItems(ref: ZoteroItemReference): Promise<MenuItem[
     if (item.isAttachment()) {
         await loadTableItemFields([item]);
         if (isTableItem(item)) {
-            entries.push({ label: 'Open Table', icon: FileViewIcon, onClick: () => void viewAttachment(item.id) });
+            entries.push({ label: uiText("Open Table"), icon: FileViewIcon, onClick: () => void viewAttachment(item.id) });
             return entries;
         }
     }
 
     if (item.isNote()) {
         if (typeof (Zotero as any).Notes?.open === 'function') {
-            entries.push(...openEntries('Note', Boolean(Zotero.Prefs.get('openNoteInNewWindow')), (inWindow) => {
+            entries.push(...openEntries(uiText("Note"), Boolean(Zotero.Prefs.get('openNoteInNewWindow')), (inWindow) => {
                 if (inWindow) void openNoteWindow(item.id);
                 else void openNote(item.id).catch((error) => logger(`itemMenuItems: openNote: ${error}`, 2));
             }));
         } else {
-            entries.push({ label: 'Open Note', icon: NoteIcon, onClick: () => void openNoteWindow(item.id) });
+            entries.push({ label: uiText("Open Note"), icon: NoteIcon, onClick: () => void openNoteWindow(item.id) });
         }
         return entries;
     }
@@ -133,9 +134,9 @@ export async function itemMenuItems(ref: ZoteroItemReference): Promise<MenuItem[
         && candidate.attachmentLinkMode !== Zotero.Attachments.LINK_MODE_LINKED_URL);
     if (attachment) {
         const readerType = attachment.attachmentReaderType;
-        const typeLabel = READER_TYPE_LABELS[readerType] ?? 'Attachment';
+        const typeLabel = uiText(READER_TYPE_LABELS[readerType] ?? "Attachment");
         if (Zotero.Prefs.get(`fileHandler.${readerType}`)) {
-            entries.push({ label: `Open ${typeLabel}`, icon: FileViewIcon, onClick: () => void viewAttachment(attachment.id) });
+            entries.push({ label: uiText("Open {type}", { type: typeLabel }), icon: FileViewIcon, onClick: () => void viewAttachment(attachment.id) });
         } else {
             // Zotero's "open in new window" preference decides where a plain open goes;
             // the other entry inverts it, like a shift-click.
@@ -147,7 +148,7 @@ export async function itemMenuItems(ref: ZoteroItemReference): Promise<MenuItem[
     } else if (file) {
         // No built-in reader (a DOCX, an image, plain text): Zotero opens the file
         // in its system application, as a double-click in the items tree does.
-        entries.push({ label: 'Open Attachment', icon: FileViewIcon, onClick: () => void viewAttachment(file.id) });
+        entries.push({ label: uiText("Open Attachment"), icon: FileViewIcon, onClick: () => void viewAttachment(file.id) });
     }
 
     if (file) entries.push(showFileEntry(file));

@@ -24,7 +24,7 @@ const HighTokenUsageWarningBar: React.FC<HighTokenUsageWarningBarProps> = ({
         <div className="composer-docked-bar high-token-usage-warning-bar display-flex flex-row items-start px-3 py-15 gap-2">
             <Icon icon={AlertIcon} className="font-color-secondary scale-10 mt-010" />
             <span className="font-color-secondary text-sm">
-                Your conversation is long.
+                {uiText("Your conversation is long.")}
                 {' '}
                 <a
                     href="#"
@@ -42,8 +42,8 @@ const HighTokenUsageWarningBar: React.FC<HighTokenUsageWarningBarProps> = ({
                 </a>
                 {' '}
                 {isUsingAsterMarginCredits
-                    ? 'to save credits and improve response quality.'
-                    : 'to reduce costs and improve response quality.'}
+                    ? uiText("to save credits and improve response quality.")
+                    : uiText("to reduce costs and improve response quality.")}
             </span>
             <div className="flex-1" />
             <IconButton

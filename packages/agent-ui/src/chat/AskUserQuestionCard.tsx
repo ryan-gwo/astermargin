@@ -166,7 +166,9 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
             className="user-message-display"
             style={{ minHeight: 'fit-content' }}
             role="group"
-            aria-label={total > 1 ? `Question ${index + 1} of ${total}` : 'Question'}
+            aria-label={total > 1
+                ? uiText("Question {done} of {total}", { done: index + 1, total })
+                : uiText("Question")}
         >
             <div className="display-flex flex-col gap-15">
                 {/* Header: per-question label + stepper. The question's short
@@ -177,7 +179,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                         className="font-color-primary text-sm font-semibold uppercase truncate"
                         style={{ letterSpacing: '0.05em' }}
                     >
-                        {question.header || pendingQuestion.title || 'Question'}
+                        {question.header || pendingQuestion.title || uiText("Question")}
                     </div>
                     {total > 1 && (
                         <div className="display-flex flex-row items-center gap-1 flex-none">
@@ -189,7 +191,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                                 disabled={index === 0 || isSubmitted}
                             />
                             <span className="text-sm font-color-tertiary whitespace-nowrap">
-                                {index + 1} of {total}
+                                {uiText("{done} of {total}", { done: index + 1, total })}
                             </span>
                             <IconButton
                                 icon={ArrowRightIcon}
@@ -208,7 +210,7 @@ export const AskUserQuestionCard: React.FC<AskUserQuestionCardProps> = ({
                         {question.question}
                         {question.allow_multiple && (
                             <span className="font-color-secondary text-base ml-2">
-                                (Multiple choice)
+                                {uiText("(Multiple choice)")}
                             </span>
                         )}
                     </div>

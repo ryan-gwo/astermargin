@@ -337,7 +337,7 @@ export const ExternalReferenceListResultView: React.FC<{
                     className="px-3 py-2 text-sm font-color-tertiary border-t border-color-quinary"
                 >
                     <span className="font-color-secondary">{query}</span>
-                    <span> — not found</span>
+                    <span> {uiText("— not found")}</span>
                 </div>
             ))}
 
@@ -347,7 +347,7 @@ export const ExternalReferenceListResultView: React.FC<{
                     className="px-3 py-2 text-sm font-color-tertiary border-t border-color-quinary"
                 >
                     <span className="font-color-secondary">{query}</span>
-                    <span> — lookup unavailable</span>
+                    <span> {uiText("— lookup unavailable")}</span>
                 </div>
             ))}
 

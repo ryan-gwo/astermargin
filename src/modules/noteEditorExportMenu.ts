@@ -130,7 +130,7 @@ function addEntry(dropdown: Element): void {
     button.className = `option ${ENTRY_CLASS}`;
     button.setAttribute('aria-haspopup', 'menu');
     const label = doc.createElement('span');
-    label.textContent = getString('note-export-submenu');
+    label.textContent = getString('note-export-submenu', 'label');
     button.append(label, createChevron(doc));
     button.addEventListener('click', (event: Event) => {
         // The dropdown closes on any click in its popup, which React handles

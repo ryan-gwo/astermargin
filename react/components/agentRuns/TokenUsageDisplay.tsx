@@ -39,11 +39,11 @@ export const TokenUsageDisplay: React.FC<TokenUsageDisplayProps> = ({ usage, cos
     const tooltipContent = (
         <div className="display-flex flex-col gap-1 text-sm min-w-[140px]">
             <div className="display-flex justify-between gap-4">
-                <span className="font-color-secondary whitespace-nowrap">Input tokens</span>
+                <span className="font-color-secondary whitespace-nowrap">{uiText("Input tokens")}</span>
                 <span>{formatTokens(usage.input_tokens)}</span>
             </div>
             <div className="display-flex justify-between gap-4">
-                <span className="font-color-secondary whitespace-nowrap">Output tokens</span>
+                <span className="font-color-secondary whitespace-nowrap">{uiText("Output tokens")}</span>
                 <span>{formatTokens(usage.output_tokens)}</span>
             </div>
             {usage.cache_read_tokens > 0 && (
@@ -68,7 +68,7 @@ export const TokenUsageDisplay: React.FC<TokenUsageDisplayProps> = ({ usage, cos
             </div> */}
             {cost !== undefined && (
                 <div className="display-flex justify-between gap-4 font-medium mt-1 pt-1 border-top-quinary">
-                    <span className="whitespace-nowrap">Total cost</span>
+                    <span className="whitespace-nowrap">{uiText("Total cost")}</span>
                     <span>{formatCost(cost)}</span>
                 </div>
             )}

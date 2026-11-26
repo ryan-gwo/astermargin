@@ -1,6 +1,6 @@
 import { uiText } from "../../host/uiText";
 import React from "react";
-import { Icon, LayersIcon, MagicWandIcon, PlayIcon, PlusSignIcon, TableIcon, TickIcon } from "../../icons";
+import { Icon, LayersIcon, MagicWandIcon, PlusSignIcon, TableIcon, TickIcon } from "../../icons";
 
 export interface EmptyTableGuideProps {
     /** The host's Add items control (the + Items menu); absent, that step names the drop only. */
@@ -50,16 +50,8 @@ export function EmptyTableGuide({
             ? {
                   key: "items",
                   icon: TickIcon,
-                  title: itemCount === 1 ? "1 item added" : `${itemCount.toLocaleString("en-US")} items added`,
-                  text: (
-                      <>
-                          {uiText("Each item is a row. Add more with")}{" "}
-                          <span className="rt-nowrap">
-                              <Icon icon={PlusSignIcon} size={11} className="rt-empty-inline-icon" />{' '}{uiText("Items")}
-                          </span>
-                          , or drag them onto the table.
-                      </>
-                  ),
+                  title: itemCount === 1 ? uiText("1 item added") : uiText("{count} items added", { count: itemCount }),
+                  text: uiText("Each item is a row. Use Items to add more, or drag them onto the table."),
                   action: null,
                   done: true,
               }
@@ -67,7 +59,7 @@ export function EmptyTableGuide({
                   key: "items",
                   icon: LayersIcon,
                   title: uiText("Add items"),
-                  text: "Each item from your library is a row. Drag items, a collection or a tag onto the table, or pick them.",
+                  text: uiText("Each item from your library is a row. Drag items, a collection or a tag onto the table, or pick them."),
                   action: addItems ?? null,
               },
     ];
@@ -75,8 +67,8 @@ export function EmptyTableGuide({
         steps.push({
             key: "columns",
             icon: TableIcon,
-            title: "Add columns",
-            text: "Each column is a question AsterMargin answers for every item: as text, yes / no or a category.",
+            title: uiText("Add columns"),
+            text: uiText("Each column is a question AsterMargin answers for every item: as text, yes / no or a category."),
             action: (
                 // A disabled button shows no tooltip of its own.
                 <span title={addColumnDisabledReason}>
@@ -98,10 +90,10 @@ export function EmptyTableGuide({
             icon: MagicWandIcon,
             title: uiText("Ask AsterMargin"),
             text: hasItems
-                ? "Describe what you want to compare. AsterMargin suggests columns for these items."
+                ? uiText("Describe what you want to compare. AsterMargin suggests columns for these items.")
                 : onAddColumn
-                  ? "Describe what you want to compare. AsterMargin finds the items and suggests the columns."
-                  : "Describe the items you want to compare. AsterMargin finds them for you.",
+                  ? uiText("Describe what you want to compare. AsterMargin finds the items and suggests the columns.")
+                  : uiText("Describe the items you want to compare. AsterMargin finds them for you."),
             action: (
                 <button type="button" className="rt-empty-action" onClick={onAskAsterMargin}>
                     <Icon icon={MagicWandIcon} size={13} />
@@ -134,7 +126,7 @@ export function EmptyTableGuide({
                 </ul>
                 {canFill ? (
                     <p className="rt-empty-guide-foot">
-                        Then <Icon icon={PlayIcon} size={12} className="rt-empty-inline-icon" />{' '}{uiText("Fill has AsterMargin answer every cell.")}
+                        {uiText("Then Fill has AsterMargin answer every cell.")}
                     </p>
                 ) : null}
             </div>

@@ -198,37 +198,20 @@ function responseText(response: unknown): string {
     return "";
 }
 
-function htmlToText(value: string): string {
-    const withoutTags = value.replace(/<[^>]+>/g, " ");
-    return withoutTags
-        .replace(/&nbsp;/giu, " ")
-        .replace(/&amp;/giu, "&")
-        .replace(/&lt;/giu, "<")
-        .replace(/&gt;/giu, ">")
-        .replace(/&#39;/giu, "'")
-        .replace(/&quot;/giu, '"')
-        .replace(/\s+/gu, " ")
-        .trim();
-}
-
 export function parseReleasePage(
     html: string,
-    version: string,
-): Partial<AvailableUpdate> {
-    const date = html.match(
-        /<relative-time[^>]+datetime=["']([^"']+)["']/iu,
-    )?.[1];
-    const body = html.match(
-        /<div[^>]+data-test-selector=["']body-content["'][^>]*>([\s\S]*?)<\/div>/iu,
-    )?.[1];
+): Pick<AvailableUpdate, "publishedAt" | "summary"> {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const date = doc.querySelector("[data-test-selector='release-card'] relative-time[datetime], relative-time[datetime]")
+        ?.getAttribute("datetime");
+    const notes = doc.querySelector("[data-test-selector='body-content'], .markdown-body");
+    for (const block of notes?.querySelectorAll("p, li, h2, h3, br") ?? []) {
+        block?.appendChild(doc.createTextNode(" "));
+    }
+    const summary = notes?.textContent?.trim().replace(/\s+/gu, " ").slice(0, 1600);
     return {
-        ...(date && Number.isFinite(Date.parse(date))
-            ? { publishedAt: date }
-            : {}),
-        ...(body
-            ? { summary: htmlToText(body).slice(0, 1600) || undefined }
-            : {}),
-        version,
+        publishedAt: date && Number.isFinite(Date.parse(date)) ? date : undefined,
+        summary: summary || undefined,
     };
 }
 
@@ -247,7 +230,6 @@ async function releaseDetails(version: string): Promise<AvailableUpdate> {
                 responseType: "text",
                 headers: {
                     Accept: "application/vnd.github+json",
-                    "User-Agent": "AsterMargin-Zotero",
                 },
             },
         );
@@ -262,23 +244,23 @@ async function releaseDetails(version: string): Promise<AvailableUpdate> {
         }
         if (typeof details.body === "string")
             release.summary = details.body.trim().slice(0, 1600) || undefined;
-    } catch (apiError) {
-        // GitHub's unauthenticated API is rate limited. The public release
-        // page carries the same date and notes, so use it when the API cannot
-        // be reached instead of showing two empty fields in the preferences.
+    } catch (error) {
+        Zotero.debug(`AsterMargin release metadata API request failed: ${String(error)}`);
+    }
+    // The API can be rate limited or omit fields. Use the same version's
+    // public release page to fill any gaps without blocking the install.
+    if (!release.publishedAt || !release.summary) {
         try {
             const page = await Zotero.HTTP.request(
                 "GET",
-                `https://github.com/${repository}/releases/tag/${tag}`,
+                release.notesUrl,
                 { timeout: 7000, responseType: "text" },
             );
-            Object.assign(
-                release,
-                parseReleasePage(responseText(page), version),
-            );
-        } catch (pageError) {
-            Zotero.logError(pageError as Error);
-            Zotero.logError(apiError as Error);
+            const details = parseReleasePage(responseText(page));
+            release.publishedAt ??= details.publishedAt;
+            release.summary ??= details.summary;
+        } catch (error) {
+            Zotero.logError(error as Error);
         }
     }
     return release;

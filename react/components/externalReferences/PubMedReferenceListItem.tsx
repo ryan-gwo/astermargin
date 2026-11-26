@@ -31,7 +31,7 @@ export const PubMedTags: React.FC<{ item: ExternalReference }> = ({ item }) => {
             {item.is_retracted && <RecordBadge label={uiText("Retracted")} tone="red" />}
             {publicationTypeBadges(item).map((badge) => <RecordBadge key={badge} label={badge} />)}
             {pmcid && isFreePmcArticle(item) && (
-                <RecordLink url={pmcUrl(pmcid)}><RecordBadge label="Free PMC article" tone="green" /></RecordLink>
+                <RecordLink url={pmcUrl(pmcid)}><RecordBadge label={uiText("Free PMC article")} tone="green" /></RecordLink>
             )}
         </RecordTags>
     );

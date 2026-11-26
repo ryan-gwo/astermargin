@@ -413,7 +413,7 @@ const ThreadMenuButton: React.FC<ThreadMenuButtonProps> = ({
             ...((host.config?.isDevelopment() ?? false) ? [
                 menuDivider('developer-divider'),
                 {
-                    label: 'Copy chat ID',
+                    label: uiText("Copy chat ID"),
                     icon: ToolsIcon,
                     onClick: handleCopyThreadId,
                     disabled: !threadId,
