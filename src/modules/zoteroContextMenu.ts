@@ -15,6 +15,7 @@
  */
 
 import { resolveChatWindow } from '../runtime/navigation';
+import { actionDisplayText } from '../utils/actionDisplayText';
 import { interfaceLocaleOverridesHost } from '../utils/interfaceLanguage';
 import { getString, localizePluginElement } from '../utils/locale';
 
@@ -561,7 +562,7 @@ function buildItemMenuItems(itemActions: Action[]): any[] {
         menus.push({
             menuType: 'menuitem' as const,
             l10nID: 'astermargin-context-menu-action',
-            l10nArgs: JSON.stringify({ title: action.title }),
+            l10nArgs: JSON.stringify({ title: actionDisplayText(action, 'title') }),
             onShowing: safeOnShowing(`item-action:${action.id}`, (_event: any, context: any) => {
                 filterItemAction(action, context);
             }),
@@ -590,7 +591,7 @@ function buildCollectionMenuItems(collectionActions: Action[]): any[] {
     const items: any[] = collectionActions.map(action => ({
         menuType: 'menuitem' as const,
         l10nID: 'astermargin-context-menu-action',
-        l10nArgs: JSON.stringify({ title: action.title }),
+        l10nArgs: JSON.stringify({ title: actionDisplayText(action, 'title') }),
         onShowing: safeOnShowing(`collection-action:${action.id}`, (_event: any, context: any) => {
             filterCollectionAction(action, context);
         }),

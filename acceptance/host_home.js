@@ -46,6 +46,80 @@ const homeCopy = {
     },
 };
 
+const readerToolbarCopy = {
+    "en-US": [
+        "Ask AsterMargin", "Actions", "Summarize", "Color-code this paper",
+        "Skim this paper", "How does this fit into my library?",
+        "Find similar papers", "Find key references from this paper", "Add custom action…",
+    ],
+    "zh-CN": [
+        "询问星笺", "动作", "概括文献", "为论文添加分类高亮",
+        "速读这篇论文", "这篇论文和库中哪些文献相关？",
+        "查找相关论文", "找出这篇论文的关键参考文献", "添加自定义动作…",
+    ],
+    "zh-TW": [
+        "詢問星箋", "動作", "摘要文獻", "依類別標示論文重點",
+        "略讀這篇論文", "這篇論文和庫中哪些文獻相關？",
+        "尋找相關論文", "找出這篇論文的重要參考文獻", "新增自定義動作…",
+    ],
+};
+
+async function inspectReaderToolbar(locale, attachment) {
+    const reader = await waitFor(
+        () => Zotero.Reader._readers.find(candidate => candidate.itemID === attachment.id),
+        "PDF reader instance",
+    );
+    const button = await waitFor(
+        () => reader._iframeWindow?.document.querySelector(".astermargin-reader-toolbar-button"),
+        "AsterMargin PDF toolbar button",
+    );
+    const expected = readerToolbarCopy[locale];
+    const inspectMenu = async (labels) => {
+        button.click();
+        const popup = await waitFor(
+            () => Array.from(reader._popupset.children).find(
+                el => el.localName === "menupopup" && el.state === "open" &&
+                    el.firstElementChild?.getAttribute("label") === expected[0],
+            ),
+            "AsterMargin PDF toolbar dropdown",
+        );
+        try {
+            const actual = Array.from(popup.children)
+                .filter(el => el.localName === "menuitem")
+                .map(el => el.getAttribute("label"));
+            if (JSON.stringify(actual) !== JSON.stringify(labels)) {
+                throw Error("PDF toolbar labels: expected " + JSON.stringify(labels) +
+                    ", got " + JSON.stringify(actual));
+            }
+            return actual;
+        } finally {
+            popup.hidePopup();
+            await waitFor(() => !popup.isConnected, "PDF toolbar dropdown closed");
+        }
+    };
+
+    const labels = await inspectMenu(expected);
+    const pref = "extensions.zotero.astermargin.actions";
+    const previous = Zotero.Prefs.get(pref, true);
+    const renamed = "My PDF skim";
+    const custom = "Summarize"; // Same source text as a built-in, with a separate ID.
+    try {
+        Zotero.Prefs.set(pref, JSON.stringify({
+            version: 1,
+            overrides: { "builtin-skim-paper": { title: renamed } },
+            custom: [{ id: "menu-fixture", title: custom, text: "Test action",
+                targets: ["attachment"], sortOrder: 1000 }],
+        }), true);
+        const customized = [...labels];
+        customized[4] = renamed;
+        customized.splice(-1, 0, custom);
+        await inspectMenu(customized);
+    } finally {
+        Zotero.Prefs.set(pref, previous, true);
+    }
+    return { labels, renamed, custom };
+}
+
 async function inspectHome(locale, parentItem) {
     const expected = homeCopy[locale];
     const win = Zotero.getMainWindow();
@@ -133,11 +207,14 @@ async function inspectHome(locale, parentItem) {
     );
     sourcesButton.click();
 
+    const toolbar = await inspectReaderToolbar(locale, attachment);
+
     // Return to the library so the generic smoke test can check quick prompt.
     win.Zotero_Tabs.select("zotero-pane");
     return {
         categories,
         readerChip: expected.currentFile,
+        toolbar,
         actions: expected.actions,
         sources: expected.sources,
     };

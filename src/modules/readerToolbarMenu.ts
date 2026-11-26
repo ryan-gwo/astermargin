@@ -10,6 +10,7 @@
  */
 
 import { captureReaderActionLocation } from '../runtime/readerActionLocation';
+import { actionDisplayText } from '../utils/actionDisplayText';
 import { getString } from "../utils/locale";
 import { resolveChatWindow } from '../runtime/navigation';
 
@@ -243,7 +244,7 @@ function openAsterMarginMenu(reader: any, anchorButton: HTMLElement): void {
 
             for (const action of actions) {
                 const menuitem = xulDoc.createXULElement('menuitem');
-                menuitem.setAttribute('label', action.title);
+                menuitem.setAttribute('label', actionDisplayText(action, 'title'));
                 menuitem.classList.add('menuitem-iconic');
                 setMenuItemIcon(menuitem, categoryIconDataUri(action.category, win));
                 menuitem.addEventListener('command', async () => {

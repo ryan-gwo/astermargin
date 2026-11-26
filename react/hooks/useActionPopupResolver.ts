@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { useAtomValue } from 'jotai';
 import { actionsAtom } from '../atoms/actions';
 import type { ActionPopupSource } from '@astermargin/agent-ui/chat/actionPopup';
+import { actionDisplayText } from '../utils/actionDisplayText';
 
 /**
  * Resolves a /command pill's action id to the content its hover card shows.
@@ -18,8 +19,8 @@ export function useActionPopupResolver(): (actionId: string) => ActionPopupSourc
             const action = actions.find((a) => a.id === actionId);
             if (!action) return null;
             return {
-                title: action.title,
-                description: action.description,
+                title: actionDisplayText(action, 'title'),
+                description: actionDisplayText(action, 'description'),
                 prompt: action.text,
                 category: action.category,
             };

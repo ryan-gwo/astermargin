@@ -17,6 +17,7 @@ import { buildActionPopup } from '@astermargin/agent-ui/chat/actionPopup';
 import { highlightText } from '@astermargin/agent-ui/chat/highlightText';
 import { findMatchRanges, type FindQuery } from '@astermargin/agent-ui/chat/findContext';
 import { getHost } from '@astermargin/agent-ui/host';
+import { actionDisplayText } from '../../utils/actionDisplayText';
 
 /**
  * Render message content with recognized `/command` tokens styled as pills.
@@ -49,10 +50,11 @@ export function renderContentWithSlashPills(
             // query or no match, so the no-find rendering is untouched.
             return <React.Fragment key={i}>{highlightText(segment.text, findQuery, `find-${i}`)}</React.Fragment>;
         }
+        const displayAction = { id: action.action_id, title: action.title ?? "", description: action.description };
         const popup = buildActionPopup({
-            title: action.title,
+            title: action.title === undefined ? undefined : actionDisplayText(displayAction, 'title'),
             command: action.command,
-            description: action.description,
+            description: actionDisplayText(displayAction, 'description'),
             prompt: action.prompt,
             category: action.category,
         });

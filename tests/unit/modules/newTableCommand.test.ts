@@ -247,6 +247,22 @@ describe('the menu entries', () => {
         }
     });
 
+    it('localizes built-in titles in item and collection menus using the plugin language', () => {
+        const previousLocale = Z.AsterMargin.interfaceLocale;
+        Z.AsterMargin.interfaceLocale = 'zh-TW';
+        try {
+            initContextMenus();
+            const labels = (menuID: string) => registered.find(menu => menu.menuID === menuID)
+                .menus[0].menus
+                .filter((entry: any) => entry.l10nID === 'astermargin-context-menu-action')
+                .map((entry: any) => JSON.parse(entry.l10nArgs).title);
+            expect(labels('astermargin-item-context-menu')).toContain('摘要文獻');
+            expect(labels('astermargin-collection-context-menu')).toContain('撰寫文獻回顧');
+        } finally {
+            Z.AsterMargin.interfaceLocale = previousLocale;
+        }
+    });
+
     it('adds the table entries in production builds', () => {
         Z.AsterMargin.data.env = 'production';
         initContextMenus();
